@@ -15,11 +15,64 @@ import gevent.monkey
 gevent.monkey.patch_all()
 
 import os
+import threading
 import types
 import tempfile
 import shutil
 
 import pytest
+
+
+def _poll(done):
+    import gevent
+    while not done():
+        gevent.sleep(0.02)
+    return True
+
+
+class _PolledFlag:
+    """What xdist's worker queue waits on, without a wake-up across threads."""
+
+    def __init__(self):
+        self._set = False
+
+    def set(self):
+        self._set = True
+
+    def clear(self):
+        self._set = False
+
+    def wait(self, timeout=None):
+        return _poll(lambda: self._set)
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        'markers', 'guard_refusals: the test makes the transport guard refuse a write that '
+        'carries no confirmed lease on purpose (#625; anywhere else that fails the test)')
+    # Under pytest-xdist the worker's main thread waits on execnet's receiver, and that
+    # receiver is a real thread: it was started before the patch above. What the two
+    # share is locked and signalled with gevent's primitives from then on, and a
+    # release from the other thread now and then never wakes the worker - it sits there
+    # for good, or the idle hub ends the wait with LoopExit. So the three waits of the
+    # main thread poll instead: for the next test, for the shutdown, and for the
+    # receiver to end. The queue's lock is a real one, held for a few instructions.
+    if not hasattr(config, 'workerinput'):
+        return
+    import _thread
+    for plugin in config.pluginmanager.get_plugins():
+        queue = getattr(plugin, 'torun', None)
+        if queue is None or not hasattr(queue, '_has_items_event'):
+            continue
+        queue._lock = _thread.RLock()
+        queue._has_items_event = _PolledFlag()
+        gateway = plugin.channel.gateway
+        ready = getattr(gateway._execpool, '_primary_thread_task_ready', None)
+        if ready is not None:
+            ready.wait = lambda timeout=None, ev=ready: _poll(ev.is_set)
+        receivers = gateway._receivepool
+        receivers.waitall = lambda timeout=None, pool=receivers: _poll(lambda: not pool.active_count())
+
 
 DEFAULT_TENANT = 'default'
 
@@ -64,6 +117,116 @@ def db():
         dbmod.CONFIG_DIR, dbmod.DATABASE_FILE, dbmod.KEY_FILE = _orig
         shutil.rmtree(tmp, ignore_errors=True)
         _reset_rbac_caches()
+
+
+def unconfirmed_writes():
+    """The writes the transport guard refused in this test for want of a confirmed lease
+    in a background context (#625, design 5.3), however the code around them took it."""
+    from pegaprox.core import ha
+    return sorted(action for action, why in ha._guard_said
+                  if why in (ha.GUARD_NO_TOKEN, ha.GUARD_RAN_OUT))
+
+
+@pytest.fixture(autouse=True)
+def _ha_state_out_of_the_checkout(tmp_path, monkeypatch, request):
+    """A checkout whose config/ha_state.json says standby would turn every write in
+    the suite into a 409, and a snapshot applied in a test would write the checkout's
+    known_hosts, branding and plugin configs. Every test gets its own throwaway set;
+    AES_KEY_FILE too, because a .pre-ha backup next to it marks a joined instance."""
+    from pegaprox.core import ha
+    ha_dir = tmp_path / 'ha'
+    ha_dir.mkdir(exist_ok=True)
+    monkeypatch.setattr(ha, 'STATE_FILE', str(ha_dir / 'ha_state.json'))
+    monkeypatch.setattr(ha, 'AES_KEY_FILE', str(ha_dir / '.pegaprox_aes256.key'))
+    monkeypatch.setattr(ha, 'KNOWN_HOSTS_FILE', str(ha_dir / '.ssh_known_hosts'))
+    monkeypatch.setattr(ha, 'BRANDING_DIR', str(ha_dir / 'branding'))
+    monkeypatch.setattr(ha, 'PLUGINS_DIR', str(ha_dir / 'plugins'))
+    # what a sync did not carry over is kept there; the change journal waits in memory,
+    # and so does what the tick last saw
+    monkeypatch.setattr(ha, 'ORPHANS_DIR', str(ha_dir / 'ha_orphans'))
+    monkeypatch.setattr(ha, '_journal', {'pending': [], 'dropped': 0, 'last_id': None,
+                                         'filled_to': 0, 'due': False})
+    # its timer is a second one next to the note's, which the group tests count
+    monkeypatch.setattr(ha, '_journal_later', lambda: None)
+    monkeypatch.setattr(ha, '_tick', {'seen': None, 'checked': None, 'schema': None})
+    monkeypatch.setattr(ha, '_read_look', {'checked': None, 'schema': None})
+    # a process that has synced before: its first sync would read the rows whatever the
+    # change mark says, and which test runs first in a worker must not matter
+    monkeypatch.setattr(ha, '_mark_checked', True)
+    monkeypatch.setattr(ha, '_orphans', {'count': None, 'over_said': False, 'not_kept': None})
+    # an applied snapshot reloads the IP allow list from that test's database into
+    # module globals; without this a later test in the run meets someone else's list
+    import pegaprox.api.settings as settings_api
+    monkeypatch.setattr(settings_api, '_ip_whitelist_enabled', False)
+    monkeypatch.setattr(settings_api, '_ip_whitelist', set())
+    monkeypatch.setattr(settings_api, '_ip_blacklist', set())
+    # The certificate in the checkout's config/ssl (a dev instance's) went into every
+    # pairing code a test made, so the pins in the member records depended on the
+    # machine: green in CI, red next to a running instance. A test that wants a pin
+    # sets one.
+    import pegaprox.api.auto_install as auto_install
+    monkeypatch.setattr(auto_install, 'self_signed_fingerprint', lambda: '')
+    # A signed call from before the process started is refused (the nonces seen until
+    # then are gone). The test process started whenever the run did, so every test
+    # counts as a process that has run for longer than the signature window (lease
+    # time 0 is the boot of the host).
+    monkeypatch.setattr(ha, '_PROCESS_STARTED', 0)
+    # a standby's note that its active did not answer lives as long as the process
+    monkeypatch.setattr(ha, '_silent_source', {'id': None})
+    # A timer of core/ha.py (the active's note to its members after a write, a standby's
+    # reload once a change has settled) fires seconds later on a thread of its own, in
+    # whatever state file a later test holds by then. None starts here; a test that
+    # wants one replaces ha._later and runs what it was handed.
+    monkeypatch.setattr(ha, '_later', lambda delay, fn, name: None)
+    monkeypatch.setattr(ha, '_nudge', {'due': False, 'last': None})
+    monkeypatch.setattr(ha, '_run', ha._fresh_run())
+    # Automatic failover: what runs a lease lives as long as the process, one per
+    # instance id. Nothing of it runs on its own in a test - no loop, no watchdog, no
+    # call in the background: the calls a node wants sent stay in its queue, and a test
+    # that wants them delivers them by hand (tests/test_ha_auto.py).
+    monkeypatch.setattr(ha, '_rts', {})
+    monkeypatch.setattr(ha, 'lease_start', lambda: False)
+    monkeypatch.setattr(ha, '_lease_dispatch', lambda rt: None)
+    monkeypatch.setattr(ha, '_lease_spawn', lambda fn, name: None)
+    # the zone of the machine the suite runs on would go into every group a test forms
+    monkeypatch.setattr(ha, '_local_zone', {'name': ''})
+    # what the transport guard holds per thread (a confirmed lease, a read, a job) and
+    # what it said, from a test before: the tests share their greenlet (S4)
+    monkeypatch.setattr(ha, '_guard_tls', threading.local())
+    monkeypatch.setattr(ha, '_guard_said', set())
+    monkeypatch.setattr(ha, '_recovery_live', set())
+    monkeypatch.setattr(ha, '_missed_said', {})
+    ha.reset_for_tests()
+    yield
+    # in a test, a background write without a confirmed lease is a failure even where
+    # a broad except swallowed the refusal (design 5.3)
+    unconfirmed = unconfirmed_writes()
+    ha.reset_for_tests()
+    if unconfirmed and request.node.get_closest_marker('guard_refusals') is None:
+        pytest.fail('the transport guard refused writes that no step confirmed: '
+                    f'{unconfirmed[:5]} - confirm the step before it (ha.confirm_step), run '
+                    'the job through ha.as_job or carry the token into the fan-out (ha.carry); '
+                    'mark the test guard_refusals where the refusal is what it tests')
+
+
+def _reset_api_rate_window():
+    """Forget every client the API rate limiter has seen. Shared process state, and the
+    whole harness looks like one client to it."""
+    try:
+        import pegaprox.globals as ppglobals
+        ppglobals.api_rate_window.reset()
+    except Exception:
+        pass
+
+
+def _reset_guest_index():
+    """The guest search index keeps what every config read handed it, by cluster id, and
+    the next test's cluster_1 is another cluster."""
+    try:
+        from pegaprox.background import guest_index
+        guest_index.clear()
+    except Exception:
+        pass
 
 
 def _reset_rbac_caches():
@@ -192,7 +355,9 @@ def _integration_app():
     dbmod._db = None
     dbmod.PegaProxDB._instance = None
 
-    # never persist test sessions to disk
+    # never persist test sessions to disk (a test that checks what would be saved
+    # calls the real one with get_db patched)
+    authmod._real_save_sessions = authmod.save_sessions
     authmod.save_sessions = lambda *a, **k: None
 
     from pegaprox.app import create_app
@@ -248,6 +413,23 @@ def api(_integration_app, db):
     with authmod.sessions_lock:
         authmod.active_sessions.clear()
     ppglobals.cluster_managers.clear()
+    # MK Sep 2026 - cluster_managers was the only manager registry being reset, so a fake
+    # PBS or ESXi manager left behind by an earlier test stayed visible to every test after
+    # it. That is invisible until a test touches a route that walks one of those registries:
+    # check_cluster_updates does `pbs_results[pmgr.name or pid]`, and `pmgr.name` on a
+    # leftover MagicMock is a MagicMock, so jsonify died with "keys must be str ... not
+    # MagicMock" in a full-suite run while the same test passed on its own.
+    for _registry in ('pbs_managers', 'vmware_managers'):
+        getattr(ppglobals, _registry, {}).clear()
+    # MK Sep 2026 — the API rate limiter is a process-global sliding window keyed by client
+    # IP (1200 requests / 60s), and every request in this harness arrives from the same one.
+    # Nothing reset it between tests, so a long integration run could put more than the
+    # budget into a single 60s window and everything after that failed with 429s instead of
+    # whatever it was actually asserting. That is what took the Testing CI red on ae8674d
+    # (run 35697303667) while the same tree was green on a slower machine here. reset() is
+    # already the method the unlock endpoints use.
+    _reset_api_rate_window()
+    _reset_guest_index()
 
     client = _integration_app.test_client()
 
@@ -276,6 +458,10 @@ def api(_integration_app, db):
         with authmod.sessions_lock:
             authmod.active_sessions.clear()
         ppglobals.cluster_managers.clear()
+        for _registry in ('pbs_managers', 'vmware_managers'):
+            getattr(ppglobals, _registry, {}).clear()
+        _reset_api_rate_window()
+        _reset_guest_index()
 
 
 @pytest.fixture

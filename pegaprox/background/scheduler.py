@@ -16,6 +16,7 @@ from datetime import datetime, timedelta
 from pegaprox.constants import SCHEDULED_TASKS_FILE
 from pegaprox.globals import cluster_managers, _scheduler_running, _scheduler_thread
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 from pegaprox.utils.audit import log_audit
 
 # NS: this was buried somewhere around line 40k in the monolith, nobody could find it
@@ -137,8 +138,16 @@ def run_scheduled_tasks():
     Supported actions: start, stop, restart, snapshot, backup
     """
     config = load_scheduled_tasks()
-    current_time = datetime.now()
-    
+    # the group's zone when this instance is in one, so a failover does not shift a
+    # schedule; datetime.now() on an instance of its own (#625)
+    current_time = ha.schedule_now()
+    # automatic failover (design 5.7): what fell due while the group had no leader is
+    # said, not run late, and a new leader fires nothing in a minute the former one may
+    # have fired already. Neither does anything anywhere else
+    _report_missed(config.get('tasks', []))
+    if ha.schedule_held():
+        return
+
     for task in config.get('tasks', []):
         if not task.get('enabled', True):
             continue
@@ -183,6 +192,14 @@ def run_scheduled_tasks():
             continue
         
         if should_run:
+            if ha.schedule_fire_first():
+                # at most once: the run is written and on its way to the members before
+                # the task acts, so a leader that takes over does not run it again
+                task['last_run'] = current_time.isoformat()
+                _touch_last_run(task.get('id'), task['last_run'])
+                ha.schedule_fired()
+            if not ha.confirm_step(f"scheduled task {_sl(task.get('name'))}"):
+                return
             execute_scheduled_task(task)
             # fix (audit): this used to write the WHOLE config back — a snapshot taken before
             # the tick began. execute_scheduled_task starts and stops VMs, so it can run for a
@@ -190,6 +207,39 @@ def run_scheduled_tasks():
             # reverted by this save. Touch just this task's last_run instead.
             task['last_run'] = current_time.isoformat()
             _touch_last_run(task.get('id'), task['last_run'])
+
+
+def _due_minute(task, at):
+    """Whether `task` falls due in the minute `at`, its last run aside. For the report of
+    what a change of leader missed (5.7); run_scheduled_tasks decides as it always did."""
+    try:
+        hour, minute = map(int, str(task.get('schedule_time', '02:00')).split(':'))
+    except (TypeError, ValueError):
+        return False
+    kind, day = task.get('schedule_type', 'daily'), task.get('schedule_day', 0)
+    if kind == 'hourly':
+        return at.minute == minute
+    if (at.hour, at.minute) != (hour, minute):
+        return False
+    return (kind == 'daily' or (kind == 'weekly' and at.weekday() == day)
+            or (kind == 'monthly' and at.day == day))
+
+
+def _report_missed(tasks):
+    """Once a new leader of an automatic group acts: the tasks that fell due in the gap."""
+    window = ha.missed_schedule_window('scheduled tasks')
+    if not window:
+        return
+    missed = set()
+    at = window[0] - window[0] % 60
+    while at <= window[1]:
+        when = ha.schedule_at(at)
+        # a last run from that minute on: the former leader got to it
+        missed.update(str(t.get('name') or t.get('id')) for t in tasks
+                      if t.get('enabled', True) and _due_minute(t, when)
+                      and str(t.get('last_run') or '') < when.isoformat())
+        at += 60
+    ha.missed_schedules('scheduled tasks', sorted(missed), window)
 
 def _touch_last_run(task_id, when):
     """Record a single task's last_run without rewriting the table around it."""
@@ -252,7 +302,9 @@ def scheduler_loop():
     
     while _scheduler_running:
         try:
-            run_scheduled_tasks()
+            # standby: the tasks run on the active instance, not twice
+            if ha.is_active():
+                run_scheduled_tasks()
         except Exception as e:
             logging.error(f"Scheduler error: {e}")
         

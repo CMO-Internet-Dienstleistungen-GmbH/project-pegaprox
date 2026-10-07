@@ -1,4 +1,4 @@
-# PegaProx — Encryption Architecture (Operator Guide)
+# PegaProx - Encryption Architecture (Operator Guide)
 
 > For **vulnerability reporting** see [`SECURITY.md`](../SECURITY.md) in the repo root.
 > This document covers the technical design: how keys are loaded, where the DB
@@ -6,9 +6,9 @@
 
 PegaProx persists secrets in two places:
 
-1. **Application database** (`config/pegaprox.db`) — users, sessions, audit
+1. **Application database** (`config/pegaprox.db`) - users, sessions, audit
    log, cluster credentials, scheduler state.
-2. **Configuration files** under `config/` — TLS certificates, cluster JSON,
+2. **Configuration files** under `config/` - TLS certificates, cluster JSON,
    plugin state, etc.
 
 Both rely on a single 32-byte **master key**. Where that key lives is the
@@ -26,12 +26,12 @@ the first hit for the lifetime of the process.
 | 1 | `PEGAPROX_DB_KEY` env var | Docker secrets, k8s, CI | Accepts urlsafe-base64 (44 chars) **or** hex (64 chars) |
 | 2 | `${CREDENTIALS_DIRECTORY}/db-key` | systemd `LoadCredentialEncrypted=` | TPM2- or host-key-bound. Strongest at-rest option |
 | 3 | `PEGAPROX_KEY_FILE` env var → file | Custom path, e.g. NFS mount | chmod 0600 (or 0640 root:pegaprox) |
-| 4 | `/etc/pegaprox/secret.key` | **System-service install default** | chmod **0640** root:pegaprox — group-read required so the systemd unit (running as `pegaprox`) can load it. 0600 root:pegaprox is unreadable for the service. |
+| 4 | `/etc/pegaprox/secret.key` | **System-service install default** | chmod **0640** root:pegaprox - group-read required so the systemd unit (running as `pegaprox`) can load it. 0600 root:pegaprox is unreadable for the service. |
 | 5 | `~/.config/pegaprox/secret.key` | Single-user / dev install | chmod 0600 (owner = user running PegaProx) |
-| 6 | `config/.pegaprox.key` (CONFIG_DIR) | **Legacy** — pre-0.9.9.3 | Triggers deprecation warning on every boot |
+| 6 | `config/.pegaprox.key` (CONFIG_DIR) | **Legacy** - pre-0.9.9.3 | Triggers deprecation warning on every boot |
 
 The loader **rejects** any file-based tier whose permissions have group-write,
-group-exec, or *any* other-user bits set — an accidentally chmod-755'd key file
+group-exec, or *any* other-user bits set - an accidentally chmod-755'd key file
 never becomes the active key silently. The rejection is logged. Group-read is
 **allowed** so the system-service install pattern (`root:pegaprox 0640`) works.
 
@@ -44,7 +44,7 @@ The 0.9.9.2 audit flagged the legacy default (Tier 6) for storing the key
 Tiers 1–5 break that coupling: the key lives somewhere a `config/` snapshot
 won't capture. Tier 2 is the strongest because the key is **only**
 available to the running service unit and is wrapped against the host's TPM2
-chip or host key — not even root can read it directly without unsealing.
+chip or host key - not even root can read it directly without unsealing.
 
 ### Inspecting the active tier
 
@@ -94,15 +94,15 @@ each page carries an HMAC-SHA512 tag.
 | Windows | ❌ no wheel | Plain SQLite + field-level Fernet |
 | Docker `python:3.12-slim` | ✅ (x86_64 base image) | **Full DB encryption** |
 
-The fallback is *not* unencrypted — sensitive fields (cluster passwords,
+The fallback is *not* unencrypted - sensitive fields (cluster passwords,
 2FA secrets, OIDC client secrets, API tokens) are still individually
 Fernet-encrypted with the same master key. The fallback gives up on
 metadata-at-rest (table names, audit-log timestamps, session IDs).
 
 You can force-disable SQLCipher by uninstalling `sqlcipher3-binary` and
-restarting — the connection layer detects the missing module and falls
+restarting - the connection layer detects the missing module and falls
 back transparently. **Note**: any DB already encrypted will become
-unreadable until the module is reinstalled — there is no automatic
+unreadable until the module is reinstalled - there is no automatic
 decrypt-back-to-plain step.
 
 ### Cipher parameters
@@ -113,7 +113,7 @@ PRAGMA key = x'<64-hex-chars>'
 ```
 
 We pass the key as a 32-byte hex literal so SQLCipher skips its
-PBKDF2 key-derivation — the master key already has full entropy and
+PBKDF2 key-derivation - the master key already has full entropy and
 running 256k PBKDF2 rounds on every connection acquire is pointless
 overhead. This matches the documented `cipher_default_kdf_iter = 0`
 posture for high-entropy raw keys.
@@ -137,8 +137,11 @@ restart-storm cannot double-migrate. Boot output:
   backup: config/pegaprox.db.plain.bak.1778613855
 ```
 
-The plain backup is **retained** — delete it manually once you've
-verified the encrypted DB works for a day or two.
+The plain backup is kept for a short rollback window only: every start
+shreds (overwrites, then deletes) plaintext backups older than one hour.
+Set `PEGAPROX_PLAIN_BACKUP_RETENTION_S` to change the window (`0` shreds
+them on the next start). Take your own copy of it first if you want a
+longer way back.
 
 ### Opt-out
 
@@ -178,29 +181,30 @@ sudo -u pegaprox python3 pegaprox_multi_cluster.py --migrate-db --yes
 
 The four-step process:
 
-1. **Backup** — `config/pegaprox.db` → `config/pegaprox.db.plain.bak.<timestamp>`
-2. **Encrypt** — new file `config/pegaprox.db.enc` built via SQLite's
+1. **Backup** - `config/pegaprox.db` → `config/pegaprox.db.plain.bak.<timestamp>`
+2. **Encrypt** - new file `config/pegaprox.db.enc` built via SQLite's
    `ATTACH … KEY … AS encrypted; SELECT sqlcipher_export('encrypted');`
-3. **Verify** — every table's row count is compared between the plain
+3. **Verify** - every table's row count is compared between the plain
    backup and the encrypted target. Any mismatch aborts the migration
    *before* the swap.
-4. **Atomic swap** — `os.replace(pegaprox.db.enc, pegaprox.db)`. POSIX
+4. **Atomic swap** - `os.replace(pegaprox.db.enc, pegaprox.db)`. POSIX
    `rename(2)` is atomic on the same filesystem.
 
-The `.plain.bak.<timestamp>` file is kept indefinitely — clean it up
-manually once you've confirmed the encrypted DB works end-to-end. **Do
-not delete it the same day** unless you have your own backups; this is
-the only path back if the encrypted DB becomes inaccessible.
+The `.plain.bak.<timestamp>` file holds every stored credential in the
+clear, so it is not kept: the first start after the retention window
+(default one hour, `PEGAPROX_PLAIN_BACKUP_RETENTION_S`) shreds it. If you
+want it as a way back until you have checked the encrypted DB, copy it
+somewhere safe right after the migration and delete that copy yourself.
 
 ### Exit codes
 
 | Code | Meaning |
 |------|---------|
 | 0 | Migration successful, encrypted DB is now active |
-| 2 | `sqlcipher3` not installed — install `sqlcipher3-binary` first |
+| 2 | `sqlcipher3` not installed - install `sqlcipher3-binary` first |
 | 3 | Existing DB already encrypted with a **different** key (refuses to clobber) |
-| 4 | Source DB is corrupt — repair before retrying |
-| 5 | Row-count verification failed — encrypted DB *not* swapped in |
+| 4 | Source DB is corrupt - repair before retrying |
+| 5 | Row-count verification failed - encrypted DB *not* swapped in |
 
 ---
 
@@ -212,7 +216,7 @@ the only path back if the encrypted DB becomes inaccessible.
 
 ### Backup discipline
 
-If you take backups of `config/`, **also** back up the master key — but
+If you take backups of `config/`, **also** back up the master key - but
 *to a different location and with different access controls*. Examples:
 
 - DB → encrypted nightly snapshot to S3 (versioned, KMS-encrypted bucket).
@@ -232,7 +236,7 @@ emitted by the migrator, or from a pre-migration full backup.
 
 `pegaprox_multi_cluster.py --keystore-status` will report
 `"db": {"backend": "sqlcipher", "encrypted_at_rest": true}` even on a
-corrupt DB — corruption manifests as `OperationalError: file is not a
+corrupt DB - corruption manifests as `OperationalError: file is not a
 database` at first query. Use `--migrate-db --dry-run` to detect the
 `corrupt` state.
 
@@ -241,7 +245,7 @@ corrupt DB out, restore the backup, re-run `--migrate-db`.
 
 ---
 
-## 5. systemd LoadCredentialEncrypted (Tier 2) — strongest at-rest
+## 5. systemd LoadCredentialEncrypted (Tier 2) - strongest at-rest
 
 This is the recommended posture for production Linux deployments.
 
@@ -323,7 +327,7 @@ exactly this case.
    `sqlcipher_export`.
 2. **Field-level Fernet keys are not separately rotated.** Master key
    rotation does not re-wrap existing Fernet-encrypted fields. This is
-   acceptable since both rely on the same master key — when the master
+   acceptable since both rely on the same master key - when the master
    key changes, both layers change together.
 3. **No second-factor at the DB layer.** A compromised host running
    PegaProx can read the DB. Compartmentalization (running clusters in
@@ -331,7 +335,7 @@ exactly this case.
 4. **Plugin compatibility.** First-party plugins use `dbcrypto.connect()`
    and work transparently. Third-party community plugins that call
    `sqlite3.connect()` directly will **not** be able to read an encrypted
-   DB — they need to be updated.
+   DB - they need to be updated.
 
 ---
 

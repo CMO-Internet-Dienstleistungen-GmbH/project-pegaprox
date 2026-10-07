@@ -17,6 +17,7 @@ from pegaprox.globals import (
     task_pegaprox_users_cache, task_pegaprox_users_lock,
 )
 from pegaprox.core.db import get_db
+from pegaprox.utils.rbac import acts_as_admin
 
 def effective_reverse_proxy(settings=None):
     """#614 — the frontend builds console (VNC/SSH) WebSocket URLs from
@@ -249,6 +250,15 @@ def save_server_settings(settings):
     SQLite migration
     """
     try:
+        from pegaprox.core.ha import STAMPS_ZONE_SETTING
+        # MK Oct 2026 (#625) - the zone the schedule stamps are in is written with the
+        # stamps only. A caller read every setting before a change of the group zone, and
+        # writing that value back would make the next look move stamps that are in place
+        # MK Oct 2026 - nor the broadcast banners, which api/banners.py writes on its own:
+        # the ACME request saves back what it read 30 s earlier, and a banner added in
+        # between would be gone again
+        from pegaprox.api.banners import BANNERS_KEY
+        settings = {k: v for k, v in settings.items() if k not in (STAMPS_ZONE_SETTING, BANNERS_KEY)}
         db = get_db()
         db.save_server_settings(settings)
         return True
@@ -366,14 +376,22 @@ def get_connected_manager(cluster_id):
         }), 503)
     return manager, None
 
-def check_cluster_access(cluster_id):
-    """Check if current user can access a cluster based on tenant or VM ACLs.
-    Returns (True, None) if allowed, (False, error_response) if not.
+def acting_user():
+    """The identity an authorization decision should be made against.
+
+    require_auth stashes the RAW stored record in g.current_user. That record carries no
+    effective_role, so handing it straight to get_user_clusters gives an API token its
+    OWNER's scope — and for an admin owner get_user_clusters answers None, "all clusters",
+    which makes a caller's own filtering a no-op rather than a refusal. Every route that
+    scopes its own output wants this function, not g.current_user.
+
+    #491 — for an API token, floor the acting role to the token's grant (like
+    build_authz_user) so an admin-owned scoped token can't reach clusters outside its
+    scope. H2 (scale audit): reuse the user require_auth already fetched, else fetch just
+    that one — don't re-scan the whole users table per cluster route, which is also why
+    this does not simply call build_authz_user. MK Sep 2026, Aikido 700487434.
     """
-    from flask import request, jsonify, g
-    from pegaprox.utils.rbac import get_user_clusters
-    # H2 (scale audit): reuse the acting user require_auth already fetched (g.current_user),
-    # else fetch just that one user — don't re-scan the whole users table per cluster route.
+    from flask import request, g
     user = getattr(g, 'current_user', None)
     if user is None:
         try:
@@ -381,15 +399,26 @@ def check_cluster_access(cluster_id):
         except Exception:
             from pegaprox.utils.auth import load_users
             user = load_users().get(request.session['user'], {})
-    # #491 — for an API token, floor the acting role to the token's grant (like build_authz_user)
-    # so an admin-owned scoped token can't reach clusters outside its scope. Done inline (a copy,
-    # not mutating g.current_user) to avoid the whole-table load_users() this hot path deliberately
-    # skips; get_user_clusters now honors effective_role.
     if request.session.get('api_token') and isinstance(user, dict) and 'effective_role' not in user:
-        from pegaprox.models.permissions import ROLE_ADMIN, ROLE_USER, ROLE_VIEWER
-        _h = {ROLE_ADMIN: 3, ROLE_USER: 2, ROLE_VIEWER: 1}
-        _eff = min(_h.get(request.session.get('role'), 1), _h.get(user.get('role'), 1))
-        user = {**user, 'effective_role': next((r for r, lvl in _h.items() if lvl == _eff), ROLE_VIEWER)}
+        from pegaprox.utils.auth import apply_token_role
+        user = apply_token_role(user, request.session.get('role'))
+    return user
+
+
+def caller_acts_as_admin():
+    """rbac.acts_as_admin for the caller of this request. request.session['role'] is the
+    account's role as stored: neither a token's floor nor a tenant override lowers it, so it
+    is no answer to "may this caller skip the tenant checks". NS Oct 2026 (#1060)"""
+    return acts_as_admin(acting_user())
+
+
+def check_cluster_access(cluster_id):
+    """Check if current user can access a cluster based on tenant or VM ACLs.
+    Returns (True, None) if allowed, (False, error_response) if not.
+    """
+    from flask import request, jsonify, g
+    from pegaprox.utils.rbac import get_user_clusters
+    user = acting_user()
     allowed = get_user_clusters(user)
     if allowed is not None and cluster_id not in allowed:
         # #248: check VM ACLs as fallback — users with VM-level access can reach the cluster
@@ -427,12 +456,11 @@ def caller_is_scoped(user, cluster_id):
     caller whose tenant DOES own the cluster — the Client Portal case. Those endpoints therefore
     treated a portal user as a cluster-wide operator and handed back the whole cluster. Centralised
     here so the rule can't drift between call sites again."""
-    from pegaprox.models.permissions import ROLE_ADMIN
     from pegaprox.utils.rbac import (get_user_clusters, user_has_any_pool_access, get_vm_acls,
                                      acls_unavailable, acl_grants_user)
     if not user:
         return True   # unknown identity → treat as confined (fail closed)
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(user):
         return False
     tenant_clusters = get_user_clusters(user, include_pools=False)
     if tenant_clusters is not None and cluster_id not in tenant_clusters:
@@ -458,6 +486,60 @@ def caller_is_scoped(user, cluster_id):
     except Exception:
         return True
     return False
+
+
+# MK Oct 2026 - what a confined caller does not get of a node's maintenance: the guests in it
+# (moving, pending, failed, placed off their pin, the templates moved or left behind) and the
+# HA rules held off over them, which the maintenance plan does not show such a caller either.
+# Status, counts and the note stay; the note names no guest.
+MAINTENANCE_GUEST_FIELDS = ('failed_vms', 'pending_vms', 'current_vm', 'off_pin_vms',
+                            'templates_moved', 'templates_left', 'ha_rules_off', 'ha_rules_kept_on')
+
+
+def sees_whole_maintenance(user, cluster_id):
+    """Whether `user` gets the guests of a maintenance in `cluster_id`: when caller_is_scoped
+    says no. An admin a tenant override lowers where they live is asked as that role (see
+    rbac.acts_as_admin). Fails closed."""
+    try:
+        return not caller_is_scoped(user, cluster_id)
+    except Exception as e:
+        logging.warning(f"[MAINT] scope on {cluster_id} unknown, maintenance guests left out: {e}")
+        return False
+
+
+def maintenance_without_guests(task):
+    """A maintenance task as to_dict() gives it, less MAINTENANCE_GUEST_FIELDS. A new dict."""
+    if not isinstance(task, dict):
+        return task
+    return {k: v for k, v in task.items() if k not in MAINTENANCE_GUEST_FIELDS}
+
+
+def nodes_in_maintenance_view(nodes):
+    """Whether a node map of get_node_status() (or of /node-progress) has a maintenance on it."""
+    return isinstance(nodes, dict) and any(
+        isinstance(n, dict) and n.get('maintenance_task') for n in nodes.values())
+
+
+def nodes_without_maintenance_guests(nodes):
+    """The node map with every maintenance_task less its guests. get_node_status() answers
+    from the manager's cache, which the broadcast loop shares: the nodes that change are
+    copies, the map is never written to."""
+    return {name: (dict(n, maintenance_task=maintenance_without_guests(n['maintenance_task']))
+                   if isinstance(n, dict) and isinstance(n.get('maintenance_task'), dict) else n)
+            for name, n in nodes.items()}
+
+
+def node_maintenance_for_caller(cluster_id, nodes):
+    """The node map as the caller of this request may see it. The caller is only looked up
+    when a node is in maintenance: /metrics is polled from every open tab."""
+    if not nodes_in_maintenance_view(nodes):
+        return nodes
+    from flask import request
+    from pegaprox.utils.auth import build_authz_user
+    if sees_whole_maintenance(build_authz_user(request.session.get('user', ''), request.session),
+                              cluster_id):
+        return nodes
+    return nodes_without_maintenance_guests(nodes)
 
 
 def scope_vm_rows(cluster_id, rows, *, vmid_key='vmid', type_key='type'):
@@ -502,7 +584,6 @@ def check_pbs_access(pbs_id):
     from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import get_user_clusters
     from pegaprox.globals import pbs_managers
-    from pegaprox.models.permissions import ROLE_ADMIN
 
     # Check if PBS exists
     if pbs_id not in pbs_managers:
@@ -514,8 +595,8 @@ def check_pbs_access(pbs_id):
     # check_cluster_access). get_user_clusters() already honors effective_role.
     user = build_authz_user(request.session.get('user', ''), request.session)
 
-    # Admins have full access
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    # Admins have full access - not one a tenant override lowered where they live
+    if acts_as_admin(user):
         return True, None
     
     # Get PBS linked clusters
@@ -540,6 +621,27 @@ def check_pbs_access(pbs_id):
     return False, (jsonify({'error': 'Access denied to this PBS server'}), 403)
 
 
+def bounded_limit(value, default=50, maximum=1000):
+    """Clamp a caller-supplied row limit.
+
+    NS Sep 2026 (audit) — several routes took ?limit= with Flask's type=int, which stops
+    a string but not `?limit=99999999`, and handed it straight to a SQL LIMIT or to the
+    upstream PVE/PBS API. type=int is a parser, not a bound.
+
+    1000 is deliberately generous: the frontend's largest ask on these routes is 200.
+    The audit CSV export is NOT routed through here — it documents ?limit=10000 in the
+    UI and is a deliberate export, so capping it would break a feature rather than close
+    a hole.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    if n <= 0:
+        return default
+    return min(n, maximum)
+
+
 def require_unconfined(cluster_id):
     """sec (audit): guard for a WHOLE-CLUSTER operation — one with no per-object notion, so
     user_can_access_vm has nothing to ask about: rebooting a node, draining it, rewriting the
@@ -558,6 +660,23 @@ def require_unconfined(cluster_id):
     return None
 
 
+# NS Oct 2026 - an XCP-ng pool asks for its own xapi.vm.* permission next to the vm.* one,
+# as its power, config and migrate routes already did (#1110)
+XAPI_TWINS = {'vm.config': 'xapi.vm.config', 'vm.snapshot': 'xapi.vm.snapshot',
+              'vm.clone': 'xapi.vm.clone', 'vm.delete': 'xapi.vm.delete',
+              'vm.migrate': 'xapi.vm.migrate'}
+
+
+def xapi_permission_missing(cluster_id, user, perm):
+    """The xapi.vm.* permission `user` lacks for `perm` when `cluster_id` is an XCP-ng
+    pool, else None."""
+    twin = XAPI_TWINS.get(perm)
+    if not twin or getattr(cluster_managers.get(cluster_id), 'cluster_type', 'proxmox') != 'xcpng':
+        return None
+    from pegaprox.utils.rbac import has_permission
+    return None if has_permission(user, twin) else twin
+
+
 def check_vmware_access(vmware_id):
     """NS Jul 2026 (CodeAnt re-scan IDOR) — tenant gate for a VMware/ESXi server, mirroring
     check_pbs_access. Most vmware.py routes only had a role perm and never scoped to tenant, so
@@ -566,16 +685,22 @@ def check_vmware_access(vmware_id):
     all-cluster (get_user_clusters None), or the caller reaches one of the server's linked clusters.
     Returns (True, None) or (False, error_response)."""
     from flask import request, jsonify
-    from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import get_user_clusters
     from pegaprox.globals import vmware_managers
-    from pegaprox.models.permissions import ROLE_ADMIN
 
     if vmware_id not in vmware_managers:
         return False, (jsonify({'error': 'VMware server not found'}), 404)
     # #491 — floor an admin-owned scoped API token to its effective_role (mirrors check_cluster_access).
-    user = build_authz_user(request.session.get('user', ''), request.session)
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    # NS Oct 2026 (#1101) - resolve by the account's own row through acting_user (g.current_user,
+    # the record require_auth already fetched and refused when it was gone), not build_authz_user:
+    # that re-read the whole users table, and the {} a failed read answers is a role-less
+    # default-tenant identity get_user_clusters hands every cluster. A transient read therefore let
+    # any vmware-view holder past this server gate onto another tenant's ESXi (detail, performance,
+    # watch, the VM list) - the same empty-read hole closed for the console. No account, no reach.
+    user = acting_user()
+    if not user:
+        return False, (jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401)
+    if acts_as_admin(user):
         return True, None
     linked = getattr(vmware_managers[vmware_id], 'linked_clusters', None) or []
     if not linked:
@@ -591,6 +716,30 @@ def check_vmware_access(vmware_id):
     if any(c in uc for c in linked):
         return True, None
     return False, (jsonify({'error': 'Access denied to this VMware server'}), 403)
+
+
+def vmware_server_reach(user):
+    """check_vmware_access's answer for every ESXi server at once, for a caller that lists
+    servers instead of naming one. Returns reaches(linked_clusters) -> bool.
+
+    NS Oct 2026 - GET /api/vmware and the 'vmware_servers' stream frame asked for vmware.view
+    and nothing else, so every holder read every tenant's servers (host, account, notes, last
+    error). Same rule as the gate: a global admin, an unlinked server, an unconfined caller, or
+    a linked cluster the caller owns - pool grants do not count. The caller's reach is resolved
+    once, not once per server."""
+    from pegaprox.utils.rbac import get_user_clusters
+
+    if not user:
+        return lambda linked: False
+    if acts_as_admin(user):
+        return lambda linked: True
+    uc = get_user_clusters(user, include_pools=False)
+
+    def reaches(linked):
+        if not linked or uc is None:
+            return True
+        return any(c in uc for c in linked)
+    return reaches
 
 
 def safe_error(e, default_msg='An internal error occurred'):
@@ -633,6 +782,129 @@ def parse_pve_error(response_text, fallback='Proxmox API error'):
     if '<html' in text.lower():
         return fallback
     return html.escape(text) if text else fallback
+
+
+# MK Oct 2026 (#763, #954) - the two evacuation options of a rolling update. The run started
+# by hand (settings.py) and the scheduled one (schedules.py) are two copies of the loop; what
+# the options do in either of them is written down once, here. Each reads its flags from the
+# state of the run, mgr._rolling_update.
+
+def evacuation_options(mgr, data):
+    """(migrate_templates, relax_anti_affinity) from a request body or a stored schedule: off
+    unless set to a real true, and off on XCP-ng, which has neither the templates nor the HA
+    rules meant here. Also for a node's maintenance."""
+    data = data or {}
+    is_pve = getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox'
+    return (is_pve and data.get('migrate_templates') is True,
+            is_pve and data.get('relax_anti_affinity') is True)
+
+
+def evacuation_options_said(migrate_templates, relax_anti_affinity):
+    """': what the options change' for an audit line, '' with both off."""
+    said = [o for o, on in (('templates move with the evacuation', migrate_templates),
+                            ('negative affinity rules give way until it ends', relax_anti_affinity)) if on]
+    return f": {'; '.join(said)}" if said else ''
+
+
+def rolling_log(mgr, msg):
+    """One line with its time in the log of the rolling update that runs."""
+    try:
+        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+    except Exception:
+        pass
+
+
+def rolling_options_intro(mgr):
+    """What the options mean for this run, said once when it starts."""
+    state = mgr._rolling_update or {}
+    if state.get('skip_evacuation'):
+        return
+    if state.get('migrate_templates'):
+        rolling_log(mgr, "Templates: moved offline with each node's evacuation, only to a node that has every "
+                         "storage they use. One that cannot move stays where it is and does not pause the run")
+    if state.get('relax_anti_affinity'):
+        rolling_log(mgr, "Negative affinity: guests that must run apart may share a node until the run ends. "
+                         "Proxmox HA rules are switched off before the first evacuation and back on at the end; "
+                         "PegaProx's own rules are enforced again by the balancer after the run")
+
+
+def rolling_node_templates(mgr, vms_here):
+    """#763 - said either way: without the option a template goes down with its node."""
+    tpls = [v for v in vms_here if v.get('template')]
+    if tpls:
+        names = ', '.join(f"{v.get('name') or v.get('vmid')} ({v.get('vmid')})" for v in tpls[:8])
+        more = f" and {len(tpls) - 8} more" if len(tpls) > 8 else ''
+        moving = (mgr._rolling_update or {}).get('migrate_templates')
+        rolling_log(mgr, f"  → template(s) {'to move' if moving else 'staying here'}: {names}{more}")
+
+
+def rolling_moved_templates(mgr, task):
+    """#763 - what the evacuation of a node did with its templates."""
+    for t in getattr(task, 'templates_moved', None) or []:
+        rolling_log(mgr, f"  ✓ Template {t.get('name')} ({t.get('vmid')}) moved to {t.get('to')}")
+    for t in getattr(task, 'templates_left', None) or []:
+        rolling_log(mgr, f"  ⚠ Template {t.get('name')} ({t.get('vmid')}) stays on the node: {t.get('reason')}")
+    # MK Oct 2026 (#811) - and the pinned guests none of their plb_pin_ nodes could take
+    for o in getattr(task, 'off_pin_vms', None) or []:
+        rolling_log(mgr, f"  ⚠ {o.get('name')} ({o.get('vmid')}) went to {o.get('target')}, off its pin "
+                         f"({', '.join(o.get('pinned_nodes') or [])})")
+
+
+def rolling_rules_give_way(mgr, who):
+    """#954 - the negative affinity rules off, once, before the first evacuation of a run that
+    lets them give way. From here the daemon loop keeps its hands off them."""
+    state = mgr._rolling_update
+    if not state.get('relax_anti_affinity') or state.get('ha_rules_held') is not None:
+        return
+    state['ha_rules_held'] = True
+    try:
+        off, failed = mgr.suspend_negative_ha_rules(who=who)
+    except Exception as e:
+        off, failed = [], []
+        rolling_log(mgr, f"⚠ Negative affinity rules could not be switched off ({e}) - evacuating with them on")
+    if off:
+        rolling_log(mgr, f"Negative affinity: {len(off)} Proxmox HA rule(s) switched off until the run ends: "
+                         f"{', '.join(off)}")
+    elif not failed:
+        rolling_log(mgr, "Negative affinity: no enabled negative Proxmox HA rule to switch off")
+    if failed:
+        rolling_log(mgr, f"⚠ Proxmox kept these rules on, their guests may still not move: {', '.join(failed)}")
+    state['ha_rules_off'] = list(off)
+    state['ha_rules_held'] = bool(off)
+
+
+def rolling_rules_back_on(mgr, who):
+    """#954 - on again when the run ends, however it ends. A rule a node's maintenance still
+    holds stays off until that node leaves it."""
+    state = mgr._rolling_update or {}
+    if not state.get('ha_rules_held'):
+        return
+    try:
+        on, left = mgr.restore_suspended_ha_rules(who=who)
+        if on:
+            rolling_log(mgr, f"✓ Negative affinity rules switched back on: {', '.join(on)} - Proxmox HA moves their "
+                             f"guests apart again where a node is free")
+        if left:
+            rolling_log(mgr, f"✗ Still off: {', '.join(left)} - PegaProx keeps retrying; or run "
+                             f"`ha-manager rules set resource-affinity <rule> --disable 0`")
+    except Exception as e:
+        left = None
+        rolling_log(mgr, f"✗ Switching the negative affinity rules back on failed: {e} - PegaProx keeps retrying")
+    finally:
+        state['ha_rules_held'] = False
+    if left is None:
+        return
+    try:
+        held = mgr.held_ha_rules()
+    except Exception:
+        held = None
+    if not isinstance(held, dict):
+        return
+    for rule in sorted(r for r in (state.get('ha_rules_off') or []) if r not in left and r in held):
+        nodes = sorted(str(o).split(':', 1)[1] for o in held[rule] if str(o).startswith('maintenance:'))
+        if nodes:
+            rolling_log(mgr, f"Negative affinity: {rule} stays off while {', '.join(nodes)} "
+                             f"{'is' if len(nodes) == 1 else 'are'} in maintenance")
 
 
 # NS 2026-06-04 — shared metrics_history loader for insights/cost/power.

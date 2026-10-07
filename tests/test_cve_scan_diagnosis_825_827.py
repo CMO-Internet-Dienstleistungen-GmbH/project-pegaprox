@@ -137,9 +137,9 @@ def test_the_block_announces_suite_mode_and_total():
 
 
 @pytest.mark.parametrize('blob,expect', [
-    ("---DEBSECAN---\nSUITE=trixie\nMODE=all\nTOTAL=1043\nTRUNCATED=500\nCVE-2026-1 pkg1 low (open)\n---END---",
+    ("---DEBSECAN---\nSUITE=trixie\nMODE=all\nTOTAL=1043\nTRUNCATED=500\nCVE-2026-1 pkg1 (low urgency)\n---END---",
      {'suite': 'trixie', 'cve_mode': 'all', 'cve_total': 1043, 'cve_truncated': True}),
-    ("---DEBSECAN---\nSUITE=trixie\nMODE=fixed\nTOTAL=2\nCVE-2026-1111 curl low (fixed)\n---END---",
+    ("---DEBSECAN---\nSUITE=trixie\nMODE=fixed\nTOTAL=2\nCVE-2026-1111 curl (fixed, low urgency)\n---END---",
      {'suite': 'trixie', 'cve_mode': 'fixed', 'cve_total': 2, 'cve_truncated': False}),
     ("---DEBSECAN---\nNOT_INSTALLED\n---END---",
      {'cve_mode': '', 'cve_total': 0, 'cve_truncated': False}),
@@ -152,7 +152,7 @@ def test_the_markers_reach_the_result(blob, expect):
 
 def test_a_truncated_run_is_flagged_rather_than_silently_short():
     res = _mgr("---DEBSECAN---\nSUITE=trixie\nMODE=all\nTOTAL=1043\nTRUNCATED=500\n"
-               + '\n'.join(f"CVE-2026-{i} pkg{i} low (open)" for i in range(500))
+               + '\n'.join(f"CVE-2026-{i} pkg{i} (low urgency)" for i in range(500))
                + "\n---END---").scan_node_packages('n1')
     assert res['cve_truncated'] is True
     assert res['cve_total'] == 1043
@@ -216,3 +216,70 @@ def test_the_fixed_list_is_preferred_and_not_capped_at_500(tmp_path):
 def test_the_block_is_valid_shell():
     p = subprocess.run(['bash', '-n'], input=_scan_cmd(), text=True, capture_output=True)
     assert p.returncode == 0, p.stderr
+
+
+# ── #827: read the notes debsecan actually prints ────────────────────────────
+#
+# SummaryFormatter (debsecan 0.4.20.1, the default format) writes "CVE pkg" or
+# "CVE pkg (fixed, remotely exploitable, <low|medium|high> urgency, obsolete)", each note
+# optional, in both --only-fixed and full mode. There is no bare urgency column.
+
+_REAL_LINES = (
+    "CVE-2026-3184 bsdextrautils\n"
+    "CVE-2026-76957 libexpat1 (fixed)\n"
+    "CVE-2026-14164 libarchive13t64 (fixed, obsolete)\n"
+    "CVE-2026-20001 openssh-server (fixed, remotely exploitable, high urgency)\n"
+    "CVE-2026-20002 curl (low urgency)\n"
+    "CVE-2026-20003 libxml2 (remotely exploitable, medium urgency, obsolete)\n"
+)
+
+
+def _scan_real(monkeypatch, mode='all'):
+    import pegaprox.core.db as dbmod
+    written = []
+
+    class _Db:
+        def upsert_cve(self, cid, node, cve, pkg, sev):
+            written.append((cve, sev))
+
+        def get_cve_first_seen(self, *a):
+            return None
+
+        def mark_cves_resolved(self, *a):
+            pass
+
+    monkeypatch.setattr(dbmod, 'get_db', lambda: _Db())
+    blob = f"---DEBSECAN---\nSUITE=trixie\nMODE={mode}\nTOTAL=6\n{_REAL_LINES}---END---"
+    res = _mgr(blob).scan_node_packages('n1')
+    return {c['cve']: c for c in res['cves']}, res, dict(written)
+
+
+def test_a_line_without_notes_is_kept(monkeypatch):
+    cves, res, _ = _scan_real(monkeypatch)
+    assert 'CVE-2026-3184' in cves, "a note-less summary line was dropped"
+    assert cves['CVE-2026-3184']['package'] == 'bsdextrautils'
+    assert res['cve_count'] == res['cve_total'] == 6
+
+
+def test_the_urgency_comes_from_the_urgency_note(monkeypatch):
+    cves, _, written = _scan_real(monkeypatch)
+    assert cves['CVE-2026-20001']['urgency'] == 'high'
+    assert cves['CVE-2026-20002']['urgency'] == 'low'
+    assert cves['CVE-2026-20003']['urgency'] == 'medium'
+    # no urgency note means debsecan has none - not a made-up medium
+    for cve in ('CVE-2026-3184', 'CVE-2026-76957', 'CVE-2026-14164'):
+        assert cves[cve]['urgency'] == 'unknown', cve
+        assert written[cve] == 'unknown', f"{cve} went into the history as {written[cve]!r}"
+    assert written['CVE-2026-20001'] == 'high'
+
+
+def test_fixed_remote_and_obsolete_stay_as_flags(monkeypatch):
+    cves, _, _ = _scan_real(monkeypatch, mode='fixed')
+    ssh = cves['CVE-2026-20001']
+    assert (ssh['fixed'], ssh['remote'], ssh['obsolete']) == (True, True, False)
+    assert ssh['status'] == 'fixed, remotely exploitable'
+    arc = cves['CVE-2026-14164']
+    assert (arc['fixed'], arc['remote'], arc['obsolete']) == (True, False, True)
+    assert arc['status'] == 'fixed, obsolete'
+    bare = cves['CVE-2026-3184']
+    assert (bare['fixed'], bare['remote'], bare['obsolete'], bare['status']) == (False, False, False, '')

@@ -19,7 +19,7 @@ from pegaprox.utils.auth import (
     hash_password, verify_password, needs_password_rehash,
     validate_password_policy, load_users, save_users, save_single_user,
     create_initial_admin, is_initialized, initialization_state,
-    INIT_UNINITIALIZED, INIT_UNKNOWN,
+    INIT_UNINITIALIZED, INIT_UNKNOWN, INIT_NO_ACCOUNTS, consume_setup_reopen,
     claim_admin_initialization, release_admin_initialization,
     create_session, validate_session, invalidate_session,
     invalidate_all_user_sessions, cleanup_expired_sessions,
@@ -28,14 +28,16 @@ from pegaprox.utils.auth import (
     generate_session_id, mark_admin_initialized, ensure_api_tokens_table,
     dummy_verify_password,
     ARGON2_AVAILABLE, TOTP_AVAILABLE,
+    mfa_enrolment_state, MFA_DUE, MFA_SKIPPED_ON_STANDBY,
 )
 from pegaprox.utils.audit import log_audit, get_client_ip
-from pegaprox.utils.ldap import get_ldap_settings, ldap_authenticate, ldap_provision_user
+from pegaprox.utils.ldap import (get_ldap_settings, ldap_authenticate, ldap_provision_user,
+                                 ldap_build_user_row, LDAP_AUTH_SOURCES)
 from pegaprox.utils.oidc import (
     get_oidc_settings, get_oidc_endpoints, oidc_build_auth_url,
     oidc_exchange_code, oidc_decode_id_token, oidc_get_user_info,
     oidc_get_user_groups, oidc_get_user_groups_ex, oidc_map_groups_to_role, oidc_provision_user,
-    oidc_derive_username,
+    oidc_derive_username, oidc_build_user_row, OIDC_AUTH_SOURCES,
 )
 from pegaprox.utils.rbac import get_user_permissions, DEFAULT_TENANT_ID
 from pegaprox.api.helpers import load_server_settings, save_server_settings, get_login_settings, get_session_timeout, safe_error, effective_reverse_proxy
@@ -229,7 +231,42 @@ def oidc_callback():
     provider = config.get('provider', 'oidc')
     auth_source = 'entra' if provider == 'entra' else 'oidc'
     
-    user = oidc_provision_user(user_info, role_mapping, auth_source=auth_source)
+    from pegaprox.core import ha
+    on_standby = ha.is_standby()
+    if on_standby:
+        # MK Oct 2026 (#625) - a standby writes no users row here either, as for a
+        # directory login in auth_login: the next sync puts the active's copy back, and
+        # an account made here would be gone with it while its session stays. So the
+        # sign-in goes through only when the account is here already and the identity
+        # provider says what the synced row says. A serving member is a standby too.
+        users = load_users()
+        built = oidc_build_user_row(user_info, role_mapping, auth_source, users)
+        user = None  # another source owns the name: the answer below, as on the active
+        if built is not None:
+            username, would_be = built
+            row = users.get(username)
+            if not isinstance(row, dict):
+                logging.warning(f"[OIDC] '{username}' signs in on a standby that does not "
+                                f"hold the account yet - refused")
+                return jsonify({
+                    'error': 'Your account is not on this instance yet - sign in on the active '
+                             'instance once; it reaches this standby with the next sync.',
+                    'code': 'HA_STANDBY',
+                }), 409
+            if not row.get('enabled', True):
+                return jsonify({'error': 'Account is disabled'}), 403
+            if not _idp_agrees_with_synced_row(would_be, row, username):
+                logging.warning(f"[OIDC] '{username}' signs in on a standby with access at the "
+                                f"identity provider that differs from the synced account - refused")
+                return jsonify({
+                    'error': 'Your access changed at the identity provider - sign in on the active '
+                             'instance once; it reaches this standby with the next sync.',
+                    'code': 'HA_STANDBY',
+                }), 409
+            user = {**row, 'username': username}
+            logging.info(f"[OIDC] User '{username}' authenticated via {provider} from {client_ip} (standby, synced row)")
+    else:
+        user = oidc_provision_user(user_info, role_mapping, auth_source=auth_source)
     
     # NS: SECURITY - oidc_provision_user returns None if local account would be overwritten
     if not user:
@@ -251,8 +288,10 @@ def oidc_callback():
     # Management however often it signed in — misleading when reviewing dormant accounts.
     # Placed after create_session and after the disabled-account gate above, so a rejected
     # attempt is not recorded as a login.
-    user['last_login'] = datetime.now().isoformat()
-    save_single_user(username, user)
+    # #625: not on a standby, where no login writes the synced row
+    if not on_standby:
+        user['last_login'] = datetime.now().isoformat()
+        save_single_user(username, user)
 
     log_audit(username, 'auth.oidc.login', f"OIDC login via {provider} from {client_ip}")
     
@@ -408,10 +447,15 @@ def oidc_test_connection():
             results.append({'step': 'JWKS Endpoint', 'status': 'error',
                             'detail': f"URL rejected by SSRF guard: {guard_err}{hint}"})
             return jsonify({'success': False, 'results': results})
-        resp = requests.get(validated_jwks_url, timeout=10)
+        # NS Oct 2026 - not followed: a redirect target is a URL the guard above never saw
+        resp = requests.get(validated_jwks_url, allow_redirects=False, timeout=10)
         if resp.status_code == 200:
             keys = resp.json().get('keys', [])
             results.append({'step': 'JWKS Endpoint', 'status': 'ok', 'detail': f"Found {len(keys)} signing keys"})
+        elif 300 <= resp.status_code < 400:
+            results.append({'step': 'JWKS Endpoint', 'status': 'warning',
+                            'detail': f"HTTP {resp.status_code}: the JWKS URL redirects, "
+                                      f"which this test does not follow"})
         else:
             results.append({'step': 'JWKS Endpoint', 'status': 'error', 'detail': f"HTTP {resp.status_code}"})
     except Exception as e:
@@ -458,6 +502,15 @@ def auth_setup():
             'error': 'Cannot read the user store - refusing setup. Check the server logs.',
             'code': 'USER_STORE_UNAVAILABLE',
         }), 503
+    if state == INIT_NO_ACCOUNTS:
+        logging.error(f"[SETUP] refused from {get_client_ip()}: this install holds configuration "
+                      f"but no accounts. To create a new administrator on it, create the file "
+                      f"{SETUP_REOPEN_FILE} on the server and open the setup page again")
+        return jsonify({
+            'error': 'This install holds configuration but no accounts - setup stays closed. '
+                     'See the server log.',
+            'code': 'NO_ACCOUNTS',
+        }), 409
     if state != INIT_UNINITIALIZED:
         # already done, no replay
         return jsonify({
@@ -527,6 +580,7 @@ def auth_setup():
                       "restrict access to this port until it completes")
         return jsonify({'error': 'Setup failed, check server logs'}), 500
 
+    consume_setup_reopen()
     log_audit(username, 'admin.initial_setup',
               f"First admin '{username}' created via setup wizard from {client_ip}")
     logging.info(f"[SETUP] initial admin '{username}' created from {client_ip}")
@@ -556,6 +610,86 @@ def _totp_replayed(username, code):
     return False
 
 
+def _directory_agrees_with_synced_row(ldap_result, row):
+    """#625 - would a directory login leave this account's access as the row says?
+
+    What a directory login rewrites and what decides access: the global role, the
+    tenant, the extra permissions and the per-tenant overrides. Display name, mail and
+    the ldap_* bookkeeping change nothing a check reads. A missing row (a first sign-in)
+    or one another identity source owns is never a match. MK Sep 2026
+    """
+    if not isinstance(row, dict) or row.get('auth_source', 'local') not in LDAP_AUTH_SOURCES:
+        return False
+    would_be = ldap_build_user_row(ldap_result, row)
+    if would_be is None:
+        return False
+    return _same_access(would_be, row, (ldap_result.get('username') or '').lower())
+
+
+def _same_access(would_be, row, username):
+    """Role, tenant, extra permissions (as a set) and per-tenant overrides: what a
+    sign-in rewrites and a check reads. And no stored group a pool grant names that the
+    sign-in no longer brings."""
+    def _perms(u):
+        return sorted(set(u.get('permissions') or []))
+
+    # MK Oct 2026 (#940) - the groups only one way. A group the directory dropped would
+    # keep granting its pools here until the next sync, so that is refused - when a grant
+    # names it; other memberships churn without changing access. A group the row does not
+    # have yet grants nothing here, so it is not: rows written before the groups were
+    # stored have none, and refusing on that would keep every directory user out of a
+    # standby until they signed in on the active once.
+    return (would_be.get('role') == row.get('role')
+            and would_be.get('tenant_id') == row.get('tenant_id')
+            and _perms(would_be) == _perms(row)
+            and (would_be.get('tenant_permissions') or {}) == (row.get('tenant_permissions') or {})
+            and not get_db().group_grants_lost(get_db().get_user_directory_groups(username),
+                                               would_be.get('groups') or []))
+
+
+def _idp_agrees_with_synced_row(would_be, row, username):
+    """#625 - the same question for an OIDC / Entra sign-in, and the same four answers
+    to compare. `would_be` is the row oidc_build_user_row says the sign-in would store;
+    display name, mail and the oidc_* bookkeeping change nothing a check reads here
+    either. A missing row or one another identity source owns is never a match.
+    MK Oct 2026
+    """
+    if not isinstance(row, dict) or row.get('auth_source', 'local') not in OIDC_AUTH_SOURCES:
+        return False
+    return isinstance(would_be, dict) and _same_access(would_be, row, username)
+
+
+def _ha_banner(username='', session=None):
+    """ha.banner(), and on a standby whether it shows the clusters live. With the live
+    view off its cluster list is empty on purpose, and the UI has to say so. forwarding
+    says whether a change made here goes to the active right now or is refused, serving
+    whether this standby serves its users like an active instance (consoles here), and
+    leader_reachable whether the leader answered the last time this instance asked.
+
+    MK Oct 2026 (#625) - in a group that fails over automatically, for every signed-in
+    user: automatic, and no_leader (changes and automation paused, consoles keep
+    working), takeover {resume_in} and leader_changed {at} for ten minutes after a
+    change (ha.lease_banner). The addresses in them (takeover.leader, leader_changed.to
+    and .from) only for an admin the HA tab is open to. Nothing of it in a manual group
+    or on an instance of its own."""
+    from pegaprox.core import ha
+    from pegaprox.api.ha import unconfined_admin
+    out = ha.banner()
+    if out.get('role') == ha.ROLE_STANDBY:
+        out['live_view'] = bool(ha.live_view())
+        out['forwarding'] = bool(ha.forwarding())
+        out['serving'] = bool(ha.serving())
+        out['leader_reachable'] = bool(ha.leader_reachable())
+    try:
+        # whom the addresses go to is only asked where the group is automatic
+        named = ha.lease_in_force() and unconfined_admin(username, session)
+        out.update(ha.lease_banner(names=named))
+    except Exception as e:
+        # the sign-in and the session check answer whatever the lease state says
+        logging.warning(f"[HA] no lease banner: {e}")
+    return out
+
+
 @bp.route('/api/auth/login', methods=['POST'])
 def auth_login():
     """login endpoint - MK"""
@@ -578,6 +712,12 @@ def auth_login():
         return jsonify({
             'error': 'PegaProx is not initialised — run the setup wizard first',
             'code': 'NOT_INITIALIZED',
+        }), 503
+    if _init_state == INIT_NO_ACCOUNTS:
+        # NS Oct 2026 (#991) - refused here as before, when this state still read as fresh
+        return jsonify({
+            'error': 'This install has no accounts - see the server log',
+            'code': 'NO_ACCOUNTS',
         }), 503
 
     # get settings
@@ -707,13 +847,37 @@ def auth_login():
     # =================================================================
     ldap_config = get_ldap_settings()
     ldap_authenticated = False
+    # MK Sep 2026 (#625) - set when a standby let a directory login in on the synced row
+    ldap_row_untouched = False
+    from pegaprox.core import ha
     
     if ldap_config['enabled']:
         ldap_result = ldap_authenticate(username, password)
         
         if ldap_result.get('success'):
             # LW: LDAP auth succeeded - provision/update local user
-            if ldap_config['auto_create_users'] or username in users_db:
+            if (ldap_config['auto_create_users'] or username in users_db) and ha.is_standby():
+                # MK Sep 2026 (#625) - a standby writes no users row: the next sync puts
+                # the active's copy back, and a demotion the directory did here would
+                # be undone with it while the session stays. So only let the sign-in
+                # through when the directory says what the synced row already says.
+                row = users_db.get(username)
+                if isinstance(row, dict) and ldap_build_user_row(ldap_result, row) is None:
+                    # another source owns the account: local auth decides, as on the active
+                    logging.info(f"[LDAP] User '{username}' has local account, skipping LDAP provisioning")
+                elif not _directory_agrees_with_synced_row(ldap_result, row):
+                    logging.warning(f"[LDAP] '{username}' signs in on a standby with directory "
+                                    f"access that differs from the synced account - refused")
+                    return jsonify({
+                        'error': 'Your directory access changed - sign in on the active '
+                                 'instance once; it reaches this standby with the next sync.',
+                        'code': 'HA_STANDBY',
+                    }), 409
+                else:
+                    ldap_authenticated = True
+                    ldap_row_untouched = True
+                    logging.info(f"[LDAP] User '{username}' authenticated via LDAP from {client_ip} (standby, synced row)")
+            elif ldap_config['auto_create_users'] or username in users_db:
                 user = ldap_provision_user(ldap_result)
                 if user is None:
                     # NS: Local account exists - fall through to local auth
@@ -889,7 +1053,11 @@ def auth_login():
     
     # NS: Auto-migrate password to Argon2id if using old PBKDF2 format - Jan 2026
     # Only rehash for locally-authenticated users - LDAP passwords must NEVER be stored locally
-    if not ldap_authenticated and needs_password_rehash(user.get('password_salt', ''), user.get('password_hash', '')):
+    # #625: not on a standby. Its users table is the active's copy; a rehash here comes
+    # back as a changed hash with the next sync, and that ends the user's sessions.
+    # The active migrates the hash at the user's next login there.
+    if (not ldap_authenticated and not ha.is_standby()
+            and needs_password_rehash(user.get('password_salt', ''), user.get('password_hash', ''))):
         try:
             new_salt, new_hash = hash_password(password)
             user['password_salt'] = new_salt
@@ -903,9 +1071,10 @@ def auth_login():
     remember = data.get('remember', False)
     session_id = create_session(username, user['role'], remember=bool(remember))
     
-    # Update last login
-    user['last_login'] = datetime.now().isoformat()
-    save_single_user(username, user)
+    # Update last login - not on a standby, where no login writes the synced row
+    if not ldap_row_untouched and not ha.is_standby():
+        user['last_login'] = datetime.now().isoformat()
+        save_single_user(username, user)
     
     logging.info(f"User '{username}' logged in successfully")
     log_audit(username, 'user.login', f"User logged in" + (" (with 2FA)" if user.get('totp_enabled') else ""))
@@ -918,19 +1087,28 @@ def auth_login():
     default_theme = settings.get('default_theme', 'proxmoxDark')
     
     # NS: Feb 2026 - Check if user needs to set up 2FA (force_2fa setting)
-    requires_2fa_setup = False
-    if settings.get('force_2fa') and TOTP_AVAILABLE:
-        has_2fa = user.get('totp_enabled', False)
-        is_external = user.get('auth_source', 'local') in ('oidc', 'entra')
-        is_admin = user.get('role') == ROLE_ADMIN
-        exclude_admins = settings.get('force_2fa_exclude_admins', False)
-        if not has_2fa and not is_external and not (is_admin and exclude_admins):
-            requires_2fa_setup = True
+    # NS Oct 2026 (#1076) - the same decision validate_session holds the session to
+    _mfa = mfa_enrolment_state(user, settings)
+    requires_2fa_setup = _mfa == MFA_DUE
+    if _mfa == MFA_SKIPPED_ON_STANDBY:
+        # MK Sep 2026 (#625) - enrolment is a write, and a standby that cannot hand
+        # it to the active (the active is gone, or forwarding is off) refuses it;
+        # the setup screen has no way past it. For an admin that is the way to
+        # the promote button during a failover, so let them in and say so in the
+        # audit trail. While the standby forwards, enrolment goes to the active
+        # like any other change, and nobody skips it.
+        log_audit(username, 'ha.standby_2fa_skipped',
+                  'Forced 2FA enrolment skipped on a standby for an admin without TOTP')
     
     # NS: Debug log for theme sync issues
     user_theme = user.get('theme', '') or default_theme
     logging.info(f"[LOGIN] User {username} theme from DB: '{user.get('theme', '')}', using: '{user_theme}'")
     
+    # MK Sep 2026 - imported here, not at the top: one blueprint should not load another
+    from pegaprox.utils.auth import active_sessions
+    from pegaprox.api.auto_install import autoinstall_access
+    autoinstall = autoinstall_access(username, active_sessions.get(session_id) or {})
+
     response = jsonify({
         'success': True,
         'user': {
@@ -949,7 +1127,8 @@ def auth_login():
             'taskbar_auto_expand': user.get('taskbar_auto_expand', True),  # NS: Feb 2026
             'sidebar_show_vmid': user.get('sidebar_show_vmid', False),  # NS Jul 2026 — corporate sidebar VMIDs
             'layout_chosen': user.get('layout_chosen', False),
-            'portal_only': user.get('portal_only', False)
+            'portal_only': user.get('portal_only', False),
+            'autoinstall_access': autoinstall,  # 'manage' | 'view' | '', same rule as the routes
         },
         'session_id': session_id,
         'portal_only': user.get('portal_only', False),
@@ -959,7 +1138,8 @@ def auth_login():
         'requires_2fa_setup': requires_2fa_setup,  # NS: Feb 2026 - Force 2FA
         # NS: Security warning if using default password
         'security_warning': 'DEFAULT_PASSWORD' if (user['role'] == ROLE_ADMIN and password == 'admin') else None,
-        'requires_password_change': bool(user.get('force_password_change'))
+        'requires_password_change': bool(user.get('force_password_change')),
+        'ha': _ha_banner(username, active_sessions.get(session_id)),  # MK Sep 2026 (#625) - role, and on a standby where it follows
     })
     
     # Set session cookie with security flags
@@ -1090,8 +1270,9 @@ def health_check():
 @bp.route('/api/auth/check', methods=['GET'])
 def auth_check():
     """Check if current session is valid"""
+    from pegaprox.core import ha
     session_id = request.headers.get('X-Session-ID') or request.cookies.get('session_id')
-    
+
     session = validate_session(session_id)
     if not session:
         # NS: Feb 2026 - Include LDAP/OIDC status so login page can show indicators
@@ -1109,6 +1290,8 @@ def auth_check():
             'oidc_enabled': oidc_enabled,
             'oidc_button_text': oidc_button_text,
             'login_background': login_background,
+            # the role only; where a standby follows is for signed-in users (#625)
+            'ha_role': ha.role(),
         }), 401
     
     # Get user info - always fresh from database
@@ -1188,16 +1371,11 @@ def auth_check():
     user_permissions = get_user_permissions(user)
     
     # NS: Feb 2026 - Check if user needs to set up 2FA (force_2fa setting)
-    requires_2fa_setup = False
-    if settings.get('force_2fa') and TOTP_AVAILABLE:
-        has_2fa = user.get('totp_enabled', False)
-        is_external = user.get('auth_source', 'local') in ('oidc', 'entra')
-        is_admin = fresh_role == ROLE_ADMIN
-        exclude_admins = settings.get('force_2fa_exclude_admins', False)
-        # skip OIDC/Entra users (they use their IdP's MFA) and optionally admins
-        if not has_2fa and not is_external and not (is_admin and exclude_admins):
-            requires_2fa_setup = True
+    # skip OIDC/Entra users (they use their IdP's MFA), optionally admins, and #625 admins
+    # on a standby that cannot enrol them (see auth_login)
+    requires_2fa_setup = mfa_enrolment_state(user, settings) == MFA_DUE
     
+    from pegaprox.api.auto_install import autoinstall_access
     return jsonify({
         'authenticated': True,
         'session_id': session_id,
@@ -1217,13 +1395,15 @@ def auth_check():
             'sidebar_show_vmid': user.get('sidebar_show_vmid', False),  # NS Jul 2026 — corporate sidebar VMIDs
             'totp_enabled': user.get('totp_enabled', False),
             'layout_chosen': user.get('layout_chosen', False),
-            'portal_only': user.get('portal_only', False)
+            'portal_only': user.get('portal_only', False),
+            'autoinstall_access': autoinstall_access(session['user'], session),
         },
         'password_expiry': password_expiry,
         'requires_2fa_setup': requires_2fa_setup,
         'reverse_proxy_enabled': effective_reverse_proxy(settings),
         'air_gap_mode': settings.get('air_gap_mode', False),
-        'default_theme': default_theme
+        'default_theme': default_theme,
+        'ha': _ha_banner(session['user'], session),
     })
 
 
@@ -1259,10 +1439,13 @@ def auth_validate():
     if _u is not None and not _u.get('enabled', True):
         return jsonify({'valid': False, 'error': 'Account disabled'}), 401
 
+    from pegaprox.core import ha
     return jsonify({
         'valid': True,
         'user': session['user'],
-        'role': session['role']
+        'role': session['role'],
+        # #625 - the SSH server pins no new host key on a standby (see ssh_security)
+        'known_hosts_only': ha.is_standby(),
     })
 
 
@@ -1273,6 +1456,13 @@ def get_cluster_creds_internal(cluster_id):
     MK: Returns node IPs for SSH connections
     For single-node setups, we use the cluster host directly
     """
+    # #625 - node addresses and a fresh PVE ticket for a shell: that is a console, and
+    # a standby opens none (the legacy session path of the SSH server lands here)
+    from pegaprox.api.ha import standby_console_refusal
+    refused = standby_console_refusal()
+    if refused:
+        return refused
+
     # Check session from cookie
     session_id = request.cookies.get('session') or request.cookies.get('session_id')
     
@@ -1427,10 +1617,15 @@ def get_cluster_creds_internal(cluster_id):
     # NS 2026-06-05 (C-1): the termproxy WS proxy gets the PVE session cookie
     # from here (server-side) instead of the browser. Mint fresh; None for
     # token-only clusters. Other consumers (SSH) ignore the field.
+    # MK Sep 2026 (#956) - the termproxy subprocess builds its own wss:// URL to PVE and
+    # used to pin 8006. One port per cluster is all PegaProx models, so a multi-node cluster
+    # reached on a non-default port needs the same port on every node; that is still better
+    # than the literal, which was wrong for every node at once.
     resp = {
         'host': cluster_host,
         'node_ips': node_ips,
         'ssh_port': ssh_port,
+        'api_port': int(cluster_port or 8006),
         'verify_pve_tls': verify_pve_tls,
     }
     try:
@@ -1654,6 +1849,9 @@ def setup_2fa():
     """Generate TOTP secret and QR code for 2FA setup"""
     global users_db
     
+    refused = _refuse_api_token('Setting up 2FA')
+    if refused:
+        return refused
     if not TOTP_AVAILABLE:
         return jsonify({'error': '2FA not available. Please install pyotp and qrcode: pip install pyotp qrcode[pil]'}), 500
     
@@ -1672,7 +1870,27 @@ def setup_2fa():
     if user.get('auth_source', 'local') in ('oidc', 'entra'):
         provider_name = 'Microsoft Entra ID' if user.get('auth_source') == 'entra' else 'your OIDC provider'
         return jsonify({'error': f'2FA is managed by {provider_name}. Please enable MFA there instead.'}), 400
-    
+
+    # MK Sep 2026 (audit) — REPLACING an existing factor needs the password, enrolling a
+    # first one does not. Nothing here looked at totp_enabled, so a live session on an
+    # account that already had 2FA could enrol a new secret and verify it with its own
+    # authenticator: the account's second factor becomes the attacker's, and the password
+    # they never knew is now the only thing they lack. disable_2fa - the weaker operation,
+    # since it leaves the account on one factor rather than handing the second one over -
+    # has always asked for the password. Same question, same rate limit.
+    if user.get('totp_enabled') and user.get('totp_secret'):
+        _pw = (request.get_json(silent=True) or {}).get('password', '')
+        if not _pw:
+            return jsonify({'error': 'Password required to replace an existing 2FA device',
+                            'code': 'PASSWORD_REQUIRED'}), 400
+        if not check_auth_action_rate_limit(f'2fa_setup:{username}', max_attempts=5, window=300):
+            return jsonify({'error': 'Too many attempts. Try again in 5 minutes.'}), 429
+        if user.get('auth_source') == 'ldap':
+            if not ldap_authenticate(username, _pw).get('success'):
+                return jsonify({'error': 'Invalid LDAP password'}), 401
+        elif not verify_password(_pw, user['password_salt'], user['password_hash']):
+            return jsonify({'error': 'Invalid password'}), 401
+
     # Generate new secret
     secret = pyotp.random_base32()
     
@@ -1708,6 +1926,9 @@ def verify_2fa_setup():
     """Verify TOTP code and activate 2FA"""
     global users_db
     
+    refused = _refuse_api_token('Setting up 2FA')
+    if refused:
+        return refused
     if not TOTP_AVAILABLE:
         return jsonify({'error': '2FA not available'}), 500
     
@@ -1762,6 +1983,9 @@ def disable_2fa():
     """Disable 2FA for current user"""
     global users_db
     
+    refused = _refuse_api_token('Disabling 2FA')
+    if refused:
+        return refused
     data = request.get_json()
     password = data.get('password', '')
     
@@ -1846,8 +2070,9 @@ def _api_token_admin_scope():
     used IP) and revoke any of it. Same rule the user-management routes use.
     """
     from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import acts_as_admin
     u = build_authz_user(request.session.get('user', ''), request.session)
-    if u.get('effective_role', u.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(u):
         return None
     return u.get('tenant_id', DEFAULT_TENANT_ID)
 
@@ -1855,6 +2080,25 @@ def _api_token_admin_scope():
 def _token_owner_tenant(owner, users=None):
     users = users if users is not None else load_users()
     return (users.get(owner) or {}).get('tenant_id', DEFAULT_TENANT_ID)
+
+
+def _refuse_api_token(what):
+    """403 when an API token asks for `what`, None for a signed-in session.
+
+    NS Oct 2026 (#1001) - minting a token and enrolling a second factor act on the
+    owner's credentials, and both were judged by the owner's account. A token scoped
+    to viewer minted an admin token: the one-active-token rule only held it back until
+    a DELETE of the calling token landed while the POST body was still arriving, and
+    the new token then outlived the revocation. Enrolment let the same token put its
+    own authenticator on an owner who had none, which locks the owner out of the
+    login. Neither has a use without a browser: the one-token rule already refused
+    every token-made token that did not win that race.
+    """
+    if not (getattr(request, 'session', None) or {}).get('api_token'):
+        return None
+    return jsonify({'error': f'{what} needs an interactive sign-in - an API token '
+                             'cannot do it',
+                    'code': 'INTERACTIVE_SESSION_REQUIRED'}), 403
 
 
 @bp.route('/api/auth/tokens', methods=['GET'])
@@ -1897,6 +2141,10 @@ def list_api_tokens():
 @require_auth()
 def create_api_token_endpoint():
     """Create a new API token for the current user"""
+    # before the body is read: the race in _refuse_api_token was won while it arrived
+    refused = _refuse_api_token('Creating an API token')
+    if refused:
+        return refused
     username = request.session['user']
     data = request.get_json() or {}
     

@@ -20,7 +20,7 @@ from pegaprox.core.db import get_db
 from pegaprox.utils.auth import require_auth, load_users, verify_password
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.ssh import read_capped as _read_capped
-from pegaprox.api.helpers import check_cluster_access, safe_error, scope_vm_rows, caller_is_scoped, require_unconfined
+from pegaprox.api.helpers import check_cluster_access, safe_error, scope_vm_rows, caller_is_scoped, require_unconfined, bounded_limit
 
 bp = Blueprint('nodes', __name__)
 
@@ -947,7 +947,7 @@ def get_node_syslog_api(cluster_id, node):
     
     manager = cluster_managers[cluster_id]
     start = request.args.get('start', 0, type=int)
-    limit = request.args.get('limit', 500, type=int)
+    limit = bounded_limit(request.args.get('limit'), 500, 5000)
     return jsonify(manager.get_node_syslog(node, start, limit))
 
 
@@ -1067,7 +1067,7 @@ def get_node_tasks_api(cluster_id, node):
     
     manager = cluster_managers[cluster_id]
     start = request.args.get('start', 0, type=int)
-    limit = request.args.get('limit', 50, type=int)
+    limit = bounded_limit(request.args.get('limit'), 50, 1000)
     errors = request.args.get('errors', 'false').lower() == 'true'
     vmid = request.args.get('vmid', None, type=int)
     
@@ -1130,7 +1130,7 @@ def get_node_task_log_api(cluster_id, node, upid):
             return jsonify({'error': 'Access denied to this task'}), 403
 
     start = request.args.get('start', 0, type=int)
-    limit = request.args.get('limit', 500, type=int)
+    limit = bounded_limit(request.args.get('limit'), 500, 5000)
 
     log_lines = manager.get_node_task_log(node, upid, start, limit)
     # Join lines into a single string for display
@@ -1408,7 +1408,8 @@ def log_message(message):
     """write to log file, nothing fancy"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = f"[{{timestamp}}] {{message}}"
-    print(log_entry)
+    # line by line under systemd, not in blocks minutes later
+    print(log_entry, flush=True)
     try:
         with open(LOG_FILE, 'a') as f:
             f.write(log_entry + "\\n")
@@ -1439,16 +1440,36 @@ def save_processed_vm(vmid):
         f.write(f"{{vmid}}\\n")
 
 def get_current_smbios(vmid):
-    """read smbios from conf file directly — no perl overhead"""
+    """read smbios from conf file directly - no perl overhead.
+
+    Section-aware: `qm set` on a RUNNING vm writes into the conf's
+    [PENDING] section (applied at the next vm start), so a pending
+    smbios1 line must win over the main-section value. Without this
+    the daemon never sees its own previous stamp and re-writes smbios1
+    on every poll cycle. smbios1 lines inside any OTHER bracketed
+    section (e.g. snapshot sections) are stale snapshots of old config
+    and are ignored.
+    """
     try:
         conf_path = f"/etc/pve/qemu-server/{{vmid}}.conf"
         if not os.path.exists(conf_path):
             return None
+        main_val = None
+        pending_val = None
+        section = 'main'
         with open(conf_path, 'r') as f:
             for line in f:
-                if line.startswith('smbios1:'):
-                    return line.split(':', 1)[1].strip()
-        return None
+                s = line.strip()
+                if s.startswith('[') and s.endswith(']'):
+                    section = 'pending' if s == '[PENDING]' else 'other'
+                    continue
+                if s.startswith('smbios1:'):
+                    val = s.split(':', 1)[1].strip()
+                    if section == 'pending':
+                        pending_val = val
+                    elif section == 'main':
+                        main_val = val
+        return pending_val if pending_val is not None else main_val
     except:
         return None
 
@@ -1464,7 +1485,8 @@ def parse_smbios_string(smbios_str):
     return params
 
 def needs_smbios_update(vmid):
-    """Check if VM needs SMBIOS configuration"""
+    """Check if VM needs SMBIOS configuration. Logs nothing: the re-create check runs it
+    for every configured VM on every cycle"""
     smbios_str = get_current_smbios(vmid)
     if not smbios_str:
         return True
@@ -1477,7 +1499,6 @@ def needs_smbios_update(vmid):
     
     if ('manufacturer' in params or 'product' in params or 
         'version' in params or 'serial' in params or 'family' in params):
-        log_message(f"VM {{vmid}} already has SMBIOS configuration")
         return False
     
     return True
@@ -2240,8 +2261,8 @@ def install_starlvm_plugin(cluster_id):
     # to that delegate; pointing it somewhere else is the global admin's call.
     from pegaprox.utils.auth import build_authz_user as _bau
     _caller = _bau(request.session.get('user', ''), request.session)
-    if (_caller.get('effective_role', _caller.get('role')) != ROLE_ADMIN
-            and (body.get('repo_url') or body.get('key_url'))):
+    from pegaprox.utils.rbac import acts_as_admin
+    if not acts_as_admin(_caller) and (body.get('repo_url') or body.get('key_url')):
         return jsonify({'error': 'Only a global admin can install from a repository or '
                                  'signing key other than the default'}), 403
     try:
@@ -2377,7 +2398,12 @@ def get_custom_scripts(cluster_id):
     """Get all custom scripts for a cluster (excludes soft-deleted)"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
-    
+    # NS Oct 2026 - the scripts run on every node, so reading them and their output is for
+    # whoever may write and run them: not a caller confined to some guests (#1024)
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+
     try:
         db = get_db()
         # Ensure table exists with soft delete support
@@ -2829,7 +2855,10 @@ def get_script_output(cluster_id, script_id):
     """Get the last execution output of a script"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
-    
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+
     db = get_db()
     script = db.query_one('SELECT name, last_run, last_status, last_output FROM custom_scripts WHERE id = ? AND cluster_id = ? AND deleted_at IS NULL', (script_id, cluster_id))
     
@@ -2850,7 +2879,10 @@ def get_deleted_scripts(cluster_id):
     """Get list of soft-deleted scripts (pending permanent deletion)"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
-    
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+
     try:
         db = get_db()
         scripts = db.query(

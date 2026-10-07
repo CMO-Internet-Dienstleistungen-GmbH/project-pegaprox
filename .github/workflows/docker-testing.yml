@@ -4,9 +4,11 @@ name: Build Testing Docker Image
 # ghcr.io/pegaprox/pegaprox-testing so people can track the dev branch via
 #   docker pull ghcr.io/pegaprox/pegaprox-testing:latest
 # Kept fully separate from docker.yml (release-tag-only) so it never touches the
-# release build. amd64-only + no-cache: a Testing push is frequent, but each build
+# release build. amd64 + arm64 + no-cache: a Testing push is frequent, but each build
 # stays clean (same posture as the release image) so `apt upgrade` re-pulls the
 # current Debian security patches instead of freezing a stale openssl into the image.
+# NS Oct 2026 - 32-bit ARM (arm/v7) compiles a dozen Python packages under emulation,
+# far too long for every push: a manual run with armv7 ticked adds it.
 # The Dockerfile COPYs the committed web/index.html — so run web/Dev/build.sh and
 # commit the UI before pushing, as usual.
 # NOTE: the pegaprox-testing GHCR package is created PRIVATE on the first run —
@@ -15,13 +17,18 @@ on:
   push:
     branches: [Testing]
   workflow_dispatch:
+    inputs:
+      armv7:
+        description: 'Also build linux/arm/v7 (slow: compiles under emulation)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 # rapid Testing pushes: cancel a superseded build instead of queuing N of them
 concurrency:
-  group: docker-testing-${{ github.ref }}
+  group: docker-testing-${{ github.ref }}-${{ inputs.armv7 && 'armv7' || 'std' }}
   cancel-in-progress: true
 
 jobs:
@@ -42,8 +49,16 @@ jobs:
         with:
           persist-credentials: false
 
+      # NS Oct 2026 (#982) - and the images those two pull, by digest, as in docker.yml
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        with:
+          driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
@@ -65,8 +80,13 @@ jobs:
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: .
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64${{ inputs.armv7 && ',linux/arm/v7' || '' }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           no-cache: true
+          # NS Oct 2026 (#625): the image says it follows Testing - "Add witness" on an
+          # instance of it names this image for the witness (the release images have none
+          # before the release after 1.2.0)
+          build-args: |
+            PEGAPROX_BRANCH=Testing

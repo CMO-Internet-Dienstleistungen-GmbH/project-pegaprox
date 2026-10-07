@@ -345,37 +345,53 @@
             const running = r.status === 'running';
             const paused = r.status === 'paused' || r.status === 'suspended';
             const isCt = r.type === 'lxc';
-            return [
-                (!running && !paused) && { label: t('start') || 'Start', icon: 'Play', onClick: () => act.vmAction(r, 'start') },
-                paused && { label: t('resume') || 'Resume', icon: 'PlayCircle', onClick: () => act.vmAction(r, 'resume') },
-                running && { label: t('shutdown') || 'Shutdown', icon: 'Power', onClick: () => act.vmAction(r, 'shutdown') },
-                running && { label: t('reboot') || 'Reboot', icon: 'RotateCw', onClick: () => act.vmAction(r, 'reboot') },
-                (running && !isCt) && { label: t('suspend') || 'Suspend', icon: 'Pause', onClick: () => act.vmAction(r, 'suspend') },
-                running && { label: t('stop') || 'Stop', icon: 'Square', onClick: () => act.vmAction(r, 'stop') },
-                running && { label: t('forceStop') || 'Force stop', icon: 'StopCircle', danger: true, onClick: () => act.forceStop(r) },
+            // a standby hands over metrics and config only (#625), the rest is not offered
+            const has = (k) => !act.has || act.has(k);
+            const power = has('vmAction');
+            const items = [
+                power && (!running && !paused) && { label: t('start') || 'Start', icon: 'Play', onClick: () => act.vmAction(r, 'start') },
+                power && paused && { label: t('resume') || 'Resume', icon: 'PlayCircle', onClick: () => act.vmAction(r, 'resume') },
+                power && running && { label: t('shutdown') || 'Shutdown', icon: 'Power', onClick: () => act.vmAction(r, 'shutdown') },
+                power && running && { label: t('reboot') || 'Reboot', icon: 'RotateCw', onClick: () => act.vmAction(r, 'reboot') },
+                power && (running && !isCt) && { label: t('suspend') || 'Suspend', icon: 'Pause', onClick: () => act.vmAction(r, 'suspend') },
+                power && running && { label: t('stop') || 'Stop', icon: 'Square', onClick: () => act.vmAction(r, 'stop') },
+                has('forceStop') && running && { label: t('forceStop') || 'Force stop', icon: 'StopCircle', danger: true, onClick: () => act.forceStop(r) },
                 { divider: true },
-                { label: t('console') || 'Console', icon: 'Monitor', onClick: () => act.openConsole(r) },
-                (running && !isCt) && { label: t('spiceConsole') || 'SPICE', icon: 'ExternalLink', onClick: () => act.openSpice(r) },
-                isCt && { label: t('shell') || 'Shell', icon: 'Terminal', onClick: () => act.openLxcShell(r) },
-                { label: t('snapshots') || 'Snapshot', icon: 'Camera', onClick: () => act.snapshot(r) },
+                has('openConsole') && { label: t('console') || 'Console', icon: 'Monitor', onClick: () => act.openConsole(r) },
+                // a standby never runs a console; this opens the guest's console on the active (#625)
+                act.consoleOnActive && { label: t('pgHaOpenOnActive'), icon: 'ExternalLink', onClick: () => act.consoleOnActive(r) },
+                has('openSpice') && (running && !isCt) && { label: t('spiceConsole') || 'SPICE', icon: 'ExternalLink', onClick: () => act.openSpice(r) },
+                has('openLxcShell') && isCt && { label: t('shell') || 'Shell', icon: 'Terminal', onClick: () => act.openLxcShell(r) },
+                has('snapshot') && { label: t('snapshots') || 'Snapshot', icon: 'Camera', onClick: () => act.snapshot(r) },
                 { label: t('metrics') || 'Metrics', icon: 'BarChart', onClick: () => act.openMetrics(r) },
                 { divider: true },
                 { label: t('edit') || 'Edit / Hardware', icon: 'Cog', onClick: () => act.openConfig(r) },
-                { label: t('migrate') || 'Migrate', icon: 'Send', onClick: () => act.migrate(r) },
-                act.multiCluster && { label: t('cloud.crossMigrate') || 'Migrate to cluster…', icon: 'Send', onClick: () => act.crossMigrate(r) },
-                { label: t('clone') || 'Clone', icon: 'Copy', onClick: () => act.clone(r) },
+                has('migrate') && { label: t('migrate') || 'Migrate', icon: 'Send', onClick: () => act.migrate(r) },
+                has('crossMigrate') && act.multiCluster && { label: t('cloud.crossMigrate') || 'Migrate to cluster…', icon: 'Send', onClick: () => act.crossMigrate(r) },
+                has('clone') && { label: t('clone') || 'Clone', icon: 'Copy', onClick: () => act.clone(r) },
                 { divider: true },
-                { label: t('delete') || 'Delete', icon: 'Trash2', danger: true, onClick: () => act.del(r) },
+                has('del') && { label: t('delete') || 'Delete', icon: 'Trash2', danger: true, onClick: () => act.del(r) },
             ].filter(Boolean);
+            // no divider at either end, or two in a row, once entries are gone
+            const out = [];
+            for (const it of items) {
+                if (it.divider && (!out.length || out[out.length - 1].divider)) continue;
+                out.push(it);
+            }
+            while (out.length && out[out.length - 1].divider) out.pop();
+            return out;
         }
 
         // ── side nav (collapsible, grouped) ────────────────────────
-        function CloudSideNav({ active, onSelect, isAdmin, collapsed, onToggle }) {
+        function CloudSideNav({ active, onSelect, isAdmin, canAutoInstall, collapsed, onToggle }) {
+            const { t } = useTranslation();
             const groups = [
                 { label: 'DASHBOARD', items: [{ id: 'overview', label: 'Overview', icon: 'Grid' }] },
                 { label: 'COMPUTE', items: [
                     { id: 'vms', label: 'Virtual Machines', icon: 'Server' },
                     { id: 'containers', label: 'Containers', icon: 'Box' },
+                    // LW Oct 2026 - containers from OCI images
+                    { id: 'apps', label: t('ociTabLabel'), icon: 'Container' },
                 ] },
                 { label: 'STORAGE', items: [
                     { id: 'datastores', label: 'Datastores', icon: 'Database' },
@@ -405,6 +421,9 @@
                 { label: 'INFRASTRUCTURE', items: [
                     { id: 'clusters', label: 'Clusters', icon: 'Cloud' },
                     { id: 'nodes', label: 'Hosts', icon: 'Cpu' },
+                    ...(canAutoInstall ? [{ id: 'autoinstall', label: 'Automated Installs', icon: 'Disc' }] : []),
+                    // LW Oct 2026 - directory, PCI and USB mappings of the selected cluster
+                    { id: 'mappings', label: t('rmTitle'), icon: 'Link' },
                     { id: 'ha', label: 'High Availability', icon: 'Shield' },
                     { id: 'updates', label: 'Update Manager', icon: 'Download' },
                 ] },
@@ -482,7 +501,7 @@
         }
 
         // ── top bar (masthead) ─────────────────────────────────────
-        function CloudTopbar({ crumbs, clusters, selectedCluster, setSelectedCluster, theme, onToggleTheme, onRefresh, onExitCloud, onOpenSettings, onOpenProfile, onLogout, isAdmin, currentUser, t }) {
+        function CloudTopbar({ crumbs, clusters, selectedCluster, setSelectedCluster, theme, onToggleTheme, onRefresh, onExitCloud, onOpenSettings, onOpenProfile, onOpenApiReference, onLogout, isAdmin, currentUser, t }) {
             const safe = Array.isArray(clusters) ? clusters : [];
             const selId = selectedCluster && (selectedCluster.id != null ? selectedCluster.id : selectedCluster.name);
             const onChange = (e) => {
@@ -495,6 +514,7 @@
             const userMenu = [
                 { label: t('cloud.profile') || 'Profile & preferences', icon: 'User', onClick: () => onOpenProfile && onOpenProfile() },
                 isAdmin && { label: t('cloud.settings') || 'Settings', icon: 'Settings', onClick: () => onOpenSettings && onOpenSettings() },
+                (typeof onOpenApiReference === 'function') && { label: t('apiRefTitle'), icon: 'Book', onClick: onOpenApiReference },
                 { divider: true },
                 (typeof onExitCloud === 'function') && { label: t('cloud.exit') || 'Exit Cloud (Modern view)', icon: 'Grid', onClick: onExitCloud },
                 (typeof onLogout === 'function') && { label: t('logout') || 'Sign out', icon: 'LogOut', danger: true, onClick: onLogout },
@@ -704,26 +724,41 @@
                 </th>
             );
 
-            const bulk = (action) => selectedRows.forEach(r => act.vmAction(r, action));
+            // LW Oct 2026 - one dialog for the selection: one confirmation, a few requests at a
+            // time and a line per guest, instead of a prompt and a request per row at once
+            const bulk = (action) => act.has('bulkGuests') ? act.bulkGuests(selectedRows, action)
+                : selectedRows.forEach(r => act.vmAction(r, action));
+            const canCreate = act.has('createVm');
+            const canPower = act.has('vmAction');
 
             return (
                 <div className="cloud-body">
                     <CloudPageHeader title={title} sub={`${safe.length} ${kind === 'lxc' ? (t('cloud.containers') || 'containers') : (t('cloud.vms') || 'virtual machines')}`}>
-                        <button type="button" className="cloud-btn cloud-btn-primary" onClick={() => onCreate(kind === 'lxc' ? 'lxc' : 'qemu')}>
-                            <Icons.Plus /> {kind === 'lxc' ? (t('newContainer') || 'New Container') : (t('newVm') || 'New VM')}
-                        </button>
+                        {canCreate && (
+                            <button type="button" className="cloud-btn cloud-btn-primary" onClick={() => onCreate(kind === 'lxc' ? 'lxc' : 'qemu')}>
+                                <Icons.Plus /> {kind === 'lxc' ? (t('newContainer') || 'New Container') : (t('newVm') || 'New VM')}
+                            </button>
+                        )}
                     </CloudPageHeader>
 
                     <div className="cloud-card cloud-table-card">
                         <div className="cloud-toolbar">
                             <div className="cloud-toolbar-left">
-                                {selCount > 0 ? (
+                                {selCount > 0 && canPower ? (
                                     <div className="cloud-bulkbar">
                                         <span className="cloud-sel-note">{selCount} {t('cloud.selected') || 'selected'}</span>
                                         <button type="button" className="cloud-btn cloud-btn-sm" onClick={() => bulk('start')}><Icons.Play /> {t('start') || 'Start'}</button>
                                         <button type="button" className="cloud-btn cloud-btn-sm" onClick={() => bulk('shutdown')}><Icons.Power /> {t('shutdown') || 'Shutdown'}</button>
                                         <button type="button" className="cloud-btn cloud-btn-sm" onClick={() => bulk('reboot')}><Icons.RotateCw /> {t('reboot') || 'Reboot'}</button>
                                         <button type="button" className="cloud-btn cloud-btn-sm cloud-btn-danger" onClick={() => bulk('stop')}><Icons.Square /> {t('stop') || 'Stop'}</button>
+                                        {act.has('bulkGuests') && (<>
+                                            <button type="button" className="cloud-btn cloud-btn-sm" onClick={() => bulk('snapshot')}><Icons.Camera /> {t('snapshot')}</button>
+                                            <button type="button" className="cloud-btn cloud-btn-sm" onClick={() => bulk('tags')}><Icons.Tag /> {t('tags')}</button>
+                                        </>)}
+                                        {/* LW Oct 2026 (#952) - one dialog, one at a time unless picked otherwise */}
+                                        {act.has('bulkMigrate') && (
+                                            <button type="button" className="cloud-btn cloud-btn-sm" data-bulk="migrate" onClick={() => act.bulkMigrate(selectedRows)}><Icons.ArrowRight /> {t('migrate')}</button>
+                                        )}
                                         <button type="button" className="cloud-sel-clear" onClick={() => setChecked({})}>{t('cloud.clear') || 'Clear'}</button>
                                     </div>
                                 ) : (
@@ -767,7 +802,7 @@
                                 icon={kind === 'lxc' ? 'Box' : 'Server'}
                                 title={(q || statusFilter !== 'all') ? (t('cloud.noMatch') || 'No matches') : (kind === 'lxc' ? (t('cloud.noContainers') || 'No containers yet') : (t('cloud.noVms') || 'No virtual machines yet'))}
                                 text={(q || statusFilter !== 'all') ? (t('cloud.adjustFilters') || 'Try adjusting your search or filters.') : null}
-                                action={!(q || statusFilter !== 'all') ? (
+                                action={!(q || statusFilter !== 'all') && canCreate ? (
                                     <button type="button" className="cloud-btn cloud-btn-primary" onClick={() => onCreate(kind === 'lxc' ? 'lxc' : 'qemu')}>
                                         <Icons.Plus /> {kind === 'lxc' ? (t('newContainer') || 'New Container') : (t('newVm') || 'New VM')}
                                     </button>
@@ -857,7 +892,7 @@
             ];
 
             // primary action buttons in the bar (contextual) + full kebab
-            const primary = running
+            const primary = !act.has('vmAction') ? [] : running
                 ? [
                     { label: t('shutdown') || 'Shutdown', icon: 'Power', onClick: () => act.vmAction(r, 'shutdown') },
                     { label: t('reboot') || 'Reboot', icon: 'RotateCw', onClick: () => act.vmAction(r, 'reboot') },
@@ -882,10 +917,13 @@
                                     {React.createElement(Icons[b.icon] || Icons.Box)} {b.label}
                                 </button>
                             ))}
-                            <button type="button" className="cloud-btn" onClick={() => act.openConsole(r)}><Icons.Monitor /> {t('console') || 'Console'}</button>
-                            {r.status === 'running' && r.type === 'qemu' && (
+                            {act.has('openConsole') && (
+                                <button type="button" className="cloud-btn" onClick={() => act.openConsole(r)}><Icons.Monitor /> {t('console') || 'Console'}</button>
+                            )}
+                            {act.has('openSpice') && r.status === 'running' && r.type === 'qemu' && (
                                 <button type="button" className="cloud-btn" onClick={() => act.openSpice(r)} title={t('spiceConsoleHint') || 'Download a virt-viewer file (audio / USB / multi-monitor)'}><Icons.ExternalLink /> {t('spiceConsole') || 'SPICE'}</button>
                             )}
+                            {act.consoleOnActive && <HaOnActiveLink vm={r} className="cloud-btn" />}
                             <CloudActionMenu items={cloudVmActionItems(r, act, t)} triggerLabel={t('cloud.actions') || 'Actions'} label="Actions" />
                         </div>
                     </div>
@@ -1123,7 +1161,10 @@
                                 const memP = Math.round(Number(m.mem_percent) || 0);
                                 const diskP = Math.round(Number(m.disk_percent) || 0);
                                 const maint = m.maintenance_mode;
-                                const nodeActions = isAdmin ? [
+                                // a standby keeps Manage host only (#625)
+                                const nodeActions = !isAdmin ? [] : !act.has('nodeAction') ? [
+                                    { label: t('cloud.manageHost') || 'Manage host', icon: 'Cog', onClick: () => act.configNode(name) },
+                                ] : [
                                     { label: t('cloud.manageHost') || 'Manage host', icon: 'Cog', onClick: () => act.configNode(name) },
                                     { divider: true },
                                     maint
@@ -1133,7 +1174,7 @@
                                     { divider: true },
                                     { label: t('rebootNode') || 'Reboot', icon: 'RotateCw', danger: true, onClick: () => act.nodeAction(name, 'reboot') },
                                     { label: t('shutdownNode') || 'Shutdown', icon: 'Power', danger: true, onClick: () => act.nodeAction(name, 'shutdown') },
-                                ] : [];
+                                ];
                                 return (
                                     <div className="cloud-card cloud-node-card" key={name}>
                                         <div className="cloud-node-head">
@@ -1262,15 +1303,26 @@
             const [data, setData] = React.useState(null);
             const [loading, setLoading] = React.useState(true);
             const [err, setErr] = React.useState(null);
+            // LW Oct 2026 (#828) - only the newest request for the current path may answer: a
+            // slow one for the cluster shown before must not replace the data, set an error
+            // or end the load
+            const seqRef = React.useRef(0);
+            const pathRef = React.useRef(path);      // whose data is held
+            const currentRef = React.useRef(path);
+            currentRef.current = path;
             const reload = React.useCallback(() => {
-                if (!path) { setLoading(false); return; }
+                // the reload a mutation kept from before the switch
+                if (currentRef.current !== path) return;
+                const seq = ++seqRef.current;
+                if (pathRef.current !== path) { pathRef.current = path; setData(null); }
+                if (!path) { setLoading(false); setErr(null); return; }
                 setLoading(true); setErr(null);
                 fetch(path, { headers: getAuthHeaders() })
                     .then(r => r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status)))
-                    .then(d => { setData(d); setLoading(false); })
-                    .catch(e => { setErr(String(e && e.message || e)); setLoading(false); });
+                    .then(d => { if (seq !== seqRef.current) return; setData(d); setLoading(false); })
+                    .catch(e => { if (seq !== seqRef.current) return; setErr(String(e && e.message || e)); setLoading(false); });
             }, [path]);
-            React.useEffect(() => { reload(); }, [reload]);
+            React.useEffect(() => { reload(); return () => { seqRef.current++; }; }, [reload]);
             return { data, loading, err, reload };
         }
         function CloudSectionState({ loading, err, empty, emptyIcon, emptyTitle, emptyText, t, children }) {
@@ -1282,8 +1334,13 @@
         function cloudHead(p) { return <div className="cloud-toolbar"><div className="cloud-toolbar-left"><span className="cloud-toolbar-icon">{p.icon}</span><span className="cloud-toolbar-title">{p.title}</span><span className="cloud-count-chip">{p.count}</span></div>{p.right ? <div className="cloud-toolbar-right">{p.right}</div> : null}</div>; }
         // NS 2026-06-11 — mutation helper for the cloud sections (phase 3). POST/PUT/
         // DELETE with auth, optional confirm() for destructive ops, reload on success.
+        // #625: `acts` is false on a standby, and the pages show their changing buttons
+        // only with it; a refusal that still comes back says why, in the user's language.
+        // True again on a standby that forwards; the active out of reach says so too.
+        // A member that serves users names the leader in both.
         function useCloudMutate(reload) {
-            const { getAuthHeaders } = useAuth();
+            const { getAuthHeaders, haReadOnly, haServing } = useAuth();
+            const { t } = useTranslation();
             const [busy, setBusy] = React.useState('');
             const run = React.useCallback((key, method, path, body, confirmMsg) => {
                 if (confirmMsg && !window.confirm(confirmMsg)) return;
@@ -1291,11 +1348,14 @@
                 const opts = { method, headers: Object.assign({}, getAuthHeaders(), { 'Content-Type': 'application/json' }) };
                 if (body !== undefined) opts.body = JSON.stringify(body);
                 fetch(path, opts)
-                    .then(r => r.ok ? r.json().catch(() => ({})) : Promise.reject(new Error('HTTP ' + r.status)))
+                    .then(r => r.ok ? r.json().catch(() => ({})) : r.json().catch(() => ({})).then(b => Promise.reject(
+                        new Error(b && b.code === 'HA_STANDBY' ? (haServing ? t('pgHaServingRefused') : t('pgHaStandbyRefused'))
+                            : b && b.code === 'HA_ACTIVE_UNREACHABLE' ? (haServing ? t('pgHaLeaderUnreachable') : t('pgHaActiveUnreachable'))
+                            : 'HTTP ' + r.status))))
                     .then(() => { setBusy(''); if (reload) reload(); })
                     .catch(e => { setBusy(''); window.alert('Action failed: ' + (e && e.message || e)); });
-            }, [reload]);
-            return { busy, run };
+            }, [reload, t, haServing]);
+            return { busy, run, acts: !haReadOnly };
         }
         function CloudRowActions({ children }) { return <td><div style={{ display: 'flex', gap: 4, justifyContent: 'flex-end' }}>{children}</div></td>; }
 
@@ -1333,9 +1393,11 @@
                                         <td>{st ? (ok ? <span className="cloud-chip cloud-chip-ok">OK</span> : <span className="cloud-chip cloud-chip-err">{j['last-run-status']}</span>) : <span className="cloud-cell-muted">—</span>}</td>
                                         <td>{(Number(j.enabled) === 1 || j.enabled === true) ? <CloudConnChip connected={true} t={t} /> : <CloudConnChip connected={false} t={t} />}</td>
                                         <CloudRowActions>
+                                            {mut.acts && (<>
                                             <CloudIconBtn icon="Play" title={t('cloud.runNow') || 'Run now'} onClick={() => mut.run('r' + j.id, 'POST', `/api/clusters/${clusterId}/datacenter/backup/${j.id}/run`)} />
                                             <CloudIconBtn icon="Power" title={(Number(j.enabled) === 1 || j.enabled === true) ? (t('disable') || 'Disable') : (t('enable') || 'Enable')} onClick={() => mut.run('t' + j.id, 'PUT', `/api/clusters/${clusterId}/datacenter/backup/${j.id}`, { enabled: (Number(j.enabled) === 1 || j.enabled === true) ? 0 : 1 })} />
                                             <CloudIconBtn icon="Trash2" danger title={t('delete') || 'Delete'} onClick={() => mut.run('d' + j.id, 'DELETE', `/api/clusters/${clusterId}/datacenter/backup/${j.id}`, undefined, (t('cloud.confirmDelBackup') || 'Delete this backup job?'))} />
+                                            </>)}
                                         </CloudRowActions>
                                     </tr>);
                                 })}</tbody>
@@ -1376,7 +1438,7 @@
             return (
                 <div className="cloud-body">
                     <CloudPageHeader title={t('cloud.firewall') || 'Firewall'} sub={t('cloud.firewallSub') || 'Datacenter firewall rules'}>
-                        <button type="button" className="cloud-link-btn" onClick={() => setShowNew(true)}><Icons.Plus /> {t('cloud.newRule') || 'New rule'}</button>
+                        {mut.acts && <button type="button" className="cloud-link-btn" onClick={() => setShowNew(true)}><Icons.Plus /> {t('cloud.newRule') || 'New rule'}</button>}
                         <button type="button" className="cloud-link-btn" onClick={reload}><Icons.RefreshCw /> {t('refresh') || 'Refresh'}</button>
                     </CloudPageHeader>
                     <CloudSectionState loading={loading} err={err} empty={!rules.length} emptyIcon="Shield" emptyTitle={t('cloud.noFwRules') || 'No datacenter firewall rules'} t={t}>
@@ -1396,8 +1458,10 @@
                                     <td className="cloud-cell-muted">{r.comment || ''}</td>
                                     <td>{(Number(r.enable) === 1 || r.enable === true) ? <CloudConnChip connected={true} t={t} /> : <CloudConnChip connected={false} t={t} />}</td>
                                     <CloudRowActions>
+                                        {mut.acts && (<>
                                         <CloudIconBtn icon="Power" title={(Number(r.enable) === 1 || r.enable === true) ? (t('disable') || 'Disable') : (t('enable') || 'Enable')} onClick={() => mut.run('t' + r.pos, 'PUT', `/api/clusters/${clusterId}/datacenter/firewall/rules/${r.pos}`, { enable: (Number(r.enable) === 1 || r.enable === true) ? 0 : 1 })} />
                                         <CloudIconBtn icon="Trash2" danger title={t('delete') || 'Delete'} onClick={() => mut.run('d' + r.pos, 'DELETE', `/api/clusters/${clusterId}/datacenter/firewall/rules/${r.pos}`, undefined, (t('cloud.confirmDelRule') || 'Delete this firewall rule?'))} />
+                                        </>)}
                                     </CloudRowActions>
                                 </tr>))}</tbody>
                             </table></div>
@@ -1649,7 +1713,7 @@
                         <button type="button" className="cloud-link-btn" onClick={reload}><Icons.RefreshCw /> {t('refresh') || 'Refresh'}</button>
                     </CloudPageHeader>
                     <CloudSectionState loading={loading} err={err} empty={notAvail} emptyIcon="Network" emptyTitle={t('cloud.sdnNA') || 'SDN is not configured on this cluster'} t={t}>
-                        {s.pending ? (
+                        {s.pending && mut.acts ? (
                             <div className="cloud-card" style={{ padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 10, borderLeft: '3px solid #eab308' }}>
                                 <Icons.AlertTriangle />
                                 <span style={{ flex: 1 }}>{t('cloud.sdnPending') || 'You have unapplied SDN changes.'}</span>
@@ -1659,37 +1723,37 @@
                         <div className="cloud-kpi-grid">{kpis.map((k, i) => <CloudKpiCard key={i} icon={k.icon} value={k.value} label={k.label} accent={k.accent} />)}</div>
 
                         <div className="cloud-card cloud-table-card">
-                            {cloudHead({ icon: <Icons.Globe />, title: t('cloud.sdnZones') || 'Zones', count: zones.length, right: <button type="button" className="cloud-link-btn" onClick={() => setModal('zone')}><Icons.Plus /> {t('cloud.addZone') || 'Add zone'}</button> })}
+                            {cloudHead({ icon: <Icons.Globe />, title: t('cloud.sdnZones') || 'Zones', count: zones.length, right: mut.acts ? <button type="button" className="cloud-link-btn" onClick={() => setModal('zone')}><Icons.Plus /> {t('cloud.addZone') || 'Add zone'}</button> : null })}
                             {zones.length ? <div className="cloud-table-scroll"><table className="cloud-table">
                                 <thead><tr><th>{t('cloud.colName') || 'Name'}</th><th>{t('cloud.colType') || 'Type'}</th><th>MTU</th><th>{t('cloud.colNodes') || 'Nodes'}</th><th>{t('cloud.colState') || 'State'}</th><th style={{ textAlign: 'right' }}></th></tr></thead>
                                 <tbody>{zones.map((z, i) => (<tr className="cloud-table-row cloud-table-row-static" key={z.zone || i}>
                                     <td>{z.zone || z.name || '—'}</td><td className="cloud-table-mono">{z.type || '—'}</td><td className="cloud-cell-muted">{z.mtu || '—'}</td><td className="cloud-cell-muted">{z.nodes || '—'}</td>
                                     <td><span className="cloud-chip cloud-chip-soft">{z.state || z.status || 'ok'}</span></td>
-                                    <CloudRowActions><CloudIconBtn icon="Trash2" danger title={t('delete') || 'Delete'} onClick={() => mut.run('dz' + (z.zone), 'DELETE', `${base}/zones/${z.zone}`, undefined, (t('cloud.confirmDelZone') || 'Delete this zone?'))} /></CloudRowActions>
+                                    <CloudRowActions>{mut.acts && (<><CloudIconBtn icon="Trash2" danger title={t('delete') || 'Delete'} onClick={() => mut.run('dz' + (z.zone), 'DELETE', `${base}/zones/${z.zone}`, undefined, (t('cloud.confirmDelZone') || 'Delete this zone?'))} /></>)}</CloudRowActions>
                                 </tr>))}</tbody>
                             </table></div> : <div className="cloud-empty" style={{ padding: 14 }}>{t('cloud.noZones') || 'No zones.'}</div>}
                         </div>
 
                         <div className="cloud-card cloud-table-card">
-                            {cloudHead({ icon: <Icons.Network />, title: t('cloud.sdnVnets') || 'VNets', count: vnets.length, right: <button type="button" className="cloud-link-btn" onClick={() => setModal('vnet')}><Icons.Plus /> {t('cloud.addVnet') || 'Add VNet'}</button> })}
+                            {cloudHead({ icon: <Icons.Network />, title: t('cloud.sdnVnets') || 'VNets', count: vnets.length, right: mut.acts ? <button type="button" className="cloud-link-btn" onClick={() => setModal('vnet')}><Icons.Plus /> {t('cloud.addVnet') || 'Add VNet'}</button> : null })}
                             {vnets.length ? <div className="cloud-table-scroll"><table className="cloud-table">
                                 <thead><tr><th>{t('cloud.colName') || 'Name'}</th><th>{t('cloud.sdnZone') || 'Zone'}</th><th>{t('cloud.colTag') || 'Tag'}</th><th>{t('cloud.colAlias') || 'Alias'}</th><th style={{ textAlign: 'right' }}></th></tr></thead>
                                 <tbody>{vnets.map((v, i) => (<tr className="cloud-table-row cloud-table-row-static" key={v.vnet || i}>
                                     <td>{v.vnet || '—'}</td><td className="cloud-cell-muted">{v.zone || '—'}</td><td className="cloud-table-mono">{v.tag || '—'}</td><td className="cloud-cell-muted">{v.alias || '—'}</td>
-                                    <CloudRowActions><CloudIconBtn icon="Trash2" danger title={t('delete') || 'Delete'} onClick={() => mut.run('dv' + v.vnet, 'DELETE', `${base}/vnets/${v.vnet}`, undefined, (t('cloud.confirmDelVnet') || 'Delete this VNet?'))} /></CloudRowActions>
+                                    <CloudRowActions>{mut.acts && (<><CloudIconBtn icon="Trash2" danger title={t('delete') || 'Delete'} onClick={() => mut.run('dv' + v.vnet, 'DELETE', `${base}/vnets/${v.vnet}`, undefined, (t('cloud.confirmDelVnet') || 'Delete this VNet?'))} /></>)}</CloudRowActions>
                                 </tr>))}</tbody>
                             </table></div> : <div className="cloud-empty" style={{ padding: 14 }}>{t('cloud.noVnets') || 'No VNets.'}</div>}
                         </div>
 
                         <div className="cloud-card cloud-table-card">
-                            {cloudHead({ icon: <Icons.Layers />, title: t('cloud.sdnSubnets') || 'Subnets', count: subnets.length, right: vnets.length ? <button type="button" className="cloud-link-btn" onClick={() => setModal('subnet')}><Icons.Plus /> {t('cloud.addSubnet') || 'Add subnet'}</button> : null })}
+                            {cloudHead({ icon: <Icons.Layers />, title: t('cloud.sdnSubnets') || 'Subnets', count: subnets.length, right: vnets.length && mut.acts ? <button type="button" className="cloud-link-btn" onClick={() => setModal('subnet')}><Icons.Plus /> {t('cloud.addSubnet') || 'Add subnet'}</button> : null })}
                             {subnets.length ? <div className="cloud-table-scroll"><table className="cloud-table">
                                     <thead><tr><th>CIDR</th><th>{t('cloud.colGateway') || 'Gateway'}</th><th>DHCP</th><th>SNAT</th><th>{t('cloud.sdnVnet') || 'VNet'}</th><th style={{ textAlign: 'right' }}></th></tr></thead>
                                     <tbody>{subnets.map((sn, i) => (<tr className="cloud-table-row cloud-table-row-static" key={(sn.subnet || i)}>
                                         <td className="cloud-table-mono">{sn.subnet || sn.cidr || '—'}</td><td className="cloud-cell-muted">{sn.gateway || '—'}</td><td className="cloud-cell-muted">{sn.dhcp || 'none'}</td>
                                         <td>{(Number(sn.snat) === 1 || sn.snat === true) ? <span className="cloud-chip cloud-chip-ok">on</span> : <span className="cloud-cell-muted">off</span>}</td>
                                         <td className="cloud-cell-muted">{sn.vnet || '—'}</td>
-                                        <CloudRowActions>{sn.vnet ? <CloudIconBtn icon="Trash2" danger title={t('delete') || 'Delete'} onClick={() => mut.run('ds' + (sn.subnet), 'DELETE', `${base}/vnets/${sn.vnet}/subnets/${encodeURIComponent(sn.subnet)}`, undefined, (t('cloud.confirmDelSubnet') || 'Delete this subnet?'))} /> : null}</CloudRowActions>
+                                        <CloudRowActions>{mut.acts && (<>{sn.vnet ? <CloudIconBtn icon="Trash2" danger title={t('delete') || 'Delete'} onClick={() => mut.run('ds' + (sn.subnet), 'DELETE', `${base}/vnets/${sn.vnet}/subnets/${encodeURIComponent(sn.subnet)}`, undefined, (t('cloud.confirmDelSubnet') || 'Delete this subnet?'))} /> : null}</>)}</CloudRowActions>
                                     </tr>))}</tbody>
                                 </table></div> : <div className="cloud-empty" style={{ padding: 14 }}>{vnets.length ? (t('cloud.noSubnets') || 'No subnets.') : (t('cloud.subnetsNeedVnet') || 'Create a VNet first.')}</div>}
                         </div>
@@ -1804,7 +1868,9 @@
                                         <td>{j.last_sync ? cloudRelTime(j.last_sync) : '—'}</td>
                                         <td>{(j.error && String(j.error).trim()) ? <span className="cloud-chip cloud-chip-err">error</span> : (Number(j.disable) === 1 ? <CloudConnChip connected={false} t={t} /> : <CloudConnChip connected={true} t={t} />)}</td>
                                         <CloudRowActions>
+                                            {mut.acts && (<>
                                             <CloudIconBtn icon="Play" title={t('cloud.runNow') || 'Run now'} onClick={() => mut.run('r' + j.id, 'POST', `/api/clusters/${clusterId}/replication/${j.id}/run`)} />
+                                            </>)}
                                         </CloudRowActions>
                                     </tr>))}</tbody>
                                 </table></div>
@@ -1913,6 +1979,62 @@
             );
         }
 
+        // LW Oct 2026 (#625) - the HA page of this layout shows the Proxmox HA groups
+        // (ProxmoxHaSection, since aed792d CloudHA above is no longer mounted). What the
+        // node HA settings of the cluster warn about gets one line each on top of it: an
+        // agent of an earlier PegaProx on a node, and unsafe two-node recovery. Nothing at
+        // all when neither applies, or the server does not report them.
+        function CloudHaNodeNotes({ clusterId, t, authFetch }) {
+            const [ha, setHa] = React.useState(null);
+            React.useEffect(() => {
+                let gone = false;
+                setHa(null);
+                if (!clusterId || !authFetch) return undefined;
+                authFetch(`${API_URL}/clusters/${clusterId}/ha/status`)
+                    .then(r => (r && r.ok ? r.json() : null))
+                    .then(d => { if (!gone) setHa(d); })
+                    .catch(() => {});
+                return () => { gone = true; };
+            }, [clusterId]);
+            if (!ha || !ha.enabled) return null;
+            const sbp = ha.split_brain_prevention || {};
+            const fa = ha.fence_agent || {};
+            const outdated = Array.isArray(fa.outdated) ? fa.outdated : [];
+            const unsafe = sbp.unsafe_two_node_recovery === true;
+            // LW Oct 2026 (#625) - guests an interrupted recovery left moved or held: started or
+            // dismissed in the HA settings of the other layouts, this one only says so
+            const left = [...new Set((Array.isArray(ha.interrupted_recoveries) ? ha.interrupted_recoveries : [])
+                .flatMap(r => [...(r.moved || []), ...(r.held || []), ...(r.guests_open || [])]))];
+            if (!outdated.length && !unsafe && !left.length) return null;
+            const line = { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13 };
+            return (
+                <div className="cloud-card" data-ha-node-cloud
+                    style={{ marginBottom: 16, borderLeft: `3px solid ${unsafe ? '#f87171' : '#f59e0b'}` }}>
+                    {unsafe && (
+                        <div data-ha-node-cloud-line="unsafe" title={sbp.unsafe_two_node_warning || undefined}
+                            style={{ ...line, color: 'var(--cloud-error, #f87171)' }}>
+                            <span style={{ display: 'inline-flex' }}><Icons.AlertTriangle /></span>
+                            <span><strong>{t('haNodeUnsafeSwitch')}</strong>: {t('enabled')}</span>
+                        </div>
+                    )}
+                    {outdated.length > 0 && (
+                        <div data-ha-node-cloud-line="outdated" title={fa.outdated_warning || undefined}
+                            style={{ ...line, color: 'var(--cloud-warning, #e0a82e)', marginTop: unsafe ? 6 : 0 }}>
+                            <span style={{ display: 'inline-flex' }}><Icons.AlertTriangle /></span>
+                            <span><strong>{t('haNodeCloudOutdated')}</strong>: {outdated.join(', ')}</span>
+                        </div>
+                    )}
+                    {left.length > 0 && (
+                        <div data-ha-node-cloud-line="interrupted" title={t('haNodeIrCloudHint')}
+                            style={{ ...line, color: 'var(--cloud-warning, #e0a82e)', marginTop: unsafe || outdated.length ? 6 : 0 }}>
+                            <span style={{ display: 'inline-flex' }}><Icons.AlertTriangle /></span>
+                            <span><strong>{t('haNodeIrTitle')}</strong>: {left.join(', ')} - {t('haNodeIrCloudHint')}</span>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         // NS 2026-06-11 — sponsors show in every layout, Cloud included. Same slots
         // + OC button as the classic footer, just sized for the cloud content area.
         // Reuses the global SponsorSlot so the mirror/GitHub self-heal applies here too.
@@ -1940,13 +2062,19 @@
         function CloudPlugins({ clusterId, t }) {
             const { data, loading, err, reload } = useCloudData('/api/plugins');
             const mut = useCloudMutate(reload);
-            const list = (Array.isArray(data) ? data : []).filter(p => p && p.enabled);
+            // a process loads its own plugins: no standby rescans, reloads or switches them,
+            // forwarding or not (#625)
+            const { haStandby } = useAuth();
+            // #642 - a plugin limited to other clusters has nothing to say about this one
+            const list = (Array.isArray(data) ? data : [])
+                .filter(p => p && p.enabled)
+                .filter(p => pluginAppliesToCluster(p, clusterId));
             const [sel, setSel] = React.useState(null);
             const cur = list.find(p => p.id === sel) || null;
             return (
                 <div className="cloud-body">
                     <CloudPageHeader title={t('plugins') || 'Plugins'} sub={list.length + ' ' + (t('plugins') || 'plugins')}>
-                        <button type="button" className="cloud-link-btn" onClick={() => mut.run('rescan', 'POST', '/api/plugins/rescan')}><Icons.Search /> {t('rescan') || 'Rescan'}</button>
+                        {!haStandby && <button type="button" className="cloud-link-btn" onClick={() => mut.run('rescan', 'POST', '/api/plugins/rescan')}><Icons.Search /> {t('rescan') || 'Rescan'}</button>}
                         <button type="button" className="cloud-link-btn" onClick={reload}><Icons.RefreshCw /> {t('refresh') || 'Refresh'}</button>
                     </CloudPageHeader>
                     <CloudSectionState loading={loading} err={err} empty={!list.length} emptyIcon="Box" emptyTitle={t('noPlugins') || 'No plugins enabled'} emptyText={t('cloud.pluginsHint') || 'Enable plugins in Settings → Plugins.'} t={t}>
@@ -1961,7 +2089,7 @@
                         </div>
                         {cur && (
                             <div className="cloud-card cloud-table-card" style={{ padding: 0, overflow: 'hidden' }}>
-                                {cloudHead({ icon: <Icons.Box />, title: cur.name || cur.id, count: (cur.routes && cur.routes.length) || null, right: (
+                                {cloudHead({ icon: <Icons.Box />, title: cur.name || cur.id, count: (cur.routes && cur.routes.length) || null, right: !haStandby && (
                                     <div style={{ display: 'flex', gap: 4 }}>
                                         <CloudIconBtn icon="RotateCw" title={t('reload') || 'Reload'} onClick={() => mut.run('rl' + cur.id, 'POST', `/api/plugins/${cur.id}/reload`)} />
                                         <CloudIconBtn icon="Power" danger title={t('disable') || 'Disable'} onClick={() => mut.run('ds' + cur.id, 'POST', `/api/plugins/${cur.id}/disable`)} />
@@ -2004,7 +2132,7 @@
             return (
                 <div className="cloud-body">
                     <CloudPageHeader title={t('customScripts') || 'Scripts'} sub={t('cloud.scriptsSub') || 'Custom cluster scripts'}>
-                        <button type="button" className="cloud-link-btn" onClick={() => setShowNew(true)}><Icons.Plus /> {t('cloud.newScript') || 'New script'}</button>
+                        {mut.acts && <button type="button" className="cloud-link-btn" onClick={() => setShowNew(true)}><Icons.Plus /> {t('cloud.newScript') || 'New script'}</button>}
                         <button type="button" className="cloud-link-btn" onClick={reload}><Icons.RefreshCw /> {t('refresh') || 'Refresh'}</button>
                     </CloudPageHeader>
                     <CloudSectionState loading={loading} err={err} empty={!rows.length} emptyIcon="Terminal" emptyTitle={t('cloud.noScripts') || 'No scripts'} t={t}>
@@ -2022,9 +2150,9 @@
                                         <td className="cloud-cell-muted">{s.last_run || '—'}</td>
                                         <td>{s.last_status ? (ok ? <span className="cloud-chip cloud-chip-ok">{s.last_status}</span> : <span className="cloud-chip cloud-chip-err">{s.last_status}</span>) : <span className="cloud-cell-muted">—</span>}</td>
                                         <CloudRowActions>
-                                            <CloudIconBtn icon="Play" title={t('cloud.runNow') || 'Run'} onClick={() => setRunFor(s)} />
+                                            {mut.acts && <CloudIconBtn icon="Play" title={t('cloud.runNow') || 'Run'} onClick={() => setRunFor(s)} />}
                                             <CloudIconBtn icon="FileText" title={t('cloud.viewOutput') || 'Output'} onClick={() => viewOutput(s)} />
-                                            <CloudIconBtn icon="Trash2" danger title={t('delete') || 'Delete'} onClick={() => mut.run('d' + s.id, 'DELETE', `/api/clusters/${clusterId}/scripts/${s.id}`, undefined, (t('cloud.confirmDelScript') || 'Delete this script?'))} />
+                                            {mut.acts && <CloudIconBtn icon="Trash2" danger title={t('delete') || 'Delete'} onClick={() => mut.run('d' + s.id, 'DELETE', `/api/clusters/${clusterId}/scripts/${s.id}`, undefined, (t('cloud.confirmDelScript') || 'Delete this script?'))} />}
                                         </CloudRowActions>
                                     </tr>);
                                 })}</tbody>
@@ -2076,7 +2204,7 @@
             return (
                 <div className="cloud-body">
                     <CloudPageHeader title={t('scheduledActions') || 'Schedules'} sub={t('cloud.schedulesSub') || 'Time-based VM actions'}>
-                        <button type="button" className="cloud-link-btn" onClick={() => setShowNew(true)}><Icons.Plus /> {t('cloud.newSchedule') || 'New schedule'}</button>
+                        {mut.acts && <button type="button" className="cloud-link-btn" onClick={() => setShowNew(true)}><Icons.Plus /> {t('cloud.newSchedule') || 'New schedule'}</button>}
                         <button type="button" className="cloud-link-btn" onClick={reload}><Icons.RefreshCw /> {t('refresh') || 'Refresh'}</button>
                     </CloudPageHeader>
                     <CloudSectionState loading={loading} err={err} empty={!rows.length} emptyIcon="Clock" emptyTitle={t('cloud.noSchedules') || 'No schedules'} t={t}>
@@ -2092,9 +2220,11 @@
                                         <td className="cloud-cell-muted">{s.last_run || s.last_run_at || '—'}</td>
                                         <td><CloudConnChip connected={isOn(s)} t={t} /></td>
                                         <CloudRowActions>
+                                            {mut.acts && (<>
                                             <CloudIconBtn icon="Play" title={t('cloud.runNow') || 'Run now'} onClick={() => mut.run('r' + s.id, 'POST', `/api/schedules/${s.id}/run`)} />
                                             <CloudIconBtn icon="Power" title={isOn(s) ? (t('disable') || 'Disable') : (t('enable') || 'Enable')} onClick={() => mut.run('t' + s.id, 'PUT', `/api/schedules/${s.id}`, { enabled: isOn(s) ? 0 : 1 })} />
                                             <CloudIconBtn icon="Trash2" danger title={t('delete') || 'Delete'} onClick={() => mut.run('d' + s.id, 'DELETE', `/api/schedules/${s.id}`, undefined, (t('cloud.confirmDelSchedule') || 'Delete this schedule?'))} />
+                                            </>)}
                                         </CloudRowActions>
                                     </tr>
                                 ))}</tbody>
@@ -2120,6 +2250,7 @@
         }
 
         function CloudCVE({ clusterId, t }) {
+            const { haReadOnly } = useAuth();
             const [res, setRes] = React.useState(null);
             const [busy, setBusy] = React.useState(false);
             const [err, setErr] = React.useState(null);
@@ -2141,7 +2272,7 @@
             return (
                 <div className="cloud-body">
                     <CloudPageHeader title={t('cveScanner') || 'CVE Scanner'} sub={t('cloud.cveSub') || 'Package vulnerability scan (debsecan)'}>
-                        <button type="button" className="cloud-btn-primary" onClick={scan} disabled={busy}>{busy ? (t('cloud.scanning') || 'Scanning…') : (t('cloud.runScan') || 'Run scan')}</button>
+                        {!haReadOnly && <button type="button" className="cloud-btn-primary" onClick={scan} disabled={busy}>{busy ? (t('cloud.scanning') || 'Scanning…') : (t('cloud.runScan') || 'Run scan')}</button>}
                     </CloudPageHeader>
                     {err && <div className="cloud-card"><CloudEmpty icon="AlertTriangle" title={t('cloud.scanFailed') || 'Scan failed'} text={err} /></div>}
                     {!res && !busy && !err && <div className="cloud-card"><CloudEmpty icon="Shield" title={t('cloud.cveIdle') || 'No scan yet'} text={t('cloud.cveHint') || 'Run a scan to check node packages for known CVEs (needs debsecan on the nodes).'} /></div>}
@@ -2175,7 +2306,7 @@
             );
         }
 
-        function CloudShell({ clusters, selectedCluster, setSelectedCluster, clusterResources, clusterMetrics, allClusterMetrics, clusterDatastores, clusterNetworks, clusterPools, tasks, knownNodes, actions, isAdmin, currentUser, t, authFetch, addToast, onExitCloud, onOpenSettings, onOpenProfile, onLogout }) {
+        function CloudShell({ clusters, selectedCluster, setSelectedCluster, clusterResources, clusterMetrics, allClusterMetrics, clusterDatastores, clusterNetworks, clusterPools, tasks, knownNodes, actions, isAdmin, currentUser, t, authFetch, addToast, onExitCloud, onOpenSettings, onOpenProfile, onOpenApiReference, onLogout }) {
             const [section, setSection] = React.useState('overview');
             const [detailRes, setDetailRes] = React.useState(null);
             const [collapsed, setCollapsed] = React.useState(false);
@@ -2207,6 +2338,11 @@
 
             const safeClusters = Array.isArray(clusters) ? clusters : [];
             const safeResources = Array.isArray(clusterResources) ? clusterResources : [];
+            // server-computed, already false for tenant/cluster-confined users; a standby
+            // installs nothing (#625), like the sidebar entry in the other two layouts. Not
+            // even a forwarding one: the answer URL it would show is this instance's own.
+            const { ha, haStandby, haConsolesElsewhere } = useAuth();
+            const canAutoInstall = !!(currentUser && currentUser.autoinstall_access) && !haStandby;
 
             // PegaProx t() ECHOES the key back on a miss, so `t('cloud.x') || 'Fallback'`
             // would render the raw key. treat key-echo as "no translation". -- NS
@@ -2233,13 +2369,20 @@
                 del: (r) => actions?.del?.(stamp(r)),
                 crossMigrate: (r) => actions?.crossMigrate?.(stamp(r)),
                 snapshot: (r) => actions?.snapshot?.(stamp(r)),
+                bulkGuests: (rows, a) => actions?.bulkGuests?.(rows.map(stamp), a),
+                bulkMigrate: (rows) => actions?.bulkMigrate?.(rows.map(stamp)),
                 createVm: (type) => actions?.createVm?.(type),
                 nodeAction: (n, a) => actions?.nodeAction?.(n, a),
                 maintenanceToggle: (n, e) => actions?.maintenanceToggle?.(n, e),
                 startUpdate: (n, r) => actions?.startUpdate?.(n, r),
                 configNode: (n) => actions?.configNode?.(n),
                 multiCluster: safeClusters.length > 1,   // gate the cross-cluster migrate item
-            }), [actions, cid, safeClusters.length]);
+                // what the dashboard handed over; a standby leaves out everything that acts (#625)
+                has: (k) => typeof actions?.[k] === 'function',
+                // a standby leaves out the consoles too, forwarding or not, unless it serves
+                // users; this opens the guest's console on the active in their place
+                consoleOnActive: haConsolesElsewhere ? (r) => haOpenOnActive(ha && ha.peer_url, haConsoleSearch(stamp(r))) : null,
+            }), [actions, cid, safeClusters.length, haConsolesElsewhere, ha && ha.peer_url]);
 
             const vms = safeResources.filter(r => r && r.type === 'qemu');
             const cts = safeResources.filter(r => r && r.type === 'lxc');
@@ -2258,11 +2401,13 @@
                 overview: T('cloud.overview') || 'Overview',
                 vms: T('cloud.vms') || 'Virtual Machines',
                 containers: T('cloud.containers') || 'Containers',
+                apps: T('ociTabLabel') || 'App Containers',
                 datastores: T('cloud.datastores') || 'Datastores',
                 pools: T('cloud.pools') || 'Resource Pools',
                 networks: T('cloud.networks') || 'Networks',
                 clusters: T('cloud.clustersTitle') || 'Clusters',
                 nodes: T('cloud.hosts') || 'Hosts',
+                mappings: T('rmTitle') || 'Resource Mappings',
                 ha: T('cloud.ha') || 'High Availability',
                 storage: T('cloud.storageConfig') || 'Storage',
                 ceph: T('cloud.ceph') || 'Ceph',
@@ -2285,6 +2430,7 @@
                 siem: T('siem') || 'SIEM',
                 alerts: T('alertChannels') || 'Alert Channels',
                 updates: T('updateManager') || 'Update Manager',
+                autoinstall: T('autoInstall') || 'Automated Installations',
                 plugins: T('plugins') || 'Plugins',
                 scripts: T('customScripts') || 'Scripts',
                 schedules: T('scheduledActions') || 'Schedules',
@@ -2321,6 +2467,10 @@
                     case 'containers':
                         body = <CloudInstanceList rows={cts} kind="lxc" clusterId={cid} act={act} onOpen={openDetail} onCreate={act.createVm} t={T} />;
                         break;
+                    case 'apps':
+                        // raw t: every string of the tab is translated, and it fills {placeholders} in
+                        body = <div className="cloud-mounted"><OciCatalogTab clusters={safeClusters} clusterId={cid} authFetch={authFetch} addToast={addToast} t={t} /></div>;
+                        break;
                     case 'datastores':
                         body = <CloudDatastores datastores={clusterDatastores} t={T} />;
                         break;
@@ -2337,10 +2487,13 @@
                         body = <CloudNodes metrics={clusterMetrics} act={act} isAdmin={isAdmin} t={T} />;
                         break;
                     case 'ha':
-                        body = <div className="cloud-mounted"><ProxmoxHaSection clusterId={cid} /></div>;
+                        body = <div className="cloud-mounted"><CloudHaNodeNotes clusterId={cid} t={t} authFetch={authFetch} /><ProxmoxHaSection clusterId={cid} /></div>;
                         break;
                     case 'storage':
                         body = <div className="cloud-mounted"><DatastoreTab clusterId={cid} addToast={addToast} sharedDatastoreData={clusterDatastores} /></div>;
+                        break;
+                    case 'mappings':
+                        body = <div className="cloud-mounted">{cid && <ResourceMappingsSection clusterId={cid} addToast={addToast} />}</div>;
                         break;
                     case 'ceph':
                         body = <CloudCeph clusterId={cid} t={T} />;
@@ -2422,6 +2575,13 @@
                     case 'alerts':
                         body = <div className="cloud-mounted"><AlertChannelsPanel t={T} addToast={addToast} getAuthHeaders={() => ({})} /></div>;
                         break;
+                    case 'autoinstall':
+                        // raw t on purpose: T gives undefined on a miss, and the panel strings
+                        // t() results together into confirms and labels
+                        body = canAutoInstall
+                            ? <div className="cloud-mounted"><AutoInstallPanel t={t} addToast={addToast} getAuthHeaders={() => ({})} clusters={safeClusters} /></div>
+                            : <CloudDashboard clusters={safeClusters} resources={safeResources} metrics={clusterMetrics} dcStatus={dcStatus} tasks={tasks} onNav={selectSection} t={T} />;
+                        break;
                     case 'updates':
                         body = <div className="cloud-mounted"><UpdateManagerSection clusterId={cid} addToast={addToast} /></div>;
                         break;
@@ -2453,7 +2613,7 @@
 
             return (
                 <div className="cloud-shell">
-                    <CloudSideNav active={section} onSelect={selectSection} isAdmin={!!isAdmin} collapsed={collapsed} onToggle={() => setCollapsed(c => !c)} />
+                    <CloudSideNav active={section} onSelect={selectSection} isAdmin={!!isAdmin} canAutoInstall={canAutoInstall} collapsed={collapsed} onToggle={() => setCollapsed(c => !c)} />
                     <div className="cloud-content">
                         <CloudTopbar
                             crumbs={crumbs}
@@ -2466,11 +2626,26 @@
                             onExitCloud={onExitCloud}
                             onOpenSettings={onOpenSettings}
                             onOpenProfile={onOpenProfile}
+                            onOpenApiReference={onOpenApiReference}
                             onLogout={onLogout}
                             isAdmin={isAdmin}
                             currentUser={currentUser}
                             t={T}
                         />
+                        <BroadcastBanners cloud />
+                        {/* #625 - same banner as the classic layouts, in the shell's colours */}
+                        <HaStandbyBanner cloud onOpenHa={() => {
+                            onOpenSettings && onOpenSettings();
+                            window.dispatchEvent(new CustomEvent('pegaprox-navigate-ha'));
+                        }} />
+                        <HaCopiesBanner cloud onOpenHa={() => {
+                            onOpenSettings && onOpenSettings();
+                            window.dispatchEvent(new CustomEvent('pegaprox-navigate-ha'));
+                        }} />
+                        <HaLeaderBanner cloud onOpenHa={() => {
+                            onOpenSettings && onOpenSettings();
+                            window.dispatchEvent(new CustomEvent('pegaprox-navigate-ha'));
+                        }} />
                         <div className="cloud-content-scroll">
                             {body}
                             <CloudSponsorFooter t={T} />

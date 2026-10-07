@@ -393,6 +393,14 @@ fi
 chmod +x deploy.sh update.sh 2>/dev/null || true
 chmod +x web/Dev/build.sh 2>/dev/null || true
 
+# NS Oct 2026 (#625): the branch this install follows from now on, for what the app says
+# about itself ("Add witness" names the Docker image of that branch)
+if [ "$GITHUB_BRANCH" = main ]; then
+    rm -f .pegaprox-branch
+else
+    printf '%s\n' "$GITHUB_BRANCH" > .pegaprox-branch
+fi
+
 # Fix ownership if running as root
 if [ "$EUID" -eq 0 ] && [ -n "$ORIGINAL_OWNER" ] && [ "$ORIGINAL_OWNER" != "root:root" ]; then
     echo -n "Fixing file ownership ($ORIGINAL_OWNER)... "

@@ -24,8 +24,8 @@ from flask import request, jsonify
 from typing import List, Optional
 
 from pegaprox.constants import (
-    SESSION_TIMEOUT, CONFIG_DIR, USERS_FILE_ENCRYPTED,
-    SESSIONS_FILE, SESSIONS_FILE_ENCRYPTED, ADMIN_INITIALIZED_FILE,
+    SESSION_TIMEOUT, CONFIG_DIR,
+    SESSIONS_FILE, SESSIONS_FILE_ENCRYPTED, ADMIN_INITIALIZED_FILE, SETUP_REOPEN_FILE,
     LOGIN_MAX_ATTEMPTS, LOGIN_LOCKOUT_TIME, LOGIN_ATTEMPT_WINDOW,
 )
 from pegaprox.globals import (
@@ -200,6 +200,40 @@ def dummy_verify_password(password: str) -> None:
     _pw_hash_offload(_dummy_verify_password_sync, (password,))
 
 
+def recheck_account_password(username: str, password: str, user: dict,
+                             audit_action: str = None, context: str = '') -> tuple:
+    """Is `password` this account's own password? Returns (ok, auth_source).
+
+    For actions a session alone must not unlock. An LDAP account is checked with a bind
+    against the directory, every other account against its local hash, so one without
+    a local password never passes here. A failure goes into the audit trail as
+    `audit_action` when one is given.
+
+    MK Sep 2026 (#625) - lifted out of the config backup so the backup and the standby
+    pairing routes ask this the same way and cannot drift apart.
+    """
+    auth_source = (user.get('auth_source') if isinstance(user, dict) else None) or 'local'
+    ok = False
+    if auth_source == 'ldap':
+        # #355 - LDAP accounts have no local hash, the directory is the only judge
+        try:
+            from pegaprox.utils.ldap import ldap_authenticate
+            res = ldap_authenticate(username, password)
+            ok = bool(res and res.get('success'))
+        except Exception as e:
+            logging.warning(f"[AUTH] LDAP password re-check failed for {username}: {e}")
+            ok = False
+    else:
+        salt = user.get('password_salt', '') if isinstance(user, dict) else ''
+        pw_hash = user.get('password_hash', '') if isinstance(user, dict) else ''
+        ok = verify_password(password, salt, pw_hash)
+    if not ok and audit_action:
+        from pegaprox.utils.audit import log_audit
+        detail = f'Password verification failed (auth_source={auth_source})'
+        log_audit(username, audit_action, f'{detail} for {context}' if context else detail)
+    return ok, auth_source
+
+
 def needs_password_rehash(salt_b64: str, hash_b64: str) -> bool:
     """check if pw needs upgrade to argon2"""
     if not ARGON2_AVAILABLE:
@@ -302,14 +336,46 @@ def load_users(readonly: bool = False) -> dict:
                     logging.error(f"User {username} has invalid data type: {type(userdata)}")
             return users
     except Exception as e:
+        # NS Oct 2026 (#1053) - this fell back to users.enc, a copy frozen at the SQLite
+        # import: a DB that stopped answering signed people in with the old passwords and
+        # roles, and accounts deleted since. An unreadable store has nobody to sign in.
         logging.error(f"db load failed: {e}")
-        return _load_users_legacy()  # fallback to old format
+        return {}
 
     # no users in db — uninitialised install, or admin deleted on purpose.
     # the previous code auto-bootstrapped pegaprox/admin here; that path is
     # gone for security reasons (Aikido finding: hardcoded creds, fresh
     # network-reachable install = remote admin takeover).
     return {}
+
+
+def apply_token_role(user: dict, token_role: str) -> dict:
+    """Return a COPY of `user` carrying the effective_role an API token acts under.
+
+    One implementation for the two places that need it. build_authz_user does this for
+    the object-level checks; check_cluster_access had its own inline copy so the cluster
+    hot path would not have to load the whole users table — and the two drifted. The
+    inline one collapsed a tenant CUSTOM role to a builtin level, which is exactly what
+    NS removed from build_authz_user in Aug 2026 (Aikido 469089255): a builtin makes
+    get_user_clusters skip its custom-role -> tenant remap, so the caller falls back to
+    the default tenant, and THAT tenant's empty cluster list means "all clusters". A
+    token deliberately scoped narrower than its owner therefore came out wider — it read
+    every cluster on the installation, across tenants. Shared now so it cannot drift a
+    third time. MK Sep 2026, Aikido 700488915.
+    """
+    _h = {ROLE_ADMIN: 3, ROLE_USER: 2, ROLE_VIEWER: 1}
+    out = dict(user)
+    if token_role and token_role not in _h:
+        # a custom role keeps its NAME — see build_authz_user for why, and for what
+        # _token_owner_capped then has to do about the missing numeric floor
+        out['effective_role'] = token_role
+    else:
+        eff = min(_h.get(token_role, 1), _h.get(user.get('role'), 1))
+        out['effective_role'] = next((r for r, lvl in _h.items() if lvl == eff), ROLE_VIEWER)
+    # NS Oct 2026 (#1014) - a builtin token role too: the floor caps the role, not the
+    # owner's extra grants, and only rbac._token_permissions leaves those out
+    out['_token_owner_capped'] = True
+    return out
 
 
 def build_authz_user(username: str, session: dict) -> dict:
@@ -321,29 +387,59 @@ def build_authz_user(username: str, session: dict) -> dict:
     user = users.get(username, {})
     user['username'] = username
     if session.get('api_token'):
-        _h = {ROLE_ADMIN: 3, ROLE_USER: 2, ROLE_VIEWER: 1}
-        token_role = session.get('role')
         # NS Aug 2026 (Aikido 469089255 core) — a token bound to a tenant CUSTOM role must KEEP that
         # role name, not collapse to a builtin level. The old collapse both under-privileged the token
         # (has_permission then only saw viewer perms) AND — the security bug — made get_user_clusters
-        # see a builtin, SKIP its custom-role→tenant remap (rbac.py:318), fall back to the owner's
+        # see a builtin, SKIP its custom-role→tenant remap (rbac.py), fall back to the owner's
         # (default) tenant and return None = "all clusters". Keeping the name lets get_user_clusters
         # scope the token to the role's tenant and lets its real permissions resolve. It can't outrank
         # the owner: create_api_token binds a token at/below the owner's level and require_auth
         # re-floors the numeric role every request. A BUILTIN token role is still floored numerically.
-        if token_role and token_role not in _h:
-            user['effective_role'] = token_role
-            # MK Sep 2026 - a CUSTOM token role keeps its name (see above), and the numeric
-            # floor above therefore never runs for it. So the token kept resolving through
-            # that role's permission list no matter what happened to its owner afterwards:
-            # demote the owner to viewer, strip a permission from their account, and a token
-            # they minted while they still held it carried on working. Mark the identity so
-            # get_user_permissions can intersect with what the owner holds TODAY - it has to
-            # happen there, not here, because the answer is per-tenant.
-            user['_token_owner_capped'] = True
-        else:
-            eff = min(_h.get(token_role, 1), _h.get(user.get('role'), 1))
-            user['effective_role'] = next((r for r, lvl in _h.items() if lvl == eff), ROLE_VIEWER)
+        #
+        # MK Sep 2026 - a CUSTOM token role keeps its name, so the numeric floor never runs for
+        # it. The token therefore kept resolving through that role's permission list no matter
+        # what happened to its owner afterwards: demote the owner to viewer, strip a permission
+        # from their account, and a token they minted while they still held it carried on
+        # working. _token_owner_capped marks the identity so get_user_permissions can intersect
+        # with what the owner holds TODAY - it has to happen there, not here, because the
+        # answer is per-tenant.
+        #
+        # MK Sep 2026 - the body moved into apply_token_role because check_cluster_access
+        # carries the same decision on a path that must not load the whole users table, and
+        # the two copies had already drifted apart once.
+        user = apply_token_role(user, session.get('role'))
+    return user
+
+
+def resolve_authz_user(auth: dict):
+    """The identity a console, shell or terminal is opened for, or None.
+
+    `auth` is a session or the ws token minted from one: the user, the role it was
+    issued with and whether an API token stood behind it.
+
+    NS Oct 2026 (#1101) - read by the account's own row. The console handlers used
+    load_users().get(name, {}), and that whole-table read comes back as {} when it
+    fails; {} is a role-less viewer in the default tenant, whose empty cluster list
+    means every cluster. An account we cannot read is a refusal, never a default.
+
+    (#1116) - an API token acts under its own role, floored to the owner's, exactly as
+    build_authz_user does for the REST routes. A ws token whose role is not the one
+    stored on the account is floored the same way, so a role change inside its 60 s
+    life cannot widen it either."""
+    username = (auth or {}).get('user') or ''
+    if not username:
+        return None
+    try:
+        stored = get_db().get_user(username)
+    except Exception as e:
+        logging.warning(f"[AUTHZ] could not read account {username!r}: {type(e).__name__}")
+        return None
+    if not stored:
+        return None
+    user = dict(stored, username=username)
+    role = auth.get('role')
+    if auth.get('api_token') or (role and role != stored.get('role')):
+        user = apply_token_role(user, role)
     return user
 
 
@@ -352,6 +448,8 @@ def build_authz_user(username: str, session: dict) -> dict:
 INIT_INITIALIZED = 'initialized'
 INIT_UNINITIALIZED = 'uninitialized'
 INIT_UNKNOWN = 'unknown'
+# configuration but no account: lost its users, never was a fresh install (#991)
+INIT_NO_ACCOUNTS = 'no_accounts'
 
 
 def initialization_state() -> str:
@@ -386,7 +484,15 @@ def initialization_state() -> str:
     # the user table survived (volume mount oddities, manual restore, etc.)
     try:
         db = get_db()
-        return INIT_INITIALIZED if db.get_all_users() else INIT_UNINITIALIZED
+        if db.get_all_users():
+            return INIT_INITIALIZED
+        # NS Oct 2026 (#991) - and when both are gone, an empty users table alone does not
+        # make a fresh install. With the clusters, their credentials and the issued tokens
+        # still there, setup handed the first caller to reach the port an administrator
+        # over all of it. Reopened only by the operator on the server (SETUP_REOPEN_FILE).
+        if db.holds_configuration() and not os.path.exists(SETUP_REOPEN_FILE):
+            return INIT_NO_ACCOUNTS
+        return INIT_UNINITIALIZED
     except Exception as e:
         logging.error(f"cannot read the user store to decide first-run state: {e}")
         return INIT_UNKNOWN
@@ -420,24 +526,6 @@ def backfill_initialized_marker():
             logging.info("backfilled ADMIN_INITIALIZED_FILE for pre-setup-wizard install")
     except Exception as e:
         logging.debug(f"backfill check skipped: {e}")
-
-
-def _load_users_legacy() -> dict:
-    """old json loader, just for migration"""
-    fernet = get_fernet()
-    
-    if fernet and os.path.exists(USERS_FILE_ENCRYPTED):
-        try:
-            with open(USERS_FILE_ENCRYPTED, 'rb') as f:
-                encrypted_data = f.read()
-            decrypted_data = fernet.decrypt(encrypted_data)
-            users = json.loads(decrypted_data.decode('utf-8'))
-            logging.info(f"loaded {len(users)} users from legacy file")
-            return users
-        except Exception as e:
-            logging.error(f"legacy load failed: {e}")
-    
-    return {}
 
 
 def save_single_user(username: str, data: dict):
@@ -510,6 +598,17 @@ def release_admin_initialization():
         logging.error(f"couldnt release admin init: {e}")
 
 
+def consume_setup_reopen():
+    """Drop SETUP_REOPEN_FILE once a setup created the administrator: it opens the
+    wizard for one setup, not for whenever the accounts are gone again (#991)."""
+    try:
+        os.unlink(SETUP_REOPEN_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logging.error(f"[SETUP] could not remove {SETUP_REOPEN_FILE}, remove it by hand: {e}")
+
+
 def mark_admin_initialized():
     """mark admin as customized so we dont recreate it"""
     try:
@@ -572,9 +671,11 @@ def save_sessions():
         for sid in expired:
             del active_sessions[sid]
         
-        # Save to database
+        # Save to database - without the sessions of forwarded writes, which hold for
+        # one request in this process and nowhere else
         db = get_db()
-        db.save_all_sessions(active_sessions)
+        db.save_all_sessions({sid: sess for sid, sess in active_sessions.items()
+                              if not sess.get('ha_forward')})
         
     except Exception as e:
         logging.error(f"Failed to save sessions: {e}")
@@ -642,15 +743,19 @@ def create_session(username: str, role: str, remember: bool = False) -> str:
     with sessions_lock:
         # Session rotation: invalidate existing sessions for this user
         # MK: keep max 3 sessions per user (browser, phone, etc)
+        # not the one-request session of a write a standby forwarded (#625), it ends
+        # on its own a moment later
         user_sessions = [(sid, sess) for sid, sess in active_sessions.items()
-                         if sess.get('user') == username]
+                         if sess.get('user') == username and not sess.get('ha_forward')]
 
         # Sort by last_activity, remove oldest if more than 2 (new one will be 3rd)
+        rotated = []
         if len(user_sessions) >= 3:
             user_sessions.sort(key=lambda x: x[1].get('last_activity', 0))
             # Remove oldest sessions, keep 2
             for sid, _ in user_sessions[:-2]:
                 del active_sessions[sid]
+                rotated.append(sid)
                 logging.debug(f"Session rotation: removed old session for {username}")
 
         active_sessions[session_id] = {
@@ -665,8 +770,94 @@ def create_session(username: str, role: str, remember: bool = False) -> str:
 
     # Save sessions to disk (outside lock - I/O operation)
     save_sessions()
+    if rotated:
+        _end_channels(username, sids=rotated)
 
     return session_id
+
+
+# NS Oct 2026 (#1076) - force_2fa held on the server, not only by the setup screen.
+MFA_NOT_DUE = 'not_due'
+MFA_DUE = 'due'
+MFA_SKIPPED_ON_STANDBY = 'skipped_on_standby'
+
+# What a session that still has to enrol may reach: the enrolment, the session check the
+# setup screen reads, and signing out. Matched on the endpoint that serves the request.
+MFA_ENROLMENT_ENDPOINTS = frozenset({
+    'auth.setup_2fa', 'auth.verify_2fa_setup', 'auth.get_2fa_status',
+    'auth.auth_check', 'auth.auth_logout',
+})
+# marks the request validate_session held back, so require_auth can say why
+MFA_HELD_ENVIRON = 'pegaprox.mfa_enrolment_due'
+_MFA_RECHECK_S = 30
+
+
+def mfa_enrolment_state(user: dict, settings: dict) -> str:
+    """Whether force_2fa still holds `user` back. MFA_SKIPPED_ON_STANDBY is an admin let
+    past it on a standby that cannot hand the enrolment to the active (#625); the
+    sign-in puts that on the record."""
+    if not settings.get('force_2fa') or not TOTP_AVAILABLE:
+        return MFA_NOT_DUE
+    # enrolled = a code can be asked for, which is what auth_login asks
+    if user.get('totp_enabled') and user.get('totp_secret'):
+        return MFA_NOT_DUE
+    # OIDC/Entra accounts use their IdP's MFA
+    if user.get('auth_source', 'local') in ('oidc', 'entra'):
+        return MFA_NOT_DUE
+    # NS Oct 2026 (#1028) - an admin a tenant override lowers where they live is not
+    # excused as an admin either
+    from pegaprox.utils.rbac import acts_as_admin
+    is_admin = acts_as_admin(user)
+    if is_admin and settings.get('force_2fa_exclude_admins', False):
+        return MFA_NOT_DUE
+    if is_admin:
+        from pegaprox.core import ha
+        if ha.is_standby() and not ha.forwarding():
+            return MFA_SKIPPED_ON_STANDBY
+    return MFA_DUE
+
+
+def _mfa_enrolment_lets_through(session: dict) -> bool:
+    """May this session serve this request, as far as force_2fa goes?
+
+    auth_login minted a full session and only returned requires_2fa_setup, so the setup
+    screen was the whole enforcement: a client that ignored the flag, or anyone holding
+    the password, used the API without ever enrolling. Asked from validate_session
+    because every way in passes it - require_auth, the consoles, the live WebSocket,
+    WebAuthn and the writes a standby hands on.
+
+    The answer stays on the session. Re-read on every request while it holds, so the
+    enrolment frees it at once, and every _MFA_RECHECK_S otherwise, so force_2fa
+    switched on or a factor an admin cleared reaches sessions already open.
+    """
+    now = time.time()
+    due = session.get('mfa_due')
+    if due is None or due or now - session.get('mfa_checked_at', 0) >= _MFA_RECHECK_S:
+        try:
+            user = get_db().get_user(session.get('user', ''))
+            from pegaprox.api.helpers import load_server_settings
+            fresh = bool(user) and mfa_enrolment_state(user, load_server_settings()) == MFA_DUE
+        except Exception as e:
+            # keep the last answer; a session never judged stays held until it can be
+            logging.warning(f"[2FA] cannot tell whether force_2fa holds "
+                            f"{session.get('user')!r}: {e}")
+            fresh = True if due is None else due
+        due = fresh
+        with sessions_lock:
+            session['mfa_due'] = due
+            session['mfa_checked_at'] = now
+    if not due:
+        return True
+    try:
+        from flask import has_request_context
+        if has_request_context():
+            if request.endpoint in MFA_ENROLMENT_ENDPOINTS:
+                return True
+            request.environ[MFA_HELD_ENVIRON] = True
+    except Exception:
+        pass
+    return False
+
 
 def validate_session(session_id: str) -> dict:
     """Validate a session and return user info if valid"""
@@ -701,6 +892,11 @@ def validate_session(session_id: str) -> dict:
         save_sessions()
         return None
 
+    # MK Sep 2026 (#625) - a session the active opened for a write a standby forwarded
+    # holds inside that one request and nowhere else (open_forwarded_session)
+    if session.get('ha_forward') and not _serves_forwarded_write(session_id):
+        return None
+
     # MK: security audit — IP binding. Default: log-only (mobile roaming friendly).
     # NS 2026-04-24: when `strict_session_ip` is enabled in server settings, invalidate
     # the session on IP change so a hijacked cookie can't be used from a different
@@ -733,17 +929,105 @@ def validate_session(session_id: str) -> dict:
     except Exception:
         pass
 
+    if not _mfa_enrolment_lets_through(session):
+        return None
+
     return session
+
+def open_forwarded_session(username: str, role: str, ip: str, via: str) -> str:
+    """A session for one write a standby forwarded to this active instance (#625).
+
+    The route runs the write as `username` under it, so require_auth and everything
+    after it see an ordinary session: role and permissions come from our users table
+    as for any other. Unlike create_session it ends none of the user's own sessions
+    and saves nothing. validate_session takes it only inside the request that carries
+    it (ha.FORWARD_ENVIRON), and end_forwarded_session drops it right after.
+    """
+    session_id = generate_session_id()
+    now = time.time()
+    with sessions_lock:
+        active_sessions[session_id] = {
+            'user': username,
+            'role': role,
+            'created_at': now,
+            'last_activity': now,
+            'ip': ip,
+            'user_agent': f'via standby {via}'[:200],
+            'remember': False,
+            'ha_forward': via,
+        }
+    return session_id
+
+
+def end_forwarded_session(session_id: str):
+    with sessions_lock:
+        active_sessions.pop(session_id, None)
+
+
+def _serves_forwarded_write(session_id: str) -> bool:
+    try:
+        from flask import request as _req, has_request_context
+        if not has_request_context():
+            return False
+        from pegaprox.core.ha import FORWARD_ENVIRON
+        mark = _req.environ.get(FORWARD_ENVIRON)
+        return isinstance(mark, dict) and mark.get('session') == session_id
+    except Exception:
+        return False
+
 
 def invalidate_session(session_id: str):
     """Invalidate a session (logout)"""
-    removed = False
+    removed = None
     with sessions_lock:
         if session_id in active_sessions:
-            del active_sessions[session_id]
-            removed = True
-    if removed:
+            removed = active_sessions.pop(session_id)
+    if removed is not None:
         save_sessions()
+        _end_channels(removed.get('user'), sids={session_id})
+
+
+def _end_channels(username, **kw):
+    """NS Oct 2026 (#1038) - what the ended sessions opened goes with them."""
+    if not username:
+        return
+    try:
+        from pegaprox.utils.realtime import end_session_channels
+        end_session_channels(username, **kw)
+    except Exception as e:
+        logging.warning(f"could not end the live channels of {username!r}: {e}")
+
+
+def session_alive(session_id: str) -> bool:
+    """Whether a session still stands. Touches nothing, so an open stream asking this does
+    not keep its session from idling out."""
+    with sessions_lock:
+        return bool(session_id) and session_id in active_sessions
+
+
+def api_token_alive(token_id):
+    """True while an API token stands, False once it is revoked, deleted or expired, None
+    when the token table cannot be read."""
+    try:
+        cur = get_db().conn.cursor()
+        cur.execute('SELECT revoked, expires_at FROM api_tokens WHERE id = ?', (token_id,))
+        row = cur.fetchone()
+        if not row or row['revoked']:
+            return False
+        return not (row['expires_at'] and datetime.now() > datetime.fromisoformat(row['expires_at']))
+    except Exception as e:
+        logging.warning(f"[APIToken] cannot tell whether token id={token_id} stands: {e}")
+        return None
+
+
+def request_credential():
+    """(session id, API token id) this request is signed in with, one of them None. For a
+    token or stream minted here, so it ends with what it was minted under."""
+    sess = getattr(request, 'session', None) or {}
+    if sess.get('api_token'):
+        return None, sess.get('token_id')
+    return request.headers.get('X-Session-ID') or request.cookies.get('session_id'), None
+
 
 def invalidate_all_user_sessions(username: str, except_session: str = None):
     """Invalidate all sessions for a user (used when password changes)
@@ -761,6 +1045,9 @@ def invalidate_all_user_sessions(username: str, except_session: str = None):
     if sessions_removed > 0:
         save_sessions()
         logging.info(f"Invalidated {sessions_removed} sessions for user '{username}'")
+    # every caller is a credential change, a disable or a delete: whatever the user has open
+    # elsewhere goes too, API token streams included
+    _end_channels(username, keep=except_session)
 
     return sessions_removed
 
@@ -798,7 +1085,11 @@ def create_api_token(username: str, token_name: str, role: str = None,
     # Default to user's own role if not specified
     if not role:
         role = user.get('role', ROLE_VIEWER)
-    
+    # NS Oct 2026 - straight from the JSON body: a list or an object is no role name,
+    # and the hierarchy lookup below died on it with a TypeError (500)
+    if not isinstance(role, str):
+        return {'error': 'Invalid role'}
+
     # NS: Don't allow creating tokens with higher privileges than the user
     # MK: custom roles default to level 2 (user) not 1 (viewer) — prevents escalation
     role_hierarchy = {ROLE_ADMIN: 3, ROLE_USER: 2, ROLE_VIEWER: 1}
@@ -817,7 +1108,7 @@ def create_api_token(username: str, token_name: str, role: str = None,
     # lacks. Admins hold everything, so their custom-role tokens are unaffected.
     if role not in role_hierarchy:
         try:
-            from pegaprox.utils.rbac import (get_user_permissions,
+            from pegaprox.utils.rbac import (get_user_permissions, token_role_tenant,
                                               get_role_permissions_for_user, DEFAULT_TENANT_ID)
             _owner = dict(user, username=username)
             # Resolve BOTH sides in the owner's tenant. get_role_permissions_for_user only
@@ -827,8 +1118,14 @@ def create_api_token(username: str, token_name: str, role: str = None,
             # catch. Request time resolves the same role WITH the tenant, so the token then
             # carried the elevated set.
             _tid = _owner.get('tenant_id') or DEFAULT_TENANT_ID
+            # NS Oct 2026 - and the token's side where request time resolves it. Another
+            # tenant's role resolved to nothing here, so it passed, and the token then
+            # acted in that tenant's clusters.
+            _role_tid = token_role_tenant(_owner, role)
+            if _role_tid is None:
+                return {'error': 'This role is not defined in your tenant'}
             _owner_perms = set(get_user_permissions(_owner, _tid))
-            _token_perms = set(get_role_permissions_for_user(dict(_owner, role=role), _tid))
+            _token_perms = set(get_role_permissions_for_user(dict(_owner, role=role), _role_tid))
             _extra = _token_perms - _owner_perms
             if _extra:
                 return {'error': 'Cannot create token with permissions beyond your own role: '
@@ -866,8 +1163,11 @@ def create_api_token(username: str, token_name: str, role: str = None,
             'expires_at': expires_at
         }
     except Exception as e:
+        # MK Sep 2026 (audit) — the caller gets this straight back as the JSON body, so a
+        # persistence error handed the client raw backend text. The detail is already in
+        # the log line above; the response only needs to say it did not work.
         logging.error(f"[APIToken] Failed to create token: {e}")
-        return {'error': str(e)}
+        return {'error': 'Failed to create API token'}
 
 
 def revoke_user_api_tokens(username: str) -> int:
@@ -925,6 +1225,18 @@ def validate_api_token(token: str) -> dict:
             if datetime.now() > expires:
                 return None
         
+        # NS Oct 2026 - and on every use, not only at mint: tokens minted before that
+        # check, an owner moved off the role or a role deleted or redefined since.
+        _role = row_dict.get('role')
+        if _role and _role not in (ROLE_ADMIN, ROLE_USER, ROLE_VIEWER):
+            from pegaprox.utils.rbac import token_role_tenant
+            _owner = db.get_user(row_dict['username'])
+            if _owner and token_role_tenant(_owner, _role) is None:
+                logging.warning(f"[APIToken] refused token id={row_dict['id']} of "
+                                f"{row_dict['username']!r}: its role does not resolve in "
+                                f"the owner's tenant")
+                return None
+
         # Update last used timestamp
         cursor.execute('''
             UPDATE api_tokens SET last_used_at = ?, last_used_ip = ? WHERE id = ?
@@ -1014,6 +1326,46 @@ def revoke_api_token(token_id: int, username: str) -> bool:
         return False
 
 
+# where app.py's request handler hangs the clock on a request body (_BodyDeadline, #1052)
+BODY_DEADLINE_ENVIRON = 'pegaprox.body_deadline'
+# a body this small comes with its headers and keeps its clock: only an upload needs more
+_SMALL_BODY = 64 * 1024
+
+
+def lift_body_deadline(owner=None):
+    """This request is somebody's: its body may take as long as the link needs.
+
+    Until then a body has PEGAPROX_BODY_TIMEOUT seconds to arrive, which is what bounds how
+    long an anonymous client holds a request slot. Called where a request is known to be
+    signed in or signed: require_auth, a standby's forwarded write, a group member's call.
+    Outside a request, or without the gevent server's clock, it does nothing.
+
+    owner: the account behind it. A signed-in account could otherwise hold every slot with
+    bodies it never sends, so a large one counts against the account like a WebSocket
+    (realtime.hold_body) and a small one keeps its clock.
+    """
+    try:
+        clock = request.environ.get(BODY_DEADLINE_ENVIRON)
+    except RuntimeError:
+        return
+    if clock is None or clock.lifted:
+        return
+    if owner is None:
+        clock.lift()
+        return
+    chunked = 'chunked' in (request.headers.get('Transfer-Encoding') or '').lower()
+    if not chunked and (request.content_length or 0) <= _SMALL_BODY:
+        return
+    from pegaprox.utils.realtime import hold_body, release_body
+    key = hold_body(owner)
+    if key is None:
+        from pegaprox.utils.sanitization import sanitize_log_message
+        logging.info(f"[auth] a large request body of '{sanitize_log_message(str(owner))}' keeps "
+                     f"its clock - the account holds its share of long requests")
+        return
+    clock.lift(release=lambda: release_body(key))
+
+
 def require_auth(roles: list = None, perms: list = None):
     """auth decorator for protected routes
 
@@ -1038,6 +1390,9 @@ def require_auth(roles: list = None, perms: list = None):
                 session = validate_session(session_id)
             
             if not session:
+                if request.environ.get(MFA_HELD_ENVIRON):
+                    return jsonify({'error': 'Set up two-factor authentication first',
+                                    'code': 'MFA_ENROLMENT_REQUIRED'}), 403
                 return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
             
             # NS: Feb 2026 - Check if user was disabled while session/token is still active
@@ -1090,8 +1445,22 @@ def require_auth(roles: list = None, perms: list = None):
                 if fresh_role != session['role']:
                     session['role'] = fresh_role
 
+            # NS Oct 2026 (#1000, #1028) - an admin a tenant override lowers where they live is
+            # that role here as well. has_permission already answered so, but roles=[ROLE_ADMIN]
+            # compared the stored role and let them run every admin-only route, the scheduled
+            # tasks against any cluster's guests among them. Published below as effective_role.
+            _lowered = False
+            if fresh_role == ROLE_ADMIN:
+                from pegaprox.utils.rbac import _admin_is_capped_in_own_tenant, get_user_effective_role
+                if _admin_is_capped_in_own_tenant(user):
+                    fresh_role, _lowered = get_user_effective_role(user), True
+
             # Check role if specified
             if roles and fresh_role not in roles:
+                if _lowered:
+                    return jsonify({'error': 'Forbidden: a tenant mapping lowers this account '
+                                             'below administrator',
+                                    'code': 'INSUFFICIENT_PERMISSIONS'}), 403
                 return jsonify({'error': 'Forbidden', 'code': 'INSUFFICIENT_PERMISSIONS'}), 403
             
             # check permissions if specified
@@ -1106,27 +1475,13 @@ def require_auth(roles: list = None, perms: list = None):
                 # own permissions only — the owner's interactive extra perms / group grants
                 # do NOT extend to a token — while still honouring the owner's denials.
                 if session.get('api_token'):
-                    # NS Aug 2026 (AI-pentest) — carry the owner's tenant overrides so a tenant-scoped
-                    # DOWNGRADE / denial isn't silently dropped for token auth (the interactive path
-                    # keeps them), but cap any tenant ROLE at fresh_role so a tenant grant can only
-                    # downgrade a token, never re-escalate it above its declared/floored role.
-                    from pegaprox.models.permissions import ROLE_ADMIN as _RA, ROLE_USER as _RU, ROLE_VIEWER as _RV
-                    _h = {_RA: 3, _RU: 2, _RV: 1}
-                    _fl = _h.get(fresh_role, 1)
-                    _tp = {}
-                    for _tid, _ov in (user.get('tenant_permissions', {}) or {}).items():
-                        if isinstance(_ov, dict):
-                            _ov = dict(_ov)
-                            if _ov.get('role') and _h.get(_ov['role'], 1) > _fl:
-                                _ov['role'] = next((k for k, v in _h.items() if v == _fl), fresh_role)
-                        _tp[_tid] = _ov
-                    perm_user = {
-                        'role': fresh_role,
-                        'permissions': [],
-                        'denied_permissions': user.get('denied_permissions', []),
-                        'tenant_id': user.get('tenant_id'),
-                        'tenant_permissions': _tp,
-                    }
+                    # NS Oct 2026 (#1014) - the identity build_authz_user hands the route, so
+                    # gate and route agree. The inline copy capped a tenant override's role by
+                    # its builtin level only: a custom tenant role (level 1) went through whole,
+                    # so a viewer token carried node.shell or admin.users wherever its owner's
+                    # override granted them, and a custom-role token was judged as a viewer.
+                    perm_user = apply_token_role(dict(user, username=session['user']),
+                                                 session.get('role'))
                 else:
                     perm_user = user
                 for p in perms:
@@ -1150,8 +1505,15 @@ def require_auth(roles: list = None, perms: list = None):
                     _eff_pub = _tr
             session = {**session, 'effective_role': _eff_pub}
             request.session = session
-            
+            # signed in and allowed: the body is no longer an anonymous one (#1052)
+            lift_body_deadline(session['user'])
+
             return f(*args, **kwargs)
+        # MK Sep 2026 - publish what this route demands so the OpenAPI generator can
+        # read it instead of re-deriving it from the decorator source. functools.wraps
+        # copies __dict__ from f, so this has to be set AFTER the wrapper is built or
+        # a stacked decorator underneath would overwrite it.
+        decorated_function._pp_auth = {'roles': list(roles or []), 'perms': list(perms or [])}
         return decorated_function
     return decorator
 

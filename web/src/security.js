@@ -6,7 +6,7 @@
         // LW: The locked IPs table was AI-generated (Claude), I just styled it - Oct 2025
         function SecuritySettingsSection({ addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, isAdmin } = useAuth();
+            const { getAuthHeaders, isAdmin, haStandby, haReadOnly } = useAuth();
             const { isCorporate } = useLayout();
             const [settings, setSettings] = useState({
                 login_max_attempts: 5,
@@ -239,6 +239,10 @@
                         )}
                     </div>
 
+                    {/* every field here saves on change, and a standby refuses that save,
+                        forwarding or not (#625). The lockouts below are its own. */}
+                    {haStandby && <HaSettingsOnActive />}
+                    <fieldset disabled={haStandby} className="space-y-6 min-w-0">
                     {/* Settings */}
                     <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4">
                         <h4 className="font-medium text-white mb-4">{t('loginProtection') || 'Login Protection'}</h4>
@@ -383,11 +387,13 @@
                             </label>
                         </div>
                     </div>
+                    </fieldset>
 
                     {/* LW: Password Expiry Settings - Dec 2025
                         NS: Good feature request from IT-Sec team. They wanted this for compliance.
                         MK: Admins exempt because otherwise you could lock yourself out lol */}
                     <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4">
+                        <fieldset disabled={haStandby} className="min-w-0">
                         <div className="flex items-center justify-between mb-4">
                             <h4 className="font-medium text-white flex items-center gap-2">
                                 <Icons.Clock />
@@ -486,23 +492,28 @@
                                         💡 {t('passwordExpiryHint') || 'Users receive email reminders at 14, 7, 3, and 1 day(s) before expiry. A warning banner is shown in the UI. SMTP must be configured for emails.'}
                                     </p>
                                 </div>
-                                
-                                {/* LW: Emergency reset button - NS wanted this after a security scare */}
-                                <div className="pt-4 border-t border-proxmox-border">
-                                    <div className="flex items-center justify-between">
-                                        <div>
-                                            <h5 className="text-sm font-medium text-white">{t('forcePasswordReset') || 'Force Password Reset'}</h5>
-                                            <p className="text-xs text-gray-500 mt-1">{t('forcePasswordResetDesc') || 'Expire all user passwords immediately. Use after security incidents.'}</p>
-                                        </div>
-                                        <button
-                                            onClick={() => setShowResetConfirm(true)}
-                                            className="px-4 py-2 bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded-lg text-sm font-medium transition-colors"
-                                        >
-                                            {t('resetAllPasswords') || 'Reset All'}
-                                        </button>
-                                    </div>
-                                </div>
                             </div>
+                        )}
+                        </fieldset>
+
+                        {/* LW: Emergency reset button - NS wanted this after a security scare.
+                            A write of its own, not a setting: a standby hands it to the leader
+                            while it forwards (#625), like every other change */}
+                        {settings.password_expiry_enabled && (
+                            <fieldset disabled={haReadOnly} className="min-w-0 mt-4 pt-4 border-t border-proxmox-border">
+                                <div className="flex items-center justify-between">
+                                    <div>
+                                        <h5 className="text-sm font-medium text-white">{t('forcePasswordReset') || 'Force Password Reset'}</h5>
+                                        <p className="text-xs text-gray-500 mt-1">{t('forcePasswordResetDesc') || 'Expire all user passwords immediately. Use after security incidents.'}</p>
+                                    </div>
+                                    <button
+                                        onClick={() => setShowResetConfirm(true)}
+                                        className="px-4 py-2 bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded-lg text-sm font-medium transition-colors disabled:opacity-50"
+                                    >
+                                        {t('resetAllPasswords') || 'Reset All'}
+                                    </button>
+                                </div>
+                            </fieldset>
                         )}
                     </div>
                     
@@ -564,6 +575,7 @@
                         </div>
                     )}
 
+                    <fieldset disabled={haStandby} className="space-y-6 min-w-0">
                     {/* NS: Feb 2026 - Force 2FA Settings */}
                     <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4">
                         <div className="flex items-center justify-between mb-4">
@@ -641,6 +653,7 @@
                             </div>
                         </label>
                     </div>
+                    </fieldset>
 
                     {/* Locked IPs */}
                     <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4">
@@ -780,7 +793,7 @@
         // Compliance & Key Management Section (HIPAA/ISO 27001)
         function ComplianceSection({ addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, isAdmin } = useAuth();
+            const { getAuthHeaders, isAdmin, haStandby } = useAuth();
             const [compliance, setCompliance] = useState(null);
             const [auditIntegrity, setAuditIntegrity] = useState(null);
             const [keyInfo, setKeyInfo] = useState(null);
@@ -925,6 +938,9 @@
                             <Icons.Lock /> {t('complianceSettings') || 'Compliance & Hardening'}
                         </h3>
 
+                        {/* both save through /settings/server, which no standby carries out (#625) */}
+                        {haStandby && <HaSettingsOnActive />}
+                        <fieldset disabled={haStandby} className="space-y-5 min-w-0">
                         {/* Audit retention */}
                         <div>
                             <label className="block text-sm font-medium text-gray-200 mb-1">
@@ -975,6 +991,7 @@
                                 </div>
                             )}
                         </div>
+                        </fieldset>
                     </div>
 
                     {/* Compliance Score */}
@@ -1383,7 +1400,7 @@
         // NS: Double password (user + backup) for security
         function ConfigBackupSection({ addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();
+            const { getAuthHeaders, haStandby } = useAuth();
             const [exporting, setExporting] = useState(false);
             const [importing, setImporting] = useState(false);
             const [includeSecrets, setIncludeSecrets] = useState(false);  // LW: off by default for safety
@@ -1634,13 +1651,16 @@
                                 <span className="text-green-500 text-xs">({t('validateOnly') || 'Validate only, don\'t apply'})</span>
                             </label>
                         </div>
-                        
+
+                        {/* a restore on a standby is refused, forwarding or not (#625) */}
+                        {haStandby ? <HaSettingsOnActive /> : (
                         <button
                             onClick={() => setShowImportModal(true)}
                             className="flex items-center gap-2 px-4 py-2 bg-orange-500/20 text-orange-400 hover:bg-orange-500/30 rounded-lg text-sm font-medium transition-colors"
                         >
                             <Icons.Upload className="w-4 h-4" /> {t('restoreBackup') || 'Restore from Backup'}
                         </button>
+                        )}
                     </div>
 
                     {/* Results */}
@@ -2068,13 +2088,187 @@
             );
         }
 
+        // LW Oct 2026 (#763, #954) - the two evacuation options and what ticking each would change,
+        // read from the plan. The rolling update dialog, its schedule and the maintenance dialog
+        // of a node use them; the plan is read once each time the dialog opens
+        function useEvacPlan(url, open) {
+            const { getAuthHeaders } = useAuth();
+            const [plan, setPlan] = useState(null);
+            useEffect(() => {
+                if (!open) return undefined;
+                let gone = false;
+                setPlan(null);
+                (async () => {
+                    try {
+                        const r = await fetch(url, { credentials: 'include', headers: getAuthHeaders() });
+                        const d = r.ok ? await r.json() : null;
+                        if (!gone) setPlan(d || { error: true });
+                    } catch (_) {
+                        if (!gone) setPlan({ error: true });
+                    }
+                })();
+                return () => { gone = true; };
+            }, [open, url]);
+            return plan;
+        }
+
+        // kind: 'rolling' and 'schedule' say it for the update, 'maint' for one node's maintenance
+        function EvacOptions({ kind, plan, skip, migrateTemplates, setMigrateTemplates, relaxAntiAffinity, setRelaxAntiAffinity }) {
+            const { t } = useTranslation();
+            const maint = kind === 'maint';
+            if (plan?.supported === false) return null;
+
+            const templateWhy = (tp) => {
+                const text = {
+                    storage_list: t('rollEvacWhyStorageList'), config: t('rollEvacWhyConfig'),
+                    local_image: t('rollEvacWhyLocalImage'), storage_missing: t('rollEvacWhyStorageMissing'),
+                    storage_split: t('rollEvacWhyStorageSplit'),
+                }[tp.code];
+                if (!text) return tp.reason;
+                const args = tp.args || {};
+                return text.replace('{drive}', () => args.drive || '').replace('{storage}', () => args.storage || '')
+                    .replace('{storages}', () => args.storages || '');
+            };
+
+            const planTemplates = () => {
+                if (!plan) return <span className="text-gray-500">{t('rollEvacPlanLoading')}</span>;
+                if (plan.error) return <span className="text-gray-500">{t('rollEvacPlanError')}</span>;
+                const all = plan.templates || [];
+                if (!all.length) return <span className="text-gray-500">{maint ? t('maintEvacNoTemplates') : t('rollEvacNoTemplates')}</span>;
+                if (!migrateTemplates) {
+                    return <span className="text-yellow-400">{(maint ? t('maintEvacTemplatesStay') : t('rollEvacTemplatesStay')).replace('{n}', () => all.length)}</span>;
+                }
+                return (
+                    <>
+                        {all.slice(0, 8).map(tp => (
+                            <div key={tp.vmid} data-template={tp.vmid} data-moves={tp.reason ? 'no' : 'yes'}
+                                className={tp.reason ? 'text-yellow-400' : 'text-gray-400'}>
+                                {tp.name} ({tp.vmid}, {tp.node}): {tp.reason ? templateWhy(tp)
+                                    : t('rollEvacTemplateMoves').replace('{nodes}', () => (tp.targets || []).join(', '))}
+                            </div>
+                        ))}
+                        {all.length > 8 && <div className="text-gray-500">{t('rollEvacMore').replace('{n}', () => all.length - 8)}</div>}
+                    </>
+                );
+            };
+
+            const planRules = () => {
+                if (!plan) return <span className="text-gray-500">{t('rollEvacPlanLoading')}</span>;
+                if (plan.error) return <span className="text-gray-500">{t('rollEvacPlanError')}</span>;
+                const rules = plan.negative_rules;
+                const own = plan.own_rules || [];
+                const stillOff = plan.still_off || [];
+                // off already for somebody else: kept off for this one too when it is ticked
+                const held = plan.held || [];
+                const byMaint = held.filter(h => (h.nodes || []).length);
+                const maintNodes = [...new Set(byMaint.flatMap(h => h.nodes))];
+                const byRolling = held.filter(h => h.rolling);
+                return (
+                    <>
+                        {rules == null ? <div className="text-yellow-400">{t('rollEvacRulesUnreadable')}</div>
+                            : !rules.length ? <div className="text-gray-500">{maint ? t('maintEvacNoRules') : t('rollEvacNoRules')}</div>
+                            : <>
+                                <div className="text-gray-400">{!relaxAntiAffinity ? t('rollEvacRulesOn')
+                                    : maint ? t('maintEvacRulesOff') : t('rollEvacRulesOff')}</div>
+                                {rules.slice(0, 8).map(r => (
+                                    <div key={r.rule} data-rule={r.rule} className="text-gray-400">
+                                        <span className="font-mono">{r.rule}</span>: {(r.resources || []).join(', ')}
+                                        {r.blocks && <span className={relaxAntiAffinity ? 'text-gray-500' : 'text-yellow-400'}> - {t('rollEvacRuleBlocks')}</span>}
+                                    </div>
+                                ))}
+                                {rules.length > 8 && <div className="text-gray-500">{t('rollEvacMore').replace('{n}', () => rules.length - 8)}</div>}
+                            </>}
+                        {byMaint.length > 0 && (
+                            <div className="text-gray-400" data-held="maintenance">
+                                {t('evacHeldMaintenance').replace('{nodes}', () => maintNodes.join(', '))
+                                    .replace('{rules}', () => byMaint.map(h => h.rule).join(', '))}
+                            </div>
+                        )}
+                        {byRolling.length > 0 && (
+                            <div className="text-gray-400" data-held="rolling">
+                                {t('evacHeldRolling').replace('{rules}', () => byRolling.map(h => h.rule).join(', '))}
+                            </div>
+                        )}
+                        {own.length > 0 && (
+                            <div className="text-gray-400" data-own-rules={own.length}>
+                                {(maint || !relaxAntiAffinity ? t('rollEvacOwnEnforced')
+                                    : plan.balancer_separates ? t('rollEvacOwnHeld') : t('rollEvacOwnHeldNoBalancer'))
+                                    .replace('{n}', () => own.length)}
+                            </div>
+                        )}
+                        {stillOff.length > 0 && (
+                            <div className="text-yellow-400">{t('rollEvacStillOff').replace('{rules}', () => stillOff.join(', '))}</div>
+                        )}
+                    </>
+                );
+            };
+
+            return (
+                <div className="space-y-2" data-testid={`${kind}-evac-options`}>
+                    {kind === 'schedule' && <p className="text-xs text-gray-500">{t('schedEvacPlanNow')}</p>}
+                    <label className="flex items-start gap-2 cursor-pointer">
+                        <input
+                            type="checkbox"
+                            data-testid={`${kind}-move-templates`}
+                            checked={migrateTemplates && !skip}
+                            disabled={skip}
+                            onChange={(e) => setMigrateTemplates(e.target.checked)}
+                            className="mt-0.5 w-4 h-4 flex-shrink-0 rounded border-proxmox-border bg-proxmox-dark text-proxmox-orange focus:ring-proxmox-orange"
+                        />
+                        <div>
+                            <span className="text-white text-sm">{t('rollEvacTemplates')}</span>
+                            <p className="text-xs text-gray-500">{maint ? t('maintEvacTemplatesHint') : t('rollEvacTemplatesHint')}</p>
+                        </div>
+                    </label>
+                    {!skip && (
+                        <div className="ml-6 text-xs space-y-0.5" data-testid={`${kind}-plan-templates`}>
+                            {planTemplates()}
+                        </div>
+                    )}
+                    <label className="flex items-start gap-2 cursor-pointer">
+                        <input
+                            type="checkbox"
+                            data-testid={`${kind}-relax-affinity`}
+                            checked={relaxAntiAffinity && !skip}
+                            disabled={skip}
+                            onChange={(e) => setRelaxAntiAffinity(e.target.checked)}
+                            className="mt-0.5 w-4 h-4 flex-shrink-0 rounded border-proxmox-border bg-proxmox-dark text-proxmox-orange focus:ring-proxmox-orange"
+                        />
+                        <div>
+                            <span className="text-white text-sm">{maint ? t('maintEvacRelax') : t('rollEvacRelax')}</span>
+                            <p className="text-xs text-gray-500">{maint ? t('maintEvacRelaxHint') : t('rollEvacRelaxHint')}</p>
+                        </div>
+                    </label>
+                    {!skip && (
+                        <div className="ml-6 text-xs space-y-0.5" data-testid={`${kind}-plan-rules`}>
+                            {planRules()}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // the maintenance dialog of a node: the plan of this node only, from the route the
+        // maintenance itself needs the permission of
+        function MaintenanceEvacOptions({ clusterId, node, value, onChange }) {
+            const plan = useEvacPlan(`${API_URL}/clusters/${clusterId}/nodes/${encodeURIComponent(node)}/maintenance-plan`, true);
+            return (
+                <EvacOptions kind="maint" plan={plan} skip={false}
+                    migrateTemplates={!!value.migrate_templates}
+                    setMigrateTemplates={(on) => onChange({ ...value, migrate_templates: on })}
+                    relaxAntiAffinity={!!value.relax_anti_affinity}
+                    setRelaxAntiAffinity={(on) => onChange({ ...value, relax_anti_affinity: on })} />
+            );
+        }
+
         // update Manager Section Component (for Settings tab)
         function UpdateManagerSection({ clusterId, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, isAdmin, user } = useAuth();
+            const { getAuthHeaders, isAdmin, user, haReadOnly, haServing } = useAuth();
             // #644-class: gate the update-manager controls on the backend perms they
             // actually call (backup.schedule / node.update), not a blanket isAdmin.
-            const hasPerm = (p) => isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(p));
+            // Nothing here is a reading permission, so a standby (#625) shows none of them.
+            const hasPerm = (p) => (!haReadOnly || haReadPermission(p)) && (isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(p)));
             const { isCorporate } = useLayout();
             const [loading, setLoading] = useState(false);
             const [checking, setChecking] = useState(false);
@@ -2082,11 +2276,32 @@
             const [rollingUpdate, setRollingUpdate] = useState(null);
             const [includeReboot, setIncludeReboot] = useState(true);
             const [skipUpToDate, setSkipUpToDate] = useState(true);  // NS: Skip nodes without updates
+            // MK Sep 2026 (#716) - which alert channels hear about this run,
+            // so the on-call monitoring can be muted for its real duration. Opt-in: nothing
+            // ticked, nothing sent.
+            const [notifyChannels, setNotifyChannels] = useState([]);
+            const [alertChannels, setAlertChannels] = useState([]);
+            useEffect(() => {
+                let gone = false;
+                (async () => {
+                    try {
+                        const r = await fetch('/api/alert-channels', {
+                            credentials: 'include', headers: getAuthHeaders() });
+                        if (r && r.ok && !gone) {
+                            const d = await r.json();
+                            setAlertChannels(Array.isArray(d) ? d : (d.channels || []));
+                        }
+                    } catch (_) { /* no channels configured is the normal case */ }
+                })();
+                return () => { gone = true; };
+            }, []);
             const [skipEvacuation, setSkipEvacuation] = useState(false);  // NS: Issue #22 - skip VM evacuation (NOT RECOMMENDED)
             const [evacuationTimeout, setEvacuationTimeout] = useState(1800);  // NS: 30 min default
             const [rebootTimeout, setRebootTimeout] = useState(600);  // NS Apr 2026 (#328): 10 min default, extend for Ceph/slow-boot nodes
             const [allowLocalDisks, setAllowLocalDisks] = useState(false);  // #330
             const [cephHealthGate, setCephHealthGate] = useState('off');  // NS #403 part 2 — 'off' | 'degraded' | 'strict'
+            const [migrateTemplates, setMigrateTemplates] = useState(false);  // #763
+            const [relaxAntiAffinity, setRelaxAntiAffinity] = useState(false);  // #954
             const [waitForReboot, setWaitForReboot] = useState(true);  // NS: GitHub #40 - wait for node online before next
             const [pauseOnEvacError, setPauseOnEvacError] = useState(true);  // NS: GitHub #40 - pause if VMs fail to migrate
             const [showAdvancedOptions, setShowAdvancedOptions] = useState(false);  // NS: Toggle for timeouts
@@ -2113,6 +2328,8 @@
             const [scheduleEvacTimeout, setScheduleEvacTimeout] = useState(1800);
             const [scheduleRebootTimeout, setScheduleRebootTimeout] = useState(600);  // MK #630
             const [scheduleWaitForReboot, setScheduleWaitForReboot] = useState(true);
+            const [scheduleMigrateTemplates, setScheduleMigrateTemplates] = useState(false);  // #763
+            const [scheduleRelaxAntiAffinity, setScheduleRelaxAntiAffinity] = useState(false);  // #954
             const [scheduleShowAdvanced, setScheduleShowAdvanced] = useState(false);
             const [scheduleSaving, setScheduleSaving] = useState(false);
 
@@ -2254,7 +2471,8 @@
                             addToast(t('noUpdatesAvailable'), 'success');
                         }
                     } else {
-                        addToast(json.error || 'Error checking updates', 'error');
+                        addToast(json.code === 'HA_STANDBY' ? (haServing ? t('pgHaServingRefused') : t('pgHaStandbyRefused'))
+                            : (json.error || 'Error checking updates'), 'error');
                     }
                 } catch (err) {
                     console.error('Update check error:', err);
@@ -2283,6 +2501,8 @@
                         setScheduleEvacTimeout(data.evacuation_timeout || 1800);
                         setScheduleRebootTimeout(data.reboot_timeout || 600);  // MK #630
                         setScheduleWaitForReboot(data.wait_for_reboot !== false);
+                        setScheduleMigrateTemplates(data.migrate_templates === true);  // #763
+                        setScheduleRelaxAntiAffinity(data.relax_anti_affinity === true);  // #954
                     }
                 } catch (e) {
                     console.error('Error loading update schedule:', e);
@@ -2307,7 +2527,9 @@
                             wait_for_reboot: scheduleWaitForReboot,
                             skip_up_to_date: true,
                             evacuation_timeout: scheduleEvacTimeout,
-                            reboot_timeout: scheduleRebootTimeout  // MK #630
+                            reboot_timeout: scheduleRebootTimeout,  // MK #630
+                            migrate_templates: scheduleMigrateTemplates && !scheduleSkipEvacuation,  // #763
+                            relax_anti_affinity: scheduleRelaxAntiAffinity && !scheduleSkipEvacuation,  // #954
                         })
                     });
                     if (res.ok) {
@@ -2394,6 +2616,9 @@
                             reboot_timeout: rebootTimeout,  // NS Apr 2026 (#328): per-cluster override for slow-boot nodes
                             allow_local_disks: allowLocalDisks,  // #330
                             ceph_health_gate: cephHealthGate,  // NS #403 part 2 — hold on unsafe Ceph
+                            notify_channels: notifyChannels,  // MK #716 - mute/un-mute the monitoring
+                            migrate_templates: migrateTemplates && !skipEvacuation,  // #763
+                            relax_anti_affinity: relaxAntiAffinity && !skipEvacuation,  // #954
                         })
                     });
                     const data = await response.json();
@@ -2410,6 +2635,13 @@
                     addToast(t('connectionError'), 'error');
                 }
             };
+
+            // LW Oct 2026 (#763, #954) - what moving the templates and letting negative affinity
+            // rules give way would change, read once each time the dialog opens; the schedule
+            // dialog reads it for the cluster as it is now (EvacOptions says so)
+            const rollingPlanUrl = `${API_URL}/clusters/${clusterId}/updates/rolling/plan`;
+            const rollingPlan = useEvacPlan(rollingPlanUrl, showConfirm);
+            const schedulePlan = useEvacPlan(rollingPlanUrl, showScheduleModal);
 
             // Cancel rolling update
             const cancelRollingUpdate = async () => {
@@ -2461,7 +2693,9 @@
                 // Check rolling update status
                 getRollingStatus();
                 
-                // Load cached status from localStorage
+                // Load cached status from localStorage. A standby shows what this browser
+                // checked before but starts no check itself: the check runs apt-update over
+                // SSH on every node, which is the active's job (#625)
                 const cached = localStorage.getItem(`updateCheck_${clusterId}`);
                 if (cached) {
                     try {
@@ -2473,13 +2707,13 @@
                         // Check if cache is older than 24 hours
                         const lastCheck = new Date(data.time);
                         const hoursSince = (Date.now() - lastCheck.getTime()) / (1000 * 60 * 60);
-                        if (hoursSince > 24) {
+                        if (hoursSince > 24 && !haReadOnly) {
                             checkUpdates();
                         }
                     } catch (e) {
-                        checkUpdates();
+                        if (!haReadOnly) checkUpdates();
                     }
-                } else {
+                } else if (!haReadOnly) {
                     // No cache - do initial check
                     checkUpdates();
                 }
@@ -2493,6 +2727,7 @@
 
             // #183: auto-refresh update counts when rolling update finishes
             useEffect(() => {
+                if (haReadOnly) return;
                 if (rollingUpdate && ['completed', 'failed', 'cancelled'].includes(rollingUpdate.status)) {
                     localStorage.removeItem(`updateCheck_${clusterId}`);
                     checkUpdates();
@@ -2569,7 +2804,7 @@
                         <div className="border-t border-proxmox-border p-4 space-y-4">
                             {/* Actions */}
                             <div className="flex items-center gap-3">
-                                <button
+                                {!haReadOnly && <button
                                     onClick={(e) => { e.stopPropagation(); checkUpdates(true); }}
                                     disabled={checking}
                                     className="px-4 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-sm hover:border-proxmox-orange transition-colors flex items-center gap-2 disabled:opacity-50"
@@ -2580,7 +2815,7 @@
                                         <Icons.RefreshCw />
                                     )}
                                     {t('checkForUpdates')}
-                                </button>
+                                </button>}
                                 
                                 {/* MK: Schedule button */}
                                 {hasPerm('backup.schedule') && (
@@ -2836,7 +3071,8 @@
                                                             {(pbsJob.output_lines || []).map((line, i) => {
                                                                 // LW: output_lines can carry a non-string entry (e.g. an exit code) — String() it
                                                                 // so .includes() can't blow up the whole page (#584 white-screen)
-                                                                const s = String(line);
+                                                                // update tasks keep each line as {timestamp, text} (#964, #971)
+                                                                const s = line && typeof line === 'object' && line.text != null ? String(line.text) : String(line);
                                                                 return <div key={i} className={`${s.includes('[ERROR]') ? 'text-red-400' : s.includes('[OK]') ? 'text-green-400' : 'text-gray-300'}`}>{s}</div>;
                                                             })}
                                                             {pbsJob.error && <div className="text-red-400 mt-2">⚠ {pbsJob.error}</div>}
@@ -3275,7 +3511,7 @@
                     {/* Confirm Modal */}
                     {showConfirm && (
                         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop" onClick={() => setShowConfirm(false)}>
-                            <div className="bg-proxmox-card border border-proxmox-border rounded-2xl p-6 max-w-md w-full animate-scale-in" onClick={e => e.stopPropagation()}>
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-2xl p-6 max-w-md w-full max-h-[90vh] overflow-y-auto animate-scale-in" data-testid="rolling-confirm" onClick={e => e.stopPropagation()}>
                                 <h3 className="text-lg font-semibold text-white mb-2">{t('confirmRollingUpdate')}</h3>
                                 <p className="text-gray-400 text-sm mb-4">{t('rollingUpdateWarning')}</p>
                                 
@@ -3301,6 +3537,32 @@
                                         />
                                         <span className="text-white">{t('skipUpToDate') || 'Skip up-to-date nodes'}</span>
                                     </label>
+
+                                    {/* MK Sep 2026 (#716) - tell the monitoring when this starts and ends.
+                                        Only rendered when somebody has actually configured a channel. */}
+                                    {alertChannels.length > 0 && (
+                                        <div className="pl-1">
+                                            <p className="text-gray-400 text-sm mb-1">
+                                                {t('notifyChannelsLabel') || 'Notify on start and finish'}
+                                            </p>
+                                            <div className="flex flex-wrap gap-1.5">
+                                                {alertChannels.map(ch => {
+                                                    const on = notifyChannels.indexOf(ch.id) >= 0;
+                                                    return (
+                                                        <button key={ch.id} type="button"
+                                                            onClick={() => setNotifyChannels(on
+                                                                ? notifyChannels.filter(x => x !== ch.id)
+                                                                : notifyChannels.concat([ch.id]))}
+                                                            className={`text-xs px-2 py-0.5 rounded border transition-colors ${
+                                                                on ? 'border-proxmox-orange text-proxmox-orange'
+                                                                   : 'border-proxmox-border text-gray-500 hover:text-gray-300'}`}>
+                                                            {ch.name || ch.id}
+                                                        </button>
+                                                    );
+                                                })}
+                                            </div>
+                                        </div>
+                                    )}
                                     
                                     {/* MK: Skip evacuation - moved from advanced options for visibility */}
                                     <label className="flex items-center gap-2 cursor-pointer">
@@ -3318,7 +3580,13 @@
                                             {t('skipEvacuationWarning') || '⚠️ Warning: VMs may crash if something goes wrong during the update!'}
                                         </div>
                                     )}
-                                    
+
+                                    {/* LW Oct 2026 (#763, #954) - two evacuation options, off as before; the plan
+                                        under each says what ticking it changes. Proxmox clusters only */}
+                                    <EvacOptions kind="rolling" plan={rollingPlan} skip={skipEvacuation}
+                                        migrateTemplates={migrateTemplates} setMigrateTemplates={setMigrateTemplates}
+                                        relaxAntiAffinity={relaxAntiAffinity} setRelaxAntiAffinity={setRelaxAntiAffinity} />
+
                                     {/* NS: Advanced options toggle */}
                                     <button
                                         onClick={() => setShowAdvancedOptions(!showAdvancedOptions)}
@@ -3508,7 +3776,7 @@
                     {/* MK: Schedule Modal */}
                     {showScheduleModal && (
                         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 modal-backdrop" onClick={() => setShowScheduleModal(false)}>
-                            <div className="bg-proxmox-card border border-proxmox-border rounded-2xl p-6 max-w-md w-full animate-scale-in" onClick={e => e.stopPropagation()}>
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-2xl p-6 max-w-md w-full max-h-[90vh] overflow-y-auto animate-scale-in" data-testid="schedule-dialog" onClick={e => e.stopPropagation()}>
                                 <div className="flex items-center gap-3 mb-4">
                                     <div className="p-2 rounded-lg bg-blue-500/20">
                                         <Icons.Clock className="text-blue-400" />
@@ -3626,7 +3894,12 @@
                                                     <span className="text-red-400 text-sm">{t('skipEvacuation') || 'Skip VM evacuation'}</span>
                                                     <span className="text-xs bg-red-900/30 text-red-400 px-1.5 py-0.5 rounded">{t('notRecommended') || 'NOT RECOMMENDED'}</span>
                                                 </label>
-                                                
+
+                                                {/* LW Oct 2026 (#763, #954) - the same two options for the scheduled run */}
+                                                <EvacOptions kind="schedule" plan={schedulePlan} skip={scheduleSkipEvacuation}
+                                                    migrateTemplates={scheduleMigrateTemplates} setMigrateTemplates={setScheduleMigrateTemplates}
+                                                    relaxAntiAffinity={scheduleRelaxAntiAffinity} setRelaxAntiAffinity={setScheduleRelaxAntiAffinity} />
+
                                                 {/* NS: GitHub #40 - Advanced Options */}
                                                 <button
                                                     onClick={() => setScheduleShowAdvanced(!scheduleShowAdvanced)}

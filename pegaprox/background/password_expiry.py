@@ -14,6 +14,7 @@ from pegaprox.globals import (
     _password_expiry_last_check,
 )
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 from pegaprox.api.helpers import load_server_settings
 from pegaprox.models.permissions import ROLE_ADMIN
 from pegaprox.utils.auth import load_users
@@ -175,7 +176,9 @@ def password_expiry_check_loop():
     
     while _password_expiry_running:
         try:
-            check_password_expiry()
+            # the active instance sends these mails; a standby would send each one twice
+            if ha.is_active():
+                check_password_expiry()
         except Exception as e:
             logging.error(f"Password expiry check error: {e}")
         

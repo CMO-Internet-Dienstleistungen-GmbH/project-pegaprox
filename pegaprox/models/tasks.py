@@ -23,6 +23,18 @@ class MaintenanceTask:
         self.acknowledged = False
         self.native_ha = False  # NS feb 2026 - tracks if Proxmox native HA maintenance was used
         self.note = None  # NS jul 2026 - informational note (e.g. single-node: no evacuation target)
+        # MK Oct 2026 (#763) - templates move only when asked; the ones that stay say why
+        self.migrate_templates = False
+        self.templates_moved = []
+        self.templates_left = []
+        # #954 - negative affinity rules this maintenance holds off, and the ones Proxmox kept on
+        self.relax_anti_affinity = False
+        self.ha_rules_off = []
+        self.ha_rules_kept_on = []
+        # Sep 2026 - guests this drain had to place off their plb_pin_ node because
+        # no pinned node could take them. Reported, not an error: the drain is what
+        # the operator asked for, and pin reconciliation returns them afterwards.
+        self.off_pin_vms = []
 
     def to_dict(self):
         return {
@@ -38,7 +50,12 @@ class MaintenanceTask:
             'error': self.error,
             'acknowledged': self.acknowledged,
             'native_ha': self.native_ha,
-            'note': self.note
+            'note': self.note,
+            'templates_moved': self.templates_moved,
+            'templates_left': self.templates_left,
+            'ha_rules_off': self.ha_rules_off,
+            'ha_rules_kept_on': self.ha_rules_kept_on,
+            'off_pin_vms': self.off_pin_vms,
         }
 
 
@@ -55,6 +72,8 @@ class UpdateTask:
         self.error = None
         self.packages_upgraded = 0
         self.completed_at = None
+        self.reboot_issued = False
+        self.back_online = False
 
     def add_output(self, line: str):
         self.output_lines.append({
@@ -98,6 +117,14 @@ class PegaProxConfig:
         # MK Jul 2026 (#426) — opt-in: derive affinity/anti-affinity/ignore/pin
         # placement rules from ProxLB-convention VM tags. Off = zero change.
         self.proxlb_tags_enabled = cluster_data.get('proxlb_tags_enabled', False)
+        # Pin reconciliation migrates a guest back onto its plb_pin_ node only
+        # when this is on; otherwise off-pin guests are only reported.
+        self.proxlb_pins_auto_migrate = cluster_data.get('proxlb_pins_auto_migrate', False)
+        # A plb_pin_ tag ranks evacuation targets but does not veto a drain - a
+        # guest stranded on a node about to reboot is worse than a guest in the
+        # wrong place. Turn this on where a pin is a hard constraint (licensing,
+        # PCI passthrough, local disks) and the drain should fail instead.
+        self.proxlb_pins_strict = cluster_data.get('proxlb_pins_strict', False)
         self.dry_run = cluster_data.get('dry_run', False)
         self.enabled = cluster_data.get('enabled', True)
         self.ha_enabled = cluster_data.get('ha_enabled', False)
@@ -105,6 +132,10 @@ class PegaProxConfig:
         self.ssh_user = cluster_data.get('ssh_user', '')
         self.ssh_key = cluster_data.get('ssh_key', '')
         self.ssh_port = cluster_data.get('ssh_port', 22)
+        # MK Sep 2026 (#941) — hard off switch. Everything that reaches a node over SSH
+        # goes through PegaProxManager._ssh_connect, so this turns the lot off for this
+        # cluster: node shell, VNC tunnel, the LVM snapshot probe, the hardening checks.
+        self.ssh_disabled = bool(cluster_data.get('ssh_disabled', False))
         # MK May 2026 — Proxmox API port. Default :8006 covers ~all installs,
         # but ops running PVE on a non-standard port (firewall constraint,
         # multi-tenant single-IP, hardened jumpbox) need to override this.

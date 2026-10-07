@@ -830,7 +830,9 @@
         // LW: this shows when you click a VM in detail view mode
         function VmDetailPanel({ vm, clusterId, onAction, onOpenConsole, onOpenSpice, onOpenLxcShell, onOpenConfig, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();
+            const { getAuthHeaders, haReadOnly, haConsolesElsewhere } = useAuth();
+            const acts = !haReadOnly;  // #625: a standby shows this VM, the active acts on it
+            const consoles = !haConsolesElsewhere;  // a standby opens the console on the active, unless it serves users
             
             // some quick helpers
             const isQemu = vm.type === 'qemu';
@@ -1081,7 +1083,7 @@
                                 {lockInfo?.locked && (
                                     <span 
                                         className="px-2 py-1 rounded-full text-xs font-medium bg-red-500/20 text-red-400 border border-red-500/30 flex items-center gap-1 cursor-pointer hover:bg-red-500/30 transition-colors"
-                                        onClick={() => setShowUnlockConfirm(true)}
+                                        onClick={() => acts && setShowUnlockConfirm(true)}
                                         title={lockInfo?.lock_description || 'Locked'}
                                     >
                                         <Icons.Lock />
@@ -1354,7 +1356,7 @@
                     <div className="px-6 pb-6">
                         <div className="text-xs text-gray-500 mb-3">{t('quickActions')}</div>
                         <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-                            {vm.status === 'stopped' ? (
+                            {!acts ? null : vm.status === 'stopped' ? (
                                 <button
                                     onClick={() => handleAction('start')}
                                     disabled={actionLoading?.[`${vm.vmid}-start`]}
@@ -1383,6 +1385,7 @@
                                     </button>
                                 </>
                             )}
+                            {consoles && (
                             <button
                                 onClick={() => onOpenConsole(vm)}
                                 className="flex items-center justify-center gap-2 p-3 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/30 rounded-lg text-blue-400 transition-all"
@@ -1390,9 +1393,14 @@
                                 <Icons.Monitor />
                                 {t('console')}
                             </button>
+                            )}
+                            {!consoles && (
+                                <HaOnActiveLink vm={vm} clusterId={clusterId}
+                                    className="flex items-center justify-center gap-2 p-3 bg-blue-500/10 hover:bg-blue-500/20 border border-blue-500/30 rounded-lg text-blue-400 transition-all" />
+                            )}
                             {/* NS May 2026 — VNC↔Term toggle moved inside Console modal. */}
                             {/* MK Aug 2026 — SPICE (virt-viewer .vv) sits next to the web console; QEMU only */}
-                            {isQemu && onOpenSpice && (
+                            {consoles && isQemu && onOpenSpice && (
                                 <button
                                     onClick={() => onOpenSpice(vm)}
                                     title={t('spiceConsoleHint') || 'Download a virt-viewer file (audio / USB / multi-monitor)'}
@@ -1423,6 +1431,7 @@
                                 <Icons.BarChart />
                                 {t('performanceMetrics')}
                             </button>
+                            {acts && (<>
                             <button
                                 onClick={onMigrate}
                                 className="flex items-center gap-2 px-3 py-2 bg-proxmox-dark hover:bg-proxmox-border border border-proxmox-border rounded-lg text-sm text-gray-300 transition-all"
@@ -1475,6 +1484,7 @@
                                 <Icons.Trash />
                                 {t('delete')}
                             </button>
+                            </>)}
                         </div>
                     </div>
 
@@ -1498,6 +1508,7 @@
                                         </div>
                                     </div>
                                 </div>
+                                {acts && (
                                 <button
                                     onClick={toggleProxmoxHa}
                                     disabled={haLoading}
@@ -1515,6 +1526,7 @@
                                         t('haActivate')
                                     )}
                                 </button>
+                                )}
                             </div>
                             {haEnabled && (
                                 <div className="mt-3 pt-3 border-t border-gray-700/50 grid grid-cols-2 gap-4 text-xs">
@@ -1551,7 +1563,14 @@
         // LW: Feb 2026 - Corporate VM Detail View (experimental)
         function CorporateVmDetailView({ vm, clusterId, onAction, onOpenConsole, onOpenSpice, onOpenConfig, onBack, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();
+            const { getAuthHeaders, haReadOnly, haStandby, haConsolesElsewhere } = useAuth();
+            // #625 v2 - on a standby: no power, console, SPICE, snapshot or HA changes, and no
+            // console preview either, since the grab runs on the node
+            // A forwarding standby changes things through the active again. Consoles and the
+            // preview stay off unless it serves users, the snapshot refresh (it runs lvs on
+            // the node) on every one
+            const acts = !haReadOnly;
+            const consoles = !haConsolesElsewhere;
             const [activeDetailTab, setActiveDetailTab] = useState('summary');
             const [showActionsMenu, setShowActionsMenu] = useState(false);
             const [snapshots, setSnapshots] = useState([]);
@@ -1581,7 +1600,7 @@
             const [shotLoading, setShotLoading] = useState(false);
             const [shotNonce, setShotNonce] = useState(0);  // bump = force fresh grab
             useEffect(() => {
-                if (!isQemu || !isRunning) { setConsoleShot(null); return; }
+                if (!isQemu || !isRunning || !consoles) { setConsoleShot(null); return; }
                 // reuse a recent frame on re-mount/poll instead of re-grabbing
                 const cached = _consoleShotCache[shotKey];
                 if (shotNonce === 0 && cached && (Date.now() - cached.ts) < SHOT_REUSE_MS) {
@@ -1606,7 +1625,7 @@
                     .catch(() => { if (!cancelled) setConsoleShot(_consoleShotCache[shotKey]?.url || null); })
                     .finally(() => { if (!cancelled) setShotLoading(false); });
                 return () => { cancelled = true; };
-            }, [vm.vmid, vm.status, clusterId, shotNonce]);
+            }, [vm.vmid, vm.status, clusterId, shotNonce, consoles]);
 
             // LW Apr 2026 (#250) — per-VM web link (browser-local; keyed by cluster:vmid)
             const webLinkKey = `${clusterId}:${vm.vmid}`;
@@ -1644,24 +1663,36 @@
                 catch(e) { console.error(e); return null; }
             };
 
+            // LW Oct 2026 (#828) - every fetch and every VM switch moves the counter on; an
+            // answer only lands while it is still the newest one for this VM
+            const snapSeqRef = React.useRef(0);
+            const snapKey = `${clusterId}/${vm.vmid}`;
+            const snapKeyRef = React.useRef(snapKey);
+            snapKeyRef.current = snapKey;
             const fetchSnapshots = async () => {
+                if (snapKeyRef.current !== snapKey) return;  // a create/delete that finished after the switch
+                const seq = ++snapSeqRef.current;
                 setSnapsLoading(true);
                 try {
                     const base = `${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}`;
                     const [stdRes, effRes] = await Promise.all([
                         authFetch(`${base}/snapshots`),
-                        authFetch(`${base}/efficient-snapshots?refresh=true`)
+                        authFetch(`${base}/efficient-snapshots${haStandby ? '' : '?refresh=true'}`)
                     ]);
-                    if (stdRes?.ok) setSnapshots(await stdRes.json());
-                    if (effRes?.ok) setEfficientSnapshots(await effRes.json());
+                    const std = stdRes?.ok ? await stdRes.json() : undefined;
+                    const eff = effRes?.ok ? await effRes.json() : undefined;
+                    if (seq !== snapSeqRef.current) return;
+                    if (std !== undefined) setSnapshots(std);
+                    if (eff !== undefined) setEfficientSnapshots(eff);
                 } catch(e) { console.error('snapshots fetch:', e); }
-                setSnapsLoading(false);
+                if (seq === snapSeqRef.current) setSnapsLoading(false);
             };
 
             // refetch when VM changes while snapshots tab is open
             React.useEffect(() => {
-                setSnapshots([]); setEfficientSnapshots([]);
+                setSnapshots([]); setEfficientSnapshots([]); setSnapsLoading(false);
                 if (activeDetailTab === 'snapshots') fetchSnapshots();
+                return () => { snapSeqRef.current++; };
             }, [vm.vmid, clusterId]);
 
             const handleCreateSnap = async () => {
@@ -1755,18 +1786,24 @@
             }, [showActionsMenu]);
 
             // Fetch lock status
-            const fetchLockStatus = async () => {
+            const fetchLockStatus = async (isStale) => {
+                let next = { locked: false, lock_reason: null, lock_description: null, unlock_command: null };
                 try {
                     const response = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/lock`);
                     if (response && response.ok) {
                         const data = await response.json();
-                        setLockInfo({ locked: data.locked || false, lock_reason: data.lock_reason || null, lock_description: data.lock_description || null, unlock_command: data.unlock_command || null });
-                    } else {
-                        setLockInfo({ locked: false, lock_reason: null, lock_description: null, unlock_command: null });
+                        next = { locked: data.locked || false, lock_reason: data.lock_reason || null, lock_description: data.lock_description || null, unlock_command: data.unlock_command || null };
                     }
-                } catch (error) { setLockInfo({ locked: false, lock_reason: null, lock_description: null, unlock_command: null }); }
+                } catch (error) {}
+                // #828 - the lock of the VM shown before must not offer Unlock on this one
+                if (!isStale()) setLockInfo(next);
             };
-            useEffect(() => { fetchLockStatus(); }, [vm.vmid, clusterId]);
+            useEffect(() => {
+                let stale = false;
+                setLockInfo({ locked: false, lock_reason: null, lock_description: null, unlock_command: null });
+                fetchLockStatus(() => stale);
+                return () => { stale = true; };
+            }, [vm.vmid, clusterId]);
 
             // Unlock VM
             const handleUnlock = async () => {
@@ -1790,32 +1827,49 @@
                 const gkey = `${clusterId}:${vm.vmid}`;
                 // #560 — also fetch for LXC (backend returns os/ip via config+pct, no agent)
                 if (!(isQemu || vm.type === 'lxc') || vm.status !== 'running') { delete _guestInfoCache[gkey]; setGuestInfo(null); return; }
+                // LW Oct 2026 (#828) - this VM's own last-known info (or none) while it loads; an
+                // answer for the VM shown before still fills its cache, never this view
+                setGuestInfo(_guestInfoCache[gkey] || null);
+                let stale = false;
                 authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/guest-info`)
                     .then(r => r && r.ok ? r.json() : null)
                     .then(data => {
                         // LXC has no guest agent → accept on is_lxc, not just agent_running
-                        if (data && (data.agent_running || data.is_lxc)) { _guestInfoCache[gkey] = data; setGuestInfo(data); }
-                        else setGuestInfo(_guestInfoCache[gkey] || null);  // keep last-known on transient miss, don't flip
+                        if (data && (data.agent_running || data.is_lxc)) { _guestInfoCache[gkey] = data; if (!stale) setGuestInfo(data); }
+                        else if (!stale) setGuestInfo(_guestInfoCache[gkey] || null);  // keep last-known on transient miss, don't flip
                     })
-                    .catch(() => setGuestInfo(_guestInfoCache[gkey] || null));
+                    .catch(() => { if (!stale) setGuestInfo(_guestInfoCache[gkey] || null); });
+                return () => { stale = true; };
             }, [vm.vmid, vm.status, clusterId]);
 
             // MK #334 — fsinfo. Only polls when guest agent is alive to avoid hammering the
             // proxmox API with 500s for VMs without an agent.
             useEffect(() => {
-                if (!isQemu || vm.status !== 'running' || !guestInfo) { setFsInfo(null); return; }
+                setFsInfo(null);
+                if (!isQemu || vm.status !== 'running' || !guestInfo) return;
+                let stale = false;
                 authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/guest-fsinfo`)
                     .then(r => r && r.ok ? r.json() : null)
-                    .then(d => setFsInfo(d || null))
-                    .catch(() => setFsInfo(null));
+                    .then(d => { if (!stale) setFsInfo(d || null); })
+                    .catch(() => { if (!stale) setFsInfo(null); });
+                return () => { stale = true; };
             }, [vm.vmid, vm.status, clusterId, !!guestInfo]);
 
             // Fetch VM hardware config
+            // LW Sep 2026 (#813) - clear FIRST, and drop an answer that arrives
+            // after the user has moved on. The clear used to sit inside the isQemu guard,
+            // so it only ran for containers; switching between two VMs left the previous
+            // one's values on screen until the new request came back. Nobody noticed while
+            // the fields were machine types that read alike - a description is a sentence
+            // about a specific VM, and reading the wrong one is worse than reading none.
             useEffect(() => {
-                if (!isQemu) { setVmHwInfo(null); return; }
+                setVmHwInfo(null);
+                if (!isQemu) return;
+                let stale = false;
                 authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/config`)
                     .then(r => r && r.ok ? r.json() : null)
                     .then(cfg => {
+                        if (stale) return;
                         if (!cfg) { setVmHwInfo(null); return; }
                         const raw = cfg.raw || cfg;
                         setVmHwInfo({
@@ -1823,40 +1877,52 @@
                             cpu: raw.cpu || 'kvm64', scsihw: raw.scsihw || 'lsi',
                             cores: raw.cores || 1, sockets: raw.sockets || 1,
                             ostype: raw.ostype,
+                            // #813 - rides along in the same response, no extra request
+                            description: (raw.description || '').trim(),
                             net: (() => { const nk = Object.keys(raw).find(k => k.startsWith('net')); return nk ? raw[nk].split(',')[0].split('=')[0] : null; })(),
                             agent: raw.agent,
                         });
                     })
-                    .catch(() => setVmHwInfo(null));
-            }, [vm.vmid, clusterId]);
+                    .catch(() => { if (!stale) setVmHwInfo(null); });
+                return () => { stale = true; };
+            }, [vm.vmid, vm.node, clusterId]);
 
             // Fetch HA status
             useEffect(() => {
+                let stale = false;
                 authFetch(`${API_URL}/clusters/${clusterId}/proxmox-ha/resources`)
                     .then(r => r && r.ok ? r.json() : null)
                     .then(resources => {
-                        if (resources) {
+                        // #828 - the HA switch acts on this VM, so it must not show another one's state
+                        if (resources && !stale) {
                             setHaResources(resources);
                             const vmType = isQemu ? 'vm' : 'ct';
                             setHaEnabled(resources.some(r => r.sid === `${vmType}:${vm.vmid}`));
                         }
                     })
                     .catch(() => {});
+                return () => { stale = true; };
             }, [vm.vmid, clusterId]);
 
             // NS: inline perf charts - only bother fetching when vm is actually up
             const [metricsRefreshTick, setMetricsRefreshTick] = useState(0);
+            // LW Oct 2026 (#828) - only the newest request draws the charts, and another VM
+            // starts with empty ones instead of the previous VM's
+            const metricsSeqRef = React.useRef(0);
+            useEffect(() => { setMetricsData(null); }, [vm.vmid, clusterId]);
             const fetchMetrics = React.useCallback(() => {
-                if (!isRunning) return;
+                const seq = ++metricsSeqRef.current;
+                if (!isRunning) { setMetricsLoading(false); return; }
                 setMetricsLoading(true);
                 authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/rrd/${metricsTimeframe}`)
                     .then(r => r?.ok ? r.json() : null)
-                    .then(d => { setMetricsData(d); setMetricsLoading(false); })
-                    .catch(() => setMetricsLoading(false));
+                    .then(d => { if (seq !== metricsSeqRef.current) return; setMetricsData(d); setMetricsLoading(false); })
+                    .catch(() => { if (seq === metricsSeqRef.current) setMetricsLoading(false); });
             }, [metricsTimeframe, vm.vmid, isRunning, clusterId]);
 
             useEffect(() => {
                 fetchMetrics();
+                return () => { metricsSeqRef.current++; };
             }, [fetchMetrics, metricsRefreshTick]);
 
             const maxMemGB = vm.maxmem ? vm.maxmem / (1024 * 1024 * 1024) : 0;
@@ -1924,12 +1990,12 @@
                             {lockInfo.locked && <span className="corp-badge corp-badge-locked flex items-center gap-1"><Icons.Lock className="w-2.5 h-2.5" />{t('locked')}</span>}
                         </div>
                         <div className="corp-toolbar flex items-center gap-1">
-                            {!isRunning && (
+                            {acts && !isRunning && (
                                 <button onClick={() => handleAction('start')} disabled={actionLoading?.[`${vm.vmid}-start`]}>
                                     {actionLoading?.[`${vm.vmid}-start`] ? <Icons.RotateCw className="w-3 h-3 animate-spin" /> : <Icons.PlayCircle className="w-3 h-3" style={{color: '#60b515'}} />} {t('start')}
                                 </button>
                             )}
-                            {isRunning && (
+                            {acts && isRunning && (
                                 <>
                                     <button onClick={() => handleAction('shutdown')} disabled={actionLoading?.[`${vm.vmid}-shutdown`]}>
                                         {actionLoading?.[`${vm.vmid}-shutdown`] ? <Icons.RotateCw className="w-3 h-3 animate-spin" /> : <Icons.Power className="w-3 h-3" style={{color: '#f54f47'}} />} {t('shutdown')}
@@ -1939,12 +2005,13 @@
                                     </button>
                                 </>
                             )}
-                            {isQemu && isRunning && (
+                            {consoles && isQemu && isRunning && (
                                 <button onClick={() => onOpenConsole(vm)}>
                                     <Icons.Terminal className="w-3 h-3" /> {t('console')}
                                 </button>
                             )}
-                            {isQemu && isRunning && onOpenSpice && (
+                            {!consoles && isRunning && <HaOnActiveLink vm={vm} clusterId={clusterId} button iconClass="w-3 h-3" />}
+                            {consoles && isQemu && isRunning && onOpenSpice && (
                                 <button onClick={() => onOpenSpice(vm)} title={t('spiceConsoleHint') || 'Download a virt-viewer file (audio / USB / multi-monitor)'}>
                                     <Icons.ExternalLink className="w-3 h-3" /> {t('spiceConsole') || 'SPICE'}
                                 </button>
@@ -1964,6 +2031,7 @@
                                                 <Icons.BarChart className="w-3.5 h-3.5" /> {t('performanceMetrics')}
                                             </button>
                                         )}
+                                        {acts && (<>
                                         <button onClick={() => { onMigrate(vm); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
                                             <Icons.ArrowRight className="w-3.5 h-3.5" /> {t('migrate')}
                                         </button>
@@ -1985,6 +2053,7 @@
                                                 <Icons.XCircle className="w-3.5 h-3.5" /> {t('forceStop')}
                                             </button>
                                         )}
+                                        </>)}
                                         <div className="my-1" style={{borderTop: '1px solid var(--corp-border-medium)'}}></div>
                                         {/* LW Apr 2026 (#250) — user-configurable web URL for this VM */}
                                         <button onClick={() => { openVmWebUrl(); setShowActionsMenu(false); }}
@@ -1998,10 +2067,12 @@
                                                 <span className="w-3.5 h-3.5" /> {t('editVmWebLink') || 'Edit Web URL…'}
                                             </button>
                                         )}
+                                        {acts && (<>
                                         <div className="my-1" style={{borderTop: '1px solid var(--corp-border-medium)'}}></div>
                                         <button onClick={() => { onDelete(vm); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: '#f54f47'}}>
                                             <Icons.Trash className="w-3.5 h-3.5" /> {t('delete')}
                                         </button>
+                                        </>)}
                                     </div>
                                 )}
                             </div>
@@ -2021,7 +2092,7 @@
                             <Icons.Settings className="w-3 h-3 inline mr-1" />{t('configure')}
                         </button>
                         {/* LW: Feb 2026 - console tab for QEMU (VNC) and LXC (xterm.js) */}
-                        {isRunning && (
+                        {consoles && isRunning && (
                             <button onClick={() => onOpenConsole(vm)}>
                                 <Icons.Terminal className="w-3 h-3 inline mr-1" />{t('console')}
                             </button>
@@ -2057,19 +2128,25 @@
                                                 }
                                                 <div className="text-[11px]" style={{color: '#728b9a'}}>
                                                     {!isRunning ? (t('vmStopped') || 'VM is powered off')
+                                                        : !consoles ? t('running')
                                                         : (shotLoading && isQemu ? (t('loadingPreview') || 'Loading preview…')
                                                                                  : (t('consoleAvailable') || 'Console available'))}
                                                 </div>
                                             </div>
                                         )}
                                     </div>
-                                    {isRunning && (
+                                    {consoles && isRunning && (
                                         <button onClick={() => onOpenConsole(vm)} className="w-full mt-1.5 py-1.5 text-[12px] font-medium uppercase tracking-wider flex items-center justify-center gap-1.5" style={{background: 'var(--corp-header-bg)', border: '1px solid var(--corp-border-medium)', color: 'var(--corp-accent)'}}>
                                             <Icons.Terminal className="w-3.5 h-3.5" />
                                             {t('launchWebConsole') || 'Launch Web Console'}
                                         </button>
                                     )}
-                                    {isRunning && isQemu && onOpenSpice && (
+                                    {!consoles && isRunning && (
+                                        <HaOnActiveLink vm={vm} clusterId={clusterId} iconClass="w-3.5 h-3.5"
+                                            className="w-full mt-1.5 py-1.5 text-[12px] font-medium uppercase tracking-wider flex items-center justify-center gap-1.5"
+                                            style={{background: 'var(--corp-header-bg)', border: '1px solid var(--corp-border-medium)', color: 'var(--corp-accent)'}} />
+                                    )}
+                                    {consoles && isRunning && isQemu && onOpenSpice && (
                                         <button onClick={() => onOpenSpice(vm)} title={t('spiceConsoleHint') || 'Download a virt-viewer file (audio / USB / multi-monitor)'} className="w-full mt-1.5 py-1.5 text-[12px] font-medium uppercase tracking-wider flex items-center justify-center gap-1.5" style={{background: 'var(--corp-surface-1)', border: '1px solid var(--corp-border-medium)', color: 'var(--corp-text-secondary)'}}>
                                             <Icons.ExternalLink className="w-3.5 h-3.5" />
                                             {t('spiceConsole') || 'SPICE'}
@@ -2089,6 +2166,11 @@
                                             {vm.tags && <tr><td>Tags</td><td><div className="flex flex-wrap gap-1">{(Array.isArray(vm.tags) ? vm.tags : vm.tags.split(';')).map(tag => (
                                                 <span key={tag} className="px-1.5 py-0.5 text-[11px]" style={{background: 'rgba(73, 175, 217, 0.12)', color: '#49afd9', border: '1px solid rgba(73, 175, 217, 0.25)'}}>{tag}</span>
                                             ))}</div></td></tr>}
+                                            {/* #813 - operator-entered free text, rendered as text: React escapes it,
+                                                pre-wrap keeps the author's line breaks, break-word stops a pasted URL
+                                                from widening the whole grid. The Config editor keeps its Markdown. */}
+                                            {vmHwInfo?.description && <tr><td>{t('description') || 'Description'}</td>
+                                                <td style={{whiteSpace: 'pre-wrap', overflowWrap: 'break-word', maxWidth: 0}}>{vmHwInfo.description}</td></tr>}
                                         </tbody>
                                     </table>
                                     {/* stats */}
@@ -2131,9 +2213,11 @@
                                         <Icons.Lock className="w-4 h-4" style={{color: '#efc006'}} />
                                         <span className="text-[13px]" style={{color: '#efc006'}}>{t('vmLocked') || 'This virtual machine is locked'}: {lockInfo.lock_reason || 'unknown'}</span>
                                     </div>
+                                    {acts && (
                                     <button onClick={() => setShowUnlockConfirm(true)} className="px-2 py-1 text-[12px] font-medium" style={{color: '#49afd9'}}>
                                         {t('unlock') || 'Unlock'}
                                     </button>
+                                    )}
                                 </div>
                             )}
                             {isQemu && isRunning && !guestInfo && (
@@ -2387,6 +2471,7 @@
                                     <div style={{border: '1px solid var(--corp-border-medium)'}}>
                                         <div className="px-3 py-2 flex items-center justify-between" style={{background: 'var(--corp-header-bg)', borderBottom: '1px solid var(--corp-border-medium)'}}>
                                             <span className="text-[13px] font-medium" style={{color: '#e9ecef'}}>{t('proxmoxHa') || 'Proxmox HA'}</span>
+                                            {acts && (
                                             <button
                                                 onClick={toggleProxmoxHa}
                                                 disabled={haLoading}
@@ -2398,6 +2483,7 @@
                                             >
                                                 {haLoading ? <Icons.RotateCw className="w-3 h-3 animate-spin" /> : haEnabled ? t('disable') : t('haActivate') || 'Enable'}
                                             </button>
+                                            )}
                                         </div>
                                         <div className="px-3 py-2 flex items-center gap-2">
                                             <Icons.Shield className="w-4 h-4" style={{color: haEnabled ? '#60b515' : '#728b9a'}} />
@@ -2490,14 +2576,16 @@
                                         </span>
                                     )}
                                 </h3>
+                                {acts && (
                                 <button onClick={() => setShowCreateSnap(!showCreateSnap)}
                                     className="corp-vm-btn corp-vm-btn-primary flex items-center gap-1.5">
                                     <Icons.Plus className="w-3 h-3" />
                                     {t('createSnapshot') || 'Take Snapshot'}
                                 </button>
+                                )}
                             </div>
 
-                            {showCreateSnap && (
+                            {acts && showCreateSnap && (
                                 <div style={{background: 'var(--corp-surface-2, #1a2733)', border: '1px solid var(--corp-border-medium, #344955)', padding: '12px 14px'}}>
                                     <div className="space-y-2">
                                         <div>
@@ -2563,7 +2651,7 @@
                                                         )}
                                                     </div>
                                                     <div className="text-[11px] mt-0.5" style={{color: 'var(--corp-text-muted, #728b9a)'}}>
-                                                        {node.snaptime ? new Date(node.snaptime * 1000).toLocaleString() : ''}
+                                                        {node.snaptime ? fmtDate(node.snaptime) : ''}
                                                         {node.description && <span className="ml-2" style={{color: '#5a7a8a'}}>— {node.description}</span>}
                                                     </div>
                                                 </div>
@@ -2574,6 +2662,7 @@
                                                     <Icons.ChevronRight className="w-3 h-3" style={{transform:'rotate(90deg)'}} />
                                                     <span className="text-[11px]">{t('compare') || 'Compare'}</span>
                                                 </button>
+                                                {acts && (<>
                                                 <button onClick={() => handleRollbackSnap(node.name)}
                                                     className="corp-vm-btn corp-vm-btn-ghost flex items-center gap-1" title={t('rollback')}>
                                                     <Icons.RotateCcw className="w-3 h-3" />
@@ -2583,6 +2672,7 @@
                                                     className="corp-vm-btn corp-vm-btn-danger-ghost" title={t('delete')}>
                                                     <Icons.Trash2 className="w-3 h-3" />
                                                 </button>
+                                                </>)}
                                             </div>
                                         </div>
                                         {node.children.map(child => renderSnapNode(child, depth + 1))}
@@ -2629,6 +2719,7 @@
                                                     </div>
                                                 </div>
                                                 <div className="flex gap-1">
+                                                    {acts && (<>
                                                     <button onClick={() => handleRollbackEfficientSnap(snap.id, snap.name)}
                                                         className="corp-vm-btn corp-vm-btn-ghost flex items-center gap-1" title={t('rollback')}>
                                                         <Icons.RotateCcw className="w-3 h-3" />
@@ -2638,6 +2729,7 @@
                                                         className="corp-vm-btn corp-vm-btn-danger-ghost" title={t('delete')}>
                                                         <Icons.Trash2 className="w-3 h-3" />
                                                     </button>
+                                                    </>)}
                                                 </div>
                                             </div>
                                         ))}
@@ -2667,7 +2759,9 @@
         // Proxmox Native HA Section for Settings
         function ProxmoxHaSection({ clusterId }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();
+            const { getAuthHeaders, user, isAdmin, haReadOnly } = useAuth();
+            // LW Oct 2026 (#625) - taking a guest out of HA wants ha.config; ha.view only looks
+            const canEdit = !haReadOnly && (isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes('ha.config')));
             const [resources, setResources] = useState([]);
             const [loading, setLoading] = useState(true);
 
@@ -2747,13 +2841,15 @@
                                                 Max Restart: {resource.max_restart || 3}
                                             </span>
                                         </div>
-                                        <button
-                                            onClick={() => removeFromHa(resource.sid)}
-                                            className="p-1 rounded hover:bg-red-500/20 text-gray-500 hover:text-red-400"
-                                            title={t('removeFromHa')}
-                                        >
-                                            <Icons.X />
-                                        </button>
+                                        {canEdit && (
+                                            <button
+                                                onClick={() => removeFromHa(resource.sid)}
+                                                className="p-1 rounded hover:bg-red-500/20 text-gray-500 hover:text-red-400"
+                                                title={t('removeFromHa')}
+                                            >
+                                                <Icons.X />
+                                            </button>
+                                        )}
                                     </div>
                                 );
                             })}
@@ -2781,6 +2877,10 @@
             const [hasCdDvd, setHasCdDvd] = useState(false);
             const [detectedIsos, setDetectedIsos] = useState([]);
             const [bootOrderIssues, setBootOrderIssues] = useState([]);
+            // LW Oct 2026 - virtiofs shares ([{ key, dirid }]) and the cluster's directory mappings,
+            // null until read or when this account may not read them
+            const [virtiofs, setVirtiofs] = useState([]);
+            const [dirMappings, setDirMappings] = useState(null);
 
             const availableNodes = nodes.filter(n => n !== vm.node);
             const isContainer = vm.type === 'lxc';
@@ -2845,6 +2945,11 @@
                         }
                     });
                     setBootOrderIssues(issues);
+
+                    // a VM with virtiofs does not migrate live (qemu-server check_local_resources), and
+                    // offline only to a node its directory mappings cover
+                    setVirtiofs(Object.keys(config).filter(k => /^virtiofs[0-9]$/.test(k) && config[k]).sort()
+                        .map(k => ({ key: k, dirid: parseVirtiofs(config[k]).dirid })));
                 };
                 
                 const checkVmConfig = async () => {
@@ -2876,6 +2981,26 @@
                 window.addEventListener('pegaprox-vm-config', handleVmConfigUpdate);
                 return () => window.removeEventListener('pegaprox-vm-config', handleVmConfigUpdate);
             }, [vm, clusterId]);
+
+            useEffect(() => {
+                if (!virtiofs.length || !clusterId) return;
+                let gone = false;
+                (async () => {
+                    try {
+                        const r = await fetch(`${API_URL}/clusters/${clusterId}/datacenter/mapping/dir`, { credentials: 'include', headers: getAuthHeaders() });
+                        const d = r && r.ok ? await r.json() : null;
+                        if (!gone) setDirMappings(d && d.supported !== false ? (d.mappings || []) : null);
+                    } catch (e) {
+                        if (!gone) setDirMappings(null);
+                    }
+                })();
+                return () => { gone = true; };
+            }, [virtiofs.length, clusterId]);
+
+            const vfsRunning = virtiofs.length > 0 && vm.status === 'running';
+            const vfsMissing = targetNode && dirMappings
+                ? virtiofs.filter(v => !dirMappings.some(m => m.id === v.dirid && m.nodes.includes(targetNode)))
+                : [];
 
             // Fetch storages when target node changes
             useEffect(() => {
@@ -2938,6 +3063,28 @@
                             </div>
                             
                             {/* Migration Warnings */}
+                            {virtiofs.length > 0 && (
+                                <div className={`p-3 rounded-lg border ${vfsRunning ? 'bg-red-500/10 border-red-500/30' : 'bg-yellow-500/10 border-yellow-500/30'}`}
+                                    data-mig-vfs={vfsRunning ? 'running' : 'stopped'}>
+                                    <div className="flex items-start gap-2">
+                                        <Icons.AlertTriangle />
+                                        <div className="flex-1 min-w-0">
+                                            <p className={`font-medium text-sm ${vfsRunning ? 'text-red-400' : 'text-yellow-400'}`}>{t('migVfsTitle')}</p>
+                                            <p className="text-xs text-gray-300 mt-1">{t(vfsRunning ? 'migVfsLive' : 'migVfsOffline')}</p>
+                                            <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                                                {virtiofs.map(v => (
+                                                    <code key={v.key} className="bg-proxmox-dark px-1 rounded text-gray-300">{v.key}: {v.dirid}</code>
+                                                ))}
+                                            </div>
+                                            {vfsMissing.length > 0 && (
+                                                <p className="text-xs text-red-400 mt-2" data-mig-vfs-missing>
+                                                    {t('migVfsMissing').replace(/\{node\}/g, () => targetNode).replace(/\{ids\}/g, () => vfsMissing.map(v => v.dirid).join(', '))}
+                                                </p>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
                             {(hasCdDvd || bootOrderIssues.length > 0) && (
                                 <div className="space-y-2">
                                     {hasCdDvd && (
@@ -3078,7 +3225,7 @@
                             <button onClick={onClose} className="px-4 py-2 text-gray-300 hover:text-white">{t('cancel')}</button>
                             <button
                                 onClick={handleMigrate}
-                                disabled={!targetNode || loading}
+                                disabled={!targetNode || loading || vfsRunning || vfsMissing.length > 0}
                                 className="flex items-center gap-2 px-4 py-2 bg-blue-600 rounded-lg text-white hover:bg-blue-700 disabled:opacity-50"
                             >
                                 {loading && <Icons.RotateCw />}
@@ -3092,82 +3239,786 @@
 
         // Bulk Migrate Modal Component
         // NS: For evacuating nodes before maintenance
-        // Migrations run sequentially to avoid overloading the network
+        // LW Oct 2026 (#952) - the migrations run on the server as a bulk run now: one at a
+        // time from a few guests on, a few at a time or all at once as picked here. The
+        // dialog only asks where to and how, the progress shows in BulkMigrateRuns
+        const MIG_RUN_PARALLEL_MAX = 5;
+        const migRunDefaultPlan = (count) => ({ mode: count > 3 ? 'sequential' : 'all', parallel: 2 });
+
+        function MigRunPlan({ plan, onChange }) {
+            const { t } = useTranslation();
+            const { isCorporate } = useLayout();
+            const option = (mode, label, hint, extra) => (
+                <label key={mode} className="flex items-start gap-2 text-sm cursor-pointer" data-mig-mode={mode}>
+                    <input type="radio" name="mig-run-mode" checked={plan.mode === mode} className="mt-1"
+                        onChange={() => onChange({ ...plan, mode })} />
+                    <span className="flex-1 min-w-0">
+                        <span className="flex items-center gap-2 text-white">{label}{extra}</span>
+                        <span className="block text-xs text-gray-400">{hint}</span>
+                    </span>
+                </label>
+            );
+            return (
+                <div className="space-y-2" data-testid="mig-run-plan">
+                    <div className={isCorporate ? 'corp-vm-section-title' : 'block text-sm text-gray-400 mb-1'}>{t('migRunHow')}</div>
+                    {option('sequential', t('migRunOne'), t('migRunOneHint'))}
+                    {option('parallel', t('migRunSome'), guestBulkFill(t('migRunSomeHint'), { max: MIG_RUN_PARALLEL_MAX }),
+                        <input type="number" min="2" max={MIG_RUN_PARALLEL_MAX} value={plan.parallel} data-testid="mig-run-parallel"
+                            onChange={e => onChange({ mode: 'parallel', parallel: Math.max(2, Math.min(MIG_RUN_PARALLEL_MAX, parseInt(e.target.value, 10) || 2)) })}
+                            className={isCorporate ? '' : 'w-16 px-2 py-0.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm'}
+                            style={isCorporate ? { width: '64px' } : undefined} />)}
+                    {option('all', t('migRunAll'), t('migRunAllHint'))}
+                </div>
+            );
+        }
+
         function BulkMigrateModal({ vms, nodes, clusterId, onMigrate, onClose }) {
             const { t } = useTranslation();  // MK: Fix missing translation hook
+            const { isCorporate } = useLayout();
             const [targetNode, setTargetNode] = useState('');
             const [online, setOnline] = useState(true);
-            const [loading, setLoading] = useState(false);
+            const [localDisks, setLocalDisks] = useState(false);
+            const [plan, setPlan] = useState(() => migRunDefaultPlan(vms.length));
+            const [busy, setBusy] = useState(false);
+            const [error, setError] = useState('');
 
             // Get all unique current nodes
             const currentNodes = [...new Set(vms.map(v => v.node))];
-            const availableNodes = nodes.filter(n => !currentNodes.includes(n) || currentNodes.length > 1);
+            const availableNodes = (nodes || []).filter(n => n !== 'error' && n !== 'offline')
+                .filter(n => !currentNodes.includes(n) || currentNodes.length > 1);
 
             const handleMigrate = async () => {
-                if(!targetNode) return;
-                setLoading(true);
-                await onMigrate(vms, targetNode, online);
-                setLoading(false);
-                onClose();
+                if (!targetNode || busy) return;
+                setBusy(true);
+                setError('');
+                const res = await onMigrate({ clusterId, vms, target: targetNode, online, withLocalDisks: localDisks, ...plan });
+                setBusy(false);
+                if (res && res.ok) onClose();
+                else setError((res && res.error) || t('bulkMigrationFailed'));
             };
 
-            return(
-                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80">
-                    <div className="w-full max-w-lg bg-proxmox-card border border-proxmox-border rounded-xl p-6 animate-scale-in">
-                        <h3 className="text-lg font-semibold text-white mb-4">{t('bulkMigration')}</h3>
-                        <div className="space-y-4">
-                            <div className="p-3 bg-proxmox-dark rounded-lg max-h-48 overflow-y-auto">
-                                <div className="text-sm text-gray-400 mb-2">{vms.length} {t('vmsSelected')}:</div>
-                                <div className="space-y-1">
-                                    {vms.map(vm => (
-                                        <div key={vm.vmid} className="flex items-center gap-2 text-sm">
-                                            <span className="text-proxmox-orange font-mono">{vm.vmid}</span>
-                                            <span className="text-white">{vm.name || '-'}</span>
-                                            <span className="text-gray-500">({vm.node})</span>
-                                        </div>
-                                    ))}
+            const inputCls = isCorporate ? '' : 'w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm';
+            const labelCls = isCorporate ? 'corp-vm-section-title' : 'block text-sm text-gray-400 mb-1';
+            const boxCls = isCorporate ? 'p-2 space-y-1 overflow-y-auto' : 'p-3 bg-proxmox-dark rounded-lg space-y-1 overflow-y-auto';
+            const boxStyle = isCorporate ? { maxHeight: '180px', background: 'var(--corp-surface-2)', border: '1px solid var(--corp-border-medium)' } : { maxHeight: '180px' };
+
+            const footer = (<>
+                <button onClick={onClose} disabled={busy} className={guestBulkButton(isCorporate, 'ghost')}>{t('cancel')}</button>
+                <button onClick={handleMigrate} disabled={!targetNode || busy} data-testid="bulk-migrate-run"
+                    className={guestBulkButton(isCorporate, 'primary')}>
+                    {busy && <span className="flex animate-spin"><Icons.RotateCw /></span>}
+                    {guestBulkFill(t('migRunGo'), { count: vms.length })}
+                </button>
+            </>);
+
+            return (
+                <GuestBulkFrame testId="bulk-migrate-modal" icon={<Icons.ArrowRight />} closable={!busy} onClose={onClose}
+                    title={t('bulkMigration')} meta={`${vms.length} ${t('vmsSelected')}`} footer={footer}>
+                    <div className="space-y-4">
+                        <div className={boxCls} style={boxStyle}>
+                            {vms.map(vm => (
+                                <div key={vm.vmid} className="flex items-center gap-2 text-sm" data-guest={vm.vmid}>
+                                    <span className="font-mono text-xs text-gray-400">{vm.vmid}</span>
+                                    <span className="truncate flex-1 text-white">{vm.name || '-'}</span>
+                                    <span className="text-xs text-gray-500">{vm.node}</span>
                                 </div>
-                            </div>
-                            <div>
-                                <label className="block text-sm text-gray-400 mb-2">{t('targetNode')}</label>
-                                <select
-                                    value={targetNode}
-                                    onChange={(e) => setTargetNode(e.target.value)}
-                                    className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white"
-                                >
-                                    <option value="">{t('selectNode')}</option>
-                                    {availableNodes.map(node => (
-                                        <option key={node} value={node}>{node}</option>
-                                    ))}
-                                </select>
-                            </div>
-                            <label className="flex items-center gap-3 text-sm text-gray-300">
-                                <input
-                                    type="checkbox"
-                                    checked={online}
-                                    onChange={(e) => setOnline(e.target.checked)}
-                                    className="w-4 h-4 rounded"
-                                />
-                                {t('liveMigration')}
-                            </label>
-                            <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg text-sm text-yellow-400">
-                                {t('bulkMigrationNote') || 'Migrations will be performed sequentially. This may take some time.'}
-                            </div>
+                            ))}
                         </div>
-                        <div className="flex justify-end gap-3 mt-6">
-                            <button onClick={onClose} className="px-4 py-2 text-gray-300 hover:text-white">{t('cancel')}</button>
-                            <button
-                                onClick={handleMigrate}
-                                disabled={!targetNode || loading}
-                                className="flex items-center gap-2 px-4 py-2 bg-blue-600 rounded-lg text-white hover:bg-blue-700 disabled:opacity-50"
-                            >
-                                {loading && <Icons.RotateCw />}
-                                {vms.length} {t('migrateVms')}
-                            </button>
+                        <div>
+                            <div className={labelCls}>{t('targetNode')}</div>
+                            <select value={targetNode} onChange={(e) => setTargetNode(e.target.value)} className={inputCls} data-testid="bulk-migrate-target"
+                                style={isCorporate ? { width: '100%' } : undefined}>
+                                <option value="">{t('selectNode')}</option>
+                                {availableNodes.map(node => (
+                                    <option key={node} value={node}>{node}</option>
+                                ))}
+                            </select>
                         </div>
+                        <label className="flex items-center gap-2 text-sm text-gray-300">
+                            <input type="checkbox" checked={online} onChange={(e) => setOnline(e.target.checked)} />
+                            {t('liveMigration')}
+                        </label>
+                        <label className="flex items-center gap-2 text-sm text-gray-300">
+                            <input type="checkbox" checked={localDisks} onChange={(e) => setLocalDisks(e.target.checked)} data-testid="bulk-migrate-local" />
+                            {t('nodeGuestsLocalDisks')}
+                        </label>
+                        <MigRunPlan plan={plan} onChange={setPlan} />
+                        <div className="text-xs text-gray-400 flex items-start gap-2" data-testid="mig-run-server-note">
+                            <Icons.Info />
+                            <span>{t('migRunServerNote')}</span>
+                        </div>
+                        {error && (
+                            <div className="text-sm text-red-400 flex items-start gap-2" data-testid="bulk-migrate-error">
+                                <Icons.AlertTriangle />
+                                <span className="break-all">{error}</span>
+                            </div>
+                        )}
+                    </div>
+                </GuestBulkFrame>
+            );
+        }
+
+        // LW Oct 2026 - the bulk bar of the guest table acts through the per-guest routes the
+        // buttons of one row use, so the server still asks about each guest on its own and
+        // what it refuses is listed here guest by guest. A few requests at a time: a
+        // selection of 300 must not turn into 300 requests at once.
+        const GUEST_BULK_PARALLEL = 4;
+        const GUEST_BULK_POWER = ['start', 'shutdown', 'stop', 'reboot'];
+        const PVE_TAG_RE = /^[A-Za-z0-9_][A-Za-z0-9_+.\-]*$/;
+        const PVE_SNAPNAME_RE = /^[A-Za-z][A-Za-z0-9_\-]{0,39}$/;
+
+        const guestBulkFill = (s, vars) => String(s).replace(/\{(\w+)\}/g, (m, k) => (vars[k] != null ? vars[k] : m));
+
+        function guestBulkTags(guest) {
+            const raw = guest && guest.tags;
+            return (Array.isArray(raw) ? raw : String(raw || '').split(/[;,\s]+/))
+                .map(s => String(s).trim()).filter(Boolean);
+        }
+
+        // what Proxmox puts in an error body is JSON more often than not
+        function guestBulkError(text, fallback) {
+            if (!text) return fallback;
+            try {
+                const j = JSON.parse(String(text).replace(/\n/g, ' '));
+                const msg = j && (j.message || j.errors || j.error);
+                if (typeof msg === 'string' && msg.trim()) return msg.trim();
+                if (msg && typeof msg === 'object') return Object.entries(msg).map(([k, v]) => `${k}: ${v}`).join('; ');
+            } catch (_) { /* plain text */ }
+            return String(text).slice(0, 300);
+        }
+
+        // why a guest stays out of an action, '' when it takes part
+        function guestBulkSkip(action, guest, t) {
+            const running = guest.status === 'running';
+            if (action !== 'tags' && isGuestTemplate(guest)) return t('guestBulkSkipTemplate');
+            if (action === 'start' && running) return t('guestBulkSkipRunning');
+            if (['shutdown', 'stop', 'reboot'].includes(action) && !running) return t('guestBulkSkipStopped');
+            return '';
+        }
+
+        async function guestBulkRun(items, worker, onState) {
+            let next = 0;
+            const lane = async () => {
+                while (next < items.length) {
+                    const i = next++;
+                    onState(i, { state: 'busy' });
+                    let res;
+                    try { res = await worker(items[i]); }
+                    catch (e) { res = { state: 'failed', note: String((e && e.message) || e) }; }
+                    onState(i, res);
+                }
+            };
+            await Promise.all(Array.from({ length: Math.min(GUEST_BULK_PARALLEL, items.length) }, lane));
+        }
+
+        // the frame both bulk dialogs share, in the chrome of the layout
+        function GuestBulkFrame({ icon, title, meta, closable, onClose, footer, children, testId }) {
+            const { t } = useTranslation();
+            const { isCorporate } = useLayout();
+            if (isCorporate) {
+                return (
+                    <div className="corp-vm-modal-overlay" onClick={closable ? onClose : undefined}>
+                        <div className="corp-vm-modal" data-testid={testId} role="dialog" aria-modal="true"
+                            style={{ maxWidth: '640px', width: '100%', alignSelf: 'center', maxHeight: '90vh' }}
+                            onClick={e => e.stopPropagation()}>
+                            <div className="corp-vm-modal-header">
+                                <div className="flex items-center gap-3 min-w-0 flex-1">
+                                    <span className="flex flex-shrink-0" style={{ color: 'var(--corp-accent, #49afd9)' }}>{icon}</span>
+                                    <div className="min-w-0">
+                                        <div className="corp-vm-modal-title truncate">{title}</div>
+                                        {meta && <div className="corp-vm-modal-meta">{meta}</div>}
+                                    </div>
+                                </div>
+                                {closable && (
+                                    <div className="corp-vm-modal-actions">
+                                        <button onClick={onClose} className="corp-vm-btn corp-vm-btn-ghost" title={t('close')}><Icons.X /></button>
+                                    </div>
+                                )}
+                            </div>
+                            <div className="corp-vm-modal-body">{children}</div>
+                            <div className="corp-vm-modal-footer"><div className="flex items-center gap-2 ml-auto">{footer}</div></div>
+                        </div>
+                    </div>
+                );
+            }
+            return (
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80" onClick={closable ? onClose : undefined}>
+                    <div className="w-full max-w-lg max-h-[90vh] flex flex-col bg-proxmox-card border border-proxmox-border rounded-xl animate-scale-in"
+                        data-testid={testId} role="dialog" aria-modal="true" onClick={e => e.stopPropagation()}>
+                        <div className="flex items-center gap-3 p-5 border-b border-proxmox-border">
+                            <span className="flex flex-shrink-0 text-proxmox-orange">{icon}</span>
+                            <div className="min-w-0 flex-1">
+                                <h3 className="text-lg font-semibold text-white truncate">{title}</h3>
+                                {meta && <div className="text-xs text-gray-400">{meta}</div>}
+                            </div>
+                            {closable && <button onClick={onClose} className="p-1 text-gray-400 hover:text-white rounded" title={t('close')}><Icons.X /></button>}
+                        </div>
+                        <div className="p-5 space-y-4 overflow-y-auto">{children}</div>
+                        <div className="flex justify-end gap-3 p-4 border-t border-proxmox-border">{footer}</div>
                     </div>
                 </div>
             );
+        }
+
+        function guestBulkButton(isCorporate, kind) {
+            if (isCorporate) {
+                return kind === 'ghost' ? 'corp-vm-btn corp-vm-btn-ghost'
+                    : kind === 'danger' ? 'corp-vm-btn corp-vm-btn-danger-ghost' : 'corp-vm-btn corp-vm-btn-primary';
+            }
+            if (kind === 'ghost') return 'flex items-center gap-2 px-4 py-2 text-gray-300 hover:text-white disabled:opacity-50';
+            return `flex items-center gap-2 px-4 py-2 rounded-lg text-white disabled:opacity-50 ${kind === 'danger' ? 'bg-red-600 hover:bg-red-700' : 'bg-blue-600 hover:bg-blue-700'}`;
+        }
+
+        const GUEST_BULK_BADGE = {
+            wait: 'text-gray-400', busy: 'text-blue-400', started: 'text-green-400',
+            done: 'text-green-400', skipped: 'text-gray-400', failed: 'text-red-400',
+        };
+
+        // start, shutdown, stop, reboot, snapshot or tags on the guests picked in the table
+        function GuestBulkActionModal({ action, guests, authFetch, onClose, onFinished }) {
+            const { t } = useTranslation();
+            const { isCorporate } = useLayout();
+            const [phase, setPhase] = useState('form');
+            const [results, setResults] = useState([]);
+            const [snapname, setSnapname] = useState(`snap_${Date.now()}`);
+            const [description, setDescription] = useState('');
+            const [vmstate, setVmstate] = useState(false);
+            const [tagMode, setTagMode] = useState('add');
+            const [tagText, setTagText] = useState('');
+
+            const labels = { start: t('start'), shutdown: t('shutdown'), stop: t('forceStop'), reboot: t('reboot'), snapshot: t('snapshot'), tags: t('tags') };
+            const icons = { start: <Icons.PlayCircle />, shutdown: <Icons.Power />, stop: <Icons.XCircle />, reboot: <Icons.RefreshCw />, snapshot: <Icons.Camera />, tags: <Icons.Tag /> };
+            const left = guests.map(g => ({ g, why: guestBulkSkip(action, g, t) }));
+            const targets = left.filter(x => !x.why).map(x => x.g);
+            const skipped = left.filter(x => x.why);
+            const tagList = tagText.split(/[\s,;]+/).map(s => s.trim()).filter(Boolean);
+            const tagsBad = tagList.some(x => !PVE_TAG_RE.test(x));
+            const snapBad = !PVE_SNAPNAME_RE.test(snapname.trim());
+            const formBad = !targets.length || (action === 'snapshot' && snapBad) || (action === 'tags' && (!tagList.length || tagsBad));
+
+            const runOne = async (g) => {
+                const base = `${API_URL}/clusters/${encodeURIComponent(g._clusterId)}/vms/${encodeURIComponent(g.node)}/${g.type}/${g.vmid}`;
+                const json = (method, body) => ({ method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+                let res;
+                if (GUEST_BULK_POWER.includes(action)) {
+                    // stop is the force stop of a single row, the same body
+                    res = await authFetch(`${base}/${action}`, action === 'stop' ? json('POST', { force: true }) : { method: 'POST' });
+                } else if (action === 'snapshot') {
+                    res = await authFetch(`${base}/snapshots`, json('POST', {
+                        snapname: snapname.trim(), description,
+                        vmstate: !!(vmstate && g.type === 'qemu' && g.status === 'running'),
+                    }));
+                } else {
+                    const have = guestBulkTags(g);
+                    const same = (a, b) => a.toLowerCase() === b.toLowerCase();
+                    const next = tagMode === 'add'
+                        ? have.concat(tagList.filter((x, i) => !have.some(h => same(h, x)) && tagList.findIndex(y => same(y, x)) === i))
+                        : have.filter(h => !tagList.some(x => same(h, x)));
+                    if (next.length === have.length && next.every((x, i) => x === have[i])) return { state: 'skipped', note: t('guestBulkTagsUnchanged') };
+                    res = await authFetch(`${base}/config`, json('PUT', next.length ? { tags: next.join(';') } : { delete: 'tags' }));
+                }
+                if (!res) return { state: 'failed', note: t('connectionError') };
+                if (res.ok) return { state: action === 'tags' ? 'done' : 'started' };
+                const body = await res.json().catch(() => null);
+                return { state: 'failed', note: guestBulkError(body && body.error, `${t('actionFailed')} (HTTP ${res.status})`) };
+            };
+
+            const run = async () => {
+                setPhase('run');
+                setResults(targets.map(() => ({ state: 'wait' })));
+                await guestBulkRun(targets, runOne, (i, r) => setResults(prev => { const n = prev.slice(); n[i] = r; return n; }));
+                setPhase('done');
+                if (onFinished) onFinished();
+            };
+
+            const stateText = (r) => r.state === 'busy' ? t('guestBulkBusy') : r.state === 'started' ? t('guestBulkStarted')
+                : r.state === 'done' ? t('guestBulkDone') : r.state === 'skipped' ? t('guestBulkLeftOut')
+                : r.state === 'failed' ? t('failed') : t('guestBulkWaiting');
+            const failed = results.filter(r => r.state === 'failed').length;
+            const ok = results.filter(r => r.state === 'started' || r.state === 'done').length;
+            const inputCls = isCorporate ? '' : 'w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm';
+            const labelCls = isCorporate ? 'corp-vm-section-title' : 'block text-sm text-gray-400 mb-1';
+            const boxCls = isCorporate ? 'p-2 space-y-1 overflow-y-auto' : 'p-3 bg-proxmox-dark rounded-lg space-y-1 overflow-y-auto';
+            const boxStyle = isCorporate ? { maxHeight: '240px', background: 'var(--corp-surface-2)', border: '1px solid var(--corp-border-medium)' } : { maxHeight: '240px' };
+
+            const guestRow = (g, right, note, key) => (
+                <div key={key} className="text-sm" data-guest={g.vmid}>
+                    <div className="flex items-center gap-2">
+                        <span className="font-mono text-xs text-gray-400">{g.vmid}</span>
+                        <span className="truncate flex-1 text-white">{g.name || '-'}</span>
+                        <span className="text-xs text-gray-500 truncate">{g.node}</span>
+                        {right}
+                    </div>
+                    {note && <div className="text-xs text-red-400 pl-10 break-all">{note}</div>}
+                </div>
+            );
+
+            const footer = phase === 'form' ? (<>
+                <button onClick={onClose} className={guestBulkButton(isCorporate, 'ghost')}>{t('cancel')}</button>
+                <button onClick={run} disabled={formBad} data-testid="guest-bulk-run"
+                    className={guestBulkButton(isCorporate, action === 'stop' ? 'danger' : 'primary')}>
+                    {guestBulkFill(t('guestBulkRun'), { count: targets.length })}
+                </button>
+            </>) : (
+                <button onClick={onClose} disabled={phase === 'run'} data-testid="guest-bulk-close" className={guestBulkButton(isCorporate, 'ghost')}>
+                    {phase === 'run' && <span className="flex animate-spin"><Icons.RotateCw /></span>}
+                    {t('close')}
+                </button>
+            );
+
+            return (
+                <GuestBulkFrame testId="guest-bulk-modal" icon={icons[action]} closable={phase !== 'run'} onClose={onClose} footer={footer}
+                    title={guestBulkFill(t('guestBulkTitle'), { action: labels[action], count: guests.length })}
+                    meta={phase === 'done' ? guestBulkFill(t('guestBulkSummary'), { ok, failed, total: results.length }) : null}>
+                    <div className="space-y-4">
+                        {phase === 'form' && action === 'stop' && (
+                            <div className={isCorporate ? 'text-[13px] flex items-start gap-2' : 'p-3 bg-red-500/10 border border-red-500/30 rounded-lg text-sm text-red-400 flex items-start gap-2'}
+                                style={isCorporate ? { color: '#f54f47' } : undefined}>
+                                <Icons.AlertTriangle />
+                                <span>{t('guestBulkStopWarning')}</span>
+                            </div>
+                        )}
+                        {phase === 'form' && action === 'snapshot' && (<>
+                            <div>
+                                <label className={labelCls}>{t('name')}</label>
+                                <input type="text" value={snapname} onChange={e => setSnapname(e.target.value)} className={inputCls} data-testid="guest-bulk-snapname" />
+                                {snapBad && <div className="text-xs mt-1 text-yellow-400">{t('guestBulkSnapnameRule')}</div>}
+                            </div>
+                            <div>
+                                <label className={labelCls}>{t('description')} ({t('optional')})</label>
+                                <input type="text" value={description} onChange={e => setDescription(e.target.value)} className={inputCls} placeholder={t('snapshotDescription')} />
+                            </div>
+                            <label className="flex items-start gap-2 text-sm text-gray-300">
+                                <input type="checkbox" checked={vmstate} onChange={e => setVmstate(e.target.checked)} className="mt-0.5" data-testid="guest-bulk-vmstate" />
+                                <span>{t('saveRamState')}<span className="block text-xs text-gray-500">{t('guestBulkRamNote')}</span></span>
+                            </label>
+                        </>)}
+                        {phase === 'form' && action === 'tags' && (<>
+                            <div className="flex gap-2">
+                                {['add', 'remove'].map(m => (
+                                    <button key={m} onClick={() => setTagMode(m)} data-testid={`guest-bulk-tags-${m}`}
+                                        className={isCorporate
+                                            ? `corp-vm-btn ${tagMode === m ? 'corp-vm-btn-primary' : 'corp-vm-btn-ghost'}`
+                                            : `px-3 py-1.5 rounded-lg text-sm border ${tagMode === m ? 'bg-blue-600/20 border-blue-500 text-blue-400' : 'bg-proxmox-dark border-proxmox-border text-gray-400'}`}>
+                                        {m === 'add' ? t('guestBulkTagsAdd') : t('guestBulkTagsRemove')}
+                                    </button>
+                                ))}
+                            </div>
+                            <div>
+                                <label className={labelCls}>{t('guestBulkTagsLabel')}</label>
+                                <input type="text" value={tagText} onChange={e => setTagText(e.target.value)} className={inputCls} data-testid="guest-bulk-tagtext" placeholder="prod web" />
+                                {tagsBad && <div className="text-xs mt-1 text-yellow-400">{t('guestBulkTagsRule')}</div>}
+                            </div>
+                        </>)}
+                        {phase === 'form' ? (<>
+                            <div className={boxCls} style={boxStyle}>
+                                {targets.length === 0
+                                    ? <div className="text-sm text-gray-400">{t('guestBulkNothing')}</div>
+                                    : targets.map(g => guestRow(g, null, null, `t-${g._clusterId}-${g.vmid}`))}
+                            </div>
+                            {skipped.length > 0 && (
+                                <div>
+                                    <div className={labelCls}>{guestBulkFill(t('guestBulkSkipped'), { count: skipped.length })}</div>
+                                    <div className={boxCls} style={boxStyle} data-testid="guest-bulk-skipped">
+                                        {skipped.map(({ g, why }) => guestRow(g, <span className="text-xs text-gray-400">{why}</span>, null, `s-${g._clusterId}-${g.vmid}`))}
+                                    </div>
+                                </div>
+                            )}
+                        </>) : (
+                            <div className={boxCls} style={{ ...boxStyle, maxHeight: '360px' }} data-testid="guest-bulk-results">
+                                {targets.map((g, i) => {
+                                    const r = results[i] || { state: 'wait' };
+                                    return guestRow(g, <span className={`text-xs ${GUEST_BULK_BADGE[r.state] || ''}`} data-state={r.state}>{stateText(r)}{r.state === 'skipped' && r.note ? ` (${r.note})` : ''}</span>,
+                                        r.state === 'failed' ? r.note : null, `r-${g._clusterId}-${g.vmid}`);
+                                })}
+                            </div>
+                        )}
+                    </div>
+                </GuestBulkFrame>
+            );
+        }
+
+        // start or shut down all guests of one node, through the node endpoints of Proxmox
+        // (one task there instead of one request per guest here). Migrating them all is a
+        // bulk run on the server like the one of the table (#952): one guest after another
+        // and followed per guest, where Proxmox' migrateall hands an HA guest on and goes on
+        function NodeGuestsModal({ action, clusterId, node, guests, nodes, authFetch, onClose, onDone, onBulkMigrate }) {
+            const { t } = useTranslation();
+            const { isCorporate } = useLayout();
+            const fits = (g) => action === 'startall' ? (!isGuestTemplate(g) && g.status !== 'running')
+                : action === 'stopall' ? g.status === 'running' : true;
+            const eligible = (guests || []).filter(fits).sort((a, b) => a.vmid - b.vmid);
+            const targets = (nodes || []).filter(n => n.name !== node && n.online);
+            const [picked, setPicked] = useState(() => new Set(eligible.map(g => g.vmid)));
+            const [target, setTarget] = useState(targets[0] ? targets[0].name : '');
+            const [plan, setPlan] = useState(() => migRunDefaultPlan(eligible.length));
+            const [localDisks, setLocalDisks] = useState(false);
+            const [busy, setBusy] = useState(false);
+            const [error, setError] = useState('');
+            const [result, setResult] = useState(null);
+
+            const titleKey = { startall: 'nodeGuestsTitleStart', stopall: 'nodeGuestsTitleStop', migrateall: 'nodeGuestsTitleMigrate' }[action];
+            const icon = action === 'startall' ? <Icons.PlayCircle /> : action === 'stopall' ? <Icons.Power /> : <Icons.ArrowRight />;
+            const chosen = eligible.filter(g => picked.has(g.vmid)).map(g => g.vmid);
+            const allOn = eligible.length > 0 && chosen.length === eligible.length;
+            const toggle = (vmid) => setPicked(prev => { const n = new Set(prev); if (n.has(vmid)) n.delete(vmid); else n.add(vmid); return n; });
+
+            const run = async () => {
+                setBusy(true);
+                setError('');
+                if (action === 'migrateall') {
+                    const res = await onBulkMigrate({ clusterId, vms: eligible.filter(g => picked.has(g.vmid)), target,
+                        online: true, withLocalDisks: localDisks, ...plan });
+                    setBusy(false);
+                    if (res && res.ok) onClose();
+                    else setError((res && res.error) || t('actionFailed'));
+                    return;
+                }
+                const body = { vms: chosen };
+                const res = await authFetch(`${API_URL}/clusters/${encodeURIComponent(clusterId)}/nodes/${encodeURIComponent(node)}/guests/${action}`,
+                    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+                setBusy(false);
+                if (res && res.ok) {
+                    const data = await res.json().catch(() => ({}));
+                    setResult(data);
+                    if (onDone) onDone(data);
+                } else {
+                    setError(res ? await PegaProxApiErrors.message(res, t('actionFailed')) : t('connectionError'));
+                }
+            };
+
+            const inputCls = isCorporate ? '' : 'w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm';
+            const labelCls = isCorporate ? 'corp-vm-section-title' : 'block text-sm text-gray-400 mb-1';
+            const boxCls = isCorporate ? 'p-2 space-y-1 overflow-y-auto' : 'p-3 bg-proxmox-dark rounded-lg space-y-1 overflow-y-auto';
+            const boxStyle = isCorporate ? { maxHeight: '260px', background: 'var(--corp-surface-2)', border: '1px solid var(--corp-border-medium)' } : { maxHeight: '260px' };
+            const formBad = busy || !chosen.length || (action === 'migrateall' && !target);
+
+            const footer = result ? (
+                <button onClick={onClose} className={guestBulkButton(isCorporate, 'ghost')} data-testid="node-guests-close">{t('close')}</button>
+            ) : (<>
+                <button onClick={onClose} className={guestBulkButton(isCorporate, 'ghost')}>{t('cancel')}</button>
+                <button onClick={run} disabled={formBad} data-testid="node-guests-run"
+                    className={guestBulkButton(isCorporate, action === 'stopall' ? 'danger' : 'primary')}>
+                    {busy && <span className="flex animate-spin"><Icons.RotateCw /></span>}
+                    {guestBulkFill(t('guestBulkRun'), { count: chosen.length })}
+                </button>
+            </>);
+
+            return (
+                <GuestBulkFrame testId="node-guests-modal" icon={icon} closable={!busy} onClose={onClose} footer={footer}
+                    title={guestBulkFill(t(titleKey), { node })}>
+                    {result ? (
+                        <div className="space-y-3" data-testid="node-guests-result">
+                            <div className="flex items-start gap-2 text-sm text-green-400">
+                                <Icons.CheckCircle />
+                                <span>{guestBulkFill(t('nodeGuestsTaskStarted'), { node, count: (result.vms || []).length })}</span>
+                            </div>
+                            {(result.skipped || []).length > 0 && (
+                                <div>
+                                    <div className={labelCls}>{guestBulkFill(t('guestBulkSkipped'), { count: result.skipped.length })}</div>
+                                    <div className={boxCls} style={boxStyle}>
+                                        {result.skipped.map(s => (
+                                            <div key={s.vmid} className="flex items-center gap-2 text-sm">
+                                                <span className="font-mono text-xs text-gray-400">{s.vmid}</span>
+                                                <span className="flex-1 text-xs text-gray-400">{s.reason}</span>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    ) : (
+                        <div className="space-y-4">
+                            {action === 'startall' && <div className="text-sm text-gray-400">{t('nodeGuestsStartNote')}</div>}
+                            {action === 'stopall' && <div className="text-sm text-gray-400">{t('nodeGuestsStopNote')}</div>}
+                            {action === 'migrateall' && (<>
+                                <div>
+                                    <label className={labelCls}>{t('targetNode')}</label>
+                                    <select value={target} onChange={e => setTarget(e.target.value)} className={inputCls} data-testid="node-guests-target">
+                                        {targets.length === 0 && <option value="">-</option>}
+                                        {targets.map(n => <option key={n.name} value={n.name}>{n.name}</option>)}
+                                    </select>
+                                </div>
+                                <label className="flex items-center gap-2 text-sm text-gray-300">
+                                    <input type="checkbox" checked={localDisks} onChange={e => setLocalDisks(e.target.checked)} />
+                                    {t('nodeGuestsLocalDisks')}
+                                </label>
+                                <MigRunPlan plan={plan} onChange={setPlan} />
+                                <div className="text-xs text-gray-400 flex items-start gap-2">
+                                    <Icons.Info />
+                                    <span>{t('migRunServerNote')}</span>
+                                </div>
+                            </>)}
+                            {eligible.length === 0 ? (
+                                <div className="text-sm text-gray-400">{t('nodeGuestsNone')}</div>
+                            ) : (
+                                <div>
+                                    <label className="flex items-center gap-2 text-sm text-gray-300 mb-2">
+                                        <input type="checkbox" checked={allOn} data-testid="node-guests-all"
+                                            onChange={() => setPicked(allOn ? new Set() : new Set(eligible.map(g => g.vmid)))} />
+                                        {guestBulkFill(t('nodeGuestsPicked'), { count: chosen.length, total: eligible.length })}
+                                    </label>
+                                    <div className={boxCls} style={boxStyle}>
+                                        {eligible.map(g => (
+                                            <label key={g.vmid} className="flex items-center gap-2 text-sm cursor-pointer" data-guest={g.vmid}>
+                                                <input type="checkbox" checked={picked.has(g.vmid)} onChange={() => toggle(g.vmid)} />
+                                                <span className="font-mono text-xs text-gray-400">{g.vmid}</span>
+                                                <span className="truncate flex-1 text-white">{g.name || '-'}</span>
+                                                <span className="text-xs text-gray-500">{g.type === 'lxc' ? 'CT' : 'VM'}</span>
+                                            </label>
+                                        ))}
+                                    </div>
+                                </div>
+                            )}
+                            {error && (
+                                <div className="text-sm text-red-400 flex items-start gap-2" data-testid="node-guests-error">
+                                    <Icons.AlertTriangle />
+                                    <span className="break-all">{error}</span>
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </GuestBulkFrame>
+            );
+        }
+
+        // LW Oct 2026 (#952) - the bulk migrations of the signed-in user, wherever they are
+        // in the app: a card per run in the stack of the toasts and its progress on a
+        // click. A run is the server's, so the list is back after a reload; it is read a
+        // few seconds apart while one of them runs and not at all otherwise
+        const MIG_RUN_LIST_MS = 4000;
+        const MIG_RUN_DETAIL_MS = 2500;
+        const MIG_RUN_DISMISSED = 'pegaprox-bulk-runs-dismissed';
+        const MIG_RUN_BADGE = { ...GUEST_BULK_BADGE, migrating: 'text-blue-400', cancelled: 'text-gray-400', unknown: 'text-yellow-400' };
+
+        const migRunCounts = (r) => {
+            const c = r.counts || {};
+            const open = (c.wait || 0) + (c.migrating || 0);
+            return { ok: (c.done || 0) + (c.started || 0), failed: c.failed || 0, total: r.total || 0, over: (r.total || 0) - open };
+        };
+
+        function BulkMigrateProgress({ runId, authFetch, canAct, onClose, onChanged }) {
+            const { t } = useTranslation();
+            const { isCorporate } = useLayout();
+            const [run, setRun] = useState(null);
+            const [gone, setGone] = useState(false);
+            const [asking, setAsking] = useState(false);
+            const [busy, setBusy] = useState(false);
+            const [error, setError] = useState('');
+
+            // an answer for the run shown before (another card clicked meanwhile) is dropped
+            const shown = useRef(runId);
+            shown.current = runId;
+
+            const load = useCallback(async () => {
+                try {
+                    const res = await authFetch(`${API_URL}/bulk-migrations/${encodeURIComponent(runId)}`);
+                    if (shown.current !== runId) return;
+                    if (res && res.status === 404) { setGone(true); return; }
+                    if (res && res.ok) {
+                        const data = await res.json();
+                        if (shown.current !== runId) return;
+                        setRun(data.run);
+                        setGone(false);
+                    }
+                } catch (e) { /* the next look tries again */ }
+            }, [authFetch, runId]);
+
+            useEffect(() => { setRun(null); setGone(false); setAsking(false); load(); }, [load]);
+            const running = !!run && run.state === 'running';
+            useEffect(() => {
+                if (!running) return undefined;
+                const id = setInterval(load, MIG_RUN_DETAIL_MS);
+                return () => clearInterval(id);
+            }, [running, load]);
+
+            const cancel = async () => {
+                setBusy(true);
+                setError('');
+                const res = await authFetch(`${API_URL}/bulk-migrations/${encodeURIComponent(runId)}/cancel`, { method: 'POST' });
+                setBusy(false);
+                setAsking(false);
+                if (res && res.ok) {
+                    const data = await res.json().catch(() => ({}));
+                    if (data.run && shown.current === runId) setRun(data.run);
+                    if (onChanged) onChanged();
+                } else {
+                    setError(res ? await PegaProxApiErrors.message(res, t('actionFailed')) : t('connectionError'));
+                }
+            };
+
+            const stateText = (s) => ({
+                wait: t('guestBulkWaiting'), migrating: t('migRunMoving'), done: t('guestBulkDone'),
+                started: t('guestBulkStarted'), failed: t('failed'), skipped: t('guestBulkLeftOut'),
+                cancelled: t('migRunNotStarted'), unknown: t('migRunUnknown'),
+            })[s] || s;
+            const runText = (s) => ({ running: t('migRunStateRunning'), done: t('migRunStateDone'),
+                cancelled: t('migRunStateCancelled'), stopped: t('migRunStateStopped') })[s] || s;
+            const how = !run ? '' : run.mode === 'sequential' ? t('migRunOne')
+                : run.mode === 'parallel' ? `${t('migRunSome')} (${run.parallel})` : t('migRunAll');
+            const n = run ? migRunCounts(run) : null;
+            const boxCls = isCorporate ? 'p-2 space-y-1 overflow-y-auto' : 'p-3 bg-proxmox-dark rounded-lg space-y-1 overflow-y-auto';
+            const boxStyle = isCorporate ? { maxHeight: '360px', background: 'var(--corp-surface-2)', border: '1px solid var(--corp-border-medium)' } : { maxHeight: '360px' };
+
+            const footer = (<>
+                {running && run.may_cancel && canAct && (asking ? (<>
+                    <button onClick={() => setAsking(false)} disabled={busy} className={guestBulkButton(isCorporate, 'ghost')}>{t('migRunKeep')}</button>
+                    <button onClick={cancel} disabled={busy} data-testid="mig-run-cancel-yes" className={guestBulkButton(isCorporate, 'danger')}>
+                        {busy && <span className="flex animate-spin"><Icons.RotateCw /></span>}
+                        {t('migRunCancelYes')}
+                    </button>
+                </>) : (
+                    <button onClick={() => setAsking(true)} data-testid="mig-run-cancel" className={guestBulkButton(isCorporate, 'danger')}>{t('migRunCancel')}</button>
+                ))}
+                <button onClick={onClose} data-testid="mig-run-close" className={guestBulkButton(isCorporate, 'ghost')}>{t('close')}</button>
+            </>);
+
+            return (
+                <GuestBulkFrame testId="mig-run-modal" icon={<Icons.ArrowRight />} closable onClose={onClose} footer={footer}
+                    title={run ? guestBulkFill(t('migRunTitle'), { target: run.target }) : t('bulkMigration')}
+                    meta={run ? `${runText(run.state)} - ${how} - ${guestBulkFill(t('guestBulkSummary'), n)}` : null}>
+                    <div className="space-y-4">
+                        {gone && (
+                            <div className="text-sm text-yellow-400 flex items-start gap-2" data-testid="mig-run-gone">
+                                <Icons.AlertTriangle />
+                                <span>{t('migRunGone')}</span>
+                            </div>
+                        )}
+                        {run && (<>
+                            {running && (
+                                <div className="h-1.5 rounded-full bg-proxmox-dark overflow-hidden">
+                                    <div className="h-full bg-blue-500" style={{ width: `${n.total ? Math.round(n.over * 100 / n.total) : 0}%` }} />
+                                </div>
+                            )}
+                            {asking && <div className="text-sm text-yellow-400" data-testid="mig-run-cancel-ask">{t('migRunCancelAsk')}</div>}
+                            {run.cancelled_by && <div className="text-sm text-gray-400">{guestBulkFill(t('migRunCancelledBy'), { user: run.cancelled_by })}</div>}
+                            {run.state === 'stopped' && run.reason && (
+                                <div className="text-sm text-yellow-400 flex items-start gap-2"><Icons.AlertTriangle /><span>{run.reason}</span></div>
+                            )}
+                            <div className={boxCls} style={boxStyle} data-testid="mig-run-rows">
+                                {(run.rows || []).map(r => (
+                                    <div key={r.vmid} className="text-sm" data-guest={r.vmid}>
+                                        <div className="flex items-center gap-2">
+                                            <span className="font-mono text-xs text-gray-400">{r.vmid}</span>
+                                            <span className="truncate flex-1 text-white">{r.name || '-'}</span>
+                                            <span className="text-xs text-gray-500 truncate">{r.node}{r.to && r.to !== r.node ? ` > ${r.to}` : ''}</span>
+                                            <span className={`text-xs ${MIG_RUN_BADGE[r.state] || ''}`} data-state={r.state}>
+                                                {r.state === 'migrating' && <span className="inline-flex animate-spin mr-1"><Icons.RotateCw /></span>}
+                                                {stateText(r.state)}
+                                            </span>
+                                        </div>
+                                        {r.note && <div className={`text-xs pl-10 break-all ${r.state === 'failed' ? 'text-red-400' : 'text-gray-500'}`}>{r.note}</div>}
+                                    </div>
+                                ))}
+                            </div>
+                            {run.mode === 'all' && <div className="text-xs text-gray-400">{t('migRunAllHint')}</div>}
+                        </>)}
+                        {!run && !gone && <div className="text-sm text-gray-400">{t('loading')}</div>}
+                        <div className="text-xs text-gray-400 flex items-start gap-2" data-testid="mig-run-server-note">
+                            <Icons.Info />
+                            <span>{t('migRunServerNote')}</span>
+                        </div>
+                        {error && (
+                            <div className="text-sm text-red-400 flex items-start gap-2" data-testid="mig-run-error">
+                                <Icons.AlertTriangle />
+                                <span className="break-all">{error}</span>
+                            </div>
+                        )}
+                    </div>
+                </GuestBulkFrame>
+            );
+        }
+
+        function BulkMigrateRuns({ authFetch, openId, onOpen, tick, canAct, onSettled }) {
+            const { t } = useTranslation();
+            const { isCorporate } = useLayout();
+            const [runs, setRuns] = useState([]);
+            const [lost, setLost] = useState({});
+            const [dismissed, setDismissed] = useState(() => {
+                try { return JSON.parse(localStorage.getItem(MIG_RUN_DISMISSED) || '[]') || []; } catch (e) { return []; }
+            });
+            const known = useRef({});
+            // the dashboard hands a new function every render; the list is read on its own beat
+            const settled = useRef(onSettled);
+            settled.current = onSettled;
+            // a look that was asked before the one already shown answers late: it would not
+            // know a run started in between and call it gone
+            const asked = useRef(0);
+            const shownLook = useRef(0);
+
+            const load = useCallback(async () => {
+                const look = ++asked.current;
+                try {
+                    const res = await authFetch(`${API_URL}/bulk-migrations`);
+                    if (!res || !res.ok) return;
+                    const data = await res.json();
+                    if (look < shownLook.current) return;
+                    shownLook.current = look;
+                    const mine = (data.runs || []).filter(r => r.mine);
+                    const ids = new Set(mine.map(r => r.id));
+                    // running at the last look and not listed now: gone with the process that ran it
+                    const gone = Object.values(known.current).filter(r => r.state === 'running' && !ids.has(r.id));
+                    if (gone.length) setLost(prev => { const next = { ...prev }; gone.forEach(r => { next[r.id] = { ...r, state: 'lost' }; }); return next; });
+                    mine.forEach(r => {
+                        const was = known.current[r.id];
+                        if (was && was.state === 'running' && r.state !== 'running' && settled.current) settled.current(r.cluster_id);
+                    });
+                    known.current = Object.fromEntries(mine.map(r => [r.id, r]));
+                    setRuns(mine);
+                } catch (e) { /* the next look tries again */ }
+            }, [authFetch]);
+
+            useEffect(() => { load(); }, [load, tick]);
+            const anyRunning = runs.some(r => r.state === 'running');
+            useEffect(() => {
+                if (!anyRunning) return undefined;
+                const id = setInterval(load, MIG_RUN_LIST_MS);
+                return () => clearInterval(id);
+            }, [anyRunning, load]);
+
+            const dismiss = (id) => {
+                const next = dismissed.filter(x => x !== id).concat(id).slice(-100);
+                setDismissed(next);
+                setLost(prev => { const n = { ...prev }; delete n[id]; return n; });
+                try { localStorage.setItem(MIG_RUN_DISMISSED, JSON.stringify(next)); } catch (e) { /* only this view forgets it */ }
+            };
+
+            const cards = runs.concat(Object.values(lost)).filter(r => r.state === 'running' || !dismissed.includes(r.id));
+            const cardStyle = isCorporate ? { width: '300px', background: 'var(--corp-surface, #1c2733)', border: '1px solid var(--corp-border, #29414e)', color: 'var(--corp-text, #e9ecef)' } : { width: '300px' };
+
+            return (<>
+                {cards.map(r => {
+                    const n = migRunCounts(r);
+                    const title = r.state === 'running' ? t('migRunTray') : r.state === 'lost' ? t('migRunTrayLost') : t('migRunTrayDone');
+                    return (
+                        <div key={r.id} role="button" tabIndex={0} data-testid="mig-run-card" data-run={r.id} data-state={r.state}
+                            onClick={() => onOpen(r.id)} onKeyDown={e => { if (e.key === 'Enter') onOpen(r.id); }}
+                            className={`flex items-start gap-3 px-4 py-3 rounded-lg border shadow-lg cursor-pointer ${isCorporate ? '' : 'bg-proxmox-card border-proxmox-border'}`}
+                            style={cardStyle}>
+                            <span className={`flex flex-shrink-0 mt-0.5 ${r.state === 'running' ? 'animate-spin text-blue-400' : n.failed || r.state === 'lost' ? 'text-yellow-400' : 'text-green-400'}`}>
+                                {r.state === 'running' ? <Icons.RotateCw /> : n.failed || r.state === 'lost' ? <Icons.AlertTriangle /> : <Icons.CheckCircle />}
+                            </span>
+                            <div className="min-w-0 flex-1">
+                                <div className="text-sm font-medium text-white">{guestBulkFill(title, { target: r.target })}</div>
+                                <div className="text-xs text-gray-400">{guestBulkFill(t('guestBulkSummary'), n)}</div>
+                                {r.state === 'running' && (
+                                    <div className="h-1 mt-2 rounded-full bg-proxmox-dark overflow-hidden">
+                                        <div className="h-full bg-blue-500" style={{ width: `${n.total ? Math.round(n.over * 100 / n.total) : 0}%` }} />
+                                    </div>
+                                )}
+                            </div>
+                            {r.state !== 'running' && (
+                                <button onClick={e => { e.stopPropagation(); dismiss(r.id); }} title={t('migRunDismiss')} data-testid="mig-run-dismiss"
+                                    className="p-1 text-gray-400 hover:text-white rounded flex-shrink-0"><Icons.X /></button>
+                            )}
+                        </div>
+                    );
+                })}
+                {openId && (
+                    <BulkMigrateProgress runId={openId} authFetch={authFetch} canAct={canAct}
+                        onClose={() => onOpen(null)} onChanged={load} />
+                )}
+            </>);
         }
 
         // Cross-Cluster Migration Modal
@@ -3938,6 +4789,9 @@
         // primitive, so this drives the new /api/multi-sdn/* orchestration layer.
         function MultiClusterEvpnView({ clusters = [], authFetch, API_URL, addToast, canAdminSettings = false, canManage = false }) {
             const { t } = useTranslation();
+            // the auto-reconcile switch saves through /settings/server, which no standby
+            // carries out, forwarding or not (#625)
+            const { haStandby } = useAuth();
             const [vnets, setVnets] = useState([]);
             const [loading, setLoading] = useState(false);
             const [expanded, setExpanded] = useState(null);
@@ -4128,7 +4982,7 @@
                             <p className="text-xs text-gray-500 mt-0.5">{t('mcevpnSubtitle') || 'One logical EVPN vNet spanning several clusters that share a BGP ASN. The physical BGP-EVPN underlay must already peer.'}</p>
                         </div>
                         <div className="flex items-center gap-2">
-                            {canAdminSettings && (
+                            {canAdminSettings && !haStandby && (
                                 <button onClick={() => saveAutoReconcile(!autoReconcile)} title={t('mcevpnAutoReconcileHint') || 'When on, the drift scanner re-pushes the desired config to drifted members automatically (cluster-wide SDN apply). Off = detect-only.'} className={`px-2.5 py-1.5 rounded-lg text-xs border flex items-center gap-1.5 ${autoReconcile ? 'bg-amber-500/20 text-amber-300 border-amber-500/40' : 'bg-proxmox-dark text-gray-400 border-proxmox-border hover:text-white'}`}><Icons.RefreshCw className="w-3.5 h-3.5" />{t('mcevpnAutoReconcile') || 'Auto-reconcile'}: {autoReconcile ? (t('enabled') || 'on') : (t('disabled') || 'off')}</button>
                             )}
                             <button onClick={load} className="px-2.5 py-1.5 rounded-lg text-xs bg-proxmox-dark border border-proxmox-border text-gray-300 hover:text-white flex items-center gap-1.5"><Icons.RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />{t('refresh') || 'Refresh'}</button>
@@ -5111,10 +5965,573 @@
             );
         }
 
+        // LW Oct 2026 - every storage of every cluster in one table, fullest first. The server reads
+        // each cluster once (GET /api/storage-overview, shared with the health check), and only
+        // while the panel is open. Nothing here acts, so a standby shows it as it is.
+        function StorageOverview({ clusters }) {
+            const { t } = useTranslation();
+            const { getAuthHeaders, user, isAdmin, haReadOnly } = useAuth();
+            const { isCorporate } = useLayout();
+            const ROWS = 50;
+            const store = (key, value) => { try { localStorage.setItem(key, value); } catch (e) {} };
+            const recall = (key, fallback) => { try { const v = localStorage.getItem(key); return v === null ? fallback : v; } catch (e) { return fallback; } };
+            const [data, setData] = useState(null);
+            const [loading, setLoading] = useState(false);
+            const [query, setQuery] = useState('');
+            const [limit, setLimit] = useState(() => recall('pegaprox-storage-overview-threshold', '85'));
+            const [overOnly, setOverOnly] = useState(false);
+            const [open, setOpen] = useState(() => recall('pegaprox-storage-overview-open', '1') !== '0');
+            const [showAll, setShowAll] = useState(false);
+            const [sort, setSort] = useState({ by: 'percent', dir: 'desc' });
+            const seq = useRef(0);
+            const allowed = (!haReadOnly || haReadPermission('storage.view')) &&
+                (isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes('storage.view')));
+            const clusterKey = clusters.map(c => c.id).join(',');
+
+            const load = async () => {
+                const mine = ++seq.current;
+                setLoading(true);
+                try {
+                    const r = await fetch(`${API_URL}/storage-overview`, { headers: getAuthHeaders() });
+                    if (mine !== seq.current) return;  // a newer read is on its way
+                    if (r.ok) setData(await r.json());
+                    else if (r.status === 403) setData({ denied: true });
+                    else setData(prev => prev || { failed: true });  // what was read stays shown
+                } catch (e) {
+                    console.error('storage overview:', e);
+                    if (mine === seq.current) setData(prev => prev || { failed: true });
+                } finally {
+                    if (mine === seq.current) setLoading(false);
+                }
+            };
+            useEffect(() => {
+                if (!allowed || !clusterKey || !open) return;
+                load();
+                // the server keeps a read for 30 s; a page left open looks again now and then
+                const timer = setInterval(load, 120000);
+                return () => clearInterval(timer);
+            }, [allowed, clusterKey, open]);
+
+            if (!allowed || !clusterKey || (data && data.denied)) return null;
+
+            const parsed = parseInt(limit, 10);
+            const threshold = parsed >= 1 && parsed <= 100 ? parsed : 85;
+            const label = (s) => {
+                const c = clusters.find(x => x.id === s.cluster_id);
+                return (c && (c.display_name || c.name)) || s.cluster_name;
+            };
+            const all = (data && data.storages) || [];
+            const isOver = (s) => s.active && s.percent != null && s.percent >= threshold;
+            const over = all.filter(isOver).length;
+            const q = query.trim().toLowerCase();
+            const rows = all.filter(s => !overOnly || isOver(s))
+                .filter(s => !q || `${label(s)} ${s.node} ${s.storage} ${s.type} ${s.content}`.toLowerCase().includes(q));
+            const keyOf = {
+                cluster: s => label(s).toLowerCase(), node: s => (s.shared ? '' : s.node || '').toLowerCase(),
+                storage: s => (s.storage || '').toLowerCase(), type: s => s.type || '', shared: s => s.shared ? 1 : 0,
+                used: s => s.used ?? -1, total: s => s.total ?? -1, percent: s => s.percent ?? -1, status: s => s.active ? 1 : 0,
+            };
+            const pick = keyOf[sort.by] || keyOf.percent;
+            const sorted = [...rows].sort((a, b) => {
+                const x = pick(a), y = pick(b);
+                const c = typeof x === 'string' ? x.localeCompare(y) : x - y;
+                return (sort.dir === 'asc' ? c : -c) || label(a).localeCompare(label(b)) || (a.storage || '').localeCompare(b.storage || '');
+            });
+            const shown = showAll ? sorted : sorted.slice(0, ROWS);
+            const unlisted = ((data && data.clusters) || []).filter(c => c.state !== 'ok');
+            const stateText = { offline: t('allStorageOffline'), unreadable: t('allStorageUnreadable'), confined: t('allStorageConfined') };
+            const toggle = () => { store('pegaprox-storage-overview-open', open ? '0' : '1'); setOpen(!open); };
+            // text sorts A to Z first, figures the largest first
+            const sortOn = (by) => setSort(s => s.by === by
+                ? { by, dir: s.dir === 'asc' ? 'desc' : 'asc' }
+                : { by, dir: ['cluster', 'node', 'storage', 'type'].includes(by) ? 'asc' : 'desc' });
+            const level = (s) => !s.active || s.percent == null ? 'none' : s.percent >= threshold ? 'over' : s.percent >= threshold - 10 ? 'near' : 'ok';
+            const columns = [
+                { by: 'cluster', label: t('cluster') }, { by: 'node', label: t('node') },
+                { by: 'storage', label: t('storage') }, { by: 'type', label: t('type') },
+                { by: 'shared', label: t('allStorageShared') }, { by: 'used', label: t('allStorageUsed') },
+                { by: 'total', label: t('allStorageTotal') }, { by: 'percent', label: t('allStorageUsage') },
+                { by: 'status', label: t('status') },
+            ];
+            const rowKey = (s) => `${s.cluster_id}:${s.shared ? '*' : s.node}:${s.storage}`;
+            const nodeText = (s) => s.shared
+                ? (s.nodes ? t('allStorageNodes').replace('{n}', s.nodes) : t('allStorageShared'))
+                : (s.node || '-');
+            const size = (b) => b == null ? '-' : formatBytes(b);
+            const statusText = (s) => s.active ? t('active') : t('allStorageInactive');
+            const partly = (s) => s.active && s.inactive_on && s.inactive_on.length > 0
+                ? t('allStorageInactiveOn').replace('{nodes}', s.inactive_on.join(', ')) : '';
+
+            const filters = (
+                <div className="flex items-center gap-3 flex-wrap">
+                    <div className="relative">
+                        <Icons.Search className="w-3.5 h-3.5 absolute left-2 top-1/2 -translate-y-1/2 text-gray-500" />
+                        <input data-storage-overview-search value={query} onChange={e => setQuery(e.target.value)} placeholder={t('search')}
+                            style={{ paddingLeft: '1.75rem' }} className="pr-2 py-1 text-xs bg-proxmox-dark border border-proxmox-border rounded-lg w-48" />
+                    </div>
+                    <label className="flex items-center gap-1.5 text-xs text-gray-400">
+                        {t('allStorageThreshold')}
+                        <input data-storage-overview-threshold type="number" min="1" max="100" value={limit}
+                            onChange={e => { setLimit(e.target.value); store('pegaprox-storage-overview-threshold', e.target.value); }}
+                            className="px-2 py-1 text-xs bg-proxmox-dark border border-proxmox-border rounded-lg w-16" />
+                        %
+                    </label>
+                    <label className="flex items-center gap-1.5 text-xs text-gray-400">
+                        <input data-storage-overview-over type="checkbox" checked={overOnly} onChange={e => setOverOnly(e.target.checked)} />
+                        {t('allStorageOverOnly')}
+                    </label>
+                </div>
+            );
+            const footer = (
+                <div className="flex items-center justify-between gap-3 flex-wrap text-xs text-gray-500">
+                    <div className="flex items-center gap-3 flex-wrap">
+                        {unlisted.length > 0 && (
+                            <span data-storage-overview-unlisted className="text-amber-400">
+                                {t('allStorageNotListed')} {unlisted.map(c => `${label(c)} (${stateText[c.state] || c.state})`).join(', ')}
+                            </span>
+                        )}
+                    </div>
+                    {rows.length > ROWS && (
+                        <button type="button" data-storage-overview-more onClick={() => setShowAll(!showAll)} className="text-proxmox-orange hover:underline">
+                            {showAll ? t('showLess') : t('allStorageShowAll').replace('{n}', rows.length)}
+                        </button>
+                    )}
+                </div>
+            );
+            const pending = !data && (
+                <div className="text-sm text-gray-500">{t('loading') || 'Loading...'}</div>
+            );
+            const empty = data && (data.failed ? (
+                <div data-storage-overview-failed className="text-sm text-amber-400">{t('allStorageFailed')}</div>
+            ) : rows.length === 0 && (
+                <div data-storage-overview-empty className="text-sm text-gray-400">
+                    {all.length === 0 ? t('allStorageEmpty') : t('allStorageNoMatch')}
+                </div>
+            ));
+            const refreshButton = (
+                <button type="button" onClick={() => load()} title={t('refresh')} disabled={loading}
+                    className="p-1.5 rounded text-gray-500 hover:text-proxmox-orange hover:bg-proxmox-hover disabled:opacity-50">
+                    <span className={`inline-flex ${loading ? 'animate-spin' : ''}`}><Icons.RefreshCw /></span>
+                </button>
+            );
+            const chevron = (
+                <button type="button" onClick={toggle} title={open ? t('collapse') : t('allStorageExpand')} className="p-1.5 rounded text-gray-500 hover:text-white hover:bg-proxmox-hover">
+                    <span className="inline-flex" style={{ transform: open ? 'none' : 'rotate(-90deg)' }}><Icons.ChevronDown /></span>
+                </button>
+            );
+            const aboveText = data && over > 0 ? t('allStorageAbove').replace('{n}', over).replace('{p}', threshold) : '';
+
+            if (isCorporate) {
+                const corpColor = { over: '#f54f47', near: '#efc006', ok: '#60b515', none: '#728b9a' };
+                return (
+                    <div data-storage-overview>
+                        <div className="flex items-center gap-2 py-1.5" style={{borderBottom: '1px solid var(--corp-border-subtle)'}}>
+                            <Icons.HardDrive className="w-3.5 h-3.5" style={{color: '#49afd9'}} />
+                            <button type="button" data-storage-overview-fold onClick={toggle} className="text-[13px] font-semibold" style={{color: '#adbbc4'}}>{t('allStorageTitle')}</button>
+                            {data && !data.failed && <span data-storage-overview-count className="text-[11px]" style={{color: '#728b9a'}}>{all.length}</span>}
+                            {aboveText && <span data-storage-overview-above className="text-[11px]" style={{color: '#f54f47'}}>{aboveText}</span>}
+                            <span className="flex-1" />
+                            {open && refreshButton}
+                            {chevron}
+                        </div>
+                        {open && (
+                            <div className="space-y-2 pt-2">
+                                {filters}
+                                {pending}
+                                {empty}
+                                {rows.length > 0 && (
+                                    <table className="corp-datagrid corp-datagrid-striped">
+                                        <thead>
+                                            <tr>
+                                                {columns.map(col => (
+                                                    <th key={col.by} data-storage-overview-sort={col.by} className="cursor-pointer" style={{textAlign: 'left'}} onClick={() => sortOn(col.by)}>
+                                                        {col.label} {sort.by === col.by && <span className="sort-indicator">{sort.dir === 'asc' ? '▲' : '▼'}</span>}
+                                                    </th>
+                                                ))}
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {shown.map(s => {
+                                                const color = corpColor[level(s)];
+                                                // on the cells: the striped rows paint theirs over a row background
+                                                const hot = isOver(s) ? {background: 'rgba(245,79,71,0.08)'} : {};
+                                                return (
+                                                    <tr key={rowKey(s)} data-storage-overview-row={rowKey(s)} data-over={isOver(s) ? '1' : undefined}>
+                                                        <td style={{fontWeight: 500, ...hot, ...(isOver(s) ? {boxShadow: 'inset 3px 0 0 #f54f47'} : {})}}>{label(s)}</td>
+                                                        <td style={{color: '#adbbc4', ...hot}}>{nodeText(s)}</td>
+                                                        <td style={hot}>{s.storage}</td>
+                                                        <td style={{color: '#adbbc4', ...hot}}>{s.type || '-'}</td>
+                                                        <td style={hot}>{s.shared ? t('yes') : t('no')}</td>
+                                                        <td style={hot}>{size(s.used)}</td>
+                                                        <td style={hot}>{size(s.total)}</td>
+                                                        <td style={hot}>
+                                                            {s.percent == null ? '-' : (
+                                                                <div className="flex items-center gap-1.5">
+                                                                    <span style={{color, minWidth: '40px'}}>{s.percent.toFixed(1)}%</span>
+                                                                    <span className="inline-block" style={{width: '60px', height: '3px', background: 'var(--corp-divider)', position: 'relative'}}>
+                                                                        <span style={{position: 'absolute', left: 0, top: 0, height: '3px', width: `${Math.min(s.percent, 100)}%`, background: color}} />
+                                                                    </span>
+                                                                </div>
+                                                            )}
+                                                        </td>
+                                                        <td style={hot}>
+                                                            <span className="inline-flex items-center gap-1">
+                                                                <span className="w-1.5 h-1.5 rounded-full inline-block" style={{background: s.active ? '#60b515' : '#728b9a'}} />
+                                                                <span style={{color: s.active ? '#60b515' : '#728b9a', fontSize: '12px'}}>{statusText(s)}</span>
+                                                            </span>
+                                                            {partly(s) && <span className="ml-2 text-[11px]" style={{color: '#efc006'}}>{partly(s)}</span>}
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            })}
+                                        </tbody>
+                                    </table>
+                                )}
+                                {footer}
+                            </div>
+                        )}
+                    </div>
+                );
+            }
+
+            const modernColor = {
+                over: ['bg-red-500', 'text-red-400'], near: ['bg-yellow-500', 'text-yellow-400'],
+                ok: ['bg-green-500', 'text-green-400'], none: ['bg-gray-500', 'text-gray-500'],
+            };
+            return (
+                <div data-storage-overview className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
+                    <div className="p-4 border-b border-proxmox-border flex items-center justify-between gap-3 flex-wrap">
+                        <button type="button" data-storage-overview-fold onClick={toggle} className="flex items-center gap-3 text-left">
+                            <div className="w-10 h-10 rounded-lg bg-blue-500/20 flex items-center justify-center text-blue-400">
+                                <Icons.HardDrive className="w-5 h-5" />
+                            </div>
+                            <div>
+                                <h3 className="font-semibold text-white">
+                                    {t('allStorageTitle')} {data && !data.failed && <span data-storage-overview-count className="text-sm font-normal text-gray-500">({all.length})</span>}
+                                </h3>
+                                <p className="text-xs text-gray-500">{t('allStorageDesc')}</p>
+                            </div>
+                        </button>
+                        <div className="flex items-center gap-2">
+                            {aboveText && <span data-storage-overview-above className="text-xs font-medium text-red-400">{aboveText}</span>}
+                            {open && refreshButton}
+                            {chevron}
+                        </div>
+                    </div>
+                    {open && (
+                        <div className="p-4 space-y-3">
+                            {filters}
+                            {pending}
+                            {empty}
+                            {rows.length > 0 && (
+                                <div className="overflow-x-auto">
+                                    <table className="w-full">
+                                        <thead className="bg-proxmox-dark/50">
+                                            <tr className="text-left text-xs text-gray-400">
+                                                {columns.map(col => (
+                                                    <th key={col.by} data-storage-overview-sort={col.by} className="px-4 py-3 font-medium cursor-pointer hover:text-white" onClick={() => sortOn(col.by)}>
+                                                        {col.label}{sort.by === col.by && <span className="ml-1">{sort.dir === 'asc' ? '▲' : '▼'}</span>}
+                                                    </th>
+                                                ))}
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-proxmox-border/50">
+                                            {shown.map(s => {
+                                                const [bar, text] = modernColor[level(s)];
+                                                return (
+                                                    <tr key={rowKey(s)} data-storage-overview-row={rowKey(s)} data-over={isOver(s) ? '1' : undefined}
+                                                        className={`${isOver(s) ? 'bg-red-500/10' : ''} hover:bg-proxmox-hover/50 transition-colors`}>
+                                                        <td className="px-4 py-2 text-sm text-gray-300">{label(s)}</td>
+                                                        <td className="px-4 py-2 text-sm text-gray-400">{nodeText(s)}</td>
+                                                        <td className="px-4 py-2 text-sm font-medium text-white">{s.storage}</td>
+                                                        <td className="px-4 py-2 text-xs text-gray-400">{s.type || '-'}</td>
+                                                        <td className="px-4 py-2 text-xs text-gray-400">{s.shared ? t('yes') : t('no')}</td>
+                                                        <td className="px-4 py-2 text-sm text-gray-300">{size(s.used)}</td>
+                                                        <td className="px-4 py-2 text-sm text-gray-300">{size(s.total)}</td>
+                                                        <td className="px-4 py-2">
+                                                            {s.percent == null ? <span className="text-gray-500">-</span> : (
+                                                                <div className="flex items-center gap-2">
+                                                                    <div className="w-16 h-2 bg-proxmox-dark rounded-full overflow-hidden">
+                                                                        <div className={`h-full rounded-full ${bar}`} style={{ width: `${Math.min(s.percent, 100)}%` }} />
+                                                                    </div>
+                                                                    <span className={`text-xs font-medium ${text}`}>{s.percent.toFixed(1)}%</span>
+                                                                </div>
+                                                            )}
+                                                        </td>
+                                                        <td className="px-4 py-2">
+                                                            <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium ${s.active ? 'bg-green-500/20 text-green-400' : 'bg-gray-500/20 text-gray-400'}`}>
+                                                                <span className={`w-1.5 h-1.5 rounded-full ${s.active ? 'bg-green-400' : 'bg-gray-400'}`} />
+                                                                {statusText(s)}
+                                                            </span>
+                                                            {partly(s) && <div className="text-[11px] text-amber-400 mt-0.5">{partly(s)}</div>}
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            })}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            )}
+                            {footer}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // LW Oct 2026 - the guests no backup job covers, every cluster in one list. One read per
+        // cluster on the server (GET /api/backup-coverage), shared with the alert of the same name.
+        // Only reads and links to the guest, so a standby shows it as it is.
+        function GuestsWithoutBackup({ clusters, onSelectVm }) {
+            const { t } = useTranslation();
+            const { getAuthHeaders, user, isAdmin, haReadOnly } = useAuth();
+            const { isCorporate } = useLayout();
+            const ROWS = 50;
+            const store = (key, value) => { try { localStorage.setItem(key, value); } catch (e) {} };
+            const recall = (key, fallback) => { try { const v = localStorage.getItem(key); return v === null ? fallback : v; } catch (e) { return fallback; } };
+            const [data, setData] = useState(null);
+            const [loading, setLoading] = useState(false);
+            const [query, setQuery] = useState('');
+            const [hideTags, setHideTags] = useState(() => recall('pegaprox-nobackup-hide', 'no-backup'));
+            const [open, setOpen] = useState(() => recall('pegaprox-nobackup-open', '1') !== '0');
+            const [showAll, setShowAll] = useState(false);
+            const seq = useRef(0);
+            const allowed = (!haReadOnly || haReadPermission('backup.view')) &&
+                (isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes('backup.view')));
+            const clusterKey = clusters.map(c => c.id).join(',');
+
+            const load = async (refresh) => {
+                const mine = ++seq.current;
+                setLoading(true);
+                try {
+                    const r = await fetch(`${API_URL}/backup-coverage${refresh ? '?refresh=1' : ''}`, { headers: getAuthHeaders() });
+                    if (mine !== seq.current) return;  // a newer read is on its way
+                    if (r.ok) setData(await r.json());
+                    else if (r.status === 403) setData({ denied: true });
+                } catch (e) {
+                    console.error('backup coverage:', e);
+                } finally {
+                    if (mine === seq.current) setLoading(false);
+                }
+            };
+            useEffect(() => {
+                if (!allowed || !clusterKey) return;
+                load(false);
+                // a page left open sees a new job or a new guest within a few minutes
+                const timer = setInterval(() => load(false), 300000);
+                return () => clearInterval(timer);
+            }, [allowed, clusterKey]);
+
+            if (!allowed || !clusterKey || (data && data.denied)) return null;
+
+            const hidden = new Set(hideTags.split(/[\s,;]+/).map(s => s.trim().toLowerCase()).filter(Boolean));
+            const all = (data && data.guests) || [];
+            const isHidden = (g) => (g.tags || []).some(x => hidden.has(x));
+            const tagged = all.filter(isHidden).length;
+            const q = query.trim().toLowerCase();
+            const rows = all.filter(g => !isHidden(g))
+                .filter(g => !q || `${g.name} ${g.vmid} ${g.node} ${g.cluster_name}`.toLowerCase().includes(q));
+            const shown = showAll ? rows : rows.slice(0, ROWS);
+            const notChecked = ((data && data.clusters) || []).filter(c => c.state !== 'ok');
+            const stateText = { offline: t('backupCoverageOffline'), denied: t('backupCoverageDenied'), unreadable: t('backupCoverageUnreadable') };
+            const toggle = () => { store('pegaprox-nobackup-open', open ? '0' : '1'); setOpen(!open); };
+            const openGuest = (g) => {
+                const cl = clusters.find(c => c.id === g.cluster_id);
+                if (cl && onSelectVm) onSelectVm(cl, g.vmid, g.node, { vmid: g.vmid, node: g.node, type: g.type, name: g.name, status: g.status });
+            };
+            const isRunning = (g) => g.status === 'running';
+
+            const filters = (
+                <div className="flex items-center gap-2 flex-wrap">
+                    <div className="relative">
+                        <Icons.Search className="w-3.5 h-3.5 absolute left-2 top-1/2 -translate-y-1/2 text-gray-500" />
+                        <input data-backup-coverage-search value={query} onChange={e => setQuery(e.target.value)} placeholder={t('search')}
+                            style={{ paddingLeft: '1.75rem' }} className="pr-2 py-1 text-xs bg-proxmox-dark border border-proxmox-border rounded-lg w-48" />
+                    </div>
+                    <label className="flex items-center gap-1.5 text-xs text-gray-400">
+                        {t('backupCoverageHideTagged')}
+                        <input data-backup-coverage-hide value={hideTags} onChange={e => { setHideTags(e.target.value); store('pegaprox-nobackup-hide', e.target.value); }}
+                            placeholder="no-backup" className="px-2 py-1 text-xs font-mono bg-proxmox-dark border border-proxmox-border rounded-lg w-32" />
+                    </label>
+                </div>
+            );
+            const footer = (
+                <div className="flex items-center justify-between gap-3 flex-wrap text-xs text-gray-500">
+                    <div className="flex items-center gap-3 flex-wrap">
+                        {tagged > 0 && <span data-backup-coverage-tagged>{t('backupCoverageHidden').replace('{n}', tagged)}</span>}
+                        {notChecked.length > 0 && (
+                            <span data-backup-coverage-unchecked className="text-amber-400">
+                                {t('backupCoverageNotChecked')} {notChecked.map(c => `${c.cluster_name} (${stateText[c.state] || c.state})`).join(', ')}
+                            </span>
+                        )}
+                    </div>
+                    {rows.length > ROWS && (
+                        <button type="button" onClick={() => setShowAll(!showAll)} className="text-proxmox-orange hover:underline">
+                            {showAll ? t('showLess') : t('backupCoverageShowAll').replace('{n}', rows.length)}
+                        </button>
+                    )}
+                </div>
+            );
+            const empty = data && rows.length === 0 && (
+                <div data-backup-coverage-empty className="text-sm text-gray-400 flex items-center gap-2">
+                    <Icons.CheckCircle className="w-4 h-4 text-green-400" />
+                    {all.length === 0 ? t('backupCoverageAllCovered') : t('backupCoverageNoMatch')}
+                </div>
+            );
+            const refreshButton = (
+                <button type="button" onClick={() => load(true)} title={t('refresh')} disabled={loading}
+                    className="p-1.5 rounded text-gray-500 hover:text-proxmox-orange hover:bg-proxmox-hover disabled:opacity-50">
+                    <span className={`inline-flex ${loading ? 'animate-spin' : ''}`}><Icons.RefreshCw /></span>
+                </button>
+            );
+            const chevron = (
+                <button type="button" onClick={toggle} title={open ? t('collapse') : t('backupCoverageExpand')} className="p-1.5 rounded text-gray-500 hover:text-white hover:bg-proxmox-hover">
+                    <span className="inline-flex" style={{ transform: open ? 'none' : 'rotate(-90deg)' }}><Icons.ChevronDown /></span>
+                </button>
+            );
+
+            if (isCorporate) {
+                return (
+                    <div data-backup-coverage>
+                        <div className="flex items-center gap-2 py-1.5" style={{borderBottom: '1px solid var(--corp-border-subtle)'}}>
+                            <Icons.ArchiveX className="w-3.5 h-3.5" style={{color: '#efc006'}} />
+                            <button type="button" data-backup-coverage-fold onClick={toggle} className="text-[13px] font-semibold" style={{color: '#adbbc4'}}>{t('backupCoverageTitle')}</button>
+                            <span data-backup-coverage-count className="text-[11px]" style={{color: '#728b9a'}}>{data ? all.length - tagged : '...'}</span>
+                            <span className="flex-1" />
+                            {refreshButton}
+                            {chevron}
+                        </div>
+                        {open && (
+                            <div className="space-y-2 pt-2">
+                                {filters}
+                                {empty}
+                                {rows.length > 0 && (
+                                    <table className="corp-datagrid corp-datagrid-striped">
+                                        <thead>
+                                            <tr>
+                                                <th style={{width: '24px'}}></th>
+                                                <th style={{textAlign: 'left'}}>{t('name')}</th>
+                                                <th style={{textAlign: 'left'}}>{t('cluster')}</th>
+                                                <th style={{textAlign: 'left'}}>{t('node')}</th>
+                                                <th style={{textAlign: 'left'}}>{t('status')}</th>
+                                                <th style={{textAlign: 'left'}}>{t('tags')}</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {shown.map(g => (
+                                                <tr key={`${g.cluster_id}-${g.vmid}`} data-backup-coverage-row={`${g.cluster_id}:${g.vmid}`} className="table-row-hover cursor-pointer" onClick={() => openGuest(g)}>
+                                                    <td><Icons.Monitor className="w-3.5 h-3.5" style={{color: g.type === 'qemu' ? '#49afd9' : '#a178d9'}} /></td>
+                                                    <td>
+                                                        <span style={{fontWeight: 500}}>{g.name || `${g.type === 'lxc' ? 'CT' : 'VM'} ${g.vmid}`}</span>
+                                                        <span style={{color: '#728b9a', fontSize: '11px', marginLeft: '6px'}}>#{g.vmid}</span>
+                                                        {g.template && <span className="ml-2 text-[10px] uppercase" style={{color: '#728b9a'}}>{t('template')}</span>}
+                                                    </td>
+                                                    <td>{g.cluster_name}</td>
+                                                    <td style={{color: '#adbbc4'}}>{g.node || '-'}</td>
+                                                    <td>
+                                                        <span className="inline-flex items-center gap-1">
+                                                            <span className="w-1.5 h-1.5 rounded-full inline-block" style={{background: isRunning(g) ? '#60b515' : '#728b9a'}} />
+                                                            <span style={{color: isRunning(g) ? '#60b515' : '#728b9a', fontSize: '12px'}}>{isRunning(g) ? t('running') : t('stopped')}</span>
+                                                        </span>
+                                                    </td>
+                                                    <td style={{color: '#728b9a', fontSize: '12px'}}>{(g.tags || []).join(', ')}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                )}
+                                {footer}
+                            </div>
+                        )}
+                    </div>
+                );
+            }
+
+            return (
+                <div data-backup-coverage className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
+                    <div className="p-4 border-b border-proxmox-border flex items-center justify-between gap-3 flex-wrap">
+                        <button type="button" data-backup-coverage-fold onClick={toggle} className="flex items-center gap-3 text-left">
+                            <div className="w-10 h-10 rounded-lg bg-yellow-500/20 flex items-center justify-center text-yellow-400">
+                                <Icons.ArchiveX className="w-5 h-5" />
+                            </div>
+                            <div>
+                                <h3 className="font-semibold text-white">
+                                    {t('backupCoverageTitle')} <span data-backup-coverage-count className="text-sm font-normal text-gray-500">({data ? all.length - tagged : '...'})</span>
+                                </h3>
+                                <p className="text-xs text-gray-500">{t('backupCoverageDesc')}</p>
+                            </div>
+                        </button>
+                        <div className="flex items-center gap-1">
+                            {refreshButton}
+                            {chevron}
+                        </div>
+                    </div>
+                    {open && (
+                        <div className="p-4 space-y-3">
+                            {filters}
+                            {empty}
+                            {rows.length > 0 && (
+                                <div className="overflow-x-auto">
+                                    <table className="w-full">
+                                        <thead className="bg-proxmox-dark/50">
+                                            <tr className="text-left text-xs text-gray-400">
+                                                <th className="px-4 py-3 font-medium">{t('type')}</th>
+                                                <th className="px-4 py-3 font-medium">{t('name')}</th>
+                                                <th className="px-4 py-3 font-medium">{t('cluster')}</th>
+                                                <th className="px-4 py-3 font-medium">{t('node')}</th>
+                                                <th className="px-4 py-3 font-medium">{t('status')}</th>
+                                                <th className="px-4 py-3 font-medium">{t('tags')}</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-proxmox-border/50">
+                                            {shown.map(g => (
+                                                <tr key={`${g.cluster_id}-${g.vmid}`} data-backup-coverage-row={`${g.cluster_id}:${g.vmid}`}
+                                                    className="hover:bg-proxmox-hover/50 transition-colors cursor-pointer group" onClick={() => openGuest(g)}>
+                                                    <td className="px-4 py-2">
+                                                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${g.type === 'qemu' ? 'bg-blue-500/20 text-blue-400' : 'bg-purple-500/20 text-purple-400'}`}>
+                                                            {g.type === 'qemu' ? <Icons.Monitor /> : <Icons.Layers />}
+                                                        </div>
+                                                    </td>
+                                                    <td className="px-4 py-2">
+                                                        <div className="font-medium text-white group-hover:text-proxmox-orange transition-colors">
+                                                            {g.name || `${g.type === 'lxc' ? 'CT' : 'VM'} ${g.vmid}`}
+                                                            {g.template && <span className="ml-2 px-1.5 py-0.5 text-[10px] rounded bg-proxmox-dark text-gray-400 uppercase">{t('template')}</span>}
+                                                        </div>
+                                                        <div className="text-xs text-gray-500">ID: {g.vmid}</div>
+                                                    </td>
+                                                    <td className="px-4 py-2 text-sm text-gray-300">{g.cluster_name}</td>
+                                                    <td className="px-4 py-2 text-sm text-gray-400">{g.node || '-'}</td>
+                                                    <td className="px-4 py-2">
+                                                        <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium ${isRunning(g) ? 'bg-green-500/20 text-green-400' : 'bg-gray-500/20 text-gray-400'}`}>
+                                                            <span className={`w-1.5 h-1.5 rounded-full ${isRunning(g) ? 'bg-green-400' : 'bg-gray-400'}`} />
+                                                            {isRunning(g) ? t('running') : t('stopped')}
+                                                        </span>
+                                                    </td>
+                                                    <td className="px-4 py-2 text-xs text-gray-500">{(g.tags || []).join(', ')}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            )}
+                            {footer}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         // LW: All Clusters Overview - GitHub Feature Request #16
         // added a bunch of stuff here - storage, sparklines, sorting etc
-        function AllClustersOverview({ clusters, allMetrics, clusterGroups = [], topGuests = [], allClusterGuests = {}, pbsServers = [], onSelectCluster, onSelectVm, topologyOnly = false }) {
+        function AllClustersOverview({ clusters, allMetrics, clusterGroups = [], topGuests = [], allClusterGuests = {}, pbsServers = [], onSelectCluster, onSelectVm, topologyOnly = false, onAutoInstall, addToast }) {
+            // #625: an empty list on a standby is no reason to offer adding a cluster there -
+            // say why it is empty instead: no sync yet, or its live view is off
+            const haInfo = (useAuth() || {}).ha || {};
+            const haStandby = haInfo.role === 'standby';
             const { t } = useTranslation();
+            // a member that serves users is no standby to them
+            const haNoClusters = haInfo.live_view === false ? t('pgHaNoClustersLiveOff')
+                : haInfo.serving === true ? t('pgHaNoClustersServing') : t('pgHaNoClustersHere');
             const { isCorporate } = useLayout();
             const [sortBy, setSortBy] = useState('name');
             const [sortDir, setSortDir] = useState('asc');
@@ -5446,6 +6863,10 @@
                                         <Icons.AlertTriangle className="w-3.5 h-3.5" /> {totals.totalAlerts} {t('alerts') || 'alerts'}
                                     </span>
                                 )}
+                                {!topologyOnly && clusters.length > 0 && (
+                                    <InventoryCsvButton clusters={clusters} addToast={addToast} label={t('inventoryCsv')}
+                                        className="corp-vm-btn corp-vm-btn-ghost disabled:opacity-50" />
+                                )}
                             </div>
                         </div>
 
@@ -5611,6 +7032,10 @@
                                 </table>
                             </div>
                         )}
+
+                        {!topologyOnly && clusters.length > 0 && <GuestsWithoutBackup clusters={clusters} onSelectVm={onSelectVm} />}
+
+                        {!topologyOnly && clusters.length > 0 && <StorageOverview clusters={clusters} />}
 
                         {/* NS: Mar 2026 - Multi-cluster topology redesign (#142) */}
                         {clusters.filter(c => c.connected).length > 0 && (() => {
@@ -5804,7 +7229,14 @@
                         {clusters.length === 0 && (
                             <div className="py-8 text-center text-[13px]" style={{color: '#728b9a'}}>
                                 <Icons.Server className="w-6 h-6 mx-auto mb-2" style={{color: 'var(--corp-border-medium)'}} />
-                                {t('noClustersConfigured') || 'No clusters configured'}
+                                {haStandby ? haNoClusters : (t('noClustersConfigured') || 'No clusters configured')}
+                                {onAutoInstall && !haStandby && (
+                                    <div className="mt-2">
+                                        <button onClick={onAutoInstall} className="hover:underline" style={{color: 'var(--corp-accent)'}}>
+                                            {t('autoInstallFirstHost')}
+                                        </button>
+                                    </div>
+                                )}
                             </div>
                         )}
                     </div>
@@ -5829,6 +7261,11 @@
                             </div>
 
                             <div className="flex items-center gap-3">
+                                {clusters.length > 0 && (
+                                    <InventoryCsvButton clusters={clusters} addToast={addToast} label={t('inventoryCsv')}
+                                        className="flex items-center gap-2 px-3 py-1.5 bg-proxmox-darker rounded-lg text-sm text-gray-200 hover:bg-proxmox-hover border border-proxmox-border transition-colors disabled:opacity-50" />
+                                )}
+
                                 {/* alerts */}
                                 {totals.totalAlerts > 0 && (
                                     <div className="flex items-center gap-2 px-3 py-1.5 bg-red-500/10 border border-red-500/30 rounded-lg">
@@ -6038,6 +7475,10 @@
                         </div>
                     )}
 
+                    {clusters.length > 0 && <GuestsWithoutBackup clusters={clusters} onSelectVm={onSelectVm} />}
+
+                    {clusters.length > 0 && <StorageOverview clusters={clusters} />}
+
                     {/* Empty State */}
                     {clusters.length === 0 && (
                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-12 text-center">
@@ -6045,7 +7486,17 @@
                                 <Icons.Server className="w-8 h-8 text-proxmox-orange" />
                             </div>
                             <h3 className="text-lg font-semibold text-white mb-2">{t('noClustersConfigured') || 'No clusters configured'}</h3>
-                            <p className="text-gray-500 text-sm">{t('addClusterToStart') || 'Add a cluster to get started'}</p>
+                            <p className="text-gray-500 text-sm">{haStandby ? haNoClusters : (t('addClusterToStart') || 'Add a cluster to get started')}</p>
+                            {/* no PVE box yet? the dashboard only passes this to managers */}
+                            {onAutoInstall && !haStandby && (
+                                <button
+                                    onClick={onAutoInstall}
+                                    className="mt-4 inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-proxmox-dark border border-proxmox-border hover:border-emerald-500/30 text-sm text-gray-300 hover:text-white transition-colors"
+                                >
+                                    <Icons.Disc className="w-4 h-4 text-emerald-400" />
+                                    {t('autoInstallFirstHost')}
+                                </button>
+                            )}
                         </div>
                     )}
                 </div>

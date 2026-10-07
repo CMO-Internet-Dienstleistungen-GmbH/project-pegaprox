@@ -56,11 +56,11 @@ def _require_admin():
     # sec (audit): the STORED role, so an admin-owned but viewer-scoped API token passed this
     # admin check with its owner's rights. build_authz_user carries the token-floored
     # effective_role, which is what every gate in the core uses.
+    # NS Oct 2026 (#1028) - and an admin a tenant override lowers is no admin here either
     from pegaprox.utils.auth import build_authz_user
-    from pegaprox.models.permissions import ROLE_ADMIN
+    from pegaprox.utils.rbac import acts_as_admin
     username = request.session.get('user', '')
-    user = build_authz_user(username, request.session)
-    if user.get('effective_role', user.get('role')) != ROLE_ADMIN:
+    if not acts_as_admin(build_authz_user(username, request.session)):
         return {'error': 'Admin access required'}, 403
     return None
 

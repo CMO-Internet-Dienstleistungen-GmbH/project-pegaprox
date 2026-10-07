@@ -3,6 +3,7 @@
 PegaProx LDAP Authentication - Layer 4
 """
 
+import copy
 import json
 import logging
 import time
@@ -330,18 +331,19 @@ def ldap_authenticate(username: str, password: str) -> dict:
         return {'error': 'LDAP authentication failed'}  # MK: Don't leak internal error details
 
 
-def ldap_provision_user(ldap_result: dict) -> dict:
-    from pegaprox.utils.auth import load_users, save_users
-    """Create or update a local user from LDAP authentication result
-    
-    LW: JIT (Just-In-Time) provisioning - user account is created on first login
-    MK: LDAP users have auth_source='ldap' and no local password
-    NS: Feb 2026 - Also syncs tenant, permissions, and tenant_permissions from group mappings
+def ldap_build_user_row(ldap_result: dict, existing: dict = None):
+    """The row a directory login would store for this user, without storing it.
+
+    `existing` is the row held now, or None for a first sign-in. None comes back when
+    that row belongs to another identity source; the caller leaves it alone then.
+
+    MK Sep 2026 (#625) - split out of ldap_provision_user so a standby can ask what the
+    directory says without writing it down: its users table is replaced with the
+    active's at every sync, so a write there is undone a few seconds later.
     """
     username = ldap_result['username'].lower()
-    users = load_users()
-    
-    if username in users:
+
+    if existing is not None:
         # MK Sep 2026 - this asked two questions and got both slightly wrong.
         #
         # `existing_source == 'local'` let an OIDC or Entra row be adopted by an LDAP
@@ -355,14 +357,15 @@ def ldap_provision_user(ldap_result: dict) -> dict:
         # stored password was adopted: an account whose only credential is a security
         # key has no password_hash, and neither does one created but never given a
         # password. Both were takeable.
-        existing_source = users[username].get('auth_source', 'local')
+        existing_source = existing.get('auth_source', 'local')
         if existing_source not in LDAP_AUTH_SOURCES:
             logging.warning(f"[LDAP] Rejected provisioning for '{username}' - the account "
                             f"belongs to '{existing_source}', not to this directory")
-            return None  # Caller should handle None return
+            return None
 
-        # Update the existing LDAP user with fresh LDAP info
-        user = users[username]
+        # Update the existing LDAP user with fresh LDAP info - on a copy, so the row
+        # the caller handed in stays what it was
+        user = copy.deepcopy(existing)
         user['display_name'] = ldap_result.get('display_name', username)
         user['email'] = ldap_result.get('email', user.get('email', ''))
         user['role'] = ldap_result.get('role', user.get('role', ROLE_VIEWER))
@@ -415,11 +418,14 @@ def ldap_provision_user(ldap_result: dict) -> dict:
         tp.update(new_ldap_tp)
         user['tenant_permissions'] = tp
         user['ldap_tenant_permissions'] = new_ldap_tp
-        
-        logging.info(f"[LDAP] Updated existing user '{username}' from LDAP (role={user['role']}, tenant={user.get('tenant')})")
+        # MK Oct 2026 (#940) - the memberships this login saw, replacing the stored ones.
+        # Pool grants on a group read them from here; nothing stored them before, so such
+        # a grant matched nobody. Replaced, not merged: a group the directory dropped stops
+        # granting with this sign-in.
+        user['groups'] = _directory_groups_of(ldap_result)
     else:
         # Create new user
-        users[username] = {
+        user = {
             'role': ldap_result.get('role', ROLE_VIEWER),
             'enabled': True,
             'display_name': ldap_result.get('display_name', username),
@@ -438,8 +444,40 @@ def ldap_provision_user(ldap_result: dict) -> dict:
             'auth_source': 'ldap',
             'ldap_dn': ldap_result.get('user_dn', ''),
             'last_ldap_sync': datetime.now().isoformat(),
-            'created_at': datetime.now().isoformat()
+            'created_at': datetime.now().isoformat(),
+            'groups': _directory_groups_of(ldap_result),
         }
+    return user
+
+
+def _directory_groups_of(ldap_result):
+    """The group DNs of an ldap_authenticate() result, deduplicated case-insensitively."""
+    out, seen = [], set()
+    for g in ldap_result.get('groups') or []:
+        if isinstance(g, str) and g.strip() and g.strip().lower() not in seen:
+            seen.add(g.strip().lower())
+            out.append(g.strip())
+    return out
+
+
+def ldap_provision_user(ldap_result: dict) -> dict:
+    from pegaprox.utils.auth import load_users, save_users
+    """Create or update a local user from LDAP authentication result
+    
+    LW: JIT (Just-In-Time) provisioning - user account is created on first login
+    MK: LDAP users have auth_source='ldap' and no local password
+    NS: Feb 2026 - Also syncs tenant, permissions, and tenant_permissions from group mappings
+    """
+    username = ldap_result['username'].lower()
+    users = load_users()
+    existing = users.get(username)
+    user = ldap_build_user_row(ldap_result, existing)
+    if user is None:
+        return None  # Caller should handle None return
+    users[username] = user
+    if existing is not None:
+        logging.info(f"[LDAP] Updated existing user '{username}' from LDAP (role={user['role']}, tenant={user.get('tenant')})")
+    else:
         logging.info(f"[LDAP] Provisioned new user '{username}' from LDAP (role={ldap_result.get('role', ROLE_VIEWER)}, tenant={ldap_result.get('tenant')})")
     
     save_users(users)

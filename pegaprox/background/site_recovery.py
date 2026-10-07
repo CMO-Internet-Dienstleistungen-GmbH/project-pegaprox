@@ -9,6 +9,8 @@ import requests
 from datetime import datetime
 
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
+from pegaprox.background import sr_boot_shots
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.realtime import broadcast_sse
@@ -308,7 +310,8 @@ def _migrate_vm_cross_cluster(src_mgr, tgt_mgr, vmid, vm_type, storage_map, net_
                 pass
 
         import gevent
-        gevent.spawn(_delayed_cleanup)
+        # an hour later: the delete asks for the lease at its exit then (#625)
+        gevent.spawn(ha.as_job(_delayed_cleanup, f'token cleanup for {vmid}'))
 
         if not result.get('success'):
             return False, result.get('error', 'Migration failed')
@@ -573,7 +576,10 @@ def execute_failover(plan_id, failover_type='planned', authorized_vmids=None):
             vm_type = vm.get('vm_type', 'qemu')
             vm_name = vm.get('vm_name', f'VM {vmid}')
 
-            if failover_type == 'emergency':
+            # before each guest's stop, start or migration (design 5.2, #625)
+            if not ha.confirm_step(f'site recovery of {_sl(vm_name)} ({vmid})'):
+                ok, err = False, 'not started: this instance does not hold the lease of its group'
+            elif failover_type == 'emergency':
                 # source is down - start replicated VM on target
                 logger.info(f"[SR] Emergency: starting {_sl(vm_name)} ({vmid}) on target")
                 _broadcast_progress(plan_id, f"Starting {_sl(vm_name)} on target...", int(completed / total_vms * 100))
@@ -646,18 +652,33 @@ def execute_failover(plan_id, failover_type='planned', authorized_vmids=None):
     logger.info(f"[SR] Failover {final_status} for '{_sl(plan['name'])}': {sum(1 for r in results.values() if r['success'])}/{total_vms} succeeded")
 
 
-def execute_test_failover(plan_id):
+def execute_test_failover(plan_id, console_vmids=None, authorized_vmids=None):
     """Clone replicated VMs on target, start in test mode.
-    VMs stay running until user triggers cleanup."""
+    VMs stay running until user triggers cleanup.
+
+    console_vmids: the plan's guests the caller may see the console of. Each clone that
+    started gets a boot screenshot for the evidence if its guest is among them
+    (sr_boot_shots.py); None takes none.
+    authorized_vmids: the guests the route authorized, as for execute_failover."""
     plan = _get_plan(plan_id)
     if not plan:
         return
 
     event_id = _create_event(plan_id, 'test')
     vms = _get_plan_vms(plan_id)
+    # NS Oct 2026 - a guest added to the plan after the route checked it is not cloned and
+    # started here, the same hold execute_failover keeps
+    if authorized_vmids is not None:
+        _approved = {str(v) for v in authorized_vmids}
+        _before = len(vms)
+        vms = [v for v in vms if str(v.get('vmid')) in _approved]
+        if len(vms) != _before:
+            logger.warning(f"[SR] plan {plan_id}: {_before - len(vms)} VM(s) were added "
+                           f"after authorization and are excluded from this test")
     tgt_mgr = cluster_managers.get(plan['target_cluster'])
     results = {}
     test_vmids = []
+    booted = []
 
     logger.info(f"[SR] Test failover for '{_sl(plan['name'])}' ({len(vms)} VMs)")
     _broadcast_progress(plan_id, "Starting test failover...", 0)
@@ -768,6 +789,7 @@ def execute_test_failover(plan_id):
                                 start_res = tgt_mgr.vm_action(node_name, test_vmid, vtype, 'start')
                                 if start_res.get('success'):
                                     results[str(vmid)] = {'success': True, 'test_vmid': test_vmid}
+                                    booted.append(sr_boot_shots.booted(vm, test_vmid, vtype, node_name))
                                 else:
                                     results[str(vmid)] = {'success': False, 'test_vmid': test_vmid,
                                                           'error': f"cloned OK but start failed: {start_res.get('error', 'unknown')}"}
@@ -807,7 +829,15 @@ def execute_test_failover(plan_id):
         'test_vmids': test_vmids,
         'counts': {'ok': ok_count, 'failed': failed_count, 'total': total},
     }
+    # MK Oct 2026 - the event is complete before the boot screenshots: the outcome is
+    # decided without them, and a cleanup started while they are taken finds the clones
+    shots = sr_boot_shots.pending(booted)
+    if shots:
+        summary['screenshots'] = shots
     _complete_event(event_id, event_status, summary)
+    if shots:
+        _broadcast_progress(plan_id, f"Taking boot screenshots of {len(booted)} test VM(s)...", 95)
+        shots = sr_boot_shots.run(tgt_mgr, plan_id, event_id, booted, console_vmids)
 
     db = get_db()
     now = datetime.utcnow().isoformat()
@@ -824,7 +854,9 @@ def execute_test_failover(plan_id):
 
     ok = sum(1 for r in results.values() if r.get('success'))
     log_audit('system', 'site_recovery.test_complete',
-              f"Test failover for '{_sl(plan['name'])}': {ok}/{len(vms)} VMs cloned")
+              f"Test failover for '{_sl(plan['name'])}': {ok}/{len(vms)} VMs cloned"
+              + (f", boot screenshots: {shots['taken']} taken, {shots['failed']} failed, "
+                 f"{shots['skipped']} skipped" if shots else ''))
     logger.info(f"[SR] Test failover complete for '{_sl(plan['name'])}': {len(test_vmids)} clones created")
 
 
@@ -841,7 +873,7 @@ def cleanup_test(plan_id):
     # find last test event with test_vmids
     db = get_db()
     event = db.query_one(
-        "SELECT details FROM site_recovery_events WHERE plan_id = ? AND event_type = 'test' ORDER BY started_at DESC LIMIT 1",
+        "SELECT id, details FROM site_recovery_events WHERE plan_id = ? AND event_type = 'test' ORDER BY started_at DESC LIMIT 1",
         (plan_id,))
     if not event:
         return
@@ -852,6 +884,10 @@ def cleanup_test(plan_id):
         details = {}
 
     test_vmids = details.get('test_vmids', [])
+    # NS Oct 2026 - the clones this cleanup could not remove; whatever else was listed is
+    # gone now and taken off the event, so a later cleanup cannot purge a guest that
+    # reused one of those VMIDs (#1055)
+    left = []
 
     for entry in test_vmids:
         # LW: entry can be dict {vmid, vm_type} or int (legacy)
@@ -863,6 +899,7 @@ def cleanup_test(plan_id):
             vtype = 'qemu'
         try:
             # NS Apr 2026: locate test VM via cluster resources (was iterating all nodes)
+            looked = False
             try:
                 res = tgt_mgr._api_get(
                     f"https://{tgt_mgr.host}:{tgt_mgr.api_port}/api2/json/cluster/resources",
@@ -870,15 +907,28 @@ def cleanup_test(plan_id):
                 )
                 target_node = None
                 current_status = None
+                current_name = ''
                 if res.status_code == 200:
+                    looked = True
                     for r in res.json().get('data', []):
                         if int(r.get('vmid', 0)) == int(test_vmid):
                             target_node = r.get('node')
                             current_status = r.get('status')
+                            current_name = str(r.get('name') or '')
                             break
             except Exception:
                 target_node = None
                 current_status = None
+            if not looked:
+                left.append(entry)
+                continue
+
+            # the clone is named SR-TEST-<guest>; under any other name the VMID was taken
+            # by another guest since and is not ours to remove
+            if target_node and not current_name.startswith('SR-TEST-'):
+                logger.warning(f"[SR] VMID {test_vmid} now belongs to '{_sl(current_name)}', "
+                               f"not a test clone - left alone")
+                continue
 
             if target_node:
                 try:
@@ -886,13 +936,23 @@ def cleanup_test(plan_id):
                     if current_status == 'running':
                         tgt_mgr.vm_action(target_node, test_vmid, vtype, 'stop', force=True)
                         time.sleep(3)
-                    tgt_mgr.delete_vm(target_node, test_vmid, vtype, purge=True)
+                    gone = tgt_mgr.delete_vm(target_node, test_vmid, vtype, purge=True)
+                    if isinstance(gone, dict) and not gone.get('success'):
+                        left.append(entry)
+                        continue
                     logger.info(f"[SR] Cleaned up test VM {test_vmid}")
                     continue  # go to next test_vmid entry
                 except Exception:
+                    left.append(entry)
                     continue
         except Exception as e:
+            left.append(entry)
             logger.warning(f"[SR] Cleanup failed for test VM {test_vmid}: {e}")
+
+    if left != test_vmids:
+        details['test_vmids'] = left
+        db.execute('UPDATE site_recovery_events SET details = ? WHERE id = ?',
+                   (json.dumps(details), event['id']))
 
     db.execute("UPDATE site_recovery_plans SET status = 'ready', updated_at = ? WHERE id = ?",
                (datetime.utcnow().isoformat(), plan_id))
@@ -1055,7 +1115,10 @@ def heartbeat_loop():
 
     while _heartbeat_running:
         try:
-            _heartbeat_check()
+            # no auto-failover from a standby: it has no managers to fail over with, and
+            # two instances deciding the same failover is the worst case there is
+            if ha.is_active():
+                _heartbeat_check()
         except Exception as e:
             logger.error(f"[SR] Heartbeat error: {e}")
         time.sleep(30)
@@ -1074,6 +1137,11 @@ def recover_orphan_runs():
 
     MK May 2026 (#413).
     """
+    # MK Sep 2026 (#625) - a standby resets nothing. The plan rows are the active's
+    # and come back with the next sync; events left from a time as active are
+    # cleaned up at the restart that promotes this instance again.
+    if not ha.is_active():
+        return
     try:
         db = get_db()
     except Exception as e:
@@ -1116,6 +1184,11 @@ def recover_orphan_runs():
                 (now, row['id']),
             )
             reset_plans += 1
+        # a test whose boot screenshots the restart cut short: the test had finished
+        cut_short = sr_boot_shots.mark_interrupted()
+        if cut_short:
+            logger.warning(f"[SR] orphan-cleanup at boot: the boot screenshots of {cut_short} "
+                           f"test failover(s) were cut short by the restart")
     except Exception as e:
         logger.error(f"[SR] orphan-cleanup query failed: {e}")
         return
@@ -1145,7 +1218,12 @@ def start_heartbeat():
     # before the heartbeat starts so the UI doesn't keep showing aborted runs
     # as active.
     try:
-        recover_orphan_runs()
+        if ha.acting_process() and not ha.is_active():
+            # MK Oct 2026 (#625) - automatic failover: this process leads and may not
+            # act yet (the takeover wait). The reset writes plan rows, so it waits
+            ha.when_active(recover_orphan_runs, 'sr-orphan-cleanup')
+        else:
+            recover_orphan_runs()
     except Exception as e:
         logger.error(f"[SR] orphan-cleanup wrapper crashed: {e}")
     gevent.spawn(heartbeat_loop)

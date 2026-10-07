@@ -7,9 +7,9 @@ services:
     # whatever it points at now, with nothing to compare against. That is fine for a
     # lab and wrong for anything that manages a production estate, so the tag is a
     # variable. Default unchanged, and an operator pins with one line:
-    #   PEGAPROX_VERSION=1.2.0 docker compose up -d
+    #   PEGAPROX_VERSION=1.3.0 docker compose up -d
     # Strictest is a digest, which cannot be repointed at all:
-    #   PEGAPROX_VERSION=1.2.0@sha256:<digest from `docker buildx imagetools inspect`>
+    #   PEGAPROX_VERSION=1.3.0@sha256:<digest from `docker buildx imagetools inspect`>
     image: ghcr.io/pegaprox/pegaprox:${PEGAPROX_VERSION:-latest}
     # build: .  # uncomment to build locally
     container_name: pegaprox
@@ -31,6 +31,27 @@ services:
     #   PEGAPROX_TRUSTED_PROXIES: "172.16.0.0/12"
     #   PEGAPROX_ALLOWED_ORIGINS: "https://pegaprox.example.com"
 
+  # MK Oct 2026 (#625) - the witness: the third vote of an automatic group, at a third
+  # site and never on a host that runs PegaProx. Same image, the command `witness`.
+  # "Add witness" on the leader's HA page shows a `docker run` line for it; as a compose
+  # service, put the code from there into the command for the first start (it pairs
+  # once and is left out on every start after), then: docker compose up -d pegaprox-witness
+  # It updates itself from the leader into its volume (docs/ha-witness.md). The image of
+  # release 1.2.0 and older has no witness: take the image the docker run line names (a
+  # later release, or ghcr.io/pegaprox/pegaprox-testing:latest for a Testing leader).
+  # pegaprox-witness:
+  #   image: ghcr.io/pegaprox/pegaprox:${PEGAPROX_VERSION:-latest}
+  #   container_name: pegaprox-witness
+  #   command: ["witness", "run", "--join", "<code>", "--url", "https://<this host>:5005"]
+  #   ports:
+  #     - "5005:5005"
+  #   volumes:
+  #     - pegaprox-witness:/app/witness
+  #   healthcheck:
+  #     test: ["CMD", "python3", "pegaprox_multi_cluster.py", "witness", "health"]
+  #   restart: unless-stopped
+
 volumes:
   pegaprox-config:
   pegaprox-logs:
+  # pegaprox-witness:

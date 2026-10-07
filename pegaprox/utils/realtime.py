@@ -9,10 +9,13 @@ import json
 import logging
 import threading
 import base64
+import itertools
 import os
+import socket
 from datetime import datetime
 
 from pegaprox.constants import SSE_TOKEN_TTL
+from pegaprox.utils.sanitization import sanitize_log_message as _sl
 from pegaprox.globals import (
     cluster_managers, ws_clients, ws_clients_lock,
     sse_tokens, sse_tokens_lock,
@@ -170,13 +173,16 @@ def broadcast_action(action: str, resource_type: str, resource_id: str, details:
     }, cluster_id)
 
 
-def create_sse_token(username: str, allowed_clusters: list, effective_role: str = None) -> str:
+def create_sse_token(username: str, allowed_clusters: list, effective_role: str = None,
+                     sid: str = None, token_id=None) -> str:
     """Create SSE token - avoids session ID in URL
 
     sec (audit): effective_role is captured at mint time because /api/sse/updates authenticates
     on the token alone — it has no session to floor an API token's role from, and reading the
     stored role there flagged an admin-owned viewer-scoped token as admin, which switched off
-    every per-VM filter in the broadcast loop."""
+    every per-VM filter in the broadcast loop.
+
+    sid / token_id: the session or API token it was minted under, see end_session_channels."""
     token = base64.urlsafe_b64encode(os.urandom(24)).decode('utf-8')
     expires = time.time() + SSE_TOKEN_TTL
 
@@ -192,6 +198,8 @@ def create_sse_token(username: str, allowed_clusters: list, effective_role: str 
             'expires': expires,
             'allowed_clusters': allowed_clusters,
             'effective_role': effective_role,
+            'sid': sid,
+            'token_id': token_id,
         }
 
     return token
@@ -231,8 +239,10 @@ def validate_sse_token(token: str) -> dict:
 # These are single-use and expire after 60s
 WS_TOKEN_TTL = 60
 
-def create_ws_token(username: str, role: str) -> str:
-    """Create a short-lived single-use WebSocket auth token"""
+def create_ws_token(username: str, role: str, api_token: bool = False, sid: str = None) -> str:
+    """Create a short-lived single-use WebSocket auth token. api_token: minted by an API
+    token, whose role then bounds every console the ws token opens (#1116). sid: the
+    session it was minted under, see end_session_channels."""
     token = base64.urlsafe_b64encode(os.urandom(24)).decode('utf-8')
     expires = time.time() + WS_TOKEN_TTL
 
@@ -246,7 +256,9 @@ def create_ws_token(username: str, role: str) -> str:
         ws_tokens[token] = {
             'user': username,
             'role': role,
+            'api_token': bool(api_token),
             'expires': expires,
+            'sid': sid,
         }
 
     return token
@@ -289,6 +301,138 @@ def invalidate_user_sse_tokens(username: str) -> int:
         for t in gone:
             del sse_tokens[t]
     return len(gone)
+
+
+def end_session_channels(username: str, sids=None, keep: str = None) -> int:
+    """End what a session opened next to itself: its pending ws and SSE tokens, its open
+    SSE streams and its WebSockets on this port.
+
+    NS Oct 2026 (#1038) - signing out, a revoked session or a password change dropped the
+    session and its SSE token, and left a console token minted under it working for its
+    60 s and every stream and socket it had open running. sids: those sessions only.
+    Without: every one of the user's but `keep`'s, the API token ones among them.
+    Consoles on the VNC and SSH ports of their own are not reached from here.
+    """
+    sids = set(sids) if sids is not None else None
+
+    def _ends(d):
+        if d.get('user') != username:
+            return False
+        if sids is not None:
+            return d.get('sid') in sids
+        return keep is None or d.get('sid') != keep
+
+    n = 0
+    for store, lock in ((ws_tokens, ws_tokens_lock), (sse_tokens, sse_tokens_lock),
+                        (sse_clients, sse_clients_lock)):
+        with lock:
+            gone = [k for k, d in store.items() if isinstance(d, dict) and _ends(d)]
+            for k in gone:
+                store.pop(k, None)
+        n += len(gone)
+    with _held_ws_lock:
+        gone = [k for k, (user, _ws) in _held_ws.items()
+                if _ends({'user': user, 'sid': _held_ws_sid.get(k)})]
+        socks = [_held_ws.pop(k)[1] for k in gone]
+        for k in gone:
+            _held_ws_sid.pop(k, None)
+    for ws in socks:
+        logging.info(f"[WS] hung up a WebSocket of '{_sl(username)}' - its session ended")
+        _hang_up(ws)
+    return n + len(socks)
+
+
+# NS Oct 2026 (#988) - a WebSocket on the main port holds a request-pool slot for as long
+# as it is open, like an SSE stream, and nothing bounded how many one account kept open:
+# any signed-in viewer could fill the pool with them. Counted per account across the
+# live-update socket and the consoles. Over the cap the oldest is hung up rather than the
+# new one refused, so a console that reconnects never locks its owner out. Next to the
+# SSE cap (20) one account holds at most 31 slots (slow bodies below), and the smallest
+# pool is 32.
+MAX_WS_PER_USER = 10
+_held_ws = {}
+_held_ws_sid = {}      # key -> the session a socket was opened under, when one was
+_held_ws_lock = threading.Lock()
+_held_ws_seq = itertools.count()
+# NS Oct 2026 (#1052) - request bodies taken off their clock, key -> account. A body that
+# never arrives holds its slot like a socket does, so these share the cap: one more
+# WebSocket hangs up the oldest socket, one more body keeps its clock. Bodies are never
+# hung up, so an account holds at most MAX_WS_PER_USER + 1 of the two.
+_held_bodies = {}
+
+
+def _bodies_of(username):
+    return sum(1 for user in _held_bodies.values() if user == username)
+
+
+def hold_websocket(username, ws, sid=None):
+    """Count this request's open WebSocket against its account until the route returns.
+    Past MAX_WS_PER_USER the account's oldest socket is hung up. sid: the session it was
+    opened under, hung up with it (end_session_channels)."""
+    from flask import after_this_request
+    key = next(_held_ws_seq)
+    with _held_ws_lock:
+        mine = sorted(k for k, (user, _) in _held_ws.items() if user == username)
+        over = len(mine) + _bodies_of(username) - MAX_WS_PER_USER + 1
+        gone = [_held_ws.pop(k)[1] for k in mine[:max(0, over)]]
+        _held_ws[key] = (username, ws)
+        if sid:
+            _held_ws_sid[key] = sid
+
+    # per request, not an app-wide hook: the lease fast path in app.py stands in for the
+    # app-wide ones and turns itself off for any it does not know
+    @after_this_request
+    def _let_go(response):
+        release_websocket(key)
+        return response
+
+    for old in gone:
+        logging.info(f"[WS] hung up the oldest WebSocket of '{_sl(username)}' - over the per-user cap")
+        _hang_up(old)
+
+
+def release_websocket(key):
+    with _held_ws_lock:
+        _held_ws.pop(key, None)
+        _held_ws_sid.pop(key, None)
+
+
+def hold_body(username):
+    """Count a request body that may take as long as the link needs against its account.
+    The key to release it with, or None when the account's WebSockets and slow bodies
+    already fill MAX_WS_PER_USER: that body keeps its clock."""
+    with _held_ws_lock:
+        mine = sum(1 for user, _ in _held_ws.values() if user == username) + _bodies_of(username)
+        if mine >= MAX_WS_PER_USER:
+            return None
+        key = next(_held_ws_seq)
+        _held_bodies[key] = username
+    return key
+
+
+def release_body(key):
+    with _held_ws_lock:
+        _held_bodies.pop(key, None)
+
+
+def _hang_up(ws):
+    """End a WebSocket's connection from outside the greenlet that serves it. A close frame
+    waits on a client that may never answer; a shutdown wakes every read on the connection
+    with EOF, TLS or not, and the handler unwinds as it does when a browser goes away."""
+    sock = getattr(ws, 'sock', None)                                    # simple-websocket
+    if sock is None:
+        sock = getattr(getattr(ws, 'handler', None), 'socket', None)    # geventwebsocket
+    try:
+        # on a dup of the descriptor, so a TLS socket object is left in one piece
+        raw = socket.fromfd(sock.fileno(), sock.family, sock.type)
+    except (AttributeError, OSError, ValueError):
+        return
+    try:
+        raw.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    finally:
+        raw.close()
 
 
 _SSE_FILTER_MISSING = object()
@@ -354,11 +498,47 @@ def _filtered_vmware_vms_frame(data, username, timestamp, effective_role=None):
     if not user:
         return None
     from pegaprox.utils.rbac import user_can_access_vmware_vm
+    from pegaprox.api.helpers import vmware_server_reach
+    from pegaprox.globals import vmware_managers
     data = data or {}
     vmware_id = data.get('vmware_id')
+    # NS Oct 2026 - a client subscribed to a linked cluster it does not own (a pool grant there)
+    # still got this frame for a server it cannot reach: its id, an empty list, and every ten
+    # seconds the news that the server is up. check_vmware_access answers no, so send nothing.
+    mgr = vmware_managers.get(vmware_id)
+    if mgr is not None and not vmware_server_reach(user)(getattr(mgr, 'linked_clusters', None)):
+        return None
     allowed = [v for v in (data.get('vms') or [])
                if user_can_access_vmware_vm(user, vmware_id, str(v.get('vm', '')), 'vmware.vm.view')]
     return _serialize_sse_message('vmware_vms', {**data, 'vms': allowed}, None, timestamp)
+
+
+def _filtered_vmware_servers_frame(servers, username, timestamp, effective_role=None):
+    """The 'vmware_servers' list cut to the servers a NON-admin client may reach. Returns the
+    serialized JSON, or None to send nothing (unknown user -> fail closed).
+
+    NS Oct 2026 - the frame went to every vmware.view holder, so each tenant saw the name and
+    host of every other tenant's ESXi server, pool-confined users included. Same question as
+    GET /api/vmware now asks per row. The linkage comes from the live manager, where
+    check_vmware_access reads it; a server removed since the frame was built is dropped."""
+    if not isinstance(servers, list):
+        return None
+    user = _sse_stored_user(username, effective_role)
+    if not user:
+        return None
+    from pegaprox.api.helpers import vmware_server_reach
+    from pegaprox.globals import vmware_managers
+    try:
+        reaches = vmware_server_reach(user)
+        allowed = []
+        for s in servers:
+            mgr = vmware_managers.get(s.get('id')) if isinstance(s, dict) else None
+            if mgr is not None and reaches(getattr(mgr, 'linked_clusters', None)):
+                allowed.append(s)
+    except Exception as e:
+        logging.debug(f"[SSE] vmware_servers filter failed for '{_sl(username)}': {e}")
+        return None
+    return _serialize_sse_message('vmware_servers', allowed, None, timestamp)
 
 
 def _sse_user_can_view_vmware_vm(username, vmware_id, vm_id, effective_role=None):
@@ -421,22 +601,23 @@ _SSE_OBJECT_FRAMES = ('xhm_migration', 'xhm_migration_log',
 def _sse_may_see_object_frame(username, update_type, data, effective_role=None):
     """True if this client may see one of the _SSE_OBJECT_FRAMES. Fails closed: an unknown user, or
     a frame naming an object we can no longer resolve, gets nothing (an admin short-circuits)."""
-    from pegaprox.models.permissions import ROLE_ADMIN
+    from pegaprox.utils.rbac import acts_as_admin
     user = _sse_stored_user(username, effective_role)
     if not user:
         return False
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(user):
         return True
     data = data or {}
     try:
         if update_type.startswith('xhm_'):
             from pegaprox.globals import _xhm_migrations
-            from pegaprox.utils.rbac import user_can_access_vm
+            from pegaprox.api.xhm import _may_migrate_source
             t = _xhm_migrations.get(data.get('id'))
             vmid, cid = getattr(t, 'source_vmid', None), getattr(t, 'source_cluster', None)
             if t is None or not vmid or not cid:
                 return False
-            return user_can_access_vm(user, cid, int(vmid), 'vm.migrate')
+            # the same gate as the list route, ESXi sources included (#1039)
+            return _may_migrate_source(user, cid, vmid)
 
         if update_type.startswith('vmware_migration'):
             # the live V2P registry is vmware.py's module-level dict; globals._v2p_migrations
@@ -506,6 +687,15 @@ def _filtered_tasks_frame(tasks, cluster_id, username, timestamp, effective_role
     return _serialize_sse_message('tasks', allowed, cluster_id, timestamp)
 
 
+def _sse_user_sees_maintenance(username, cluster_id, effective_role=None):
+    """MK Oct 2026 - the 'metrics' frame carries every node's maintenance task, guests and
+    all; the REST twin cuts them for a confined caller (helpers.sees_whole_maintenance).
+    Same question here, the stream's role carried. Unknown user: no."""
+    from pegaprox.api.helpers import sees_whole_maintenance
+    user = _sse_stored_user(username, effective_role)
+    return bool(user) and sees_whole_maintenance(user, cluster_id)
+
+
 def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_clusters=None):
     """Broadcast update to SSE clients
 
@@ -561,8 +751,16 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
         _tasks_frame_cache = {}   # uname -> per-VM-filtered 'tasks' frame (audit M1)
         _vmw_perm_cache = {}      # uname -> bool: holds the vmware.* perm the REST twin requires
         _vmw_vms_frame_cache = {} # uname -> per-VM-filtered ESXi inventory frame (audit)
+        _vmw_servers_frame_cache = {}  # uname -> the ESXi server list cut to what they reach
         _vmw_detail_cache = {}    # uname -> bool: may see THIS watched ESXi guest's detail (audit)
         _obj_frame_cache = {}     # uname -> bool: may see THIS migration/DR-plan frame (audit)
+        _maint_seen_cache = {}    # uname -> bool: gets the guests of a maintenance in this cluster
+        _metrics_cut = []         # the 'metrics' frame less those guests, made once
+        # only while a node of the cluster is in maintenance, so a quiet cluster costs nothing
+        _metrics_maint = False
+        if update_type == 'metrics' and cluster_id is not None:
+            from pegaprox.api.helpers import nodes_in_maintenance_view
+            _metrics_maint = nodes_in_maintenance_view(data)
         # sec/scale (audit): the per-client filtering below does uncached DB work — a single
         # user fetch plus the VM-ACL and pool lookups inside user_can_access_vm — and this loop
         # runs about once a second. Holding the GLOBAL sse_clients lock across that serialises
@@ -632,6 +830,20 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
                             client_message = _filtered_tasks_frame(data, cluster_id, uname,
                                                                    timestamp, _eff)
                             _tasks_frame_cache[uname, _eff] = client_message
+                    elif _metrics_maint:
+                        # asked of admins as well: is_admin does not know the tenant override
+                        # that lowers an admin where they live (sees_whole_maintenance does)
+                        uname, _eff = client_info.get('user'), client_info.get('effective_role')
+                        _ok_maint = _maint_seen_cache.get((uname, _eff), _SSE_FILTER_MISSING)
+                        if _ok_maint is _SSE_FILTER_MISSING:
+                            _ok_maint = _sse_user_sees_maintenance(uname, cluster_id, _eff)
+                            _maint_seen_cache[uname, _eff] = _ok_maint
+                        if not _ok_maint:
+                            if not _metrics_cut:
+                                from pegaprox.api.helpers import nodes_without_maintenance_guests
+                                _metrics_cut.append(_serialize_sse_message(
+                                    'metrics', nodes_without_maintenance_guests(data), cluster_id, timestamp))
+                            client_message = _metrics_cut[0]
                     elif update_type == 'vmware_vms' and not client_info.get('is_admin', False):
                         # audit — the ESXi twin of the 'resources' filter above. The perm gate
                         # below still decides whether this client hears about ESXi at all; what
@@ -648,6 +860,20 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
                         if client_message is _SSE_FILTER_MISSING:
                             client_message = _filtered_vmware_vms_frame(data, uname, timestamp, _eff)
                             _vmw_vms_frame_cache[uname, _eff] = client_message
+                    elif update_type == 'vmware_servers' and not client_info.get('is_admin', False):
+                        # NS Oct 2026 - the perm gate decided who hears about ESXi, never which
+                        # servers; the list carried every tenant's to each vmware.view holder
+                        uname, _eff = client_info.get('user'), client_info.get('effective_role')
+                        _ok_vmw = _vmw_perm_cache.get((uname, _eff, 'vmware.view'), _SSE_FILTER_MISSING)
+                        if _ok_vmw is _SSE_FILTER_MISSING:
+                            _ok_vmw = _sse_user_has_perm(uname, 'vmware.view', _eff)
+                            _vmw_perm_cache[uname, _eff, 'vmware.view'] = _ok_vmw
+                        if not _ok_vmw:
+                            continue
+                        client_message = _vmw_servers_frame_cache.get((uname, _eff), _SSE_FILTER_MISSING)
+                        if client_message is _SSE_FILTER_MISSING:
+                            client_message = _filtered_vmware_servers_frame(data, uname, timestamp, _eff)
+                            _vmw_servers_frame_cache[uname, _eff] = client_message
                     elif update_type == 'vmware_vm_detail' and not client_info.get('is_admin', False):
                         uname, _eff = client_info.get('user'), client_info.get('effective_role')
                         _ok_det = _vmw_detail_cache.get((uname, _eff), _SSE_FILTER_MISSING)
@@ -664,7 +890,7 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
                         # the stream skipped entirely. Both are default viewer perms, so this
                         # only bites a custom role that deliberately withholds them.
                         uname, _eff = client_info.get('user'), client_info.get('effective_role')
-                        _need = 'vmware.view' if update_type == 'vmware_servers' else 'vmware.vm.view'
+                        _need = 'vmware.vm.view'   # vmware_servers has its own branch above
                         _ok_vmw = _vmw_perm_cache.get((uname, _eff, _need), _SSE_FILTER_MISSING)
                         if _ok_vmw is _SSE_FILTER_MISSING:
                             _ok_vmw = _sse_user_has_perm(uname, _need, _eff)

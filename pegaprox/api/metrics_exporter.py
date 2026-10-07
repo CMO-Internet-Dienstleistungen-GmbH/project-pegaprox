@@ -6,7 +6,8 @@ MK Apr 2026: One endpoint — /api/metrics — that lets any Prometheus/Grafana 
 scrape PegaProx with zero custom instrumentation. We expose a curated set of gauges
 that match what admins typically want to alert on (node down, high CPU, quorum
 at risk, etc). Most data is derived from existing in-memory state; APT update
-availability is queried through Proxmox and cached briefly per node.
+availability is queried through Proxmox and cached briefly per node. Storage, replication
+and backup age come from reads other views make too (see _ESTATE_FAMILIES).
 
 Auth: Bearer token via existing API tokens (admin-view role is enough), or the
 endpoint can be made public by setting `metrics_public: true` in server settings —
@@ -22,9 +23,11 @@ from pegaprox.globals import (
     active_sessions, sessions_lock,
 )
 from pegaprox.api.helpers import load_server_settings
-from pegaprox.utils.auth import validate_api_token, load_users
+from pegaprox.utils.auth import validate_api_token, load_users, build_authz_user
 from pegaprox.core.db import get_db
+from pegaprox.core import ha  # PegaProx's own warm standby (#625)
 from pegaprox.models.permissions import ROLE_ADMIN
+from pegaprox.utils.rbac import has_permission
 from pegaprox.utils import auth as auth_state
 
 
@@ -91,6 +94,161 @@ def _resource_type_label(resource_type):
     return resource_type or 'unknown'
 
 
+# MK Oct 2026 - storage, replication and backup age. Storage is the one
+# /cluster/resources?type=storage per cluster that the health pill and the storage overview
+# share for 30 seconds (api/clusters.py). Replication reads the job list and every source
+# node (alert_events.read_replication); the backup age comes from the scan behind the VM
+# list's backup pill (api/pbs.py): the snapshot lists of the linked PBS datastores and the
+# vzdump files on the backup storages, per datastore and storage, never per guest. Those two
+# can take seconds and Prometheus gives a scrape 10, so they run in the background, one per
+# cluster and source at a time, and a scrape hands out the last read.
+_REPLICATION_EVERY = 60
+_REPLICATION_SERVE_MAX = 600
+_BACKUP_EVERY = 600            # backup age moves by the hour
+_BACKUP_PARTIAL_RETRY = 60
+_BACKUP_SERVE_MAX = 3600
+_repl_reads = {}               # cid -> (epoch, read_replication data or None)
+_reads_running = set()         # (source, cid)
+_reads_lock = threading.Lock()
+
+# written out family by family after the cluster walk: the exposition format wants all
+# samples of a metric in one group
+_ESTATE_FAMILIES = (
+    ('pegaprox_cluster_source_up', 'gauge',
+     '1 if the last read of a source behind these metrics answered in full (storage, replication, backups)'),
+    ('pegaprox_storage_active', 'gauge', '1 if the storage is active (a shared one: on at least one node)'),
+    ('pegaprox_storage_inactive_nodes', 'gauge', 'Nodes that list a shared storage without having it active'),
+    ('pegaprox_storage_used_bytes', 'gauge', 'Bytes used on an active storage'),
+    ('pegaprox_storage_total_bytes', 'gauge', 'Size of an active storage in bytes'),
+    ('pegaprox_replication_enabled', 'gauge', '1 if the replication job is enabled'),
+    ('pegaprox_replication_last_sync_timestamp_seconds', 'gauge',
+     'Unix time of the last successful sync of a replication job, 0 if it never synced'),
+    ('pegaprox_replication_last_sync_age_seconds', 'gauge',
+     'Seconds since the last successful sync of a replication job'),
+    ('pegaprox_replication_fail_count', 'gauge', 'Failed runs of a replication job in a row'),
+    ('pegaprox_replication_failed', 'gauge', '1 if the last run of a replication job failed'),
+    ('pegaprox_guest_last_backup_timestamp_seconds', 'gauge',
+     'Unix time of the newest backup of a VM or LXC container on a linked PBS or a backup storage, 0 if none'),
+    ('pegaprox_guest_last_backup_age_seconds', 'gauge',
+     'Seconds since the newest backup of a VM or LXC container'),
+)
+
+
+def _put(fam, name, value, labels):
+    fam[name].extend(_sample(name, value, labels))
+
+
+def _spawn(fn):
+    threading.Thread(target=fn, daemon=True, name='metrics-read').start()
+
+
+def _read_in_background(source, cid, read):
+    """Start read() in the background unless one for this cluster and source runs already."""
+    key = (source, cid)
+    with _reads_lock:
+        if key in _reads_running:
+            return
+        _reads_running.add(key)
+
+    def run():
+        try:
+            read()
+        except Exception as e:
+            logging.debug(f"[metrics] {cid} {source} read failed: {e}")
+        finally:
+            with _reads_lock:
+                _reads_running.discard(key)
+    try:
+        _spawn(run)
+    except Exception as e:
+        logging.debug(f"[metrics] {cid} {source} read not started: {e}")
+        with _reads_lock:
+            _reads_running.discard(key)
+
+
+def _replication_state(cid, mgr, now):
+    """The replication data of the last read when it is recent enough, else None."""
+    hit = _repl_reads.get(cid)
+    if hit is None or now - hit[0] >= _REPLICATION_EVERY:
+        def read():
+            from pegaprox.background.alert_events import read_replication
+            _status, data = read_replication(mgr)
+            _repl_reads[cid] = (time.time(), data)
+        _read_in_background('replication', cid, read)
+        hit = _repl_reads.get(cid)
+    if hit is None or now - hit[0] >= _REPLICATION_SERVE_MAX:
+        return None
+    return hit[1]
+
+
+def _last_backups(cid, mgr, now):
+    """{vmid: epoch of the newest backup, 0 for none} of the last complete scan, or None
+    while there is none to hand out (not read yet, partial, too old)."""
+    from pegaprox.api import pbs as pbs_api
+    entry = pbs_api.backup_status_entry(cid)
+    age = now - entry[0] if entry else 0
+    if entry is None or age >= _BACKUP_EVERY or (not entry[2] and age >= _BACKUP_PARTIAL_RETRY):
+        _read_in_background('backups', cid, lambda: pbs_api.scan_backup_status(cid, mgr))
+        entry = pbs_api.backup_status_entry(cid)
+        age = now - entry[0] if entry else 0
+    # a partial scan may lack a guest's newest backup and report it older than it is
+    if entry is None or not entry[2] or age >= _BACKUP_SERVE_MAX:
+        return None
+    out = {}
+    for row in entry[1] or ():
+        try:
+            out[int(row.get('vmid'))] = int(row.get('last_backup_ts') or 0)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _storage_rows(cid, mgr, ctype):
+    """The storage overview rows of a cluster (api/clusters.py), None when unread."""
+    from pegaprox.api import clusters as clusters_api
+    if ctype == 'xcpng':
+        return clusters_api._xcpng_storage_rows(cid, mgr)
+    rows = clusters_api.cluster_storage_resources(cid, mgr)
+    return None if rows is None else clusters_api._storage_overview_rows(rows)
+
+
+def _put_storage(fam, base, rows):
+    for row in rows:
+        labels = {**base, 'node': row.get('node') or '', 'storage': row.get('storage') or '',
+                  'type': row.get('type') or '', 'shared': '1' if row.get('shared') else '0'}
+        if row.get('uuid'):
+            labels['sr_uuid'] = row['uuid']
+        _put(fam, 'pegaprox_storage_active', 1 if row.get('active') else 0, labels)
+        if row.get('shared'):
+            _put(fam, 'pegaprox_storage_inactive_nodes', len(row.get('inactive_on') or ()), labels)
+        # the figures of a storage that is not active are pvestatd's last ones
+        if row.get('active') and row.get('total') is not None:
+            _put(fam, 'pegaprox_storage_used_bytes', int(row.get('used') or 0), labels)
+            _put(fam, 'pegaprox_storage_total_bytes', int(row.get('total') or 0), labels)
+
+
+def _put_replication(fam, base, data, now):
+    for job in data.get('jobs') or ():
+        jid = str(job.get('id') or '')
+        if not jid:
+            continue
+        labels = {**base, 'job': jid, 'vmid': str(job.get('guest') or jid.split('-', 1)[0]),
+                  'node': str(job.get('source') or ''), 'target': str(job.get('target') or '')}
+        enabled = not job.get('disable')
+        _put(fam, 'pegaprox_replication_enabled', 1 if enabled else 0, labels)
+        st = data['status'].get(jid)
+        if not enabled or st is None:
+            continue   # a disabled job has no state to alert on, an unread source node an unknown one
+        last = int(_num(st.get('last_sync')))
+        fails = int(_num(st.get('fail_count')))
+        _put(fam, 'pegaprox_replication_last_sync_timestamp_seconds', last, labels)
+        if last > 0:
+            _put(fam, 'pegaprox_replication_last_sync_age_seconds', max(0, round(now - last)), labels)
+        _put(fam, 'pegaprox_replication_fail_count', fails, labels)
+        failed = fails > 0 or bool(str(st.get('error') or '').strip())
+        _put(fam, 'pegaprox_replication_failed', 1 if failed else 0, labels)
+
+
 def _node_apt_updates_available(cid, mgr, node):
     """Return 1 when any APT update is available on a node, otherwise 0.
 
@@ -119,13 +277,33 @@ def _node_apt_updates_available(cid, mgr, node):
     return available
 
 
+# MK Sep 2026 (#818) - tokens we have already said the warning about, so a 15-second
+# scrape interval does not turn one warning into 5 760 a day. Keyed by the token id
+# from our own table, so nothing a caller invents lands in here, and it is rebuilt on
+# restart which is exactly when an operator wants to see it again.
+_metrics_perm_announced = set()
+
+
 def _auth_ok():
-    """Allow scrape if: (a) bearer token is a valid ADMIN-role API token, or (b) metrics_public=true.
+    """Allow a scrape when one of these holds:
+
+      (a) metrics_public = true
+      (b) the bearer token is an ADMIN-role token whose owner is still an enabled admin
+      (c) MK Sep 2026 (#818) - the token carries `metrics.view`
 
     NS Aug 2026 (Aikido pentest): /api/metrics emits cluster-wide, cross-tenant infra gauges
     (node status, quorum, CPU, VM counts across every cluster). Mere token validity is not
     enough — a viewer/tenant-scoped token would otherwise scrape all tenants' operational data.
-    Require the token's role to be admin (matches the 'admin-view role is enough' docstring intent).
+    That is why (b) demands the admin role rather than any valid token.
+
+    (c) does not weaken that: it is a permission nobody holds unless an admin grants it, it is
+    in no builtin role, and the UI says out loud at the point of granting that it is not
+    tenant-scoped. What it buys is the thing #818 asked for - a monitoring account that can
+    scrape and do nothing else, instead of an admin token in a Prometheus config file.
+
+    The permission is resolved through build_authz_user(), not off the stored account: a token
+    is capped by its own role AND by what its owner holds today, and reading the account
+    directly would let an admin-owned, viewer-capped token through.
     """
     settings = load_server_settings()
     if settings.get('metrics_public', False):
@@ -139,15 +317,36 @@ def _auth_ok():
             # account-exists / account-enabled checks. validate_api_token only looks at revoked +
             # expires_at, and disabling a user does NOT revoke their tokens — so a disabled or
             # demoted admin kept scraping every cluster's inventory. Re-check the owner here.
-            if info and info.get('role') == ROLE_ADMIN:
+            if info:
                 try:
                     owner = get_db().get_user(info.get('user'))
                 except Exception:
                     owner = None
-                if owner and owner.get('enabled', True) and owner.get('role') == ROLE_ADMIN:
-                    return True
-                logging.warning(f"[metrics] rejected admin token for '{info.get('user')}' — "
-                                "account is gone, disabled, or no longer admin")
+                if not (owner and owner.get('enabled', True)):
+                    logging.warning(f"[metrics] rejected token for '{info.get('user')}' - "
+                                    "account is gone or disabled")
+                    return False
+                if info.get('role') == ROLE_ADMIN:
+                    # an owner a tenant override lowers is not an admin here either (#1028)
+                    from pegaprox.utils.rbac import acts_as_admin
+                    if acts_as_admin(owner):
+                        return True
+                    logging.warning(f"[metrics] rejected admin token for '{info.get('user')}' - "
+                                    "owner is no longer admin")
+                    return False
+                # (c) #818
+                try:
+                    if has_permission(build_authz_user(info.get('user'), info), 'metrics.view'):
+                        tid = info.get('token_id')
+                        if tid not in _metrics_perm_announced:
+                            _metrics_perm_announced.add(tid)
+                            logging.warning(
+                                f"[metrics] token '{info.get('token_name')}' of "
+                                f"'{info.get('user')}' scrapes /api/metrics via metrics.view - "
+                                "this endpoint is NOT tenant-scoped and exposes every cluster")
+                        return True
+                except Exception as e:
+                    logging.debug(f"[metrics] metrics.view check failed: {e}")
         except Exception as e:
             logging.debug(f"[metrics] token validate failed: {e}")
     return False
@@ -157,7 +356,8 @@ def _auth_ok():
 def prometheus_metrics():
     if not _auth_ok():
         return Response(
-            '# unauthorized — set Authorization: Bearer <api_token>, or enable metrics_public\n',
+            '# unauthorized - use an admin API token, a token with the metrics.view '
+            'permission, or enable metrics_public\n',
             status=401, mimetype='text/plain; version=0.0.4'
         )
 
@@ -250,6 +450,10 @@ def prometheus_metrics():
     emit('# TYPE pegaprox_guest_network_receive_bytes_total counter')
     emit('# HELP pegaprox_guest_network_transmit_bytes_total Cumulative network bytes transmitted by a VM or LXC container')
     emit('# TYPE pegaprox_guest_network_transmit_bytes_total counter')
+    emit('# HELP pegaprox_guest_disk_read_bytes_total Bytes a VM or LXC container read from its disks since it started')
+    emit('# TYPE pegaprox_guest_disk_read_bytes_total counter')
+    emit('# HELP pegaprox_guest_disk_write_bytes_total Bytes a VM or LXC container wrote to its disks since it started')
+    emit('# TYPE pegaprox_guest_disk_write_bytes_total counter')
     emit('# HELP pegaprox_guest_uptime_seconds Uptime in seconds for a VM or LXC container')
     emit('# TYPE pegaprox_guest_uptime_seconds gauge')
     # Ceph (#540) — only emitted for clusters that actually run Ceph
@@ -260,6 +464,9 @@ def prometheus_metrics():
     emit('# HELP pegaprox_ceph_osd_in Number of Ceph OSDs currently in')
     emit('# TYPE pegaprox_ceph_osd_in gauge')
 
+    now = time.time()
+    fam = {name: [] for name, _t, _h in _ESTATE_FAMILIES}
+
     # a scrape walks every cluster over the API; copy the dict so a cluster
     # registered mid-scrape can't break the whole exposition
     for cid, mgr in list(cluster_managers.items()):
@@ -269,6 +476,7 @@ def prometheus_metrics():
         out.extend(_sample('pegaprox_cluster_connected', connected, base))
         if not connected:
             continue
+        ctype = getattr(mgr, 'cluster_type', 'proxmox')
 
         # Node counts + per-node stats
         try:
@@ -302,8 +510,13 @@ def prometheus_metrics():
         # Ceph health (#540) — best-effort; get_ceph_health_summary returns None when
         # the cluster has no Ceph, so no ceph_* series are emitted for those clusters.
         # One SSH probe per cluster per scrape, consistent with the apt-updates metric.
+        # MK Sep 2026 (#625) - not from a PegaProx standby, like the metrics collector:
+        # ceph -s goes over SSH, the active reads the same nodes already, and a host key
+        # pinned here lands in the known_hosts file the next sync replaces. A standby
+        # scrape then has no ceph series, as for a cluster without Ceph.
         try:
-            ceph = mgr.get_ceph_health_summary() if hasattr(mgr, 'get_ceph_health_summary') else None
+            ceph = (mgr.get_ceph_health_summary()
+                    if ha.is_active() and hasattr(mgr, 'get_ceph_health_summary') else None)
             if ceph:
                 _cmap = {'HEALTH_OK': 0, 'HEALTH_WARN': 1, 'HEALTH_ERR': 2}
                 out.extend(_sample('pegaprox_ceph_health_status', _cmap.get(ceph.get('status'), 3), base))
@@ -311,6 +524,32 @@ def prometheus_metrics():
                 out.extend(_sample('pegaprox_ceph_osd_in', _num(ceph.get('osd_in', 0)), base))
         except Exception as e:
             logging.debug(f"[metrics] {cid} ceph health failed: {e}")
+
+        if ctype in ('proxmox', 'xcpng'):
+            try:
+                srows = _storage_rows(cid, mgr, ctype)
+            except Exception as e:
+                logging.debug(f"[metrics] {cid} storage failed: {e}")
+                srows = None
+            _put(fam, 'pegaprox_cluster_source_up', 0 if srows is None else 1, {**base, 'source': 'storage'})
+            _put_storage(fam, base, srows or ())
+        last_backup = None
+        if ctype == 'proxmox':
+            try:
+                repl = _replication_state(cid, mgr, now)
+                if repl is not None:
+                    _put_replication(fam, base, repl, now)
+            except Exception as e:
+                logging.debug(f"[metrics] {cid} replication failed: {e}")
+                repl = None
+            _put(fam, 'pegaprox_cluster_source_up', 1 if repl is not None and not repl.get('failed') else 0,
+                 {**base, 'source': 'replication'})
+            try:
+                last_backup = _last_backups(cid, mgr, now)
+            except Exception as e:
+                logging.debug(f"[metrics] {cid} backup ages failed: {e}")
+            _put(fam, 'pegaprox_cluster_source_up', 0 if last_backup is None else 1,
+                 {**base, 'source': 'backups'})
 
         # VM counts
         try:
@@ -352,9 +591,28 @@ def prometheus_metrics():
                                    labels))
                 out.extend(_sample('pegaprox_guest_network_receive_bytes_total', _num(v.get('netin', 0)), labels))
                 out.extend(_sample('pegaprox_guest_network_transmit_bytes_total', _num(v.get('netout', 0)), labels))
+                # /cluster/resources counts these since the guest started; a cluster type
+                # that does not report them gets no series rather than a zero
+                if 'diskread' in v:
+                    out.extend(_sample('pegaprox_guest_disk_read_bytes_total', _num(v.get('diskread')), labels))
+                if 'diskwrite' in v:
+                    out.extend(_sample('pegaprox_guest_disk_write_bytes_total', _num(v.get('diskwrite')), labels))
                 out.extend(_sample('pegaprox_guest_uptime_seconds', _num(v.get('uptime', 0)), labels))
+                if last_backup is not None and v.get('type') in ('qemu', 'lxc') and not v.get('template'):
+                    try:
+                        ts = last_backup.get(int(vmid), 0)
+                    except (TypeError, ValueError):
+                        continue
+                    _put(fam, 'pegaprox_guest_last_backup_timestamp_seconds', ts, labels)
+                    if ts:
+                        _put(fam, 'pegaprox_guest_last_backup_age_seconds', max(0, round(now - ts)), labels)
         except Exception as e:
             logging.debug(f"[metrics] {cid} vm list failed: {e}")
+
+    for name, mtype, help_text in _ESTATE_FAMILIES:
+        emit(f'# HELP {name} {help_text}')
+        emit(f'# TYPE {name} {mtype}')
+        out.extend(fam[name])
 
     # ── PBS backup servers ──
     if pbs_managers:

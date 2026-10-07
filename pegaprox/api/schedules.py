@@ -2,22 +2,28 @@
 """scheduler + update schedule routes - split from monolith dec 2025, MK/NS"""
 
 import os
+import re
 import json
 import time
 import logging
 import threading
 from datetime import datetime, timedelta
+from urllib.parse import quote
 from flask import Blueprint, jsonify, request
 
 from pegaprox.constants import *
 from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 
 from pegaprox.utils.auth import require_auth, load_users, build_authz_user
 from pegaprox.utils.rbac import has_permission
 from pegaprox.utils.audit import log_audit
-from pegaprox.api.helpers import check_cluster_access, safe_error, require_unconfined
+from pegaprox.api.helpers import (check_cluster_access, safe_error, require_unconfined, evacuation_options,
+                                  evacuation_options_said, rolling_log, rolling_options_intro,
+                                  rolling_node_templates, rolling_moved_templates, rolling_rules_give_way,
+                                  rolling_rules_back_on)
 from pegaprox.api.nodes import cleanup_deleted_scripts, cleanup_orphaned_excluded_vms
 
 bp = Blueprint('schedules', __name__)
@@ -36,6 +42,73 @@ def _require_action_perm(action):
     if not has_permission(user, perm):
         return jsonify({'error': f'Permission denied: {perm} required to schedule a {action} action'}), 403
     return None
+
+
+# NS Oct 2026 - vm_type went from the request into the row and from the row into the PVE path
+# (nodes/<node>/<vm_type>/<vmid>/...), unchecked. The per-VM check does not look at it on the
+# ACL path, so one VM's start/stop grant scheduled 'qemu/<other>/status/stop#' and the scheduler
+# sent it with the cluster's own credentials (#1023). A row names a guest by type and number.
+VM_ACTIONS = ('start', 'stop', 'shutdown', 'reboot', 'snapshot')
+VM_TYPES = ('qemu', 'lxc')
+
+
+def _schedule_vmid(value):
+    """`value` as a VMID, None when it is not one. int() alone takes True, 100.9, ' 100' and '1_00'."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and re.fullmatch(r'[0-9]{1,9}', value):
+        value = int(value)
+    return value if isinstance(value, int) and 100 <= value <= 999999999 else None
+
+
+def _schedule_target_error(action):
+    """Why `action` cannot run as a scheduled VM action, '' when it can."""
+    if action.get('action') not in VM_ACTIONS:
+        return f"action must be one of {list(VM_ACTIONS)}"
+    if action.get('vm_type') not in VM_TYPES:
+        return "vm_type must be 'qemu' or 'lxc'"
+    if _schedule_vmid(action.get('vmid')) is None:
+        return 'vmid must be a VM ID (100 - 999999999)'
+    return ''
+
+
+def _creator(row):
+    """The account a stored schedule acts for, as it stands now, or None.
+
+    NS Oct 2026 - a schedule acts with the cluster's own credentials long after the request
+    that made it. Its creator may since have been demoted, moved to another tenant, lost the
+    VM grant or been removed (#1093), so every run asks again. Read by the account's own row:
+    one that is gone, unreadable or switched off acts for nobody."""
+    from pegaprox.utils.auth import resolve_authz_user
+    user = resolve_authz_user({'user': row.get('created_by') or ''})
+    if not user or not user.get('enabled', True):
+        return None
+    return user
+
+
+def _creator_may_update(cluster_id, schedule):
+    """Whether the creator of a rolling-update schedule may still arm it: the gates of
+    set_update_schedule, asked again at run time."""
+    from pegaprox.api.helpers import caller_is_scoped
+    creator = _creator(schedule)
+    if not creator or not has_permission(creator, 'node.update') or caller_is_scoped(creator, cluster_id):
+        return False
+    return not schedule.get('include_reboot', True) or has_permission(creator, 'node.reboot')
+
+
+_bad_targets_said = set()
+
+
+def _disable_bad_target(action):
+    """A stored row that names no guest (written before the checks above) stays, so it can be
+    seen, fixed or deleted, but it is switched off and never fires. Logged once per row."""
+    why = _schedule_target_error(action)
+    if not why:
+        return
+    action['enabled'] = False
+    if action.get('id') not in _bad_targets_said:
+        _bad_targets_said.add(action.get('id'))
+        logging.warning(f"[SCHEDULER] scheduled action {action.get('id')} switched off: {why}")
 
 # ============================================
 
@@ -98,6 +171,7 @@ def load_schedules():
                 'name': (row['name'] if has_name and row['name'] else ''),
                 'created_by': row['created_by'],
             })
+            _disable_bad_target(actions[-1])
         
         return _ScheduleSnapshot(actions=actions, last_id=last_id)
     except Exception as e:
@@ -106,7 +180,11 @@ def load_schedules():
         try:
             if os.path.exists(SCHEDULES_FILE):
                 with open(SCHEDULES_FILE, 'r') as f:
-                    return _ScheduleSnapshot(json.load(f))
+                    legacy = _ScheduleSnapshot(json.load(f))
+                for a in legacy.get('actions', []):
+                    a['vm_type'] = a.get('vm_type') or 'qemu'   # same default as a table row
+                    _disable_bad_target(a)
+                return legacy
         except Exception:
             pass
     # NOT an empty schedule table - we do not know what is in it.
@@ -200,17 +278,31 @@ def check_schedules():
     global _scheduler_running
     
     while _scheduler_running:
+        # a standby keeps ticking but fires nothing: VM actions, scheduled rolling
+        # updates and the 03:00 cleanup all belong to the active instance (#625)
+        if not ha.is_active():
+            _wait_a_minute()
+            continue
         try:
             schedules = load_schedules()
-            now = datetime.now()
+            # the group's zone when this instance is in one, so a failover does not
+            # shift a schedule; datetime.now() on an instance of its own (#625)
+            now = ha.schedule_now()
             current_time = now.strftime('%H:%M')
             current_day = now.strftime('%A').lower()
             current_date = now.strftime('%Y-%m-%d')
-            
+            # automatic failover (design 5.7): what fell due without a leader is said, and
+            # a new leader fires nothing in a minute the former one may have fired. Neither
+            # does anything anywhere else
+            _report_missed(schedules.get('actions', []))
+            if ha.schedule_held():
+                _wait_a_minute()
+                continue
+
             for action in schedules.get('actions', []):
                 if not action.get('enabled', True):
                     continue
-                
+
                 should_run = False
                 schedule_type = action.get('schedule_type', 'daily')
                 schedule_time = action.get('time', '')
@@ -245,7 +337,14 @@ def check_schedules():
                     last_run = action.get('last_run', '')
                     if last_run == f"{current_date} {current_time}":
                         continue
-                    
+
+                    if ha.schedule_fire_first():
+                        # at most once: written and on its way to the members before it acts
+                        _record_action_run(action.get('id'), f"{current_date} {current_time}",
+                                           disable=not action.get('enabled', True))
+                        ha.schedule_fired()
+                    if not ha.confirm_step(f"scheduled {action.get('action')} of {action.get('vmid')}"):
+                        break
                     # Execute the action
                     execute_scheduled_action(action)
                     action['last_run'] = f"{current_date} {current_time}"
@@ -272,11 +371,46 @@ def check_schedules():
         except Exception as e:
             logging.error(f"Scheduler error: {e}")
         
-        # Sleep for 60 seconds (check every minute)
-        for _ in range(60):
-            if not _scheduler_running:
-                break
-            time.sleep(1)
+        _wait_a_minute()
+
+
+def _due_minute(action, at):
+    """Whether `action` falls due in the minute `at`, its last run aside. For the report
+    of what a change of leader missed (5.7); check_schedules decides as it always did."""
+    if action.get('time', '') != at.strftime('%H:%M'):
+        return False
+    kind, day = action.get('schedule_type', 'daily'), at.strftime('%A').lower()
+    if kind == 'once':
+        return action.get('date') == at.strftime('%Y-%m-%d')
+    return (kind == 'daily' or (kind == 'weekly' and day in (action.get('days') or []))
+            or (kind == 'weekdays' and day not in ('saturday', 'sunday'))
+            or (kind == 'weekends' and day in ('saturday', 'sunday')))
+
+
+def _report_missed(actions):
+    """Once a new leader of an automatic group acts: the actions that fell due in the gap."""
+    window = ha.missed_schedule_window('scheduled actions')
+    if not window:
+        return
+    missed = set()
+    at = window[0] - window[0] % 60
+    while at <= window[1]:
+        when = ha.schedule_at(at)
+        stamp = when.strftime('%Y-%m-%d %H:%M')
+        # a last run in that minute or later: the former leader got to it
+        missed.update(str(a.get('name') or f"{a.get('action')} {a.get('vmid')}") for a in actions
+                      if a.get('enabled', True) and _due_minute(a, when)
+                      and str(a.get('last_run') or '') < stamp)
+        at += 60
+    ha.missed_schedules('scheduled actions', sorted(missed), window)
+
+
+def _wait_a_minute():
+    # Sleep for 60 seconds (check every minute), in 1s steps so a stop is quick
+    for _ in range(60):
+        if not _scheduler_running:
+            break
+        time.sleep(1)
 
 
 def execute_scheduled_action(action):
@@ -309,6 +443,24 @@ def execute_scheduled_action(action):
             execute_scheduled_rolling_update(mgr, cluster_id, action)
             return
         
+        # the row is checked again here, whatever wrote it, and the path is built from the
+        # guest PVE lists under that number: its type must be the row's (#1023)
+        why = _schedule_target_error(dict(action, vm_type=vm_type))
+        if why:
+            logging.error(f"[SCHEDULER] Refusing scheduled action {action.get('id')}: {why}")
+            return
+        vmid = _schedule_vmid(vmid)
+        from pegaprox.utils.rbac import user_can_access_vm
+        creator = _creator(action)
+        if not creator or not user_can_access_vm(creator, cluster_id, vmid,
+                                                 _perm_for_action(action_type), vm_type):
+            logging.warning(f"[SCHEDULER] Not running scheduled action {action.get('id')}: "
+                            f"{action.get('created_by')!r} may no longer {action_type} {vm_type}/{vmid}")
+            log_audit('scheduler', 'scheduled.refused',
+                      f"Scheduled {action_type} of VM {vmid} in {cluster_id} not run: its creator "
+                      f"{action.get('created_by')!r} may no longer do it")
+            return
+
         # Find the node where the VM is running
         resources = mgr.get_vm_resources()
         vm = next((r for r in resources if r.get('vmid') == vmid), None)
@@ -316,8 +468,12 @@ def execute_scheduled_action(action):
         if not vm:
             logging.error(f"[SCHEDULER] VM {vmid} not found")
             return
+        if vm.get('type') != vm_type:
+            logging.error(f"[SCHEDULER] Refusing scheduled {action_type} of {vmid}: "
+                          f"the schedule says {vm_type}, the guest is {vm.get('type')}")
+            return
         
-        node = vm.get('node')
+        node = quote(str(vm.get('node') or ''), safe='')
         host, port = mgr.host, mgr.api_port
         
         # Build the API URL based on action
@@ -370,7 +526,10 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
         except (TypeError, ValueError):
             reboot_timeout = 600
         wait_for_reboot = config.get('wait_for_reboot', True)
-        
+        # MK Oct 2026 (#763, #954) - the two evacuation options of the schedule, off on one
+        # saved before they existed and on XCP-ng, as for a run started by hand
+        migrate_templates, relax_anti_affinity = evacuation_options(mgr, config)
+
         logging.info(f"[SCHEDULER] Starting scheduled rolling update for cluster {cluster_id}")
         logging.info(f"[SCHEDULER] Config: reboot={include_reboot}, skip_evacuation={skip_evacuation}")
         
@@ -393,14 +552,23 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
             'include_reboot': include_reboot, 'skip_up_to_date': skip_up_to_date,
             'skip_evacuation': skip_evacuation, 'wait_for_reboot': wait_for_reboot,
             'pause_on_evacuation_error': False, 'force_all': False,
+            'migrate_templates': migrate_templates, 'relax_anti_affinity': relax_anti_affinity,
             'evacuation_timeout': evacuation_timeout, 'update_timeout': 900, 'reboot_timeout': reboot_timeout,
             'nodes': nodes_to_update, 'current_index': 0, 'current_node': nodes_to_update[0],
             'current_step': 'starting', 'completed_nodes': [], 'skipped_nodes': [],
             'failed_nodes': [], 'rebooting_nodes': [], 'paused_reason': None, 'paused_details': None,
             'logs': [f"[{time.strftime('%H:%M:%S')}] Scheduled rolling update started"], 'scheduled': True
         }
-        
+        log_audit('scheduler', 'node.rolling_update_started',
+                  f"Scheduled rolling update of {len(nodes_to_update)} node(s) started"
+                  + evacuation_options_said(migrate_templates, relax_anti_affinity),
+                  cluster=getattr(mgr.config, 'name', cluster_id))
+
         def run_scheduled_update():
+            rolling_log(mgr, f"Settings: skip_up_to_date={skip_up_to_date}, skip_evacuation={skip_evacuation}, "
+                             f"evacuation_timeout={evacuation_timeout}s, reboot_timeout={reboot_timeout}s, "
+                             f"migrate_templates={migrate_templates}, relax_anti_affinity={relax_anti_affinity}")
+            rolling_options_intro(mgr)
             try:
                 for idx, node_name in enumerate(nodes_to_update):
                     if not hasattr(mgr, '_rolling_update') or mgr._rolling_update.get('status') != 'running':
@@ -422,8 +590,21 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
                     # local-disk VM couldn't live-migrate is the worst possible outcome for an
                     # automatic update. On shared-storage clusters it's a no-op anyway. Honour a
                     # per-schedule override if one is ever stored, else evacuate everything.
+                    if not skip_evacuation:
+                        try:
+                            rolling_node_templates(mgr, [r for r in (mgr.get_vm_resources() or [])
+                                                         if r.get('node') == node_name
+                                                         and r.get('type') in ('qemu', 'lxc')])
+                        except Exception:
+                            pass
+                        rolling_rules_give_way(mgr, 'scheduler')   # #954, once, before the first evacuation
+                    # before each node's evacuation and its update (design 5.2)
+                    if not ha.confirm_step(f'rolling update of {node_name}'):
+                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] stopped: this instance does not hold the lease")
+                        break
                     mgr.enter_maintenance_mode(node_name, skip_evacuation=skip_evacuation,
-                                               allow_local_disks=action.get('allow_local_disks', True))
+                                               allow_local_disks=action.get('allow_local_disks', True),
+                                               **({'migrate_templates': True} if migrate_templates else {}))  # #763
                     if not skip_evacuation:
                         mgr._rolling_update['current_step'] = 'evacuating'
                         waited = 0; evacuation_ok = False
@@ -431,8 +612,10 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
                             if node_name in mgr.nodes_in_maintenance:
                                 task = mgr.nodes_in_maintenance[node_name]
                                 if task.status == 'completed':
+                                    rolling_moved_templates(mgr, task)
                                     evacuation_ok = True; break
                                 elif task.status == 'completed_with_errors':
+                                    rolling_moved_templates(mgr, task)
                                     fv = getattr(task, 'failed_vms', [])
                                     mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠️ Evacuation: {getattr(task,'migrated_vms',0)}/{getattr(task,'total_vms',0)} migrated, {len(fv)} failed - continuing")
                                     evacuation_ok = True; break
@@ -443,6 +626,9 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
                             mgr._rolling_update['failed_nodes'].append({'node': node_name, 'error': 'Evacuation failed'})
                             mgr.exit_maintenance_mode(node_name); continue
                     mgr._rolling_update['current_step'] = 'updating'
+                    if not ha.confirm_step(f'update of {node_name}'):
+                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] stopped: this instance does not hold the lease")
+                        break
                     update_task = mgr.start_node_update(node_name, reboot=include_reboot, force=True)
                     if update_task:
                         waited = 0
@@ -515,6 +701,8 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
                             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ {nn} STILL in maintenance — manual intervention needed")
                             mgr._rolling_update['failed_nodes'].append({'node': nn, 'error': 'Stuck in maintenance after rolling update'})
 
+                rolling_rules_back_on(mgr, 'scheduler')   # #954, every node is out of maintenance by now
+
                 # Finished
                 mgr._rolling_update['status'] = 'completed'
                 mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Scheduled rolling update completed")
@@ -527,13 +715,16 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
                 
             except Exception as e:
                 logging.error(f"[SCHEDULER] Rolling update error: {e}")
+                rolling_rules_back_on(mgr, 'scheduler')   # #954, before the status says the run is over
                 if hasattr(mgr, '_rolling_update'):
                     mgr._rolling_update['status'] = 'failed'
                     mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ERROR: {e}")
         
-        update_thread = threading.Thread(target=run_scheduled_update, daemon=True)
+        # the steps between the confirms (apt refresh, maintenance exit) ask at their exit (#625)
+        update_thread = threading.Thread(target=ha.as_job(run_scheduled_update, f'rolling update of {cluster_id}'),
+                                         daemon=True)
         update_thread.start()
-        
+
         logging.info(f"[SCHEDULER] Rolling update thread started for {cluster_id}")
         
     except Exception as e:
@@ -576,7 +767,8 @@ def get_schedules():
     # admin-owned viewer token hit the all-clusters early return below and read every
     # scheduled action in the install.
     user_data = build_authz_user(user, request.session)
-    is_admin = user_data.get('effective_role', user_data.get('role')) == ROLE_ADMIN
+    from pegaprox.utils.rbac import acts_as_admin
+    is_admin = acts_as_admin(user_data)
 
     # NS Jul 2026 (CodeAnt IDOR) — use the real access model. The old filter read the raw
     # user_data['clusters'] field and FELL OPEN (`if not user_clusters` -> returned every tenant's
@@ -651,15 +843,16 @@ def create_schedule():
 
     # NS Aug 2026 (Aikido pentest) — clear the SAME per-VM ACL the live action enforces (vms.py),
     # not just cluster reachability, else a pool-restricted user could schedule actions on any VMID.
-    try:
-        _sv = int(data['vmid'])
-    except (TypeError, ValueError):
-        return jsonify({'error': 'vmid must be a number'}), 400
+    _sv = _schedule_vmid(data['vmid'])
+    _vm_type = data.get('vm_type', 'qemu')
+    _bad = _schedule_target_error({'action': data['action'], 'vm_type': _vm_type, 'vmid': _sv})
+    if _bad:
+        return jsonify({'error': _bad}), 400
     from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import user_can_access_vm
     if not user_can_access_vm(build_authz_user(request.session.get('user', ''), request.session),
                               data['cluster_id'], _sv, _perm_for_action(data['action']),
-                              data.get('vm_type', 'qemu')):
+                              _vm_type):
         return jsonify({'error': 'Permission denied for this VM'}), 403
 
     # Validate schedule type
@@ -691,8 +884,8 @@ def create_schedule():
     new_schedule = {
         'id': new_id,
         'cluster_id': data['cluster_id'],
-        'vmid': int(data['vmid']),
-        'vm_type': data.get('vm_type', 'qemu'),
+        'vmid': _sv,
+        'vm_type': _vm_type,
         'action': data['action'],
         'schedule_type': data['schedule_type'],
         'time': time_str,
@@ -755,10 +948,13 @@ def update_schedule(schedule_id):
 
     # NS Aug 2026 (Aikido pentest) — re-check the per-VM ACL for the effective target/action (same
     # as create) so an edit cannot retarget a schedule onto an unauthorized VMID.
-    try:
-        _uv = int(data.get('vmid', schedule.get('vmid')))
-    except (TypeError, ValueError):
-        return jsonify({'error': 'vmid must be a number'}), 400
+    # The target as it will be stored, the request's fields over the row's (#1023).
+    _uv = _schedule_vmid(data.get('vmid', schedule.get('vmid')))
+    _ut = data.get('vm_type', schedule.get('vm_type', 'qemu'))
+    _bad = _schedule_target_error({'action': data.get('action', schedule.get('action')),
+                                   'vm_type': _ut, 'vmid': _uv})
+    if _bad:
+        return jsonify({'error': _bad}), 400
     from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import user_can_access_vm
     _authz = build_authz_user(request.session.get('user', ''), request.session)
@@ -776,7 +972,7 @@ def update_schedule(schedule_id):
         return jsonify({'error': 'Permission denied for this VM'}), 403
     if not user_can_access_vm(_authz, _cid, _uv,
                               _perm_for_action(data.get('action', schedule.get('action', 'start'))),
-                              data.get('vm_type', schedule.get('vm_type', 'qemu'))):
+                              _ut):
         return jsonify({'error': 'Permission denied for this VM'}), 403
 
     # Validate time format if being updated
@@ -802,10 +998,16 @@ def update_schedule(schedule_id):
         return jsonify({'error': 'Days are required for weekly schedules'}), 400
 
     # Update fields (vmid/vm_type added Mar 2026 - #133)
+    _before = (schedule.get('vmid'), schedule.get('vm_type', 'qemu'), schedule.get('action'))
     updatable = ['name', 'vmid', 'vm_type', 'action', 'schedule_type', 'time', 'date', 'days', 'enabled']
     for field in updatable:
         if field in data:
             schedule[field] = data[field]
+    schedule['vmid'] = _uv
+    # NS Oct 2026 - a run asks its creator again (#1093); who picked the guest and the action
+    # is the one to ask, so a retarget makes the editor the creator
+    if (schedule.get('vmid'), schedule.get('vm_type', 'qemu'), schedule.get('action')) != _before:
+        schedule['created_by'] = request.session.get('user', 'unknown')
 
     if not save_schedules(schedules):
         return jsonify({'error': 'Could not save the schedule - check the server logs',
@@ -832,7 +1034,11 @@ def delete_schedule(schedule_id):
     if not schedule:
         return jsonify({'error': 'Schedule not found'}), 404
     ok, err = check_cluster_access(schedule.get('cluster_id', ''))
-    if not ok: return err
+    if not ok:
+        # NS Sep 2026 (audit) — a schedule on a cluster this caller cannot reach must
+        # read as absent, not as forbidden; the pair of answers is what turns an id
+        # into an enumerable oracle.
+        return jsonify({'error': 'Schedule not found'}), 404
 
     perm_err = _require_action_perm(schedule.get('action', 'start'))
     if perm_err:
@@ -880,13 +1086,15 @@ def load_update_schedule(cluster_id: str) -> dict:
         'skip_evacuation': False,
         'skip_up_to_date': True,
         'evacuation_timeout': 1800,
+        'migrate_templates': False,
+        'relax_anti_affinity': False,
         'last_run': None,
         'next_run': None
     }
     try:
         db = get_db()
         cursor = db.conn.cursor()
-        
+
         # MK: Ensure table exists (migration for existing databases)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS update_schedules (
@@ -904,7 +1112,9 @@ def load_update_schedule(cluster_id: str) -> dict:
                 next_run TEXT,
                 created_by TEXT,
                 created_at TEXT,
-                updated_at TEXT
+                updated_at TEXT,
+                migrate_templates INTEGER DEFAULT 0,
+                relax_anti_affinity INTEGER DEFAULT 0
             )
         ''')
         # MK #630 — older schedule tables predate the reboot_timeout column; add it in place
@@ -914,28 +1124,40 @@ def load_update_schedule(cluster_id: str) -> dict:
             _cols = {r[1] for r in cursor.fetchall()}
             if 'reboot_timeout' not in _cols:
                 cursor.execute("ALTER TABLE update_schedules ADD COLUMN reboot_timeout INTEGER DEFAULT 600")
+            for _col in ('migrate_templates', 'relax_anti_affinity'):   # #763, #954
+                if _col not in _cols:
+                    cursor.execute(f"ALTER TABLE update_schedules ADD COLUMN {_col} INTEGER DEFAULT 0")
         except Exception as _mig_e:
             logging.warning(f"update_schedules reboot_timeout migration skipped: {_mig_e}")
 
         cursor.execute('SELECT * FROM update_schedules WHERE cluster_id = ?', (cluster_id,))
         row = cursor.fetchone()
         if row:
-            return {
-                'enabled': bool(row['enabled']),
-                'schedule_type': row['schedule_type'] or 'recurring',
-                'day': row['day'] or 'sunday',
-                'time': row['time'] or '03:00',
-                'include_reboot': bool(row['include_reboot']),
-                'skip_evacuation': bool(row['skip_evacuation']),
-                'skip_up_to_date': bool(row['skip_up_to_date']),
-                'evacuation_timeout': row['evacuation_timeout'] or 1800,
-                'reboot_timeout': (row['reboot_timeout'] if 'reboot_timeout' in row.keys() else 600) or 600,
-                'last_run': row['last_run'],
-                'next_run': row['next_run']
-            }
+            return _update_schedule_row(row)
     except Exception as e:
         logging.error(f"Error loading update schedule: {e}")
     return default
+
+
+def _update_schedule_row(row):
+    """A row of update_schedules as the routes and the scheduler read it."""
+    keys = row.keys()
+    return {
+        'enabled': bool(row['enabled']),
+        'schedule_type': row['schedule_type'] or 'recurring',
+        'day': row['day'] or 'sunday',
+        'time': row['time'] or '03:00',
+        'include_reboot': bool(row['include_reboot']),
+        'skip_evacuation': bool(row['skip_evacuation']),
+        'skip_up_to_date': bool(row['skip_up_to_date']),
+        'evacuation_timeout': row['evacuation_timeout'] or 1800,
+        'reboot_timeout': (row['reboot_timeout'] if 'reboot_timeout' in keys else 600) or 600,
+        # #763, #954 - off on a schedule saved before they existed
+        'migrate_templates': bool(row['migrate_templates']) if 'migrate_templates' in keys else False,
+        'relax_anti_affinity': bool(row['relax_anti_affinity']) if 'relax_anti_affinity' in keys else False,
+        'last_run': row['last_run'],
+        'next_run': row['next_run']
+    }
 
 
 def save_update_schedule(cluster_id: str, schedule: dict, user: str = 'system'):
@@ -947,10 +1169,11 @@ def save_update_schedule(cluster_id: str, schedule: dict, user: str = 'system'):
         
         # MK: Use INSERT OR REPLACE for older SQLite compatibility
         cursor.execute('''
-            INSERT OR REPLACE INTO update_schedules 
+            INSERT OR REPLACE INTO update_schedules
             (cluster_id, enabled, schedule_type, day, time, include_reboot, skip_evacuation,
-             skip_up_to_date, evacuation_timeout, reboot_timeout, last_run, next_run, created_by, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             skip_up_to_date, evacuation_timeout, reboot_timeout, migrate_templates, relax_anti_affinity,
+             last_run, next_run, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             cluster_id,
             1 if schedule.get('enabled') else 0,
@@ -962,6 +1185,8 @@ def save_update_schedule(cluster_id: str, schedule: dict, user: str = 'system'):
             1 if schedule.get('skip_up_to_date', True) else 0,
             schedule.get('evacuation_timeout', 1800),
             schedule.get('reboot_timeout', 600),
+            1 if schedule.get('migrate_templates') else 0,   # #763
+            1 if schedule.get('relax_anti_affinity') else 0,   # #954
             schedule.get('last_run'),
             schedule.get('next_run'),
             user,
@@ -995,19 +1220,9 @@ def load_all_update_schedules() -> dict:
         cursor = db.conn.cursor()
         cursor.execute('SELECT * FROM update_schedules WHERE enabled = 1')
         for row in cursor.fetchall():
-            schedules[row['cluster_id']] = {
-                'enabled': bool(row['enabled']),
-                'schedule_type': row['schedule_type'] or 'recurring',
-                'day': row['day'] or 'sunday',
-                'time': row['time'] or '03:00',
-                'include_reboot': bool(row['include_reboot']),
-                'skip_evacuation': bool(row['skip_evacuation']),
-                'skip_up_to_date': bool(row['skip_up_to_date']),
-                'evacuation_timeout': row['evacuation_timeout'] or 1800,
-                'reboot_timeout': (row['reboot_timeout'] if 'reboot_timeout' in row.keys() else 600) or 600,
-                'last_run': row['last_run'],
-                'next_run': row['next_run']
-            }
+            # the scheduler asks the creator again before a run (#1093); the GET route
+            # reads load_update_schedule and keeps not naming them
+            schedules[row['cluster_id']] = dict(_update_schedule_row(row), created_by=row['created_by'])
     except Exception as e:
         logging.error(f"Error loading all update schedules: {e}")
     return schedules
@@ -1056,6 +1271,10 @@ def set_update_schedule(cluster_id):
             return jsonify({'error': 'Scheduling a node reboot needs the node.reboot '
                                      'permission'}), 403
 
+    mgr = cluster_managers[cluster_id]
+    # MK Oct 2026 (#763, #954) - the two evacuation options go with the schedule, both off
+    # unless asked for, and off on XCP-ng as for a run started by hand
+    migrate_templates, relax_anti_affinity = evacuation_options(mgr, data)
     schedule = {
         'enabled': data.get('enabled', False),
         'schedule_type': data.get('schedule_type', 'recurring'),
@@ -1067,19 +1286,22 @@ def set_update_schedule(cluster_id):
         'evacuation_timeout': data.get('evacuation_timeout', 1800),
         'reboot_timeout': data.get('reboot_timeout', 600),
         'wait_for_reboot': data.get('wait_for_reboot', True),
+        'migrate_templates': migrate_templates,
+        'relax_anti_affinity': relax_anti_affinity,
         'last_run': None,
         'next_run': None
     }
-    
+
     # Calculate next run time
     if schedule['enabled']:
         schedule['next_run'] = calculate_next_update_run(schedule['day'], schedule['time'])
-    
+
     save_update_schedule(cluster_id, schedule, usr)
-    
+
     # Log audit
-    mgr = cluster_managers[cluster_id]
-    log_audit(usr, 'update.schedule', f"Update schedule {'enabled' if schedule['enabled'] else 'disabled'} for {mgr.config.name}", cluster=mgr.config.name)
+    log_audit(usr, 'update.schedule', f"Update schedule {'enabled' if schedule['enabled'] else 'disabled'} for {mgr.config.name}"
+              + (evacuation_options_said(migrate_templates, relax_anti_affinity) if schedule['enabled'] else ''),
+              cluster=mgr.config.name)
     
     return jsonify({'success': True, 'schedule': schedule})
 
@@ -1115,7 +1337,7 @@ def delete_update_schedule(cluster_id):
 def calculate_next_update_run(day: str, time_str: str) -> str:
     """Calculate the next scheduled run time"""
     try:
-        now = datetime.now()
+        now = ha.schedule_now()
         hour, minute = map(int, time_str.split(':'))
         
         day_map = {
@@ -1148,7 +1370,7 @@ def check_scheduled_updates():
     """Check if any scheduled updates should run - called by scheduler"""
     try:
         schedules = load_all_update_schedules()
-        now = datetime.now()
+        now = ha.schedule_now()
         
         for cluster_id, schedule in schedules.items():
             if not schedule.get('enabled'):
@@ -1199,9 +1421,27 @@ def check_scheduled_updates():
                 if hasattr(mgr, '_rolling_update') and mgr._rolling_update:
                     if mgr._rolling_update.get('status') == 'running':
                         continue
-                
+
+                if not _creator_may_update(cluster_id, schedule):
+                    logging.warning(f"[SCHEDULER] Not starting the scheduled update of {cluster_id}: "
+                                    f"{schedule.get('created_by')!r} may no longer schedule it")
+                    log_audit('scheduler', 'update.schedule_refused',
+                              f"Scheduled rolling update not started: its creator "
+                              f"{schedule.get('created_by')!r} may no longer schedule it",
+                              cluster=getattr(mgr.config, 'name', cluster_id))
+                    continue
+
                 logging.info(f"[SCHEDULER] Starting scheduled update for cluster {cluster_id} (type: {schedule_type})")
                 
+                if ha.schedule_fire_first():
+                    # automatic failover, at most once (5.7): written and on its way to the
+                    # members before the update starts; a one-time one switches itself off
+                    update_schedule_last_run(cluster_id, now.isoformat(), calculate_next_update_run(
+                        day, time_str) if schedule_type == 'recurring' else None)
+                    if schedule_type == 'once':
+                        save_update_schedule(cluster_id, dict(schedule, enabled=False, last_run=now.isoformat()))
+                    ha.schedule_fired()
+
                 # Execute the scheduled rolling update
                 action = {
                     'cluster_id': cluster_id,
@@ -1213,7 +1453,9 @@ def check_scheduled_updates():
                         'evacuation_timeout': schedule.get('evacuation_timeout', 1800),
                         # MK #630 — forward the per-schedule reboot timeout to the runner; without this
                         # the runner falls back to 600s and the saved value never takes effect.
-                        'reboot_timeout': schedule.get('reboot_timeout', 600)
+                        'reboot_timeout': schedule.get('reboot_timeout', 600),
+                        'migrate_templates': schedule.get('migrate_templates') is True,   # #763
+                        'relax_anti_affinity': schedule.get('relax_anti_affinity') is True,   # #954
                     }
                 }
                 

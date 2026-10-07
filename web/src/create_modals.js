@@ -1943,7 +1943,8 @@
             name: '', host: '', api_port: 8006, node_ui_suffix: '', user: 'root@pam', pass: '',
             ssl_verification: false, migration_threshold: 20, migration_tolerance: 10, check_interval: 300,
             auto_migrate: false, balance_containers: false, balance_local_disks: false,
-            dry_run: false, ssh_key: '', ha_enabled: false, proxlb_tags_enabled: false,
+            dry_run: false, ssh_key: '', ssh_disabled: false, ha_enabled: false, proxlb_tags_enabled: false,
+            proxlb_pins_auto_migrate: false, proxlb_pins_strict: false,
             predictive_balancing: false, predictive_threshold: 75,
             balance_cpu_weight: 1.0, balance_mem_weight: 1.0, balance_io_weight: 0.0,
             cpu_baseline: null,
@@ -1983,7 +1984,7 @@
                         // just this subset. The omitted toggles (HA, ProxLB tags, predictive balancing +
                         // its weights/baseline) started at their defaults, so hitting Re-configure quietly
                         // switched them back off. The list GET already returns all of these.
-                        setConfig(prev => ({ ...prev, name: rc.name || '', host: rc.host || '', api_port: rc.api_port || 8006, node_ui_suffix: rc.node_ui_suffix || '', user: rc.user || '', pass: '', ssl_verification: rc.ssl_verification || false, migration_threshold: rc.migration_threshold || 20, migration_tolerance: rc.migration_tolerance || 10, check_interval: rc.check_interval || 300, auto_migrate: rc.auto_migrate || false, balance_containers: rc.balance_containers || false, balance_local_disks: rc.balance_local_disks || false, dry_run: rc.dry_run || false, ssh_key: '', ha_enabled: rc.ha_enabled || false, proxlb_tags_enabled: rc.proxlb_tags_enabled || false, predictive_balancing: rc.predictive_balancing || false, predictive_threshold: rc.predictive_threshold || 75, balance_cpu_weight: rc.balance_cpu_weight || 1.0, balance_mem_weight: rc.balance_mem_weight || 1.0, balance_io_weight: rc.balance_io_weight || 0.0, cpu_baseline: rc.cpu_baseline || null }));
+                        setConfig(prev => ({ ...prev, name: rc.name || '', host: rc.host || '', api_port: rc.api_port || 8006, node_ui_suffix: rc.node_ui_suffix || '', user: rc.user || '', pass: '', ssl_verification: rc.ssl_verification || false, migration_threshold: rc.migration_threshold || 20, migration_tolerance: rc.migration_tolerance || 10, check_interval: rc.check_interval || 300, auto_migrate: rc.auto_migrate || false, balance_containers: rc.balance_containers || false, balance_local_disks: rc.balance_local_disks || false, dry_run: rc.dry_run || false, ssh_key: '', ssh_disabled: rc.ssh_disabled || false, ha_enabled: rc.ha_enabled || false, proxlb_tags_enabled: rc.proxlb_tags_enabled || false, proxlb_pins_auto_migrate: rc.proxlb_pins_auto_migrate === true, proxlb_pins_strict: rc.proxlb_pins_strict === true, predictive_balancing: rc.predictive_balancing || false, predictive_threshold: rc.predictive_threshold || 75, balance_cpu_weight: rc.balance_cpu_weight || 1.0, balance_mem_weight: rc.balance_mem_weight || 1.0, balance_io_weight: rc.balance_io_weight || 0.0, cpu_baseline: rc.cpu_baseline || null }));
                     }
                 }
             }, [isOpen, initialType, reconfigureConfig]);
@@ -2138,6 +2139,10 @@
                                         <textarea value={config.ssh_key} onChange={e => setConfig({...config, ssh_key: e.target.value})}
                                             className="w-full px-4 py-2.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-proxmox-orange transition-colors font-mono text-xs"
                                             placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" rows={4} />
+                                        <div className="pt-2 border-t border-proxmox-border">
+                                            <Toggle checked={config.ssh_disabled} onChange={v => setConfig({...config, ssh_disabled: v})} label={t('sshDisabled') || 'No SSH to this cluster'} />
+                                            <p className="text-xs text-gray-400 mt-2">{t('sshDisabledDesc') || 'Blocks every SSH connection to this cluster\'s nodes, including the node shell and the VNC tunnel. Features that need a shell will say so.'}</p>
+                                        </div>
                                     </div>
                                 )}
                             </div>
@@ -2242,16 +2247,18 @@
                                         placeholder="root@pam" />
                                 </div>
                                 <div>
-                                    <label className="block text-sm font-medium text-gray-300 mb-2">{t('password')}</label>
+                                    <label className="block text-sm font-medium text-gray-300 mb-2">{t('passwordOrToken') || t('password')}</label>
                                     <input type="password" value={pbsConfig.password} onChange={e => setPbsConfig({...pbsConfig, password: e.target.value})} required
                                         className="w-full px-4 py-2.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-blue-400 transition-colors"
-                                        placeholder="Password" />
+                                        placeholder={pbsConfig.user.includes('!') ? 'Token Secret' : 'Password'} />
                                 </div>
                                 <div>
                                     <label className="block text-sm font-medium text-gray-300 mb-2">Port</label>
                                     <input type="number" value={pbsConfig.port} onChange={e => setPbsConfig({...pbsConfig, port: parseInt(e.target.value) || 8007})}
                                         className="w-full px-4 py-2.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-white focus:outline-none focus:border-blue-400 transition-colors" />
                                 </div>
+                                {/* LW Oct 2026 (#805) - a token goes in like on the PVE tab, the backend reads the '!' */}
+                                <p className="col-span-3 -mt-2 text-xs text-gray-500">{t('apiTokenHint') || 'For API tokens use: user@realm!tokenid'}</p>
                             </div>
                             <div>
                                 <label className="block text-sm font-medium text-gray-300 mb-2">Fingerprint ({t('optional') || 'Optional'})</label>
@@ -3564,6 +3571,9 @@
         }
 
         function HardwareKeysPanel({ t, addToast, getAuthHeaders }) {
+            // a key is bound to the host the browser sees: no standby enrols one, forwarding
+            // or not (#625). Removing one goes through like any other change
+            const { haStandby } = useAuth();
             const [available, setAvailable] = useState(true);   // optimistic; will flip if server says no
             const [hostUsable, setHostUsable] = useState(true);
             const [hostReason, setHostReason] = useState(null);
@@ -3679,12 +3689,15 @@
                             <Icons.Key /> {t('hardwareKeys') || 'Hardware Keys'}
                             <span className="text-xs text-gray-500 ml-1">({creds.length})</span>
                         </h3>
+                        {!haStandby && (
                         <button onClick={register} disabled={registering || !hostUsable}
                             className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm font-medium disabled:opacity-50 flex items-center gap-2">
                             {registering ? <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" /> : <Icons.Plus className="w-3.5 h-3.5" />}
                             {t('addHardwareKey') || 'Add Security Key'}
                         </button>
+                        )}
                     </div>
+                    {haStandby && <HaSettingsOnActive className="mb-3" />}
                     {!hostUsable && hostReason === 'ip_literal' && (
                         <div className="mb-3 p-3 rounded-lg flex items-start gap-2" style={{background: 'rgba(239, 192, 6, 0.08)', borderLeft: '3px solid #efc006'}}>
                             <Icons.AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5" style={{color: '#efc006'}} />

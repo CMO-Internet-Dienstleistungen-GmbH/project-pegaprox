@@ -4,7 +4,10 @@ PegaProx Flask App Factory - Layer 8
 Creates and configures the Flask application.
 """
 
+import io
+import json
 import os
+import re
 import sys
 import time
 import errno
@@ -23,6 +26,7 @@ from flask_cors import CORS
 from flask_sock import Sock
 from flask_compress import Compress
 from pathlib import Path
+from werkzeug.datastructures import EnvironHeaders
 
 from pegaprox.constants import (
     PEGAPROX_VERSION, PEGAPROX_BUILD,
@@ -31,6 +35,7 @@ from pegaprox.constants import (
 )
 from pegaprox import globals as g
 from pegaprox.api import register_blueprints
+from pegaprox.utils.auth import BODY_DEADLINE_ENVIRON
 
 
 def get_allowed_origins():
@@ -138,7 +143,14 @@ def create_app():
         if request.path.startswith('/api/'):
             skip_paths = ['/api/auth/login', '/api/auth/check', '/api/events', '/api/health', '/api/sse',
                           '/api/vmware/migrations']
-            if not any(request.path.startswith(p) for p in skip_paths):
+            # MK Sep 2026 (#625) - a group member's signed call is not a client: every
+            # write a standby forwards comes from its one address, next to its sync, and
+            # the forwarded request counts against the client's own address inside
+            peer_call = False
+            if request.path.startswith('/api/ha/peer/'):
+                from pegaprox.api.ha import signed_member_call
+                peer_call = signed_member_call()
+            if not peer_call and not any(request.path.startswith(p) for p in skip_paths):
                 # NS: Mar 2026 - use centralized get_client_ip, respects trusted_proxies
                 from pegaprox.utils.audit import get_client_ip
                 client_ip = get_client_ip()
@@ -179,6 +191,11 @@ def create_app():
             '/api/health',
             '/api/webauthn/auth/begin',
             '/api/webauthn/auth/finish',
+            # MK Sep 2026 - the automated installer is not a browser: it carries no
+            # session to protect and cannot be made to send Origin or X-Requested-With.
+            # Both of these are gated by the installation token instead.
+            '/api/auto-install/answer',
+            '/api/auto-install/progress',
         )
         if (request.method in ('POST', 'PUT', 'PATCH', 'DELETE')
                 and request.path.startswith('/api/')
@@ -356,6 +373,11 @@ def create_app():
             "base-uri 'self'; "
             "form-action 'self'"
         )
+        # NS Oct 2026 - an SVG opened as a page runs its scripts under this origin, and an
+        # admin can upload one as the login background (#1065). As an <img> or a CSS
+        # background the sandbox changes nothing.
+        if response.mimetype == 'image/svg+xml':
+            csp += "; sandbox"
         response.headers['Content-Security-Policy'] = csp
 
         # LW: Mar 2026 - only trust X-Forwarded-Proto from trusted proxies
@@ -381,11 +403,475 @@ def create_app():
     # Register all API blueprints
     register_blueprints(app)
 
+    # MK Sep 2026 (#625) - a standby takes its configuration from the active instance
+    # and would lose a local change at the next sync, so it refuses writes. With the
+    # live view on it also holds connections to the clusters, and a write there is an
+    # action on them (start, migrate, delete) that only the active takes. Registered
+    # here and not in validate_request: before_request hooks run in registration
+    # order, and the IP allow list is hooked in by the settings blueprint above, so
+    # this runs after the CSRF, rate-limit and IP checks.
+    # Open on a standby: the pairing/promotion routes and signing in and out. A TOTP
+    # code travels inside /api/auth/login. Enrolment (/api/auth/2fa/*), setup, password
+    # changes, tokens and preferences are writes like any other: refused here, and
+    # forwarded to the active while forwarding is on.
+    _STANDBY_WRITABLE = (
+        '/api/auth/login',
+        '/api/auth/logout',
+        '/api/auth/oidc/callback',
+        '/api/webauthn/auth/begin',
+        '/api/webauthn/auth/finish',
+    )
+    # Writes that only ever change this instance, so no sync can undo them and nothing
+    # would be lost. Matched on the route that serves the request, not on the path
+    # text, so a parameter or an encoded character cannot stretch an entry.
+    # Not POST /api/settings/server: one body mixes local keys with synced ones.
+    _STANDBY_LOCAL_WRITES = frozenset((
+        # the caller's own session; sessions are per instance and never synced
+        ('DELETE', '/api/user/sessions/<token>'),
+        # the live stream: its short-lived token and which clusters it carries, both in
+        # memory here. Not /api/ws/token - every caller of that one opens a console,
+        # which _STANDBY_CONSOLES below decides.
+        ('POST', '/api/sse/token'),
+        ('POST', '/api/sse/subscribe'),
+        # a read that takes its filter in the body; the GET beside it is open anyway
+        ('POST', '/api/snapshots/overview'),
+        # the ESXi VM detail watch: which VMs the live stream pushes details for, a dict
+        # in this process like the SSE subscription (vmware.vm.view, the per-server
+        # check still applies). The push only reads the VM, its guest info and its
+        # performance from the ESXi host.
+        ('POST', '/api/vmware/<vmware_id>/vms/<vm_id>/watch'),
+        ('DELETE', '/api/vmware/<vmware_id>/vms/<vm_id>/watch'),
+        # restarts this process and changes nothing
+        ('POST', '/api/settings/server/restart'),
+        # Not the ACME request and DNS-complete routes and not the hardware-monitoring
+        # consent, although what they mean to change is local: each saves back the whole
+        # settings dict it loaded, so a sync that lands in between (the ACME call waits
+        # 30 s for DNS) is overwritten with the older copy until the active changes
+        # something. Set those before pairing or after promotion.
+        # login lockouts are counters in this process
+        ('DELETE', '/api/security/locked-ips/<ip_address>'),
+        ('DELETE', '/api/security/locked-users/<username>'),
+        ('DELETE', '/api/security/locked-ips'),
+        ('DELETE', '/api/security/locked-users'),
+    ))
+    # Consoles: a standby that serves users opens them itself, for the browser sessions
+    # it serves, the way an active instance does. Any other standby opens none and hands
+    # none on, the UI offers the active instance instead (ha.CONSOLE_WRITES).
+    from pegaprox.core.ha import CONSOLE_WRITES as _STANDBY_CONSOLES
+    # v3: a write refused here goes to the active instead, when a signed-in browser sent
+    # it (api/ha.py forward_to_active). These stay refused.
+    _STANDBY_NOT_FORWARDED = frozenset((
+        # This instance's own settings: run on the active they would set the active's
+        # port, domain, certificate and so on to what the form here shows. The server
+        # form sends its local keys every time, whatever else changed.
+        ('POST', '/api/settings/server'),
+        ('POST', '/api/settings/acme/request'),
+        ('POST', '/api/settings/acme/dns/complete'),
+        ('POST', '/api/hardware-monitoring/consent'),
+        ('POST', '/api/hardware-monitoring/redfish-consent'),
+        ('POST', '/api/config/restore'),
+        ('POST', '/api/security/cors'),
+        # MK Oct 2026 - the broadcast banners, stored with the settings: a standby shows
+        # them and leaves them to the settings page of the active
+        ('POST', '/api/settings/banners'),
+        ('PUT', '/api/settings/banners/<banner_id>'),
+        ('DELETE', '/api/settings/banners/<banner_id>'),
+        # the code and the loaded plugins of a process: an update or a plugin switched
+        # on would happen to the active and not here
+        ('POST', '/api/pegaprox/update'),
+        ('POST', '/api/pegaprox/update/rollback'),
+        ('POST', '/api/plugins/<plugin_id>/reload'),
+        ('POST', '/api/plugins/<plugin_id>/enable'),
+        ('POST', '/api/plugins/<plugin_id>/disable'),
+        ('POST', '/api/plugins/rescan'),
+        ('DELETE', '/api/plugins/<plugin_id>'),
+        ('POST', '/api/clusters/<cluster_id>/pools/refresh-cache'),
+        # a security key is bound to the host the browser sees, and the active would
+        # answer for its own
+        ('POST', '/api/webauthn/register/begin'),
+        ('POST', '/api/webauthn/register/finish'),
+        # rows of tables every instance keeps for itself, named by an id from this one's
+        # copy: on the active the same id is another row, or none. Not the drift, alert
+        # and inbox acks: a forwarding standby reads those lists from the active
+        # (ha.FORWARDED_READS), so their ids are the active's
+        ('DELETE', '/api/auto-install/runs/<run_id>'),
+        ('POST', '/api/insights/force-snapshot'),
+    ))
+    # The plugin proxy, and the plugin routes behind it that open a console. A plugin
+    # handler serves every method from one function and most never look at which one
+    # they got, so a GET reaches their write paths too: on a standby nothing of a plugin
+    # runs but its console where consoles open. Its GETs are read on the active while
+    # this standby forwards, its writes go there like any other.
+    from pegaprox.core.ha import (FORWARDED_READS as _ha_forwarded_reads,
+                                  FORWARD_ENVIRON as _FORWARD_ENVIRON,
+                                  PLUGIN_PROXY_RULE as _PLUGIN_PROXY_RULE,
+                                  PLUGIN_CONSOLE_PATHS as _PLUGIN_CONSOLE_PATHS)
+
+    @app.before_request
+    def refuse_writes_on_standby():
+        rule = request.url_rule.rule if request.url_rule is not None else None
+        if request.method == 'GET' and rule in _ha_forwarded_reads:
+            # the progress of a job the active runs, or a view only its tables hold: from
+            # there while this standby hands its writes on, else our own (empty) copy.
+            # The task lists only for an XCP-ng pool (ha.XCPNG_TASK_READS)
+            from pegaprox.core import ha
+            if ha.is_standby() and ha.forwards_read(rule, request.view_args):
+                from pegaprox.api.ha import forward_to_active
+                return forward_to_active(read=True)
+            return None
+        plugin_call = rule == _PLUGIN_PROXY_RULE
+        if request.method not in ('POST', 'PUT', 'PATCH', 'DELETE') and not plugin_call:
+            return None
+        path = request.path
+        if not path.startswith('/api/') or path.startswith('/api/ha/') or path in _STANDBY_WRITABLE:
+            return None
+        if (request.method, rule) in _STANDBY_LOCAL_WRITES:
+            return None
+        from pegaprox.core import ha
+        view_args = request.view_args or {}
+        if not ha.is_standby():
+            # MK Oct 2026 (#625) - the leader hands its lead on: writes wait until the
+            # member it goes to caught up (design 7.1)
+            active = ha.is_active()
+            pausing = active and ha.handing_over()
+            if active and not pausing:
+                return None
+            # MK Oct 2026 (#625) - automatic failover: this instance leads and holds no
+            # lease right now (it ran out, or the takeover wait is on). A change taken now
+            # might be one the next leader never sees. The consoles stay: they are the
+            # user's, on the instance the browser is on.
+            if (request.method, rule) in _STANDBY_CONSOLES or (
+                    plugin_call and view_args.get('subpath') in _PLUGIN_CONSOLE_PATHS):
+                return None
+            if pausing:
+                from pegaprox.api.ha import transfer_refusal
+                return transfer_refusal()
+            # never None: is_active() said no, and a second look at the state may find a
+            # standby by now, which would wave the write through
+            from pegaprox.api.ha import write_gate_refusal
+            return write_gate_refusal()
+        if plugin_call and view_args.get('subpath') in _PLUGIN_CONSOLE_PATHS:
+            # never forwarded: the browser connects to the instance that opened it. Where
+            # consoles open, only for a plugin the leader runs as well - one switched off
+            # there stays loaded in this process until it restarts, so the synced
+            # plugin_state decides, not what is loaded here
+            from pegaprox.api.ha import by_api_token, PLUGIN_CONSOLE_ERROR
+            if ha.consoles_here() and not by_api_token():
+                from pegaprox.api.plugins import plugin_runs_here
+                if plugin_runs_here(view_args.get('plugin_id')):
+                    return None
+                return jsonify({'error': PLUGIN_CONSOLE_ERROR, 'code': 'HA_STANDBY'}), 409
+            forwardable = False
+        elif (request.method, rule) in _STANDBY_CONSOLES:
+            from pegaprox.api.ha import by_api_token
+            if ha.consoles_here() and not by_api_token():
+                return None
+            forwardable = False
+        elif plugin_call and request.method not in ('POST', 'PUT', 'PATCH', 'DELETE'):
+            # a GET of a plugin is read on the active, and nowhere when that does not
+            # answer: run here it could change this copy. HEAD and OPTIONS go nowhere
+            from pegaprox.api.ha import forward_to_active
+            read = forward_to_active(read=True)
+            if read is not None:
+                return read
+            forwardable = False
+        else:
+            # a path no route serves goes nowhere: forwarded, it would only cost the active
+            forwardable = rule is not None and (request.method, rule) not in _STANDBY_NOT_FORWARDED
+        if forwardable:
+            from pegaprox.api.ha import forward_to_active
+            forwarded = forward_to_active()
+            if forwarded is not None:
+                return forwarded
+        return jsonify({
+            'error': 'This is a standby instance. Make changes and act on the active '
+                     'instance; its configuration arrives here with the next sync.',
+            'code': 'HA_STANDBY',
+        }), 409
+
+    # A read can change shared configuration as well: a plugin serves every method from
+    # one function, and the leader runs the reads its members hand over. Around those
+    # the leader takes the change count of the shared tables and files (ha.read_mark),
+    # and one that moved it tells the members like a write (below). Counted, not guessed
+    # from the route: most of them change nothing.
+    _READ_MARK = 'pegaprox.ha_read_mark'
+
+    @app.before_request
+    def count_around_a_read():
+        if request.method != 'GET':
+            return None
+        rule = request.url_rule.rule if request.url_rule is not None else None
+        if rule != _PLUGIN_PROXY_RULE and request.environ.get(_FORWARD_ENVIRON) is None:
+            return None
+        from pegaprox.core import ha
+        mark = ha.read_mark()
+        if mark is not None:
+            request.environ[_READ_MARK] = mark
+        return None
+
+    # The active tells its members after a write, so the change shows there in seconds
+    # and not at their next poll (ha.nudge_members, one call for a burst). A forwarded
+    # write runs through here on the active as well. Not for the HA routes, not for the
+    # writes above that only ever change this instance (signing in, the live stream)
+    # and not for the consoles: the members would only find nothing new, and a console
+    # over vnc-poll sends a POST for every screen update and key press while it is open.
+    @app.after_request
+    def tell_the_members_about_a_write(response):
+        try:
+            if request.method in ('POST', 'PUT', 'PATCH', 'DELETE') and 200 <= response.status_code < 300:
+                path = request.path
+                rule = request.url_rule.rule if request.url_rule is not None else None
+                if (path.startswith('/api/') and not path.startswith('/api/ha/')
+                        and path not in _STANDBY_WRITABLE
+                        and (request.method, rule) not in _STANDBY_LOCAL_WRITES
+                        and (request.method, rule) not in _STANDBY_CONSOLES
+                        and not (rule == _PLUGIN_PROXY_RULE and (request.view_args or {}).get(
+                            'subpath') in _PLUGIN_CONSOLE_PATHS)):
+                    _note_and_nudge()
+            elif _READ_MARK in request.environ:
+                # the count says something changed while it ran: the members pull either
+                # way, but only a read that went through for a signed-in user is the
+                # journal's "who wrote it" - another connection may have made the change
+                from pegaprox.core import ha
+                if ha.read_mark() != request.environ[_READ_MARK]:
+                    # a forwarded read runs for the signed-in user its member vouched for
+                    signed_in = (bool((getattr(request, 'session', None) or {}).get('user'))
+                                 or request.environ.get(ha.FORWARD_ENVIRON) is not None)
+                    _note_and_nudge(journal=signed_in and 200 <= response.status_code < 300)
+        except Exception as e:
+            logging.debug(f"[HA] no note to the members after {request.path}: {e}")
+        return response
+
+    def _note_and_nudge(journal=True):
+        from pegaprox.core import ha
+        # who wrote what, for the copy a member keeps should a sync not carry it over
+        # (ha.note_write)
+        if journal:
+            mark = request.environ.get(ha.FORWARD_ENVIRON)
+            ha.note_write((getattr(request, 'session', None) or {}).get('user', ''),
+                          request.method, request.path,
+                          mark.get('via') if isinstance(mark, dict) else '')
+        ha.nudge_members()
+
+    # MK Oct 2026 (#625) - a write the exit refused in an automatic group (ha.guard: the
+    # lease ran out, or no majority confirmed it) reaches most routes as a failed cluster
+    # call, and they answered 400 or 500 with the guard's own words. The caller hears what
+    # the write gate says instead: 503 HA_NO_LEASE, try again. A 2xx for what did go out
+    # and a 503 of the route's own stay as they are.
+    @app.after_request
+    def say_no_lease_after_a_refused_write(response):
+        if 400 <= response.status_code < 600 and response.status_code != 503:
+            from pegaprox.core import ha
+            if request.environ.get(ha.GUARD_REFUSED_ENVIRON):
+                from pegaprox.api.ha import guard_refusal
+                resp, status = guard_refusal()
+                resp.status_code = status
+                return resp
+        return response
+
+    # and the same for a refusal that no route caught on its way up
+    from pegaprox.core.ha import NoLease
+
+    @app.errorhandler(NoLease)
+    def refused_at_the_exit(e):
+        from pegaprox.api.ha import guard_refusal
+        return guard_refusal()
+
+    # the lease calls of automatic failover, answered before Flask where Flask would
+    # answer them with 200 anyway (_LeaseFastPath). It takes the hooks as they are now,
+    # before any plugin is loaded: one that hooks into requests turns it off
+    app.wsgi_app = _LeaseFastPath(app, app.wsgi_app, _default_max)
+
     # Load enabled plugins
     from pegaprox.api.plugins import load_enabled_plugins
     load_enabled_plugins(app)
 
     return app
+
+
+# --- the lease calls of automatic failover, before Flask -------------------------------------
+#
+# MK Oct 2026 (#625) - a leader in automatic mode renews its lease before every write, so
+# a member answers renewals many times a second. Through Flask one cost a member about
+# 1.0 ms of CPU (2 ms with TLS and pywsgi), more than three times the answer itself: a
+# request context and the URL map, the CSRF, rate-limit and IP hooks, the signature
+# checked twice (once before the body for the rate limit), the after-request headers.
+# Here it is 0.37 ms (1.05 ms with TLS and pywsgi).
+# _LeaseFastPath answers POST /api/ha/peer/renew and /api/ha/peer/vote in the WSGI layer
+# instead, and only a call the Flask path would answer with 200 as well: a member we hold
+# a key of signed it, the IP lists let its address through (settings.ip_lists_pass, the
+# function check_ip_whitelist goes by), its body is within both caps, its headers are what
+# the CSRF and content-type checks take, and nothing asks a hook to act (compression, a
+# CORS setup, a hook nobody here looked at). Anything else goes down the Flask path
+# untouched and is refused there as before. The one thing done before that is known is
+# the signature check; it spends the nonce, so its verdict goes along (api/ha.py
+# request_peer) and a call is judged once whichever way it takes.
+
+_LEASE_ROUTES = {'/api/ha/peer/renew': 'renew', '/api/ha/peer/vote': 'vote'}
+_LENGTH_RE = re.compile(r'[0-9]{1,9}')
+# the hooks the fast path stands in for, by name: what each does for these two routes is
+# done above or cannot apply (refuse_writes_on_standby lets /api/ha/ through,
+# count_around_a_read and tell_the_members_about_a_write look at other methods and paths,
+# say_no_lease_after_a_refused_write at a refusal of an exit, and these send through none)
+_STOOD_IN_FOR = {
+    'before': ('validate_request', 'check_ip_whitelist', 'refuse_writes_on_standby',
+               'count_around_a_read'),
+    'after': ('after_request', 'add_security_headers', 'tell_the_members_about_a_write',
+              'say_no_lease_after_a_refused_write', '_say_we_hold_the_key'),
+}
+
+
+def _request_hooks(app):
+    """The functions Flask runs around a request of the 'ha' blueprint, in order."""
+    out = []
+    for table in (app.before_request_funcs, app.after_request_funcs, app.teardown_request_funcs,
+                  app.url_value_preprocessors):
+        for key in (None, 'ha'):
+            out.append(tuple(table.get(key, ())))
+    return tuple(out)
+
+
+def _hooks_known(app):
+    def names(table):
+        return sorted(getattr(f, '__name__', '') for key in (None, 'ha') for f in table.get(key, ()))
+    befores, afters = names(app.before_request_funcs), names(app.after_request_funcs)
+    return (befores == sorted(_STOOD_IN_FOR['before'])
+            and afters == sorted(_STOOD_IN_FOR['after'])
+            and not any(app.teardown_request_funcs.get(k) for k in (None, 'ha'))
+            and not any(app.url_value_preprocessors.get(k) for k in (None, 'ha')))
+
+
+class _LeaseFastPath:
+    """The WSGI app in front of Flask: a renewal or a vote the Flask path would answer
+    with 200 is answered here, everything else goes to `wsgi_app` as it came."""
+
+    def __init__(self, app, wsgi_app, max_size):
+        self.app, self.wsgi_app, self.max_size = app, wsgi_app, max_size
+        self.hooks = _request_hooks(app)
+        # a CORS setup puts headers on these answers too (flask-cors sends them without
+        # an Origin): Flask's to make
+        self.on = _hooks_known(app) and not g._cors_origins_env
+        self.answered = 0
+        self._after_made = {}
+
+    def __call__(self, environ, start_response):
+        kind = _LEASE_ROUTES.get(environ.get('PATH_INFO'))
+        if (kind is not None and self.on and environ.get('REQUEST_METHOD') == 'POST'
+                and _request_hooks(self.app) == self.hooks):
+            resp = self._answer(environ, kind)
+            if resp is not None:
+                self.answered += 1
+                return resp(environ, start_response)
+        return self.wsgi_app(environ, start_response)
+
+    def _answer(self, environ, kind):
+        """The answer to a call that passes every check of the Flask path, None for any
+        other (the Flask path judges it; a body read here is handed on with it)."""
+        from pegaprox.core import ha, ha_wire
+        import pegaprox.api.ha as ha_api
+        from pegaprox.api.settings import ip_lists_pass
+        from pegaprox.utils.audit import client_ip_from, _is_trusted_proxy
+        get = environ.get
+        length = get('CONTENT_LENGTH') or ''
+        # the size, content-type and CSRF checks of validate_request, met the one way a
+        # member's call meets them: JSON, X-Requested-With and neither Origin nor Referer
+        if (get('QUERY_STRING') or get('SCRIPT_NAME') or get('HTTP_TRANSFER_ENCODING')
+                or get('HTTP_UPGRADE') or get('HTTP_ORIGIN') or get('HTTP_REFERER')
+                or get('HTTP_X_REQUESTED_WITH') != 'XMLHttpRequest'
+                or 'application/json' not in (get('CONTENT_TYPE') or '')
+                or (get('HTTP_ACCEPT_ENCODING') or 'identity').strip().lower() != 'identity'
+                or not _LENGTH_RE.fullmatch(length)
+                or not 0 < int(length) <= min(self.max_size, ha_api._MAX_PEER_BODY)):
+            return None
+        claimed = (get('HTTP_X_PEGAPROX_PEER') or '').partition(':')[0]
+        digest = get('HTTP_X_PEGAPROX_PEER_BODY')
+        rec = (ha._load().get('members') or {}).get(claimed)
+        # a member we hold a key of: a paired instance, and no key recorded on the way
+        if not rec or not rec.get('public_key') or not digest:
+            return None
+        path = environ['PATH_INFO']
+        ip = client_ip_from(get('REMOTE_ADDR'),
+                            lambda name: get('HTTP_' + name.upper().replace('-', '_')))
+        # the lists let a member's signed call through here, or refuse it whatever it is
+        if not ip_lists_pass(ip, path, lambda: True)[0]:
+            return None
+        n = int(length)
+        try:
+            body = environ['wsgi.input'].read(n)
+        except (OSError, ValueError):
+            # the caller went away: Flask finds the body short, as it would have
+            body = b''
+        environ['wsgi.input'] = io.BytesIO(body)
+        # the digest the headers name is the one the rate limit's look before the body
+        # checks the signature over (signed_member_call): the same call passes both
+        if len(body) != n or digest != ha_wire.body_digest(body):
+            return None
+        verdict = ha.peer_verdict(EnvironHeaders(environ), 'POST', path, body)
+        if verdict[0] != 'member' or not verdict[1].get('keyed'):
+            environ[ha_api._PEER_VERDICT] = verdict
+            return None
+        https = get('wsgi.url_scheme') in ('https', 'wss') or (
+            _is_trusted_proxy(get('REMOTE_ADDR')) and get('HTTP_X_FORWARDED_PROTO') == 'https')
+        try:
+            try:
+                data = json.loads(body)
+            except ValueError:
+                data = None
+            # api/ha.py _lease_call, as the route runs it, and jsonify's bytes
+            out = self._json(ha.lease_request(verdict[1]['instance_id'], kind,
+                                              data if isinstance(data, dict) else {}))
+        except Exception:
+            propagate = self.app.config['PROPAGATE_EXCEPTIONS']
+            if propagate is None:
+                propagate = self.app.testing or self.app.debug
+            if propagate:
+                raise
+            self.app.logger.error(f'Exception on {path} [POST]', exc_info=True)
+            from werkzeug.exceptions import InternalServerError
+            resp = InternalServerError().get_response()
+            for k, v in self._after(path, https):
+                resp.headers[k] = v
+            return resp
+        # the headers of the answer as Flask's would come out (a header set through a
+        # werkzeug Response cost more than the rest of the answer): its own two, then what
+        # the after-request hooks put on in the order Flask runs them
+        headers = [('Content-Type', self.app.json.mimetype), ('Content-Length', str(len(out)))]
+        headers += self._after(path, https)
+
+        def respond(environ, start_response):
+            start_response('200 OK', headers)
+            return [out]
+        return respond
+
+    def _json(self, obj):
+        """The bytes jsonify() makes of `obj` (flask.json.provider DefaultJSONProvider)."""
+        provider = self.app.json
+        if (provider.compact is None and self.app.debug) or provider.compact is False:
+            text = provider.dumps(obj, indent=2)
+        else:
+            text = provider.dumps(obj, separators=(',', ':'))
+        return f'{text}\n'.encode()
+
+    def _after(self, path, https):
+        """What the after-request hooks add: the blueprint's mark that we hold the key,
+        the app's security headers, flask-compress' Vary. The same for every call to a
+        path, so made once, by the app's own add_security_headers on an empty answer
+        (`https` stands for request.is_secure and a trusted proxy's X-Forwarded-Proto)."""
+        key = (path, https)
+        held = self._after_made.get(key)
+        if held is None:
+            from pegaprox.core import ha
+            hook = next(f for f in self.app.after_request_funcs[None]
+                        if f.__name__ == 'add_security_headers')
+            blank = self.app.response_class()
+            blank.headers.clear()
+            scheme = 'https' if https else 'http'
+            with self.app.test_request_context(path, method='POST', base_url=f'{scheme}://localhost',
+                                               environ_base={'REMOTE_ADDR': '192.0.2.1'}):
+                sec = list(hook(blank).headers.items())
+            held = self._after_made[key] = ([(ha.PEER_KEYED_HEADER, '1')] + sec
+                                            + [('Vary', 'Accept-Encoding')])
+        return held
 
 
 # MK Sep 2026 - the sweep this used to carry ran whenever the map passed 1024 entries
@@ -401,6 +887,21 @@ def _check_api_rate_limit(client_ip: str) -> bool:
     return g.api_rate_window.allow(client_ip)
 
 
+def _sri(data):
+    """The sha384 integrity string of some bytes, as web/index.html writes them."""
+    import base64
+    import hashlib
+    return 'sha384-' + base64.b64encode(hashlib.sha384(data).digest()).decode('ascii')
+
+
+# NS Oct 2026 - --download-static wrote whatever the CDN served for react@18, chart.js@4 and
+# friends into static/ unchecked, and the app then ran it as its own code. Every file is now
+# fetched at an exact version and kept only when it hashes to the copy this repository ships
+# (for react, react-dom, chart.js and xterm that is also the SRI hash web/index.html carries).
+# noVNC is 45 module files: one digest over all of them as downloaded, before the import rewrite.
+_NOVNC_SHA384 = 'sha384-1MofzirpfH0EVfkfVyRyOwvUg2NQKMuDXnCeYaFnB5Mm/m+6yRVLY8tIk5Yw04fS'
+
+
 def download_static_files():
     """Download all required static files for offline operation."""
     import urllib.request
@@ -413,15 +914,22 @@ def download_static_files():
 
     static_files = {
         'js': [
-            ('react.production.min.js', 'https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js'),
-            ('react-dom.production.min.js', 'https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js'),
-            ('babel.min.js', 'https://cdn.jsdelivr.net/npm/@babel/standalone@7/babel.min.js'),
-            ('chart.umd.min.js', 'https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js'),
-            ('xterm.min.js', 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js'),
-            ('xterm-addon-fit.min.js', 'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js'),
+            ('react.production.min.js', 'https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js',
+             'sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z'),
+            ('react-dom.production.min.js', 'https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom.production.min.js',
+             'sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1'),
+            ('babel.min.js', 'https://cdn.jsdelivr.net/npm/@babel/standalone@7.28.6/babel.min.js',
+             'sha384-JPppEYE7ZC9vFS/7cNjjowtWnUZ23GWT7OnRptB9bRQlXx1ufYwKfNbS2DrBYZ4a'),
+            ('chart.umd.min.js', 'https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js',
+             'sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ'),
+            ('xterm.min.js', 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js',
+             'sha384-xjfWUeCWdMtvpAb/SmM6lMzS6pQGcQa0loOl1d97j6Odw0vjK9nW3+dTb/bn/mwH'),
+            ('xterm-addon-fit.min.js', 'https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js',
+             'sha384-dpjGwSSISUTz2taP54Bor7qkyMR20sSO9oe11UVYnGs2/YdUBf7HW30XKQx9PCzn'),
         ],
         'css': [
-            ('xterm.min.css', 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css'),
+            ('xterm.min.css', 'https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css',
+             'sha384-9ftsg11+LSxVUaknegCfeKvlkO9EdIPI2op725RqY87IvhyGjElmpjZlP3LhTQjn'),
         ]
     }
 
@@ -435,7 +943,7 @@ def download_static_files():
 
     for subdir, files in static_files.items():
         print(f"Downloading {subdir} files...")
-        for filename, url in files:
+        for filename, url, integrity in files:
             dest = f'static/{subdir}/{filename}'
             print(f"  {filename}...", end=' ')
             try:
@@ -444,6 +952,9 @@ def download_static_files():
                 })
                 with urllib.request.urlopen(req, timeout=30, context=ctx) as response:
                     data = response.read()
+                if _sri(data) != integrity:
+                    # the file already in static/ stays as it is
+                    raise ValueError('hash does not match the pinned release, not written')
                 with open(dest, 'wb') as f:
                     f.write(data)
                 print(f"OK ({len(data):,} bytes)")
@@ -554,10 +1065,10 @@ def download_static_files():
 
     novnc_success = 0
     novnc_failed = 0
+    fetched = {}
 
     for filepath in novnc_files:
         url = f"{novnc_base}/{filepath}"
-        dest = f"static/js/novnc/{filepath}"
         filename = filepath.split('/')[-1]
         print(f"  {filename}...", end=' ')
         try:
@@ -565,7 +1076,26 @@ def download_static_files():
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             })
             with urllib.request.urlopen(req, timeout=30, context=ctx) as response:
-                content = response.read().decode('utf-8')
+                fetched[filepath] = response.read()
+            print("OK")
+        except Exception as e:
+            print(f"FAILED: {e}")
+            novnc_failed += 1
+            failed += 1
+
+    # written whole and as pinned, or not at all: every module imports the others
+    bundle = b''.join(fp.encode() + b'\0' + fetched.get(fp, b'') + b'\0' for fp in novnc_files)
+    if not novnc_failed and _sri(bundle) != _NOVNC_SHA384:
+        print("  noVNC: the files do not match the pinned 1.4.0 release, nothing written")
+        novnc_failed = len(novnc_files)
+        failed += novnc_failed
+    if novnc_failed:
+        fetched = {}
+
+    for filepath, raw in fetched.items():
+        dest = f"static/js/novnc/{filepath}"
+        try:
+            content = raw.decode('utf-8')
 
             file_dir = '/'.join(filepath.split('/')[:-1])
             pattern = r'''from\s+(['"])(\.{1,2}/[^'"]+)\1'''
@@ -594,11 +1124,10 @@ def download_static_files():
 
             with open(dest, 'w') as f:
                 f.write(content)
-            print("OK")
             novnc_success += 1
             success += 1
         except Exception as e:
-            print(f"FAILED: {e}")
+            print(f"  {filepath}... FAILED: {e}")
             novnc_failed += 1
             failed += 1
 
@@ -803,16 +1332,67 @@ def _resolve_ssl_context(reverse_proxy, domain='', app_name='PegaProx',
     return (cert_file, key_file)
 
 
-def main(debug_mode=False):
-    """Main entry point - starts PegaProx server."""
-    from pegaprox.utils.auth import (load_users, load_sessions, backfill_initialized_marker,
-                                     initialization_state, INIT_UNINITIALIZED, INIT_UNKNOWN)
-    from pegaprox.utils.audit import load_audit_log
-    from pegaprox.core.config import load_config
+def _start_managers(config, only=None):
+    """Cluster managers (Proxmox and XCP-ng) for `config` as load_config() returns it,
+    then the PBS and ESXi servers and the ESXi hosts XHM treats as clusters.
+
+    The same in every role: on a standby with the live view they start as well and
+    only read, since everything in them that acts asks ha.is_active() first. A standby
+    that reloads some of them (ha.reload_managers) passes those clusters in `config`
+    and the servers in `only`, as 'pbs:<id>' and 'vmware:<id>'; None is every server."""
     from pegaprox.core.pbs import load_pbs_servers
     from pegaprox.core.vmware import load_vmware_servers
     from pegaprox.models.tasks import PegaProxConfig
     from pegaprox.core.manager import PegaProxManager
+
+    for cluster_id, cluster_data in config.items():
+        config_obj = PegaProxConfig(cluster_data)
+        ctype = cluster_data.get('cluster_type', 'proxmox')
+        if ctype == 'xcpng':
+            from pegaprox.core.xcpng import XcpngManager
+            manager = XcpngManager(cluster_id, config_obj)
+            manager.start()
+            g.cluster_managers[cluster_id] = manager
+            print(f"Started XCP-ng manager for pool: {cluster_data['name']}")
+        else:
+            manager = PegaProxManager(cluster_id, config_obj)
+            manager.start()
+            g.cluster_managers[cluster_id] = manager
+            print(f"Started PegaProx manager for cluster: {cluster_data['name']}")
+
+    pbs_ids = vmw_ids = None
+    if only is not None:
+        pbs_ids = {key[4:] for key in only if key.startswith('pbs:')}
+        vmw_ids = {key[7:] for key in only if key.startswith('vmware:')}
+        if not pbs_ids and not vmw_ids:
+            return
+
+    try:
+        load_pbs_servers(only=pbs_ids)
+    except Exception as e:
+        logging.warning(f"Failed to load PBS servers at startup: {e}")
+
+    try:
+        load_vmware_servers(only=vmw_ids)
+        # NS: register ESXi hosts as XHM-capable clusters
+        from pegaprox.core.esxi_cluster import ESXiClusterManager
+        for vmw_id, vmw_mgr in list(g.vmware_managers.items()):
+            if vmw_ids is not None and vmw_id not in vmw_ids:
+                continue
+            if getattr(vmw_mgr, 'server_type', '') == 'esxi':
+                g.cluster_managers[vmw_id] = ESXiClusterManager(vmw_id, vmw_mgr)
+                logging.info(f"Registered ESXi host '{vmw_mgr.name}' as XHM cluster {vmw_id}")
+    except Exception as e:
+        logging.warning(f"Failed to load VMware servers at startup: {e}")
+
+
+def main(debug_mode=False):
+    """Main entry point - starts PegaProx server."""
+    from pegaprox.utils.auth import (load_users, load_sessions, backfill_initialized_marker,
+                                     initialization_state, INIT_UNINITIALIZED, INIT_UNKNOWN,
+                                     INIT_NO_ACCOUNTS, SETUP_REOPEN_FILE)
+    from pegaprox.utils.audit import load_audit_log
+    from pegaprox.core.config import load_config
     from pegaprox.background.broadcast import start_broadcast_thread
     from pegaprox.background.alerts import start_alert_thread
     from pegaprox.background.scheduler import start_scheduler_thread
@@ -849,13 +1429,33 @@ def main(debug_mode=False):
     # operator's terminal. Guarding the call sites means seventy-five edits and a
     # seventy-sixth somebody forgets, so it goes on the handlers instead. Tracebacks
     # arrive via exc_info and keep their newlines.
-    from pegaprox.utils.sanitization import install_log_injection_filter
+    # MK Sep 2026 (follow-up) - the handler filter alone missed the per-cluster loggers
+    # in core/manager.py and core/xcpng.py: their handlers are attached when a cluster is
+    # constructed, long after this runs, and a cluster logger writes through its own
+    # handlers before propagating here. The record factory sanitises at construction, so
+    # it covers loggers that do not exist yet. Both stay: the filter is harmless and the
+    # sanitiser is idempotent.
+    from pegaprox.utils.sanitization import (install_log_injection_filter,
+                                             install_log_record_sanitizer)
+    install_log_record_sanitizer()
     install_log_injection_filter()
 
     if not debug_mode:
         logging.getLogger('werkzeug').setLevel(logging.ERROR)
         logging.getLogger('gevent').setLevel(logging.ERROR)
         logging.getLogger('urllib3').setLevel(logging.ERROR)
+
+    # MK Oct 2026 (#625) - one process per config directory, before anything here writes
+    # to it (the DB encryption below already does). A second one - started by hand next
+    # to the service, say - shares the database and the HA state and acts next to it.
+    from pegaprox.core import ha
+    try:
+        # and never on the state directory of a witness (pegaprox/witness.py)
+        ha.check_not_a_witness_dir()
+        ha.lock_config_dir()
+    except ha.HaError as e:
+        print(f"\n[FATAL] {e}\n")
+        sys.exit(1)
 
     if debug_mode:
         print("=" * 50)
@@ -935,6 +1535,31 @@ def main(debug_mode=False):
         # don't take down boot for a non-fatal hiccup — log and continue
         logging.error(f"[DBCRYPTO] auto-encrypt check failed: {_e}", exc_info=True)
 
+    # MK Sep 2026 (#625) - an active that was down while its standby got promoted still
+    # reads "active" from its own state file. Ask the peer once, before anything here
+    # can act on the clusters with the configuration from before the outage: create_app()
+    # below is the first thing that starts threads (importing the blueprints starts the
+    # storage balancer at module import, register_blueprints the drift and multi-SDN
+    # scanners, the SIEM worker and the snapshot scheduler), and the managers and the
+    # other loops come after that. If the peer holds a newer epoch this steps down to
+    # standby without a restart, so the role read further down is already the right one.
+    # An unreachable peer changes nothing: every acting loop started below checks
+    # ha.is_active() on each tick, so it stops the moment the ha loop steps us down.
+    # The markers go first: a member whose state file is gone comes up passive.
+    # In an automatic group the same call asks for the lease instead (ha.lease_boot): a
+    # leader on disk renews with its majority here or goes on as a standby, and what
+    # starts once below goes by ha.acting_process().
+    _ha_markers = ha.check_markers_at_boot()
+    if _ha_markers == 'missing':
+        print("HA state file missing on a group member - staying passive until it is restored or unpaired")
+    try:
+        _ha_boot = ha.check_peer_at_boot(timeout=5)
+    except Exception as e:
+        _ha_boot = f'check failed: {e}'
+    logging.info(f"[HA] boot check: {_ha_boot} (role {ha.role()}, epoch {ha.epoch()})")
+    if ha.role() != ha.ROLE_STANDALONE or ha.peer():
+        print(f"HA role at boot: {ha.role()}, epoch {ha.epoch()} ({_ha_boot})")
+
     # Create Flask app (plugins + push inbox will hit the DB here)
     app = create_app()
 
@@ -976,45 +1601,48 @@ def main(debug_mode=False):
         print("  are BOTH refused until this is resolved - check the")
         print("  encryption key and the permissions on config/.")
         print("=" * 50 + "\n")
+    elif _init_state == INIT_NO_ACCOUNTS:
+        # NS Oct 2026 (#991) - not a fresh install either: the setup wizard stays shut
+        print("\n" + "=" * 50)
+        print("NO ACCOUNTS")
+        print("  This install holds configuration but no user account.")
+        print("  Login and the setup wizard are refused. To create a new")
+        print("  administrator, create this file on the server, then open")
+        print(f"  the PegaProx URL: {SETUP_REOPEN_FILE}")
+        print("=" * 50 + "\n")
+
+    # MK Sep 2026 (#625) - a standby holds the configuration and acts on none of it.
+    # The role is read once: every role change restarts the process, and so does a
+    # change of the live view or of how the managers connect.
+    standby = ha.is_standby()
+    live_managers = ha.managers_wanted()
+
+    if standby and live_managers:
+        # the live view: the managers start here too and only read. One short pull
+        # first, so they start from the active's configuration of now - starting from
+        # the one this instance stopped with would restart it right after the first sync.
+        _ha_pull = ha.boot_pull(timeout=10)
+        logging.warning(f"[HA] standby with the live view: cluster, PBS and ESXi managers start "
+                        f"read-only, nothing acts from here (sync at start: {_ha_pull})")
+    elif standby:
+        logging.warning("[HA] standby, live view off: no cluster, PBS or ESXi managers are "
+                        "started - they stay down until this instance is promoted or the "
+                        "live view is switched on")
 
     # Load existing configuration
     config = load_config()
 
-    # Start managers for existing clusters
-    for cluster_id, cluster_data in config.items():
-        config_obj = PegaProxConfig(cluster_data)
-        ctype = cluster_data.get('cluster_type', 'proxmox')
-        if ctype == 'xcpng':
-            from pegaprox.core.xcpng import XcpngManager
-            manager = XcpngManager(cluster_id, config_obj)
-            manager.start()
-            g.cluster_managers[cluster_id] = manager
-            print(f"Started XCP-ng manager for pool: {cluster_data['name']}")
-        else:
-            manager = PegaProxManager(cluster_id, config_obj)
-            manager.start()
-            g.cluster_managers[cluster_id] = manager
-            print(f"Started PegaProx manager for cluster: {cluster_data['name']}")
+    if live_managers:
+        _start_managers(config)
+        try:
+            ha.note_managers_started(ha.manager_signature())
+        except Exception as e:
+            # without a baseline a standby never restarts for new connection settings
+            logging.warning(f"[HA] could not note what the managers started from: {e}")
 
     # Start background threads
     start_broadcast_thread()
     print("Started WebSocket live updates broadcast thread")
-
-    try:
-        load_pbs_servers()
-    except Exception as e:
-        logging.warning(f"Failed to load PBS servers at startup: {e}")
-
-    try:
-        load_vmware_servers()
-        # NS: register ESXi hosts as XHM-capable clusters
-        from pegaprox.core.esxi_cluster import ESXiClusterManager
-        for vmw_id, vmw_mgr in g.vmware_managers.items():
-            if getattr(vmw_mgr, 'server_type', '') == 'esxi':
-                g.cluster_managers[vmw_id] = ESXiClusterManager(vmw_id, vmw_mgr)
-                logging.info(f"Registered ESXi host '{vmw_mgr.name}' as XHM cluster {vmw_id}")
-    except Exception as e:
-        logging.warning(f"Failed to load VMware servers at startup: {e}")
 
     start_alert_thread()
     print("Started alert monitoring thread")
@@ -1036,32 +1664,34 @@ def main(debug_mode=False):
     start_cross_cluster_replication_thread()
     print("Started cross-cluster replication scheduler thread")
 
+    # MAC addresses, notes and configured IPs for the search; the loop itself only reads
+    # where users are served
+    from pegaprox.background.guest_index import start_guest_index_thread
+    start_guest_index_thread()
+    print("Started guest search index thread")
+
     try:
         start_syslog_server()
         print("Started integrated syslog server")
     except Exception as e:
         logging.warning(f"Syslog server failed to start: {e}")
 
-    # #238: reset stuck DR plans from a previous crash/restart
-    try:
-        from datetime import datetime as _dt
-        from pegaprox.core.db import get_db
-        _db = get_db()
-        stuck = _db.query("SELECT id, name FROM site_recovery_plans WHERE status IN ('running', 'testing')")
-        for p in (stuck or []):
-            _db.execute("UPDATE site_recovery_plans SET status = 'failed', updated_at = ? WHERE id = ?",
-                        (_dt.now().isoformat(), p['id']))
-            print(f"  Reset stuck DR plan '{p['name']}' → failed")
-    except Exception as e:
-        print(f"  DR plan reset check failed: {e}")
+    # #625: not on a standby - the plans are the active's, and so is any run in flight.
+    # The reset of DR plans a crash left running or testing (#238) is start_heartbeat's
+    # recover_orphan_runs, which asks ha.is_active() right before it writes. A copy of
+    # it here wrote on the role read once above.
+    if not standby:
+        from pegaprox.background.site_recovery import start_heartbeat
+        start_heartbeat()
+        print("Started site recovery heartbeat monitor")
 
-    from pegaprox.background.site_recovery import start_heartbeat
-    start_heartbeat()
-    print("Started site recovery heartbeat monitor")
+        # Start plugin background tasks
+        from pegaprox.api.plugins import start_plugin_backgrounds
+        start_plugin_backgrounds()
 
-    # Start plugin background tasks
-    from pegaprox.api.plugins import start_plugin_backgrounds
-    start_plugin_backgrounds()
+    # #625: pulls from the active on a standby, watches the peer on an active,
+    # idles while unpaired
+    ha.start_loop()
 
     # Warm up pool cache
     def warmup_pool_cache():
@@ -1144,6 +1774,11 @@ def main(debug_mode=False):
             print(f"WARNING: IPv6 bind address '{bind_host}' requested but IPv6 not available")
             print("Falling back to 0.0.0.0")
             bind_host = '0.0.0.0'
+
+    # Publish the resolved listen address for anything that has to reach us from
+    # this host later (see globals.SERVER_BIND_HOST). MK Sep 2026 (#957)
+    g.SERVER_BIND_HOST = bind_host
+    g.SERVER_BIND_PORT = port
 
     # MK: when behind proxy, SSL is handled by nginx/haproxy - we run plain HTTP
     #
@@ -1440,22 +2075,184 @@ _KEEPALIVE_IDLE_TIMEOUT = float(os.environ.get('PEGAPROX_KEEPALIVE_TIMEOUT', '75
 # because `workers` slots held open is the whole server.
 _HANDSHAKE_TIMEOUT = float(os.environ.get('PEGAPROX_HANDSHAKE_TIMEOUT', '30'))
 _HEADER_TIMEOUT = float(os.environ.get('PEGAPROX_HEADER_TIMEOUT', '30'))
+# NS Oct 2026 (#1052) - and the body after the headers. handle() clears the socket timeout
+# and the bounds above end with the headers, so a POST that announces a Content-Length and
+# never sends it parked in get_json() - or, on a route that answers without reading it, in
+# pywsgi's discard of the rest - for as long as the client liked. Until the request is
+# signed in (lift_body_deadline) its body has this long to arrive; after that an ISO
+# upload takes as long as the link needs.
+_BODY_TIMEOUT = float(os.environ.get('PEGAPROX_BODY_TIMEOUT', '30'))
+# and the answer: how long a client may take none of it (_IdleTimeoutMixin._sendall)
+_SEND_TIMEOUT = float(os.environ.get('PEGAPROX_SEND_TIMEOUT', '60'))
+_SEND_SLICE = 64 * 1024
+
+
+class _BodyTimedOut(TimeoutError):
+    """The request body did not arrive in time. An OSError on purpose: werkzeug answers it
+    like a client that went away (400), and the HA fast path reads it as a short body."""
+
+
+class _BodyDeadline:
+    """pywsgi's request body with a clock on it.
+
+    Every read has to be done by the deadline, the discard after the response included.
+    lift() takes the clock off for the rest of the request. A read that runs out raises
+    _BodyTimedOut and marks the connection for closing: the rest of the body is still on
+    the wire, so nothing after it can be read as the next request.
+    """
+
+    def __init__(self, body, seconds):
+        self._body = body
+        self._until = time.monotonic() + seconds
+        self.expired = False
+        self._release = None
+
+    @property
+    def lifted(self):
+        return self._until is None
+
+    def lift(self, release=None):
+        """release: called once the request is done, to give back the account's share
+        (utils/auth.py lift_body_deadline)"""
+        self._until = None
+        self._release = release
+
+    def done(self):
+        release, self._release = self._release, None
+        if release is not None:
+            release()
+
+    @property
+    def rfile(self):
+        # simple-websocket finds the socket through here, as on pywsgi's own Input
+        return self._body.rfile
+
+    def _timed(self, read, *args):
+        if self._until is None:
+            return read(*args)
+        if self.expired:
+            raise _BodyTimedOut('request body not received in time')
+        import gevent
+        # what is already buffered is read without waiting, so it still comes through
+        # after the deadline; only the wait for more is cut off
+        t = gevent.Timeout(max(self._until - time.monotonic(), 0.01))
+        t.start()
+        try:
+            return read(*args)
+        except gevent.Timeout as ex:
+            if ex is not t:
+                raise
+            self.expired = True
+            raise _BodyTimedOut('request body not received in time')
+        finally:
+            t.close()
+
+    def read(self, length=None):
+        return self._timed(self._body.read, length)
+
+    def readline(self, size=None):
+        return self._timed(self._body.readline, size)
+
+    def readlines(self, hint=None):
+        return list(self)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        line = self.readline()
+        if not line:
+            raise StopIteration
+        return line
+
+    def _discard(self):
+        try:
+            self._timed(self._body._discard)
+        except _BodyTimedOut:
+            pass
 
 
 class _IdleTimeoutMixin:
-    """Bound the idle wait for the next request line, and the header read after it.
+    """Bound the idle wait for the next request line, the header read after it, the
+    body of a request nobody has signed in for yet, and each write of the answer.
 
     Compose ahead of a gevent pywsgi handler class in the MRO so `super().read_requestline()`
     reaches the real handler.
 
     MK Sep 2026 - read_requestline was the only bounded phase, so `GET / HTTP/1.1` followed by
     headers dribbled one byte at a time held a slot indefinitely: the request line arrived
-    promptly, and everything after it was unbounded. Note this bounds the HEADERS only - the
-    body is read later, by the application, and a WebSocket upgrade completes its headers in
-    one packet like any other request, so a live console is unaffected.
+    promptly, and everything after it was unbounded. A WebSocket upgrade completes its
+    headers in one packet like any other request, so a live console is unaffected.
     """
     _idle_timeout = _KEEPALIVE_IDLE_TIMEOUT
     _header_timeout = _HEADER_TIMEOUT
+    _body_timeout = _BODY_TIMEOUT
+    _send_timeout = _SEND_TIMEOUT
+
+    def get_environ(self):
+        env = super().get_environ()
+        to = self._body_timeout
+        if to and to > 0 and self.wsgi_input is not None:
+            # pywsgi hands a request that only asks for an upgrade its raw rfile, and a POST
+            # with `Connection: Upgrade` is never upgraded: the route read the body from
+            # there, off the clock. Neither WebSocket library reads frames from wsgi.input
+            # (geventwebsocket uses the handler's rfile, simple-websocket the socket behind
+            # clock.rfile), so every request gets the clock.
+            clock = _BodyDeadline(self.wsgi_input, to)
+            env['wsgi.input'] = clock
+            self.wsgi_input = clock
+            env[BODY_DEADLINE_ENVIRON] = clock
+        return env
+
+    def handle_one_response(self):
+        try:
+            return super().handle_one_response()
+        finally:
+            if getattr(self.wsgi_input, 'expired', False):
+                self.close_connection = True
+            done = getattr(self.wsgi_input, 'done', None)
+            if done is not None:
+                done()
+
+    def _sendall(self, data):
+        # NS Oct 2026 (#1052) - the mirror image of a body that never arrives: a client that
+        # asks for index.html (7 MB) and reads none of it parks this write, and the slot,
+        # once the socket buffers are full. Like nginx's send_timeout, the clock is on
+        # progress, not on the whole answer: a slow link keeps going.
+        to = self._send_timeout
+        if not to or to <= 0 or not data:
+            return super()._sendall(data)
+        import gevent
+        view = memoryview(data)
+        for at in range(0, len(view), _SEND_SLICE):
+            t = gevent.Timeout(to)
+            t.start()
+            try:
+                super()._sendall(view[at:at + _SEND_SLICE])
+            except gevent.Timeout as ex:
+                if ex is not t:
+                    raise
+                self.close_connection = True
+                # pywsgi lets a client that went away go quietly
+                raise OSError(errno.EPIPE, f'the client took nothing for {to:g}s')
+            finally:
+                t.close()
+
+    def handle_one_request(self):
+        result = super().handle_one_request()
+        if not isinstance(result, tuple):
+            return result
+        # pywsgi writes its own 400 and 414 straight to the socket, past _sendall, and a
+        # client can have filled the buffers with the answers before it: same clock
+        import gevent
+        self.status = result[0]
+        to = self._send_timeout if self._send_timeout and self._send_timeout > 0 else None
+        try:
+            with gevent.Timeout(to, False):
+                self.socket.sendall(result[1])
+        except OSError:
+            pass
+        return None
 
     def read_request(self, raw_requestline):
         to = self._header_timeout
@@ -1491,12 +2288,64 @@ class _IdleTimeoutMixin:
             t.close()
 
 
+def _no_delay(sock):
+    """TCP_NODELAY on an accepted connection.
+
+    MK Oct 2026 (#625) - pywsgi sends the head of a response and its body in two writes.
+    With Nagle on, the body waits for the client to ack the head, and a client with
+    nothing to send acks 40 ms late: every answer on a kept-alive connection took 40 ms
+    more than the network did (a renewal of the HA leader on a LAN: 43 ms instead of 1.5).
+    """
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except (OSError, AttributeError):
+        pass
+
+
+def _should_bypass_gevent_upgrade(app, environ):
+    """Is this request one that flask-sock will handshake itself?
+
+    geventwebsocket upgrades every request carrying `Upgrade: websocket` at the
+    WSGI layer, before Flask routes anything. Our three `@sock.route` endpoints
+    are served by simple_websocket, which performs its own handshake once it is
+    reached, so the client got two 101 responses, read the second as a frame and
+    closed with 1002 (#945.3).
+
+    Decided from the URL map instead of by matching path suffixes: flask-sock
+    registers its rules with websocket=True, so this keeps working when a route
+    is added or renamed. Anything unroutable, or a werkzeug without websocket
+    routing, answers False and leaves the previous behaviour alone.
+    MK Sep 2026
+    """
+    env = environ or {}
+    # only an upgrade can be double-upgraded, so ordinary traffic never reaches
+    # the routing lookup below
+    if 'websocket' not in str(env.get('HTTP_UPGRADE', '')).lower():
+        return False
+    try:
+        adapter = app.url_map.bind('localhost')
+        rule = adapter.match(env.get('PATH_INFO', '/'),
+                             method=env.get('REQUEST_METHOD', 'GET'),
+                             websocket=True, return_rule=True)[0]
+        return str(rule.endpoint).startswith('__flask_sock')
+    except Exception:
+        return False
+
+
 def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, http_redirect_port=-1):
     """Start production server with Gevent."""
     from gevent.pywsgi import WSGIServer
 
     print(f"Starting PegaProx with Gevent WSGIServer ({workers} greenlets)", flush=True)
     print("Mode: Production (async I/O optimized)", flush=True)
+
+    # #945.5 - simple-websocket writes frames with a bare send(), which is allowed
+    # to write only part of one. Has to happen before the first websocket is served.
+    try:
+        from pegaprox.utils.ws_sendall import apply_sendall_patch
+        apply_sendall_patch()
+    except Exception as _e:
+        logging.warning(f"[ws-patch] could not make simple-websocket write whole frames: {_e}")
 
     # NS: Suppress noisy errors from bots/scanners/disconnects
     import logging as log_module
@@ -1596,6 +2445,25 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
     # These happen when users close browser tabs - totally normal
     if use_websocket_handler:
         class QuietWebSocketHandler(WebSocketHandler):
+            # MK Sep 2026 (#945.3) - geventwebsocket upgrades EVERY request that
+            # carries `Upgrade: websocket`, at the WSGI layer, before Flask routes
+            # anything. Three of our routes are flask-sock (`@sock.route`), and
+            # simple_websocket.Server performs its own handshake once it is reached.
+            # The client therefore received two 101 responses back to back, parsed
+            # the second one as a frame, and closed with 1002 Protocol Error. Hand
+            # those paths to the plain WSGI handler so exactly one handshake happens.
+            #
+            # Decided from the URL map rather than by matching path suffixes: a rule
+            # registered by flask-sock carries websocket=True, so this stays correct
+            # when a route is added or renamed.
+            def run_application(self):
+                # `app` is the Flask app from the enclosing _start_gevent_server;
+                # self.application may be a WSGI wrapper without a url_map
+                if _should_bypass_gevent_upgrade(app, self.environ):
+                    from gevent.pywsgi import WSGIHandler as _PlainWSGIHandler
+                    return _PlainWSGIHandler.run_application(self)
+                return super().run_application()
+
             def handle_one_response(self):
                 try:
                     return super().handle_one_response()
@@ -1608,6 +2476,12 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
                 if 'ssl' in str(msg).lower() or 'eof' in str(msg).lower():
                     return
                 super().log_error(msg, *args)
+
+            def format_request(self):
+                # the access line carries the whole query string, and a token can
+                # only travel there for some callers (an older auto-install ISO)
+                from pegaprox.utils.sanitization import redact_request_line
+                return redact_request_line(super().format_request())
     else:
         QuietWebSocketHandler = None
 
@@ -1633,6 +2507,7 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
                     client_socket.settimeout(_HANDSHAKE_TIMEOUT)
                 except Exception:
                     pass
+            _no_delay(client_socket)
             try:
                 return super().wrap_socket_and_handle(client_socket, address)
             except (socket.timeout, OSError) as e:
@@ -1657,7 +2532,7 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
             """The handshake is done by the time we get here, so lift its deadline.
 
             Everything after this point has its own bounds: _IdleTimeoutMixin for the
-            request line and the headers, and the application for the body. A console
+            request line, the headers and an anonymous body. A console
             WebSocket lives here for hours and must not inherit a 30s socket timeout.
             """
             try:
@@ -1741,9 +2616,16 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
         def _handle_http_redirect(self, client_socket, address):
             """Send HTTP 301 redirect to HTTPS version"""
             try:
-                client_socket.settimeout(5.0)
+                # NS Oct 2026 (#997) - the 5s was per recv, so a byte every 4s held this
+                # pool slot for hours. One deadline for the whole request head, the same
+                # PEGAPROX_HEADER_TIMEOUT the TLS side gets in _IdleTimeoutMixin.
+                until = time.monotonic() + _HEADER_TIMEOUT if _HEADER_TIMEOUT > 0 else None
                 request_data = b''
                 while b'\r\n\r\n' not in request_data and len(request_data) < 8192:
+                    left = 5.0 if until is None else min(5.0, until - time.monotonic())
+                    if left <= 0:
+                        return
+                    client_socket.settimeout(left)
                     chunk = client_socket.recv(1024)
                     if not chunk:
                         break
@@ -1814,6 +2696,7 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
                     f"Connection: close\r\n"
                     f"\r\n"
                 )
+                client_socket.settimeout(5.0)
                 client_socket.sendall(response.encode())
             except Exception:
                 pass

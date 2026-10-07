@@ -73,9 +73,10 @@
         }
 
         // Node Card Component
-        function NodeCard({ name, metrics, index, clusterId, nodeUiSuffix, onMaintenanceToggle, onStartUpdate, onOpenNodeConfig, onNodeAction, onRemoveNode, onMoveNode }) {
+        function NodeCard({ name, metrics, index, clusterId, nodeUiSuffix, onMaintenanceToggle, onStartUpdate, onOpenNodeConfig, onNodeAction, onRemoveNode, onMoveNode, isFavorite, onToggleFavorite, guestActions, onGuestsAction }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();
+            // #625 v2: a standby shows maintenance and update state, it does not change them
+            const { getAuthHeaders, haReadOnly } = useAuth();
             // NS: 20 data points = last ~40s of sparkline at 2s polling interval
             const historyRef = useRef({
                 cpu: Array(20).fill(0),
@@ -86,6 +87,7 @@
             });
             const [, forceUpdate] = useState(0);
             const [showMaintenanceConfirm, setShowMaintenanceConfirm] = useState(false);
+            const [maintOptions, setMaintOptions] = useState({});  // off on each opening (#763, #954)
             const [showUpdateConfirm, setShowUpdateConfirm] = useState(false);
             const [updateWithReboot, setUpdateWithReboot] = useState(true);
             const [showUpdateLog, setShowUpdateLog] = useState(false);
@@ -93,6 +95,7 @@
             const [showShutdownConfirm, setShowShutdownConfirm] = useState(false);
             const [actionLoading, setActionLoading] = useState(null);
             const [expanded, setExpanded] = useState(false);
+            const [guestsMenu, setGuestsMenu] = useState(false);
             const lastMetricsRef = useRef(null);
 
             // auto-dismiss update banner after 30s when completed (#183)
@@ -269,7 +272,7 @@
                                              updateTask.status}
                                         </span>
                                         {/* Dismiss button for completed/failed */}
-                                        {(updateTask.status === 'completed' || updateTask.status === 'failed') && (
+                                        {!haReadOnly && (updateTask.status === 'completed' || updateTask.status === 'failed') && (
                                             <button
                                                 onClick={async (e) => {
                                                     e.stopPropagation();
@@ -313,6 +316,7 @@
                                         <div className="text-xs text-red-400">
                                             ❌ {t('error')}: {updateTask.error}
                                         </div>
+                                        {!haReadOnly && (
                                         <button
                                             onClick={async () => {
                                                 // First clear the update status
@@ -330,6 +334,7 @@
                                         >
                                             {t('cancelAndExitMaintenance')}
                                         </button>
+                                        )}
                                     </div>
                                 )}
                             </div>
@@ -418,6 +423,7 @@
                                         )}
                                         
                                         {/* Proceed or Exit buttons */}
+                                        {!haReadOnly && (
                                         <div className="flex gap-2">
                                             <button
                                                 onClick={async () => {
@@ -444,11 +450,12 @@
                                                 {t('exitMaintenance')}
                                             </button>
                                         </div>
+                                        )}
                                     </div>
                                 )}
                                 
                                 {/* After acknowledging completed_with_errors OR normal completed - show full menu */}
-                                {(maintenanceTask?.status === 'completed' || (maintenanceTask?.status === 'completed_with_errors' && metrics.maintenance_acknowledged)) && (
+                                {!haReadOnly && (maintenanceTask?.status === 'completed' || (maintenanceTask?.status === 'completed_with_errors' && metrics.maintenance_acknowledged)) && (
                                     <div className="space-y-2 mt-2">
                                         {/* Show warning reminder if there were errors */}
                                         {maintenanceTask?.status === 'completed_with_errors' && maintenanceTask?.failed_vms?.length > 0 && (
@@ -543,9 +550,54 @@
                             </div>
                         </div>
                         <div className="flex items-center gap-2">
-                            {!isInMaintenance && !isUpdating && (
+                            {/* LW Oct 2026 - the star and the guests of the node, what the
+                                right-click menu of a node offers in the corporate tree */}
+                            {!haReadOnly && onToggleFavorite && (
                                 <button
-                                    onClick={() => setShowMaintenanceConfirm(true)}
+                                    onClick={() => onToggleFavorite(name)}
+                                    className="p-2 rounded-lg bg-proxmox-dark hover:bg-yellow-500/20 text-gray-400 hover:text-yellow-400 transition-all"
+                                    title={isFavorite ? t('favRemove') : t('favAdd')}
+                                    data-fav={isFavorite ? 'on' : 'off'}
+                                >
+                                    <Icons.Star className={`w-5 h-5 ${isFavorite ? 'fill-yellow-400 text-yellow-400' : ''}`} />
+                                </button>
+                            )}
+                            {!haReadOnly && onGuestsAction && (guestActions || []).length > 0 && (
+                                <div className="relative">
+                                    <button
+                                        onClick={() => setGuestsMenu(v => !v)}
+                                        className="p-2 rounded-lg bg-proxmox-dark hover:bg-green-500/20 text-gray-400 hover:text-green-400 transition-all"
+                                        title={t('nodeGuestsMenu')}
+                                        aria-haspopup="menu"
+                                        aria-expanded={guestsMenu}
+                                        data-node-guests={name}
+                                    >
+                                        <Icons.Layers />
+                                    </button>
+                                    {guestsMenu && (
+                                        <>
+                                            <div className="fixed inset-0 z-40" onClick={() => setGuestsMenu(false)} />
+                                            <div className="absolute right-0 top-full mt-1 w-48 bg-proxmox-card border border-proxmox-border rounded-lg shadow-xl z-50 py-1" role="menu">
+                                                {guestActions.map(a => (
+                                                    <button
+                                                        key={a}
+                                                        role="menuitem"
+                                                        onClick={() => { setGuestsMenu(false); onGuestsAction(name, a); }}
+                                                        className="w-full px-3 py-2 text-left text-sm text-gray-300 hover:bg-proxmox-hover flex items-center gap-2"
+                                                        data-action={a}
+                                                    >
+                                                        {a === 'startall' ? <Icons.PlayCircle /> : a === 'stopall' ? <Icons.Power /> : <Icons.ArrowRight />}
+                                                        {t(a === 'startall' ? 'nodeGuestsStartAll' : a === 'stopall' ? 'nodeGuestsStopAll' : 'nodeGuestsMigrateAll')}
+                                                    </button>
+                                                ))}
+                                            </div>
+                                        </>
+                                    )}
+                                </div>
+                            )}
+                            {!haReadOnly && !isInMaintenance && !isUpdating && (
+                                <button
+                                    onClick={() => { setMaintOptions({}); setShowMaintenanceConfirm(true); }}
                                     className="p-2 rounded-lg bg-proxmox-dark hover:bg-yellow-500/20 text-gray-400 hover:text-yellow-400 transition-all"
                                     title={t('enterMaintenance')}
                                 >
@@ -723,8 +775,9 @@
                     {/* Maintenance Confirmation Modal */}
                     {showMaintenanceConfirm && (
                         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60" onClick={() => setShowMaintenanceConfirm(false)}>
-                            <div 
-                                className="w-full max-w-md bg-proxmox-card border border-proxmox-border rounded-2xl shadow-2xl overflow-hidden"
+                            <div
+                                className="w-full max-w-md max-h-[90vh] overflow-y-auto bg-proxmox-card border border-proxmox-border rounded-2xl shadow-2xl"
+                                data-testid="maint-dialog"
                                 onClick={e => e.stopPropagation()}
                             >
                                 <div className="p-6 border-b border-proxmox-border">
@@ -744,9 +797,13 @@
                                             <strong>{t('warning')}:</strong> {t('maintenanceWarning').replace('Warning: ', '')}
                                         </p>
                                     </div>
-                                    <p className="text-sm text-gray-400 mb-6">
+                                    <p className="text-sm text-gray-400 mb-4">
                                         {t('maintenanceDesc')}
                                     </p>
+                                    {/* LW Oct 2026 (#763, #954) - the evacuation options of the rolling update, for this node */}
+                                    <div className="mb-6">
+                                        <MaintenanceEvacOptions clusterId={clusterId} node={name} value={maintOptions} onChange={setMaintOptions} />
+                                    </div>
                                     <div className="flex gap-3">
                                         <button
                                             onClick={() => setShowMaintenanceConfirm(false)}
@@ -757,7 +814,7 @@
                                         <button
                                             onClick={() => {
                                                 setShowMaintenanceConfirm(false);
-                                                onMaintenanceToggle(name, true);
+                                                onMaintenanceToggle(name, true, maintOptions);
                                             }}
                                             className="flex-1 px-4 py-2.5 bg-yellow-500 hover:bg-yellow-600 rounded-lg text-black font-medium transition-colors"
                                         >
@@ -967,9 +1024,10 @@
         // NS: Mar 2026 - added sparkline history + detail cards
         function NodeCompactRow({ name, metrics, clusterId, nodeUiSuffix, onOpenNodeConfig, onMaintenanceToggle, onStartUpdate, onNodeAction, onRemoveNode, onMoveNode }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();
+            const { getAuthHeaders, haReadOnly } = useAuth();  // #625: read-only on a standby
             const [expanded, setExpanded] = useState(false);
             const [showMaintenanceConfirm, setShowMaintenanceConfirm] = useState(false);
+            const [maintOptions, setMaintOptions] = useState({});  // #763, #954
             const [showRebootConfirm, setShowRebootConfirm] = useState(false);
             const [showShutdownConfirm, setShowShutdownConfirm] = useState(false);
             const [showUpdateConfirm, setShowUpdateConfirm] = useState(false);
@@ -1088,7 +1146,7 @@
                                                 t('updateRunning')
                                             }: {updateTask.phase || '...'}</span>
                                         </div>
-                                        {(updateTask.status === 'completed' || updateTask.status === 'failed') && (
+                                        {!haReadOnly && (updateTask.status === 'completed' || updateTask.status === 'failed') && (
                                             <button onClick={(e) => { e.stopPropagation();
                                                 fetch(`${API_URL}/clusters/${clusterId}/nodes/${name}/update`, { method: 'DELETE', credentials: 'include', headers: getAuthHeaders() }).catch(() => {});
                                             }} className="text-[10px] px-1.5 py-0.5 hover:text-white" style={{color: '#728b9a'}}>✕</button>
@@ -1137,7 +1195,7 @@
                                         </div>
                                     )}
                                     {/* NS: force/exit buttons - only when NOT yet acknowledged */}
-                                    {!metrics.maintenance_acknowledged && (maintenanceTask.status === 'completed_with_errors' || (maintenanceTask.failed_vms && maintenanceTask.failed_vms.length > 0)) && (
+                                    {!haReadOnly && !metrics.maintenance_acknowledged && (maintenanceTask.status === 'completed_with_errors' || (maintenanceTask.failed_vms && maintenanceTask.failed_vms.length > 0)) && (
                                         <div className="mt-1.5 flex items-center gap-2">
                                             <button onClick={(e) => { e.stopPropagation();
                                                 if (confirm(t('forceMaintenanceWarning') || 'Proceeding may stop remaining VMs. Continue?')) {
@@ -1196,8 +1254,9 @@
                                 <Icons.ExternalLink className="w-3 h-3" style={{color: '#49afd9'}} /> {t('openInProxmox') || 'Open in Proxmox'}
                             </button>
                         )}
+                        {!haReadOnly && (<>
                         {!isInMaintenance ? (
-                            <button onClick={() => setShowMaintenanceConfirm(true)}>
+                            <button onClick={() => { setMaintOptions({}); setShowMaintenanceConfirm(true); }}>
                                 <Icons.Wrench className="w-3 h-3" style={{color: '#efc006'}} /> {t('enterMaintenance') || t('maintenance')}
                                     </button>
                                 ) : (
@@ -1224,6 +1283,7 @@
                                 <button onClick={() => setShowShutdownConfirm(true)}>
                                     <Icons.Power className="w-3 h-3" style={{color: '#f54f47'}} /> {t('shutdown')}
                                 </button>
+                                </>)}
                             </div>
                         </div>
                     )}
@@ -1231,12 +1291,16 @@
                     {/* Confirmation Modals */}
                     {showMaintenanceConfirm && (
                         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60">
-                            <div className="w-full max-w-sm bg-proxmox-card border border-proxmox-border p-5">
+                            <div className="w-full max-w-sm max-h-[90vh] overflow-y-auto bg-proxmox-card border border-proxmox-border p-5" data-testid="maint-dialog">
                                 <h3 className="text-[14px] font-semibold mb-2" style={{color: '#e9ecef'}}>{t('enterMaintenance') || 'Enter Maintenance Mode'}</h3>
                                 <p className="text-[13px] mb-4" style={{color: '#adbbc4'}}>{t('maintenanceWarning') || `All VMs on ${name} will be migrated to other nodes.`}</p>
+                                {/* LW Oct 2026 (#763, #954) */}
+                                <div className="mb-4">
+                                    <MaintenanceEvacOptions clusterId={clusterId} node={name} value={maintOptions} onChange={setMaintOptions} />
+                                </div>
                                 <div className="flex justify-end gap-2">
                                     <button onClick={() => setShowMaintenanceConfirm(false)} className="px-3 py-1.5 text-[13px] border border-proxmox-border hover:text-white" style={{color: '#adbbc4'}}>{t('cancel')}</button>
-                                    <button onClick={() => { onMaintenanceToggle && onMaintenanceToggle(name, true); setShowMaintenanceConfirm(false); }} className="px-3 py-1.5 text-[13px] text-white" style={{background: '#efc006', border: '1px solid #d4a905'}}>{t('confirm') || 'Confirm'}</button>
+                                    <button onClick={() => { onMaintenanceToggle && onMaintenanceToggle(name, true, maintOptions); setShowMaintenanceConfirm(false); }} className="px-3 py-1.5 text-[13px] text-white" style={{background: '#efc006', border: '1px solid #d4a905'}}>{t('confirm') || 'Confirm'}</button>
                                 </div>
                             </div>
                         </div>
@@ -1289,9 +1353,15 @@
         // NS: Added bulk select for mass operations (migration, etc.)
         // This component does a lot... might need to split it up eventually
         // NS: filtering + sorting uses useMemo below (lines 1320+)
-        function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenSpice, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, nodes, datastores, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus }) {
+        function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenSpice, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, nodes, datastores, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus, authFetch, onBulkDone, favorites, onToggleFavorite }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, user } = useAuth();
+            const { getAuthHeaders, user, haReadOnly, haConsolesElsewhere } = useAuth();
+            // #625 v2 - a standby shows the guests live but acts on none of them: no power,
+            // console, migrate, clone or delete buttons. Config, metrics and Proxmox links stay.
+            // One that forwards acts through the active again, but a console only runs on a
+            // standby that serves users: elsewhere a link opens the guest's console on the active
+            const acts = !haReadOnly;
+            const consoles = !haConsolesElsewhere;
             const { isCorporate } = useLayout(); // LW: Feb 2026 - corporate defaults to table view
             // NS Mar 2026 - per-VM sparkline history for table view
             const vmHistRef = useRef({});
@@ -1321,6 +1391,7 @@
             const [selectedVms, setSelectedVms] = useState([]);
             const [showMigrateModal, setShowMigrateModal] = useState(null);
             const [showBulkMigrate, setShowBulkMigrate] = useState(false);
+            const [bulkGuests, setBulkGuests] = useState(null);  // {action, guests}
             const [showDeleteConfirm, setShowDeleteConfirm] = useState(null);
             const [showCloneModal, setShowCloneModal] = useState(null);
             const [selectedDetailVm, setSelectedDetailVm] = useState(null); // For detail view
@@ -1566,6 +1637,28 @@
                 }
             };
 
+            // LW Oct 2026 - the bulk dialog gets the live row of each picked guest as it is at
+            // the click, so a guest that stopped since it was ticked counts as stopped
+            const openBulk = (action) => {
+                const byId = new Map(resources.map(r => [r.vmid, r]));
+                const guests = selectedVms.map(s => byId.get(s.vmid) || s)
+                    .map(r => ({ ...r, _clusterId: r._clusterId || clusterId }));
+                setBulkGuests({ action, guests });
+            };
+            const bulkButtons = [
+                { action: 'start', label: t('start'), cls: 'bg-green-600 hover:bg-green-700', icon: <Icons.PlayCircle /> },
+                { action: 'shutdown', label: t('shutdown'), cls: 'bg-yellow-600 hover:bg-yellow-700', icon: <Icons.Power /> },
+                { action: 'reboot', label: t('reboot'), cls: 'bg-orange-500 hover:bg-orange-600', icon: <Icons.RefreshCw /> },
+                { action: 'stop', label: t('forceStop'), cls: 'bg-red-600 hover:bg-red-700', icon: <Icons.XCircle /> },
+                { action: 'snapshot', label: t('snapshot'), cls: 'bg-purple-600 hover:bg-purple-700', icon: <Icons.Camera /> },
+                { action: 'tags', label: t('tags'), cls: 'bg-gray-600 hover:bg-gray-500', icon: <Icons.Tag /> },
+            ];
+
+            // the star of a guest, where the dashboard hands the favorites down
+            const favSet = useMemo(() => new Set(((favorites && favorites.vms) || []).map(f => `${f.cluster_id}:${f.vmid}`)), [favorites]);
+            const isFav = (r) => favSet.has(`${r._clusterId || clusterId}:${r.vmid}`);
+            const canStar = acts && !!onToggleFavorite;
+
             const availableNodes = useMemo(() => {
                 const nodeSet = new Set(resources.map(r => r.node).filter(Boolean));
                 return Array.from(nodeSet).sort();
@@ -1595,7 +1688,7 @@
                 <div className={isCorporate ? 'space-y-0' : 'space-y-4'}>
                     {/* LW: Mar 2026 - corporate flat toolbar vs modern rounded pills */}
                     {isCorporate ? (
-                        <div className="corp-vm-toolbar">
+                        <div className="corp-vm-toolbar" style={{flexWrap: 'wrap'}}>
                             <div className="relative">
                                 <Icons.Search className="w-3.5 h-3.5 absolute left-2 top-1/2 -translate-y-1/2" style={{color: '#728b9a'}} />
                                 <input
@@ -1627,10 +1720,18 @@
                                     {/* LW Sep 2026 (#798) - the bulk bar below is suppressed in corporate
                                         because it was meant to live up here, but only the count ever made
                                         it across, so selecting rows in this layout did nothing at all. */}
-                                    <button onClick={() => setShowBulkMigrate(true)}
+                                    {acts && (<>
+                                    {bulkButtons.map(b => (
+                                        <button key={b.action} onClick={() => openBulk(b.action)} data-bulk={b.action}
+                                            className="corp-toolbar-filter" style={b.action === 'stop' ? {color: '#f54f47'} : undefined}>
+                                            {b.label}
+                                        </button>
+                                    ))}
+                                    <button onClick={() => setShowBulkMigrate(true)} data-bulk="migrate"
                                         className="corp-toolbar-filter" style={{color: '#49afd9'}}>
                                         {t('migrate')}
                                     </button>
+                                    </>)}
                                     <button onClick={() => setSelectedVms([])}
                                         className="corp-toolbar-filter">
                                         {t('clearSelection') || 'Clear selection'}
@@ -1743,13 +1844,21 @@
                     )}
 
                     {/* Bulk Actions Bar (hidden in corporate - integrated in toolbar) */}
-                    {!isCorporate && selectedVms.length > 0 && (
-                        <div className="flex items-center gap-3 p-3 bg-proxmox-orange/10 border border-proxmox-orange/30 rounded-lg">
-                            <span className="text-sm text-proxmox-orange font-medium">
+                    {!isCorporate && acts && selectedVms.length > 0 && (
+                        <div className="flex flex-wrap items-center gap-2 p-3 bg-proxmox-orange/10 border border-proxmox-orange/30 rounded-lg">
+                            <span className="text-sm text-proxmox-orange font-medium mr-1">
                                 {selectedVms.length} {t('selectedItems')}
                             </span>
+                            {bulkButtons.map(b => (
+                                <button key={b.action} onClick={() => openBulk(b.action)} data-bulk={b.action}
+                                    className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-white text-sm ${b.cls}`}>
+                                    {b.icon}
+                                    {b.label}
+                                </button>
+                            ))}
                             <button
                                 onClick={() => setShowBulkMigrate(true)}
+                                data-bulk="migrate"
                                 className="flex items-center gap-2 px-3 py-1.5 bg-blue-600 rounded-lg text-white text-sm hover:bg-blue-700"
                             >
                                 <Icons.ArrowRight />
@@ -1928,7 +2037,7 @@
                                                         <Icons.ExternalLink />
                                                     </button>
                                                 )}
-                                                {resource.status === 'stopped' ? (
+                                                {!acts ? null : resource.status === 'stopped' ? (
                                                     <button
                                                         onClick={() => handleAction(resource, 'start')}
                                                         disabled={actionLoading[`${resource.vmid}-start`]}
@@ -1957,7 +2066,7 @@
                                                         </button>
                                                     </>
                                                 )}
-                                                {resource.status === 'running' && (
+                                                {consoles && resource.status === 'running' && (
                                                     <button
                                                         onClick={() => onOpenConsole(resource)}
                                                         className="p-1.5 rounded-lg hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
@@ -1966,7 +2075,11 @@
                                                         <Icons.Monitor />
                                                     </button>
                                                 )}
-                                                {resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
+                                                {!consoles && resource.status === 'running' && (
+                                                    <HaOnActiveLink vm={resource} clusterId={clusterId} iconOnly
+                                                        className="p-1.5 rounded-lg hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all" />
+                                                )}
+                                                {consoles && resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
                                                     <button
                                                         onClick={() => onOpenSpice(resource)}
                                                         className="p-1.5 rounded-lg hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
@@ -1982,6 +2095,7 @@
                                                 >
                                                     <Icons.Cog />
                                                 </button>
+                                                {acts && (
                                                 <button
                                                     onClick={() => setShowMigrateModal(resource)}
                                                     className="p-1.5 rounded-lg hover:bg-cyan-500/20 text-gray-400 hover:text-cyan-400 transition-all"
@@ -1989,6 +2103,7 @@
                                                 >
                                                     <Icons.ArrowRight />
                                                 </button>
+                                                )}
                                             </div>
                                             
                                             {/* More Actions Dropdown */}
@@ -2008,6 +2123,7 @@
                                                     <>
                                                         <div className="fixed inset-0 z-40" onClick={() => setOpenDropdown(null)} />
                                                         <div className="absolute right-0 bottom-full mb-1 w-48 bg-proxmox-card border border-proxmox-border rounded-lg shadow-xl z-50 py-1 animate-fade-in">
+                                                            {acts && (<>
                                                             <button
                                                                 onClick={() => { setShowMigrateModal(resource); setOpenDropdown(null); }}
                                                                 className="w-full px-3 py-2 text-left text-sm text-gray-300 hover:bg-proxmox-hover flex items-center gap-2"
@@ -2024,6 +2140,17 @@
                                                                     {t('crossClusterMigrate')}
                                                                 </button>
                                                             )}
+                                                            </>)}
+                                                            {canStar && (
+                                                                <button
+                                                                    onClick={() => { onToggleFavorite(resource); setOpenDropdown(null); }}
+                                                                    className="w-full px-3 py-2 text-left text-sm text-gray-300 hover:bg-proxmox-hover flex items-center gap-2"
+                                                                    data-fav={isFav(resource) ? 'on' : 'off'}
+                                                                >
+                                                                    <Icons.Star className={`w-4 h-4 ${isFav(resource) ? 'fill-yellow-400 text-yellow-400' : ''}`} />
+                                                                    {isFav(resource) ? t('favRemove') : t('favAdd')}
+                                                                </button>
+                                                            )}
                                                             <button
                                                                 onClick={() => { setShowMetricsModal(resource); setOpenDropdown(null); }}
                                                                 className="w-full px-3 py-2 text-left text-sm text-gray-300 hover:bg-proxmox-hover flex items-center gap-2"
@@ -2031,6 +2158,7 @@
                                                                 <Icons.BarChart className="w-4 h-4" />
                                                                 {t('performance')}
                                                             </button>
+                                                            {acts && (<>
                                                             <button
                                                                 onClick={() => { setShowCloneModal(resource); setOpenDropdown(null); }}
                                                                 className="w-full px-3 py-2 text-left text-sm text-gray-300 hover:bg-proxmox-hover flex items-center gap-2"
@@ -2067,6 +2195,7 @@
                                                                 <Icons.Trash className="w-4 h-4" />
                                                                 {t('delete')}
                                                             </button>
+                                                            </>)}
                                                         </div>
                                                     </>
                                                 )}
@@ -2301,6 +2430,7 @@
                                                             </>
                                                         )}
                                                         {/* power group */}
+                                                        {acts && (<>
                                                         <div className="corp-action-group">
                                                             {resource.status === 'stopped' ? (
                                                                 <button onClick={() => handleAction(resource, 'start')} disabled={actionLoading[`${resource.vmid}-start`]} className="corp-action-btn" title={t('start')}>
@@ -2318,20 +2448,34 @@
                                                             )}
                                                         </div>
                                                         <span className="corp-toolbar-divider" style={{margin: '0 3px'}} />
+                                                        </>)}
                                                         {/* management group */}
                                                         <div className="corp-action-group">
-                                                            {resource.status === 'running' && (
+                                                            {consoles && resource.status === 'running' && (
                                                                 <button onClick={() => onOpenConsole(resource)} className="corp-action-btn" title={t('openConsole')}><Icons.Monitor className="w-3.5 h-3.5" /></button>
                                                             )}
-                                                            {resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
+                                                            {!consoles && resource.status === 'running' && (
+                                                                <HaOnActiveLink vm={resource} clusterId={clusterId} iconOnly className="corp-action-btn" iconClass="w-3.5 h-3.5" />
+                                                            )}
+                                                            {consoles && resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
                                                                 <button onClick={() => onOpenSpice(resource)} className="corp-action-btn" title={t('spiceConsole') || 'SPICE'}><Icons.ExternalLink className="w-3.5 h-3.5" /></button>
                                                             )}
                                                             <button onClick={() => onOpenConfig(resource)} className="corp-action-btn" title={t('configuration')}><Icons.Cog className="w-3.5 h-3.5" /></button>
+                                                            {canStar && (
+                                                                <button onClick={() => onToggleFavorite(resource)} className="corp-action-btn" data-fav={isFav(resource) ? 'on' : 'off'}
+                                                                    title={isFav(resource) ? t('favRemove') : t('favAdd')}>
+                                                                    <Icons.Star className={`w-3.5 h-3.5 ${isFav(resource) ? 'fill-yellow-400 text-yellow-400' : ''}`} />
+                                                                </button>
+                                                            )}
+                                                            {acts && (<>
                                                             <button onClick={() => setShowMigrateModal(resource)} className="corp-action-btn" title={t('migrate')}><Icons.ArrowRight className="w-3.5 h-3.5" /></button>
                                                             <button onClick={() => setShowCloneModal(resource)} className="corp-action-btn" title={t('clone')}><Icons.Copy className="w-3.5 h-3.5" /></button>
+                                                            </>)}
                                                         </div>
+                                                        {acts && (<>
                                                         <span className="corp-toolbar-divider" style={{margin: '0 3px'}} />
                                                         <button onClick={() => setShowDeleteConfirm(resource)} className="corp-action-btn danger" title={t('delete')}><Icons.Trash className="w-3.5 h-3.5" /></button>
+                                                        </>)}
                                                     </div>
                                                     ) : (
                                                     <div className="flex items-center gap-1">
@@ -2351,6 +2495,17 @@
                                                         >
                                                             <Icons.Cog />
                                                         </button>
+                                                        {canStar && (
+                                                        <button
+                                                            onClick={() => onToggleFavorite(resource)}
+                                                            className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-yellow-500/20 text-gray-400 hover:text-yellow-400 transition-all"
+                                                            data-fav={isFav(resource) ? 'on' : 'off'}
+                                                            title={isFav(resource) ? t('favRemove') : t('favAdd')}
+                                                        >
+                                                            <Icons.Star className={`w-5 h-5 ${isFav(resource) ? 'fill-yellow-400 text-yellow-400' : ''}`} />
+                                                        </button>
+                                                        )}
+                                                        {acts && (
                                                         <button
                                                             onClick={() => onOpenTags && onOpenTags(resource)}
                                                             className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-yellow-500/20 text-gray-400 hover:text-yellow-400 transition-all"
@@ -2358,6 +2513,7 @@
                                                         >
                                                             <Icons.Tag />
                                                         </button>
+                                                        )}
                                                         <button
                                                             onClick={() => setShowMetricsModal(resource)}
                                                             className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
@@ -2365,6 +2521,7 @@
                                                         >
                                                             <Icons.BarChart />
                                                         </button>
+                                                        {acts && (<>
                                                         <button
                                                             onClick={() => setShowMigrateModal(resource)}
                                                             className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-cyan-500/20 text-gray-400 hover:text-cyan-400 transition-all"
@@ -2381,7 +2538,7 @@
                                                                 <Icons.Globe />
                                                             </button>
                                                         )}
-                                                        {resource.status === 'running' && (
+                                                        {consoles && resource.status === 'running' && (
                                                             <button
                                                                 onClick={() => onOpenConsole(resource)}
                                                                 className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
@@ -2390,7 +2547,7 @@
                                                                 <Icons.Monitor />
                                                             </button>
                                                         )}
-                                                        {resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
+                                                        {consoles && resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
                                                             <button
                                                                 onClick={() => onOpenSpice(resource)}
                                                                 className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
@@ -2460,6 +2617,11 @@
                                                         >
                                                             <Icons.Trash />
                                                         </button>
+                                                        </>)}
+                                                        {!consoles && resource.status === 'running' && (
+                                                            <HaOnActiveLink vm={resource} clusterId={clusterId} iconOnly
+                                                                className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all" />
+                                                        )}
                                                     </div>
                                                     )}
                                                 </td>
@@ -2709,6 +2871,16 @@
                                 setShowBulkMigrate(false);
                                 setSelectedVms([]);
                             }}
+                        />
+                    )}
+
+                    {bulkGuests && authFetch && (
+                        <GuestBulkActionModal
+                            action={bulkGuests.action}
+                            guests={bulkGuests.guests}
+                            authFetch={authFetch}
+                            onFinished={onBulkDone}
+                            onClose={() => setBulkGuests(null)}
                         />
                     )}
 

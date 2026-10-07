@@ -202,14 +202,12 @@ def list_rates():
         # leaking every cluster's cost rates to any authed user. Always keep the shared
         # '__default__' fallback row (every cluster reads it when it has no own row).
         from pegaprox.utils.rbac import get_user_clusters
-        from flask import g as _g
+        from pegaprox.api.helpers import acting_user
         # NS Aug 2026 — honour a token's floored effective_role (not the owner's account role),
         # so an admin-owned but scoped token can't enumerate every cluster's cost rates.
-        _cu = dict(getattr(_g, 'current_user', None) or {})
-        _eff = request.session.get('effective_role') if getattr(request, 'session', None) else None
-        if _eff:
-            _cu['role'] = _eff
-        allowed = get_user_clusters(_cu)
+        # NS Oct 2026 - acting_user keeps the owner's role next to the token's, which
+        # get_user_clusters needs to hold the token inside its owner's clusters
+        allowed = get_user_clusters(acting_user())
         if allowed is not None:
             rows = [r for r in rows if r['cluster_id'] == '__default__' or r['cluster_id'] in allowed]
         return jsonify({'rates': rows})
@@ -408,7 +406,9 @@ def tenant_chargeback(tenant_id):
         # MK Jun 2026 (sec-review) — admin.tenants can be a tenant-scoped custom role;
         # scope to the caller's own tenant unless a real admin, else one tenant could
         # read another tenant's full VM inventory + per-VM cost breakdown (BOLA).
-        if request.session.get('effective_role', request.session.get('role')) != _rbac.ROLE_ADMIN:
+        from pegaprox.api.helpers import caller_acts_as_admin
+        _global = caller_acts_as_admin()
+        if not _global:
             _caller = get_db().get_user(request.session.get('user', '')) or {}
             if tenant_id != _caller.get('tenant_id', _rbac.DEFAULT_TENANT_ID):
                 return jsonify({'error': 'Access denied to this tenant'}), 403
@@ -432,6 +432,11 @@ def tenant_chargeback(tenant_id):
                                        'monthly_subtotal': 0.0, 'vm_count': 0, 'enough_data': False})
                     continue
                 rows = _compute_per_vm(snaps, mgr, rates, days * 24)
+                if not _global:
+                    # NS Oct 2026 - the statement is the tenant's clusters, its rows only the
+                    # guests this caller may see, as on the per-cluster cost routes. A pool- or
+                    # ACL-confined delegate read every guest's name, size and cost here.
+                    rows = scope_vm_rows(cid, rows)
                 for r in rows:
                     r['cluster_id'] = cid
                     r['cluster_name'] = cname

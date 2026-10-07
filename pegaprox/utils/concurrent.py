@@ -41,6 +41,16 @@ def get_paramiko():
 # MK: This made the dashboard like 5x faster, totally worth it
 # ============================================
 
+def _carried(tasks):
+    """The tasks of a fan-out with what the caller may send to a cluster (#625): in an
+    automatic group a step confirmed here goes on in each task. The tasks themselves
+    anywhere else."""
+    from pegaprox.core import ha   # here: this layer is imported before core
+    if not ha.guard_on():
+        return tasks
+    return [ha.carry(task) for task in tasks]
+
+
 def run_concurrent(tasks: list, timeout: float = 30.0) -> list:
     """Run tasks concurrently with gevent pool"""
     # NS: chatgpt helped with this one, i was mass confused about greenlets
@@ -54,6 +64,7 @@ def run_concurrent(tasks: list, timeout: float = 30.0) -> list:
     # the parallel path the helper was designed for.
     if not tasks:
         return []
+    tasks = _carried(tasks)
 
     if GEVENT_POOL is not None and GEVENT_AVAILABLE:
         # Use gevent pool for concurrent execution
@@ -160,6 +171,7 @@ def run_per_node(node_callables, max_concurrent=8, timeout=120):
     """
     if not node_callables:
         return {}
+    node_callables = dict(zip(node_callables, _carried(list(node_callables.values()))))
     # Cap concurrency at the lesser of node count and max_concurrent
     n = len(node_callables)
     workers = max(1, min(int(max_concurrent), n))

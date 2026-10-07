@@ -846,7 +846,7 @@ def login_iscsi_target(cluster_id, node):
     target_q = shlex.quote(target)
     portal_q = shlex.quote(portal)
     username_q = shlex.quote(username) if username else ''
-    password_q = shlex.quote(password) if password else ''
+    # no password_q — the CHAP secret never gets interpolated, see the _exec below
 
     ssh = None
     try:
@@ -865,8 +865,15 @@ def login_iscsi_target(cluster_id, node):
         if not ssh:
             return jsonify({'error': f'SSH connection failed to {node} ({node_ip}). Check credentials.'}), 400
 
-        def _exec(cmd, timeout=30):
+        def _exec(cmd, timeout=30, feed=None):
             stdin, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
+            if feed is not None:
+                try:
+                    stdin.write(feed)
+                    stdin.flush()
+                except (OSError, EOFError):
+                    pass  # remote is already gone; the exit status below says so
+                stdin.channel.shutdown_write()
             out = _read_capped(stdout)
             err = _read_capped(stderr)
             rc = stdout.channel.recv_exit_status()
@@ -874,9 +881,22 @@ def login_iscsi_target(cluster_id, node):
 
         # If CHAP credentials provided, set them first
         if username and password:
-            _exec(f'''iscsiadm -m node -T {target_q} -p {portal_q} --op update -n node.session.auth.authmethod -v CHAP && \
-                iscsiadm -m node -T {target_q} -p {portal_q} --op update -n node.session.auth.username -v {username_q} && \
-                iscsiadm -m node -T {target_q} -p {portal_q} --op update -n node.session.auth.password -v {password_q}''')
+            # MK Sep 2026 — the secret travels down the channel on stdin, never in
+            # the command string. exec_command hands that string to a shell on the
+            # node and /proc/<pid>/cmdline is world-readable there, so the password
+            # used to be sitting in `ps` for every local account to read, for the
+            # whole length of the attach. `read` keeps it in the shell's own memory.
+            # iscsiadm still takes it as -v on its own argv for the single call that
+            # writes the field — open-iscsi has no file or stdin form for -v — so the
+            # residue is one short-lived process, not the entire operation.
+            _exec('IFS= read -r _pp || exit 64; '
+                  f'iscsiadm -m node -T {target_q} -p {portal_q} --op update'
+                  ' -n node.session.auth.authmethod -v CHAP && '
+                  f'iscsiadm -m node -T {target_q} -p {portal_q} --op update'
+                  f' -n node.session.auth.username -v {username_q} && '
+                  f'iscsiadm -m node -T {target_q} -p {portal_q} --op update'
+                  ' -n node.session.auth.password -v "$_pp"',
+                  feed=password + '\n')
 
         # Discovery
         _exec(f'iscsiadm -m discovery -t sendtargets -p {portal_q}')
@@ -2248,6 +2268,40 @@ def get_node_zfs_api(cluster_id, node):
     
     manager = cluster_managers[cluster_id]
     return jsonify(manager.get_node_zfs(node))
+
+
+# MK Oct 2026 - one pool in full: the vdev tree with state and error counts, the last
+# scrub and the data errors (utils/zpool.py). A pool or guest grant is a claim on guests,
+# not on the disks of a node, so a confined caller gets none of it
+@bp.route('/api/clusters/<cluster_id>/nodes/<node>/disks/zfs/<name>', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_node_zfs_pool_api(cluster_id, node, name):
+    """Get the status of one ZFS pool on a node"""
+    from pegaprox.utils import zpool
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    manager = cluster_managers[cluster_id]
+    if getattr(manager, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'error': 'ZFS pools are read from Proxmox VE nodes only'}), 400
+    if not zpool.valid_node_name(node):
+        return jsonify({'error': 'Invalid node name'}), 400
+    if not zpool.valid_pool_name(name):
+        return jsonify({'error': 'Invalid pool name'}), 400
+
+    status, data = manager.get_node_zfs_detail(node, name)
+    if status == 0:
+        return jsonify({'error': f'Node {node} did not answer'}), 503
+    if status != 200 or not isinstance(data, dict):
+        # zpool status fails for a pool the node does not have, and Proxmox answers 500
+        why = 'the API user needs Sys.Audit on /' if status == 403 else f'HTTP {status}'
+        return jsonify({'error': f'Pool {name} could not be read on node {node} ({why})'}), 502
+    return jsonify(dict(zpool.pool_detail(data), node=node))
 
 
 @bp.route('/api/clusters/<cluster_id>/nodes/<node>/disks/zfs', methods=['POST'])

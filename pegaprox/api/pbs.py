@@ -13,10 +13,14 @@ from pegaprox.core.db import get_db
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.sanitization import bounded_list
-from pegaprox.api.helpers import safe_error, check_pbs_access, check_cluster_access, scope_vm_rows, require_unconfined
-from pegaprox.core.pbs import PBSManager, load_pbs_servers, save_pbs_server
+from pegaprox.api.helpers import safe_error, check_pbs_access, check_cluster_access, scope_vm_rows, require_unconfined, bounded_limit, acts_as_admin, caller_acts_as_admin
+from pegaprox.core.pbs import PBSManager, load_pbs_servers, save_pbs_server, pbs_config_from_row, pbs_target_refusal
 
 bp = Blueprint('pbs', __name__)
+
+# the three secrets a PBS server holds, by the column they are encrypted into
+_PBS_SECRETS = {'password': 'pass_encrypted', 'api_token_secret': 'api_token_secret_encrypted',
+                'ssh_key': 'ssh_key_encrypted'}
 
 
 # MK Sep 2026 (#802) — PBSManager.api_get does not raise; on a refusal it returns
@@ -45,6 +49,36 @@ def pbs_upstream_error(result):
     return 502, {'error': f'PBS returned HTTP {upstream}', 'code': 'PBS_UPSTREAM',
                  'upstream_status': upstream}
 
+
+def _link_refusal(links, empty_error):
+    """The 403 for a non-admin caller who links a PBS server to `links`, or None.
+
+    linked_clusters is the list check_pbs_access reads, and an empty one opens the server to
+    every tenant. So only a global admin leaves it empty, and anybody else links it only to
+    clusters they reach themselves. NS Oct 2026 (#995) - shared by the add and the update.
+    """
+    from pegaprox.utils.auth import build_authz_user as _bau
+    from pegaprox.utils.rbac import get_user_clusters as _guc
+    _caller = _bau(request.session.get('user', ''), request.session)
+    if acts_as_admin(_caller):
+        return None
+    _new_links = list(links or [])
+    if not _new_links:
+        return jsonify({'error': empty_error}), 403
+    _reachable = _guc(_caller)
+    if _reachable is not None:
+        _beyond = [c for c in _new_links if c not in set(_reachable)]
+        if _beyond:
+            return jsonify({'error': 'Access denied: cannot link this PBS server to '
+                                     + ', '.join(_beyond)}), 403
+    return None
+
+
+def _target_refusal(host):
+    """pbs_target_refusal for the caller of this request: loopback for a global admin only."""
+    return pbs_target_refusal(host, allow_loopback=caller_acts_as_admin())
+
+
 @bp.route('/api/pbs', methods=['GET'])
 @require_auth(perms=['pbs.view'])
 def list_pbs_servers():
@@ -58,11 +92,11 @@ def list_pbs_servers():
     # PBS server (role==ADMIN short-circuit + _guc None) despite the token's reduced scope.
     from pegaprox.utils.auth import build_authz_user as _bau
     from pegaprox.utils.rbac import get_user_clusters as _guc
-    from pegaprox.models.permissions import ROLE_ADMIN as _RA
     _lu = _bau(request.session.get('user', ''), request.session)
     _uc = _guc(_lu)  # None => all clusters (admin / default tenant)
+    _all = acts_as_admin(_lu)
     def _pbs_visible(linked):
-        if _lu.get('effective_role', _lu.get('role')) == _RA or _uc is None:
+        if _all or _uc is None:
             return True
         linked = linked or []
         return (not linked) or any(c in _uc for c in linked)
@@ -121,9 +155,19 @@ def add_pbs_server():
     if not data.get('name') or not data.get('host'):
         return jsonify({'error': 'Name and host are required'}), 400
     
-    if not data.get('user'):
+    if not data.get('user') and not data.get('api_token_id'):
         return jsonify({'error': 'Username or API token is required'}), 400
-    
+
+    # NS Oct 2026 (#995) - the update has refused an empty or foreign link list since September,
+    # the add never did: a new server without links was open to every tenant from the start
+    _lerr = _link_refusal(data.get('linked_clusters'),
+                          'Access denied: only a global admin may add a PBS server linked to no cluster')
+    if _lerr:
+        return _lerr
+    _why = _target_refusal(data.get('host'))
+    if _why:
+        return jsonify({'error': _why}), 400
+
     pbs_id = str(uuid.uuid4())[:8]
     
     # Test connection first
@@ -154,23 +198,37 @@ def update_pbs_server(pbs_id):
         return err
     data = request.json or {}
 
-    # Resolve the CURRENT stored config (in-memory manager preferred, else DB row) so we can detect
-    # a host/port change BEFORE persisting anything.
+    # MK Sep 2026 (audit) — linked_clusters is the authorization list check_pbs_access reads,
+    # and an EMPTY one means "reachable by everybody" (the backward-compatibility arm). Omitting
+    # the field was already made safe at the storage layer, but sending it EXPLICITLY empty was
+    # not: any user who reached this server through one of its links could hand the whole backup
+    # server — every tenant's snapshots on it — to every tenant, in one PUT. Widening the list is
+    # the same move at half speed, so a non-admin may only ever narrow it, and only to clusters
+    # they can reach themselves.
+    if 'linked_clusters' in data:
+        _lerr = _link_refusal(data.get('linked_clusters'),
+                              'Access denied: only a global admin may unlink a PBS server from every cluster')
+        if _lerr:
+            return _lerr
+
+    # NS Oct 2026 (#999, #1033) - the stored row is what this update starts from, for the guards
+    # below and for the manager it rebuilds. The manager used to be rebuilt from the body alone:
+    # a PUT without linked_clusters left the running server unlinked (open to every tenant until
+    # a restart), and one without the secrets emptied them in memory only - which is where the
+    # host-change guard looked, so the next PUT could move the host while the row kept the real
+    # credentials for the next start. What the body leaves out now keeps its stored value.
     old_mgr = pbs_managers.get(pbs_id)
-    old_host, old_port = None, None
-    if old_mgr is not None:
-        old_host, old_port = old_mgr.host, old_mgr.port
+    db = get_db()
+    row = db.conn.cursor().execute("SELECT * FROM pbs_servers WHERE id = ?", (pbs_id,)).fetchone()
+    row = dict(row) if row else {}
+    if row:
+        stored = {k: v for k, v in pbs_config_from_row(db, row).items() if v is not None}
+    elif old_mgr is not None:
+        # a registry entry without a row: what the manager holds is all there is
+        stored = {k: getattr(old_mgr, k, '') for k in ('host', 'port', 'linked_clusters', *_PBS_SECRETS)}
     else:
-        db = get_db()
-        row = db.conn.cursor().execute("SELECT * FROM pbs_servers WHERE id = ?", (pbs_id,)).fetchone()
-        if not row:
-            return jsonify({'error': 'PBS server not found'}), 404
-        try:
-            _rk = row.keys()
-            old_host = row['host'] if 'host' in _rk else None
-            old_port = row['port'] if 'port' in _rk else None
-        except Exception:
-            old_host, old_port = None, None
+        return jsonify({'error': 'PBS server not found'}), 404
+    old_host, old_port = stored.get('host'), stored.get('port')
 
     # NS Aug 2026 (CodeAnt) — a non-numeric submitted port must not blow up change-detection with an
     # unhandled ValueError (500). Reject it up front; everything below assumes a parseable port.
@@ -190,6 +248,10 @@ def update_pbs_server(pbs_id):
         _old_port_i = 8007
     host_changed = (data.get('host') and data.get('host') != old_host) or \
                    (_new_port is not None and _new_port != _old_port_i)
+    if host_changed:
+        _why = _target_refusal(data.get('host') or old_host)
+        if _why:
+            return jsonify({'error': _why}), 400
 
     # NS Aug 2026 (Aikido 469089267 + AI-pentest re-check) — FAIL CLOSED on a host/port change: every
     # credential the STORED config holds must be freshly re-entered, otherwise it would be shipped to
@@ -201,23 +263,8 @@ def update_pbs_server(pbs_id):
     def _fresh(key):
         return data.get(key) not in (None, '', '********')
     if host_changed:
-        if old_mgr is not None:
-            _stored = {'password': bool(getattr(old_mgr, 'password', '')),
-                       'api_token_secret': bool(getattr(old_mgr, 'api_token_secret', '')),
-                       'ssh_key': bool(getattr(old_mgr, 'ssh_key', ''))}
-        else:
-            # disabled/not-loaded server (old_mgr None): introspect the encrypted DB columns — the
-            # earlier "require one connect cred" shortcut still let an attacker re-point a disabled
-            # server by supplying a dummy password and OMITTING api_token_secret/ssh_key, which
-            # save_pbs_server then preserved and shipped to the new host.
-            def _rowhas(col):
-                try:
-                    return bool(row[col])
-                except Exception:
-                    return False
-            _stored = {'password': _rowhas('pass_encrypted'),
-                       'api_token_secret': _rowhas('api_token_secret_encrypted'),
-                       'ssh_key': _rowhas('ssh_key_encrypted')}
+        # a secret is held when its encrypted column is set, decryptable or not
+        _stored = {k: bool(stored.get(k)) or bool(row.get(col)) for k, col in _PBS_SECRETS.items()}
         _stale = [k for k, present in _stored.items() if present and not _fresh(k)]
         if _stale:
             logging.warning(f"[PBS:{pbs_id}] Rejected host/port change without re-entering {_stale} (cred-exfil guard)")
@@ -230,28 +277,27 @@ def update_pbs_server(pbs_id):
     elif _new_port is not None:
         data['port'] = _new_port
 
-    # Host unchanged (or full creds supplied): preserve masked creds from the stored config so the
-    # rebuilt manager keeps working. (save_pbs_server also preserves at the DB layer.)
-    if old_mgr is not None:
-        if data.get('password') == '********':
-            data['password'] = old_mgr.password
-        if data.get('api_token_secret') == '********':
-            data['api_token_secret'] = old_mgr.api_token_secret
-        if data.get('ssh_key') == '********':
-            data['ssh_key'] = getattr(old_mgr, 'ssh_key', '')
+    # Host unchanged (or full creds supplied): a blank or masked secret keeps the stored one,
+    # in the rebuilt manager as in the row.
+    config = dict(stored)
+    for k, v in data.items():
+        if k in _PBS_SECRETS and not _fresh(k):
+            continue
+        config[k] = v
 
-    save_pbs_server(pbs_id, data)
-
+    # built before the save, so a host it refuses leaves the row as it was
     try:
-        mgr = PBSManager(pbs_id, data)
+        mgr = PBSManager(pbs_id, config)
     except ValueError as e:
         return jsonify({'error': 'Invalid PBS host'}), 400
 
-    if data.get('enabled', True):
+    save_pbs_server(pbs_id, config)
+
+    if config.get('enabled', True):
         mgr.connect()
     pbs_managers[pbs_id] = mgr
-    
-    log_audit(request.session.get('user', 'admin'), 'pbs.updated', f"Updated PBS server: {data.get('name', pbs_id)}")
+
+    log_audit(request.session.get('user', 'admin'), 'pbs.updated', f"Updated PBS server: {config.get('name', pbs_id)}")
     
     return jsonify(mgr.to_dict())
 
@@ -285,7 +331,10 @@ def test_pbs_new_connection():
     data = request.json or {}
     if not data.get('host'):
         return jsonify({'error': 'Host is required'}), 400
-    
+    _why = _target_refusal(data.get('host'))
+    if _why:
+        return jsonify({'success': False, 'error': _why}), 400
+
     try:
         test_mgr = PBSManager('test', data)
     except ValueError as e:
@@ -310,6 +359,29 @@ def test_pbs_connection(pbs_id):
     data = request.json or {}
     
     if data.get('host'):
+        _why = _target_refusal(data.get('host'))
+        if _why:
+            return jsonify({'success': False, 'error': _why}), 400
+        # MK Oct 2026 (#805) - the edit dialog shows stored secrets as '********', and its Test
+        # button sent that mask to PBS as the password or token secret, so testing a saved
+        # server always failed with HTTP 401. Fill the mask from the stored server like the PUT
+        # does, but only for the same host and port: a new endpoint gets nothing not retyped.
+        masked = [k for k in ('password', 'api_token_secret') if data.get(k) == '********']
+        if masked:
+            ok, err = check_pbs_access(pbs_id)
+            if not ok:
+                return err
+            stored = pbs_managers.get(pbs_id)
+            try:
+                same_port = stored is not None and int(data.get('port') or 8007) == int(stored.port or 8007)
+            except (TypeError, ValueError):
+                return jsonify({'success': False, 'error': 'Invalid port'}), 400
+            if not same_port or data.get('host') != stored.host:
+                return jsonify({'success': False, 'error': 'Re-enter the PBS credentials when '
+                                                           'changing the host or port.'}), 400
+            data = dict(data)
+            for k in masked:
+                data[k] = getattr(stored, k, '') or ''
         # Test with provided credentials (before save)
         try:
             test_mgr = PBSManager('test', data)
@@ -485,8 +557,13 @@ def get_pbs_update_status(pbs_id):
 @require_auth(perms=['admin.settings'])
 def clear_pbs_update_status(pbs_id):
     """Clear completed/failed update status"""
-    if pbs_id not in pbs_managers:
-        return jsonify({'error': 'PBS server not found'}), 404
+    # the same two gates as starting the upgrade beside it (#1012)
+    ok, err = check_pbs_access(pbs_id)
+    if not ok:
+        return err
+    _wide = require_pbs_wide(pbs_id, 'clearing the upgrade status')
+    if _wide:
+        return _wide
     ok = pbs_managers[pbs_id].clear_update_status()
     return jsonify({'cleared': ok})
 
@@ -532,15 +609,18 @@ def get_pbs_datastores(pbs_id):
     return jsonify(result)
 
 
-def _pbs_vm_name_lookup(pbs_mgr):
+def _pbs_vm_name_lookup(pbs_mgr, cluster_ids=None):
     """NS May 2026 — build a {(type, vmid): name} map from the PBS server's
     linked PVE clusters. Used to enrich PBS snapshot/group responses with
     `vm_name` so the frontend doesn't have to do its own lookups (which
     only work after the cluster guests have been fetched separately).
     Falls back to all connected clusters when the PBS has no explicit
-    linked_clusters configured."""
+    linked_clusters configured. cluster_ids narrows it to the owners of
+    the place being listed, so a vm/100 is not named after another
+    cluster's VM 100 (#1083)."""
     name_map = {}
-    cluster_ids = list(pbs_mgr.linked_clusters or [])
+    if cluster_ids is None:
+        cluster_ids = list(pbs_mgr.linked_clusters or [])
     if not cluster_ids:
         # if the PBS has no explicit linked clusters, fall back to all
         # connected clusters — covers fresh setups before linking is configured
@@ -597,7 +677,8 @@ def get_pbs_snapshots(pbs_id, store):
         return jsonify({'error': result['error']}), result.get('status_code', 502)
     snaps = result.get('data', []) or []
     # NS — enrich with vm_name from linked clusters
-    name_map = _pbs_vm_name_lookup(mgr)
+    owners = _BackupOwners(mgr)
+    name_map = _pbs_vm_name_lookup(mgr, owners.of(store, ns))
     for s in snaps:
         bt = s.get('backup-type')
         bid = s.get('backup-id')
@@ -605,7 +686,7 @@ def get_pbs_snapshots(pbs_id, store):
             nm = name_map.get((bt, str(bid)))
             if nm:
                 s['vm_name'] = nm
-    return jsonify(_scope_pbs_rows(mgr, snaps))
+    return jsonify(_scope_pbs_rows(mgr, snaps, store=store, ns=ns, owners=owners))
 
 
 @bp.route('/api/pbs/<pbs_id>/datastores/<store>/groups', methods=['GET'])
@@ -626,7 +707,8 @@ def get_pbs_groups(pbs_id, store):
         return jsonify({'error': result['error']}), result.get('status_code', 502)
     groups = result.get('data', []) or []
     # NS — enrich with vm_name
-    name_map = _pbs_vm_name_lookup(mgr)
+    owners = _BackupOwners(mgr)
+    name_map = _pbs_vm_name_lookup(mgr, owners.of(store, ns))
     for g in groups:
         bt = g.get('backup-type')
         bid = g.get('backup-id')
@@ -634,7 +716,7 @@ def get_pbs_groups(pbs_id, store):
             nm = name_map.get((bt, str(bid)))
             if nm:
                 g['vm_name'] = nm
-    return jsonify(_scope_pbs_rows(mgr, groups))
+    return jsonify(_scope_pbs_rows(mgr, groups, store=store, ns=ns, owners=owners))
 
 
 @bp.route('/api/pbs/<pbs_id>/datastores/<store>/gc', methods=['POST'])
@@ -700,7 +782,8 @@ def pbs_prune(pbs_id, store):
     # snapshots, so re-check the per-backup owner like the other write ops. A store-wide prune (no
     # backup-id) stays a datastore-level op gated by pbs.datastore.prune.
     if data.get('backup_id'):
-        ok, err = _authz_pbs_backup(mgr, data.get('backup_type'), data.get('backup_id'))
+        ok, err = _authz_pbs_backup(mgr, data.get('backup_type'), data.get('backup_id'),
+                                    store=store, ns=data.get('ns'))
         if not ok:
             return err
     result = mgr.prune_datastore(
@@ -718,7 +801,8 @@ def pbs_prune(pbs_id, store):
 
 
 def _scope_pbs_rows(mgr, rows, type_key='backup-type', id_key='backup-id',
-                    permission='vm.view', key_fn=None):
+                    permission='vm.view', key_fn=None, store=None, ns=None, where_fn=None,
+                    owners=None):
     """sec (audit): a datastore is shared across every VM on every linked cluster, and
     pbs.datastore.view is a BUILTIN ROLE_USER and ROLE_VIEWER permission — so the snapshot and
     group listings handed every user the whole install's backup inventory (enriched with VM
@@ -729,21 +813,29 @@ def _scope_pbs_rows(mgr, rows, type_key='backup-type', id_key='backup-id',
     dropped for a scoped caller, matching _authz_pbs_backup.
 
     key_fn overrides the two dict lookups for rows that carry the guest somewhere else — task
-    rows name it in worker_id, not in backup-type/backup-id."""
+    rows name it in worker_id, not in backup-type/backup-id.
+
+    Where a row lives - its datastore and namespace, which decide whose it is (#1083) - is
+    store/ns for a listing of one place, the _datastore/_namespace a row from
+    _pbs_collect_snapshots carries, or where_fn(row)."""
     from pegaprox.utils.auth import build_authz_user
     user = build_authz_user(request.session.get('user', ''), request.session)
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(user):
         return rows
     scoped = _caller_is_scoped_here(mgr, user)
     if not scoped:
         return rows                      # plain cluster-wide operator — unchanged
+    owners = owners or _BackupOwners(mgr)
     out = []
     for r in rows or []:
         bt, bid = key_fn(r) if key_fn else (r.get(type_key), r.get(id_key))
+        r_store, r_ns = where_fn(r) if where_fn else (r.get('_datastore', store),
+                                                       r.get('_namespace', ns))
         # hand down both the identity and the confinement answer — a datastore listing is the
         # whole install's inventory, and each of those costs a users-table read or a pool and
         # ACL enumeration per row otherwise
-        ok, _ = _authz_pbs_backup(mgr, bt, bid, permission, user=user, scoped=scoped)
+        ok, _ = _authz_pbs_backup(mgr, bt, bid, permission, user=user, scoped=scoped,
+                                  store=r_store, ns=r_ns, owners=owners)
         if ok:
             out.append(r)
     return out
@@ -771,6 +863,116 @@ def _pbs_upid_guest(upid):
     return (m.group(1), m.group(2)) if m else (None, None)
 
 
+def _pbs_task_store(text):
+    """The datastore of a backup task, out of its worker_id or its UPID - the field in front of
+    '<type>/<id>' - or None. A task in a namespace does not match and gets None."""
+    import re
+    m = re.search(r'(?:^|:)([^:/]+):(?:vm|ct)/\d+(?:[:/]|$)', str(text or ''))
+    return m.group(1) if m else None
+
+
+# NS Oct 2026 (#1083) - a VMID names a guest inside one cluster, and clusters that share a PBS
+# number their guests from 100 as well. "The caller may use VM 100 on one of the linked
+# clusters" said nothing about whose vm/100 a backup was: a tenant with VM 100 on cluster A
+# listed, browsed, downloaded and deleted cluster B's vm/100 backups on a shared datastore.
+# PBS does not record the cluster, but each cluster's storage.cfg names the datastore and
+# namespace its pbs storage writes to, and that is what decides the owner here.
+_PBS_STORAGE_TTL = 60.0
+_pbs_storages_seen = {}          # cluster id -> (monotonic read time, [pbs storage entries])
+
+
+def _pbs_storages_of(cluster_id):
+    """The pbs-type entries of a cluster's storage.cfg, or None when they cannot be told.
+
+    Kept for a minute. A read that fails falls back to the last one that worked, so a cluster
+    that drops offline keeps its claims instead of locking its tenants out."""
+    import time
+    cm = cluster_managers.get(cluster_id)
+    if cm is None:
+        return None
+    if getattr(cm, 'cluster_type', 'proxmox') != 'proxmox':
+        return []                        # only PVE writes to a PBS
+    now = time.monotonic()
+    hit = _pbs_storages_seen.get(cluster_id)
+    if hit and now - hit[0] < _PBS_STORAGE_TTL:
+        return hit[1]
+    entries = None
+    if getattr(cm, 'is_connected', False):
+        try:
+            r = cm._api_get(f"https://{cm.host}:{cm.api_port}/api2/json/storage")
+            if r is not None and r.status_code == 200:
+                entries = [s for s in (r.json().get('data') or [])
+                           if isinstance(s, dict) and s.get('type') == 'pbs']
+        except Exception as e:
+            logging.debug(f"[PBS] cannot read the storages of {cluster_id}: {e}")
+    if entries is None:
+        return hit[1] if hit else None
+    _pbs_storages_seen[cluster_id] = (now, entries)
+    return entries
+
+
+def _pbs_ns(ns):
+    return str(ns or '').strip().strip('/')
+
+
+def _storage_is_this_pbs(entry, mgr):
+    """Whether a pbs storage entry points at this PBS: same host and port, or the same
+    certificate where one side names the server by address and the other by name."""
+    def _host(h):
+        return str(h or '').strip().strip('[]').lower()
+
+    def _port(p):
+        try:
+            return int(p or 8007)
+        except (TypeError, ValueError):
+            return None
+
+    def _fp(f):
+        f = ''.join(c for c in str(f or '').upper() if c in '0123456789ABCDEF')
+        return f if len(f) == 64 else ''
+
+    server = _host(entry.get('server'))
+    if server and server == _host(mgr.host) and _port(entry.get('port')) == _port(mgr.port):
+        return True
+    fp = _fp(entry.get('fingerprint'))
+    return bool(fp) and fp == _fp(getattr(mgr, 'fingerprint', ''))
+
+
+class _BackupOwners:
+    """The clusters a backup in one datastore and namespace of this PBS may belong to.
+
+    The candidates are the clusters the PBS backs up for (linked, else every connected one,
+    as everywhere in this module). One candidate owns everything. With more, the owners of a
+    place are the candidates whose storage.cfg writes there, plus any whose storage.cfg cannot
+    be read. A place no candidate claims answers with all of them - nobody can tell whose it is,
+    so a confined caller needs the guest on each. Several claims on one place answer with all
+    the claimants for the same reason: their backup groups are one and the same.
+
+    One per listing. The storage reads happen on first use and only with two candidates or
+    more; _pbs_storages_of keeps them for a minute."""
+
+    def __init__(self, mgr):
+        self.mgr = mgr
+        self.candidates = list(mgr.linked_clusters or []) or list(cluster_managers.keys())
+        self._claims = None
+
+    def of(self, store, ns=None):
+        if len(self.candidates) < 2 or store is None:
+            return self.candidates
+        if self._claims is None:
+            self._claims = {}
+            for cid in self.candidates:
+                entries = _pbs_storages_of(cid)
+                self._claims[cid] = None if entries is None else {
+                    (str(e.get('datastore') or ''), _pbs_ns(e.get('namespace')))
+                    for e in entries if _storage_is_this_pbs(e, self.mgr)}
+        where = (str(store), _pbs_ns(ns))
+        claimed = [c for c in self.candidates if self._claims[c] and where in self._claims[c]]
+        if not claimed:
+            return self.candidates
+        return claimed + [c for c in self.candidates if self._claims[c] is None]
+
+
 def _caller_is_scoped_here(mgr, user):
     """True when this caller is confined on any cluster this PBS backs up for.
 
@@ -793,15 +995,14 @@ def _authz_restore_node(cluster_id, node, user):
     from pegaprox.api.helpers import caller_is_scoped
     if not caller_is_scoped(user, cluster_id):
         return None
-    from pegaprox.utils.rbac import get_user_vms
-    _mine = get_user_vms(user, cluster_id)
-    if _mine is None:
-        return None                      # no restrictions expressed for them here
+    from pegaprox.utils.rbac import user_can_access_vm
     mgr = cluster_managers.get(cluster_id)
     try:
+        # NS Oct 2026 - asked guest by guest. get_user_vms knows the VM-ACLs only, so a caller
+        # confined by a pool came back as unrestricted and restored onto any node (#1081)
         _nodes = {r.get('node') for r in (mgr.get_vm_resources() or [])
                   if r.get('node') and str(r.get('vmid', '')).isdigit()
-                  and int(r['vmid']) in set(_mine)}
+                  and user_can_access_vm(user, cluster_id, int(r['vmid']), 'vm.view', r.get('type'))}
     except Exception as e:
         logging.error(f"[PBS] cannot resolve the caller's nodes on {cluster_id}: {e}")
         return jsonify({'error': 'Cannot verify the restore destination - check the server logs'}), 503
@@ -839,7 +1040,7 @@ def require_pbs_wide(pbs_id, action='this action'):
         return jsonify({'error': 'PBS server not found'}), 404
 
     user = build_authz_user(request.session.get('user', ''), request.session)
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(user):
         return None
 
     linked = list(mgr.linked_clusters or [])
@@ -868,7 +1069,8 @@ def require_pbs_wide(pbs_id, action='this action'):
     return None
 
 
-def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup', user=None, scoped=None):
+def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup', user=None, scoped=None,
+                      store=None, ns=None, owners=None):
     """NS Aug 2026 (sec-report, BOLA/CWE-639) — object-level scope for PBS backup ops.
 
     check_pbs_access only proves the caller reaches ONE of the PBS's linked clusters; it
@@ -892,12 +1094,17 @@ def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup', user=
     build_authz_user reads the whole users table and decrypts two TOTP columns per account, and
     caller_is_scoped enumerates pool grants and VM ACLs per linked cluster — _scope_pbs_rows
     runs this once per snapshot, so at 10k guests both are the difference between one lookup
-    and hundreds of thousands, on a greenlet that yields to nobody while it runs."""
+    and hundreds of thousands, on a greenlet that yields to nobody while it runs.
+
+    store/ns say where the backup lives, and the guest has to be the caller's on every cluster
+    that may own that place (_BackupOwners) - not on any linked cluster that happens to use the
+    same VMID (#1083). Leaving store out asks about all of them. `owners` is shared the same way
+    as `user`."""
     from pegaprox.utils.rbac import user_can_access_vm
     if user is None:
         from pegaprox.utils.auth import build_authz_user
         user = build_authz_user(request.session.get('user', ''), request.session)
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(user):
         return True, None
 
     if scoped is None:
@@ -915,13 +1122,12 @@ def _authz_pbs_backup(mgr, backup_type, backup_id, permission='vm.backup', user=
         return _deny()
     vmid = int(str(backup_id).strip())
     vm_type = 'lxc' if bt == 'ct' else 'qemu'
-    # linked clusters own the backups; fall back to all connected clusters when a PBS has
-    # no explicit linking (mirrors _pbs_vm_name_lookup). user_can_access_vm still enforces
-    # per-cluster ACL/pool scope, so an empty-scope user gets no free pass here.
-    cluster_ids = list(mgr.linked_clusters or []) or list(cluster_managers.keys())
-    for cid in cluster_ids:
-        if user_can_access_vm(user, cid, vmid, permission, vm_type):
-            return True, None
+    # user_can_access_vm still enforces per-cluster ACL/pool scope, so an empty-scope user gets
+    # no free pass here
+    cluster_ids = (owners or _BackupOwners(mgr)).of(store, ns)
+    if cluster_ids and all(user_can_access_vm(user, cid, vmid, permission, vm_type)
+                           for cid in cluster_ids):
+        return True, None
     return _deny()
 
 
@@ -946,7 +1152,8 @@ def pbs_delete_snapshot(pbs_id, store):
 
     # NS Aug 2026 (sec-report, BOLA) — per-backup scope: the owning VMID must be one the
     # caller can access; check_pbs_access above only proves server/tenant reach.
-    _ok, _err = _authz_pbs_backup(mgr, data['backup_type'], data['backup_id'], 'vm.backup')
+    _ok, _err = _authz_pbs_backup(mgr, data['backup_type'], data['backup_id'], 'vm.backup',
+                                  store=store, ns=data.get('ns'))
     if not _ok:
         return _err
 
@@ -969,7 +1176,7 @@ def get_pbs_tasks(pbs_id):
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
-    limit = int(request.args.get('limit', 50))
+    limit = bounded_limit(request.args.get('limit'), 50, 1000)
     typefilter = request.args.get('typefilter', None)
     running = request.args.get('running', None)
     result = mgr.get_tasks(limit=limit, typefilter=typefilter,
@@ -979,7 +1186,8 @@ def get_pbs_tasks(pbs_id):
     # prune, sync) carry no per-object question, so they go the same way as everywhere else:
     # kept for an unconfined caller, dropped for a confined one.
     return jsonify(_scope_pbs_rows(mgr, result.get('data', []) or [],
-                                   key_fn=lambda t: _pbs_task_guest(t.get('worker_id') or t.get('id'))))
+                                   key_fn=lambda t: _pbs_task_guest(t.get('worker_id') or t.get('id')),
+                                   where_fn=lambda t: (_pbs_task_store(t.get('worker_id') or t.get('id')), '')))
 
 
 @bp.route('/api/pbs/<pbs_id>/tasks/<path:upid>', methods=['GET'])
@@ -995,7 +1203,7 @@ def get_pbs_task_detail(pbs_id, upid):
     mgr = pbs_managers[pbs_id]
     # sec (audit) — the log names the archives and the guest it backed up
     _bt, _bid = _pbs_upid_guest(upid)
-    ok, err = _authz_pbs_backup(mgr, _bt, _bid, 'vm.view')
+    ok, err = _authz_pbs_backup(mgr, _bt, _bid, 'vm.view', store=_pbs_task_store(upid), ns='')
     if not ok:
         return err
     status = mgr.get_task_status(upid)
@@ -1157,7 +1365,7 @@ def get_pbs_snapshot_notes(pbs_id, store):
         return jsonify({'error': 'Missing backup-type, backup-id, or backup-time'}), 400
     # sec (audit) — same per-backup owner check the PUT twin below carries. A datastore spans
     # every guest on every linked cluster, so reading is as much a boundary as writing.
-    ok, err = _authz_pbs_backup(mgr, bt, bid, 'vm.view')
+    ok, err = _authz_pbs_backup(mgr, bt, bid, 'vm.view', store=store, ns='')
     if not ok:
         return err
     result = mgr.get_snapshot_notes(store, bt, bid, int(btime))
@@ -1186,7 +1394,7 @@ def set_pbs_snapshot_notes(pbs_id, store):
         return jsonify({'error': 'Missing backup-type, backup-id, or backup-time'}), 400
     # NS Aug 2026 (audit) — per-backup owner check (delete/browse/download all carry it); a shared
     # datastore spans tenants, so without this a scoped user could rewrite another tenant's backup.
-    ok, err = _authz_pbs_backup(mgr, bt, bid)
+    ok, err = _authz_pbs_backup(mgr, bt, bid, store=store, ns='')
     if not ok:
         return err
     result = mgr.set_snapshot_notes(store, bt, bid, int(btime), notes)
@@ -1209,7 +1417,7 @@ def get_pbs_group_notes(pbs_id, store):
     bid = request.args.get('backup-id')
     if not all([bt, bid]):
         return jsonify({'error': 'Missing backup-type or backup-id'}), 400
-    ok, err = _authz_pbs_backup(mgr, bt, bid, 'vm.view')      # sec (audit), as above
+    ok, err = _authz_pbs_backup(mgr, bt, bid, 'vm.view', store=store, ns='')   # sec (audit), as above
     if not ok:
         return err
     result = mgr.get_group_notes(store, bt, bid)
@@ -1236,7 +1444,7 @@ def set_pbs_group_notes(pbs_id, store):
     if not all([bt, bid]):
         return jsonify({'error': 'Missing backup-type or backup-id'}), 400
     # NS Aug 2026 (audit) — per-backup owner check; a shared datastore spans tenants.
-    ok, err = _authz_pbs_backup(mgr, bt, bid)
+    ok, err = _authz_pbs_backup(mgr, bt, bid, store=store, ns='')
     if not ok:
         return err
     result = mgr.set_group_notes(store, bt, bid, notes)
@@ -1267,7 +1475,7 @@ def set_pbs_snapshot_protected(pbs_id, store):
         return jsonify({'error': 'Missing backup-type, backup-id, or backup-time'}), 400
     # NS Aug 2026 (audit) — per-backup owner check; protect-flag tamper on a shared datastore
     # (clear→enables a later prune to delete a co-tenant's backup; set→blocks their pruning).
-    ok, err = _authz_pbs_backup(mgr, bt, bid)
+    ok, err = _authz_pbs_backup(mgr, bt, bid, store=store, ns='')
     if not ok:
         return err
     result = mgr.set_snapshot_protected(store, bt, bid, int(btime), protected)
@@ -1304,7 +1512,7 @@ def get_pbs_syslog(pbs_id):
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
-    limit = request.args.get('limit', 100, type=int)
+    limit = bounded_limit(request.args.get('limit'), 100, 1000)
     since = request.args.get('since')
     result = mgr.get_syslog(limit=limit, since=since)
     failed = pbs_upstream_error(result)
@@ -1341,6 +1549,11 @@ def get_pbs_notifications(pbs_id):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    # NS Oct 2026 (#1012) - targets and matchers belong to the whole PBS, not to a tenant: they
+    # carry webhook URLs and mail settings, and every tenant's backup alerts go through them
+    _wide = require_pbs_wide(pbs_id, 'the notification settings')
+    if _wide:
+        return _wide
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
@@ -1383,7 +1596,7 @@ def browse_pbs_catalog(pbs_id, store):
     if not all([bt, bid, btime]):
         return jsonify({'error': 'Missing backup-type, backup-id, or backup-time'}), 400
     # NS Aug 2026 (sec-report, BOLA) — per-backup scope on top of the server/tenant gate
-    _ok, _err = _authz_pbs_backup(mgr, bt, bid, 'vm.backup')
+    _ok, _err = _authz_pbs_backup(mgr, bt, bid, 'vm.backup', store=store, ns='')
     if not _ok:
         return _err
     result = mgr.browse_catalog(store, bt, bid, int(btime), filepath)
@@ -1410,7 +1623,7 @@ def download_pbs_file(pbs_id, store):
         return jsonify({'error': 'Missing parameters'}), 400
     # NS Aug 2026 (sec-report, BOLA) — per-backup scope: only stream files from a backup
     # whose owning VMID the caller can access, not any backup on a reachable datastore.
-    _ok, _err = _authz_pbs_backup(mgr, bt, bid, 'vm.backup')
+    _ok, _err = _authz_pbs_backup(mgr, bt, bid, 'vm.backup', store=store, ns='')
     if not _ok:
         return _err
     try:
@@ -1534,6 +1747,9 @@ def update_pbs_datastore_config(pbs_id, store):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'changing a datastore')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -1677,6 +1893,9 @@ def update_pbs_job(pbs_id, job_type, job_id):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'changing a job')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -1741,6 +1960,9 @@ def stop_pbs_task(pbs_id, upid):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'stopping a task')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -1763,6 +1985,9 @@ def create_pbs_notification_target(pbs_id, target_type):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'changing the notification settings')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -1786,6 +2011,9 @@ def update_pbs_notification_target(pbs_id, target_type, name):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'changing the notification settings')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -1804,6 +2032,9 @@ def delete_pbs_notification_target(pbs_id, target_type, name):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'changing the notification settings')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -1823,6 +2054,9 @@ def create_pbs_notification_matcher(pbs_id):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'changing the notification settings')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -1844,6 +2078,9 @@ def update_pbs_notification_matcher(pbs_id, name):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'changing the notification settings')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -1862,6 +2099,9 @@ def delete_pbs_notification_matcher(pbs_id, name):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'changing the notification settings')
+    if _wide:
+        return _wide
     
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
@@ -1881,6 +2121,9 @@ def create_pbs_traffic_control(pbs_id):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'changing traffic control')
+    if _wide:
+        return _wide
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     data = request.json or {}
@@ -1903,6 +2146,9 @@ def update_pbs_traffic_control(pbs_id, name):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'changing traffic control')
+    if _wide:
+        return _wide
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     data = request.json or {}
@@ -1920,6 +2166,9 @@ def delete_pbs_traffic_control_rule(pbs_id, name):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'changing traffic control')
+    if _wide:
+        return _wide
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     result = pbs_managers[pbs_id].delete_traffic_control(name)
@@ -1958,6 +2207,9 @@ def set_pbs_subscription(pbs_id):
     ok, err = check_pbs_access(pbs_id)
     if not ok:
         return err
+    _wide = require_pbs_wide(pbs_id, 'setting the subscription')
+    if _wide:
+        return _wide
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     data = request.json or {}
@@ -2066,12 +2318,14 @@ def _pbs_collect_snapshots(mgr, protected_only=False, min_backup_time=0):
     return entries
 
 
-def _pbs_resolve_vm_names(mgr):
+def _pbs_resolve_vm_names(mgr, cluster_ids=None):
     """Walk each linked PVE cluster and build (type, vmid_str) -> name.
     type is normalized to 'vm' / 'ct' to match PBS worker-id conventions.
+    cluster_ids keeps only those of the linked clusters.
     """
     names = {}
-    for cid in (mgr.linked_clusters or []):
+    linked = list(mgr.linked_clusters or [])
+    for cid in (linked if cluster_ids is None else [c for c in linked if c in cluster_ids]):
         pve_mgr = cluster_managers.get(cid)
         if not pve_mgr or not getattr(pve_mgr, 'is_connected', False):
             continue
@@ -2089,6 +2343,20 @@ def _pbs_resolve_vm_names(mgr):
                 continue
             names[(vt, str(r.get('vmid', '')))] = r.get('name', '')
     return names
+
+
+def _pbs_names_by_place(mgr, owners):
+    """name(store, ns, (type, vmid)) for report rows: the guest's name on the clusters that may
+    own that place, so a vm/100 is not named after another cluster's VM 100 (#1083). A report
+    has thousands of rows and a handful of owner sets, hence the memo."""
+    memo = {}
+
+    def name(store, ns, key):
+        cids = tuple(owners.of(store, ns))
+        if cids not in memo:
+            memo[cids] = _pbs_resolve_vm_names(mgr, cids)
+        return memo[cids].get(key, '')
+    return name
 
 
 @bp.route('/api/pbs/<pbs_id>/reports/summary', methods=['GET'])
@@ -2127,8 +2395,11 @@ def get_pbs_reports_summary(pbs_id):
     # clusters, and pbs.view is a builtin ROLE_USER/ROLE_VIEWER permission — so the report described
     # every guest on the install. Drop the tasks whose guest the caller may not see BEFORE the
     # aggregation, so the totals and the per-day chart can't count them either.
+    owners = _BackupOwners(mgr)
     tasks = _scope_pbs_rows(mgr, tasks_resp.get('data', []) or [],
-                            key_fn=lambda t: _pbs_task_guest(t.get('worker_id') or t.get('id')))
+                            key_fn=lambda t: _pbs_task_guest(t.get('worker_id') or t.get('id')),
+                            where_fn=lambda t: (_pbs_task_store(t.get('worker_id') or t.get('id')), ''),
+                            owners=owners)
 
     totals = {'jobs': 0, 'success': 0, 'warning': 0, 'failed': 0}
     per_day = {}          # YYYY-MM-DD -> {date, success, warning, failed}
@@ -2166,7 +2437,7 @@ def get_pbs_reports_summary(pbs_id):
                 per_vm_latest[key] = t
 
     # ── Snapshot inventory for size/verify info ────────────────────────────
-    snapshots = _scope_pbs_rows(mgr, _pbs_collect_snapshots(mgr))
+    snapshots = _scope_pbs_rows(mgr, _pbs_collect_snapshots(mgr), owners=owners)
     snapshots_by_key = {}   # (type, vmid_str) -> [snap, ...]
     for s in snapshots:
         key = (s.get('backup-type', ''), str(s.get('backup-id', '')))
@@ -2182,7 +2453,7 @@ def get_pbs_reports_summary(pbs_id):
             unverified_old += 1
 
     # ── Resolve VM names from linked clusters ──────────────────────────────
-    vm_names = _pbs_resolve_vm_names(mgr)
+    vm_name = _pbs_names_by_place(mgr, owners)
 
     # ── Build per-VM rollup (Veeam-style last N per job) ───────────────────
     per_vm = []
@@ -2206,10 +2477,12 @@ def get_pbs_reports_summary(pbs_id):
             latest_verify = latest_snap.get('verification') or {}
             if not isinstance(latest_verify, dict):
                 latest_verify = {}
+        where = ((latest_snap.get('_datastore'), latest_snap.get('_namespace')) if latest_snap
+                 else (_pbs_task_store(task.get('worker_id') or task.get('id')), ''))
         per_vm.append({
             'type': vm_type,
             'vmid': vmid,
-            'vm_name': vm_names.get((vm_type, str(vmid)), ''),
+            'vm_name': vm_name(*where, (vm_type, str(vmid))),
             'datastore': latest_snap.get('_datastore') if latest_snap else '',
             'namespace': latest_snap.get('_namespace') if latest_snap else '',
             'last_backup_ts': end_ts,
@@ -2273,10 +2546,11 @@ def get_pbs_reports_inventory(pbs_id):
 
     # "every snapshot across all datastores/namespaces" means every snapshot the CALLER may
     # read — see the note in the summary route above; this one also carries the owner. (audit)
+    owners = _BackupOwners(mgr)
     raw = _scope_pbs_rows(mgr, _pbs_collect_snapshots(
-        mgr, protected_only=protected_only, min_backup_time=min_bt))
+        mgr, protected_only=protected_only, min_backup_time=min_bt), owners=owners)
 
-    vm_names = _pbs_resolve_vm_names(mgr)
+    vm_name = _pbs_names_by_place(mgr, owners)
 
     entries = []
     for s in raw:
@@ -2288,7 +2562,7 @@ def get_pbs_reports_inventory(pbs_id):
         entries.append({
             'type': vtype,
             'vmid': vmid,
-            'vm_name': vm_names.get((vtype, vmid), ''),
+            'vm_name': vm_name(s.get('_datastore'), s.get('_namespace'), (vtype, vmid)),
             'datastore': s.get('_datastore', ''),
             'namespace': s.get('_namespace', ''),
             'backup_time': s.get('backup-time', 0),
@@ -2357,6 +2631,16 @@ def get_pbs_reports_protected_vms(pbs_id):
     # Most recent backup timestamp + datastore per (type, vmid)
     most_recent = {}
     snaps = _pbs_collect_snapshots(mgr)
+    # NS Oct 2026 (#1083) - the rows above are this cluster's guests, but a vm/100 on the PBS can
+    # be another linked cluster's VM 100. A confined caller only gets the backups that may be
+    # this cluster's and that they may read; everyone else keeps the report as it was.
+    from pegaprox.utils.auth import build_authz_user
+    _caller = build_authz_user(request.session.get('user', ''), request.session)
+    if (not acts_as_admin(_caller)
+            and _caller_is_scoped_here(mgr, _caller)):
+        owners = _BackupOwners(mgr)
+        snaps = [s for s in _scope_pbs_rows(mgr, snaps, owners=owners)
+                 if cluster_id in owners.of(s.get('_datastore'), s.get('_namespace'))]
     for s in snaps:
         key = (s.get('backup-type', ''), str(s.get('backup-id', '')))
         bt = s.get('backup-time', 0)
@@ -2557,7 +2841,7 @@ def get_backup_verification_history(cluster_id):
         return err
 
     vmid = request.args.get('vmid', type=int)
-    limit = request.args.get('limit', 50, type=int)
+    limit = bounded_limit(request.args.get('limit'), 50, 1000)
 
     results = get_verification_history(cluster_id, vmid, limit)
     return jsonify(_verification_rows_visible(cluster_id, results))
@@ -2619,6 +2903,9 @@ def probe_pbs_fingerprint():
             return jsonify({'error': f'unsafe target: {reason}'}), 400
     except Exception:
         pass
+    _why = _target_refusal(host)
+    if _why:
+        return jsonify({'error': _why}), 400
 
     ctx = _ssl._create_unverified_context()
     try:
@@ -2865,6 +3152,16 @@ def auto_attach_pbs_to_clusters(pbs_id):
     cluster_ids = cluster_ids or list(pbs_mgr.linked_clusters or [])
     if not cluster_ids:
         return jsonify({'error': 'no clusters specified or linked'}), 400
+    # NS Oct 2026 (#980) - the credentials go only where the server is linked. The tenant check
+    # below takes any cluster the caller's tenant owns, so reaching the server through one
+    # linked cluster was enough to plant its credentials on another. A global admin may still
+    # attach it anywhere, and a server linked to nothing is open to everybody anyway.
+    _linked = list(pbs_mgr.linked_clusters or [])
+    if _linked and not caller_acts_as_admin():
+        _off = [c for c in cluster_ids if c not in _linked]
+        if _off:
+            return jsonify({'error': 'Access denied: this PBS server is not linked to '
+                                     + ', '.join(_off)}), 403
     # NS Aug 2026 (Aikido 469089213) — this injects the PBS's stored (often root@pam) credentials
     # into a PVE storage config, so check_cluster_access (which passes on the #555 pool / #248 ACL
     # fallback) is not enough: confine to clusters the caller's TENANT owns, like the storage
@@ -2887,15 +3184,29 @@ def auto_attach_pbs_to_clusters(pbs_id):
 
     # Probe live fingerprint so we always inject a current one
     import socket as _sock, ssl as _ssl, hashlib
+    from urllib3.util.ssl_ import assert_fingerprint as _assert_fp
+    from urllib3.exceptions import SSLError as _FpMismatch
     try:
         ctx = _ssl._create_unverified_context()
         with _sock.create_connection((pbs_mgr.host, pbs_mgr.port or 8007), timeout=10) as s:
             with ctx.wrap_socket(s, server_hostname=pbs_mgr.host) as ssock:
                 der = ssock.getpeercert(binary_form=True)
-        fp_hex = hashlib.sha256(der).hexdigest().upper()
-        fingerprint = ':'.join(fp_hex[i:i+2] for i in range(0, len(fp_hex), 2))
     except Exception as e:
         return jsonify({'error': f'fingerprint probe failed: {e}'}), 502
+    # NS Oct 2026 (#1074) - PVE is told to trust this certificate, next to the stored credentials,
+    # and it was read unverified past the fingerprint the server is pinned to. A pinned server has
+    # to present its pinned certificate now; one without a pin takes what the probe sees, as before.
+    _pin = getattr(pbs_mgr, 'fingerprint', '')
+    _pin = _pin.strip() if isinstance(_pin, str) else ''
+    if _pin:
+        try:
+            _assert_fp(der, _pin)
+        except _FpMismatch:
+            logging.warning(f"[PBS:{pbs_id}] auto-storage refused: the certificate does not match the stored fingerprint")
+            return jsonify({'error': 'The PBS server presents a certificate that does not match its '
+                                     'stored fingerprint'}), 502
+    fp_hex = hashlib.sha256(der).hexdigest().upper()
+    fingerprint = ':'.join(fp_hex[i:i+2] for i in range(0, len(fp_hex), 2))
 
     pbs_user = getattr(pbs_mgr, 'user', None) or getattr(pbs_mgr, 'username', None)
     pbs_pass = getattr(pbs_mgr, 'password', None)
@@ -2993,12 +3304,17 @@ def storage_preflight(cluster_id):
             return jsonify({'ok': False, 'issues': [f'unsafe target: {_reason}'], 'info': {}}), 200
     except Exception:
         pass
+    _why = _target_refusal(server)
+    if _why:
+        return jsonify({'ok': False, 'issues': [_why], 'info': {}}), 200
 
     issues = []
     info = {}
 
     # 1) TCP reachability
     import socket as _sock, ssl as _ssl, hashlib
+    from urllib3.util.ssl_ import assert_fingerprint as _assert_fp
+    from urllib3.exceptions import SSLError as _FpMismatch
     try:
         with _sock.create_connection((server, port), timeout=6):
             info['tcp'] = 'ok'
@@ -3014,15 +3330,25 @@ def storage_preflight(cluster_id):
         fp_hex = hashlib.sha256(der).hexdigest().upper()
         live_fp = ':'.join(fp_hex[i:i+2] for i in range(0, len(fp_hex), 2))
         info['live_fingerprint'] = live_fp
-        if given_fp and given_fp != live_fp:
-            issues.append(f'Fingerprint mismatch — server presents {live_fp[:16]}…, you supplied {given_fp[:16]}…')
     except Exception as e:
         return jsonify({'ok': False, 'issues': [f'TLS handshake failed: {e}'], 'info': info}), 200
+    # NS Oct 2026 (#1074) - a mismatch was only a line in the list, and the typed password went to
+    # that server right after. It stays here now, and with a fingerprint given the login below
+    # only talks to the certificate it names (colons and case no longer count as a mismatch).
+    if given_fp:
+        try:
+            _assert_fp(der, given_fp)
+        except _FpMismatch:
+            issues.append(f'Fingerprint mismatch - server presents {live_fp[:16]}…, you supplied {given_fp[:16]}…')
+            return jsonify({'ok': False, 'issues': issues, 'info': info}), 200
 
     # 3) Auth probe
     try:
         import requests as _r
         s = _r.Session(); s.verify = False
+        if given_fp:
+            from pegaprox.core.pbs import _PinnedFingerprintAdapter
+            s.mount('https://', _PinnedFingerprintAdapter(given_fp))
         ar = s.post(f'https://{server}:{port}/api2/json/access/ticket',
                     data={'username': username, 'password': password}, timeout=8)
         if ar.status_code != 200:
@@ -3091,6 +3417,25 @@ def get_vms_backup_status(cluster_id):
     _bc = _backup_status_cache.get(cluster_id)
     if _bc and (now - _bc[0]) < _bc[2]:
         return jsonify(_scope_backup_out(_bc[1]))
+    return jsonify(_scope_backup_out(scan_backup_status(cluster_id, cm)))
+
+
+def backup_status_entry(cluster_id):
+    """(read at, rows, complete) of the last scan of a cluster, or None. A partial scan is
+    the one cached with the short TTL. MK Oct 2026"""
+    hit = _backup_status_cache.get(cluster_id)
+    if not hit:
+        return None
+    return hit[0], hit[1], hit[2] >= _BACKUP_STATUS_TTL
+
+
+def scan_backup_status(cluster_id, cm):
+    """Read the newest backup of every guest of a cluster from the snapshot lists of the
+    PBS servers linked to it and the vzdump files on its backup storages, cache the
+    cluster-global list and return it. Unscoped: callers filter. The VM list pill and the
+    Prometheus exporter share it."""
+    import time as _t
+    now = _t.time()
     cutoff_30d = now - (30 * 86400)
 
     # Aggregate snapshots across all PBS servers linked to this cluster + the
@@ -3125,6 +3470,7 @@ def get_vms_backup_status(cluster_id):
     def _scan_pbs(pbs):
         """Returns list of (vmid, ts, encrypted, verified_ts) tuples for one PBS server."""
         bumps = []
+        owners = _BackupOwners(pbs)
         try:
             _ds = pbs.get_datastores() or {}
             stores = _ds.get('data', []) if isinstance(_ds, dict) else (_ds or [])
@@ -3135,6 +3481,9 @@ def get_vms_backup_status(cluster_id):
                 continue
             store_name = store.get('store') or store.get('name')
             if not store_name:
+                continue
+            # another linked cluster's root namespace holds its own VM 100, not ours (#1083)
+            if cluster_id not in owners.of(store_name, ''):
                 continue
             try:
                 _r = pbs.get_snapshots(store_name) or {}
@@ -3267,6 +3616,7 @@ def get_vms_backup_status(cluster_id):
             status = 'stale'
         out.append({
             'vmid': rec['vmid'],
+            'last_backup_ts': int(rec['last_backup_ts'] or 0),
             'last_backup_age_hours': round(last_age_h, 1) if last_age_h is not None else None,
             'count_30d': rec['count_30d'],
             'encrypted': rec['encrypted'],
@@ -3277,7 +3627,7 @@ def get_vms_backup_status(cluster_id):
     # cache the UNFILTERED cluster-global list; scope per-request at return time
     _backup_status_cache[cluster_id] = (
         now, out, _BACKUP_STATUS_TTL if _scan_complete else _BACKUP_STATUS_TTL_PARTIAL)
-    return jsonify(_scope_backup_out(out))
+    return out
 
 
 @bp.route('/api/clusters/<cluster_id>/datacenter/backup/<job_id>/run', methods=['POST'])
@@ -3395,7 +3745,7 @@ def restore_backup(cluster_id):
     from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import user_can_access_vm
     _src_authz_user = build_authz_user(request.session.get('user', ''), request.session)
-    if _src_authz_user.get('effective_role', _src_authz_user.get('role')) != ROLE_ADMIN:
+    if not acts_as_admin(_src_authz_user):
         _sm = _re.search(r'/(?:vm|ct)/(\d+)/', volid) or _re.search(r'vzdump-(?:qemu|lxc|openvz)-(\d+)-', volid)
         _src_vmid = int(_sm.group(1)) if _sm else None
         _src_is_lxc = '/ct/' in volid or 'vzdump-lxc' in volid or 'vzdump-openvz' in volid or volid.endswith('.lxc.tar')
@@ -3409,8 +3759,7 @@ def restore_backup(cluster_id):
     # including one inside another tenant's configured VMID range, and onto storage they have
     # no claim to. vms.py has enforced the range on create since the tenant-limits work; the
     # restore path never learned about it.
-    if mode == 'new' and _src_authz_user.get('effective_role',
-                                             _src_authz_user.get('role')) != ROLE_ADMIN:
+    if mode == 'new' and not acts_as_admin(_src_authz_user):
         from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID as _DT
         _rok, _rmsg = check_tenant_vmid(_src_authz_user.get('tenant_id') or _DT, target_vmid)
         if not _rok:
@@ -3511,7 +3860,7 @@ def diff_pbs_backups(pbs_id):
         return jsonify({'error': 'store, type, id, a, b query params required'}), 400
     # sec (audit) — type+id name a guest, and the diff hands back its manifests; the seven
     # sibling routes that take the same pair all gate on it.
-    ok, err = _authz_pbs_backup(pbs, btype, bid, 'vm.view')
+    ok, err = _authz_pbs_backup(pbs, btype, bid, 'vm.view', store=store, ns='')
     if not ok:
         return err
 

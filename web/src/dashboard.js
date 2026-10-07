@@ -545,15 +545,53 @@
             );
         }
 
+        // LW Oct 2026 - the field of a guest a search hit came from, when it is not the name
+        const SEARCH_INDEX_FIELDS = ['ip', 'mac', 'notes'];
+        function searchMatchLabel(t, field) {
+            if (field === 'mac') return t('searchMatchMac');
+            if (field === 'ip') return t('searchMatchIp');
+            if (field === 'notes') return t('searchMatchNotes');
+            return field;
+        }
+
         // LW Apr 2026 — Global command palette. Opens on Ctrl/Cmd+K.
         // Indexes: clusters, VMs, storage (from resources), and a curated action list.
         // Keyboard-first: ↑/↓ to move, enter to pick, esc to close.
         function CommandPalette({ t, clusters, clusterResources, clusterMetrics, selectedCluster,
-                                   onClose, onPickCluster, onPickVm, onAction }) {
+                                   onClose, onPickCluster, onPickVm, onAction, authFetch, onPickHit }) {
             const [query, setQuery] = useState('');
             const [highlight, setHighlight] = useState(0);
             const inputRef = useRef(null);
             useEffect(() => { inputRef.current?.focus(); }, []);
+
+            // LW Oct 2026 - MAC addresses, IPs and notes are not in the loaded resources: the
+            // server's search index has them, for every cluster the user may see. Asked once
+            // the typing pauses; an answer to an older query is dropped
+            const [remote, setRemote] = useState({ q: '', hits: [] });
+            const [remoteLoading, setRemoteLoading] = useState(false);
+            useEffect(() => {
+                const q = query.trim();
+                if (q.length < 2 || !authFetch) {
+                    setRemote({ q: '', hits: [] });
+                    setRemoteLoading(false);
+                    return;
+                }
+                const ctrl = new AbortController();
+                setRemoteLoading(true);
+                const timer = setTimeout(async () => {
+                    const res = await authFetch(`${API_URL}/global/search?q=${encodeURIComponent(q)}&type=all`, { signal: ctrl.signal });
+                    if (ctrl.signal.aborted) return;
+                    let hits = [];
+                    if (res && res.ok) {
+                        const data = await res.json().catch(() => null);
+                        hits = ((data && data.results) || []).filter(h => h.vmid != null && SEARCH_INDEX_FIELDS.includes(h.match_field));
+                    }
+                    if (ctrl.signal.aborted) return;
+                    setRemote({ q, hits });
+                    setRemoteLoading(false);
+                }, 250);
+                return () => { clearTimeout(timer); ctrl.abort(); };
+            }, [query, authFetch]);
 
             // Base catalog — regenerated whenever inputs change
             const catalog = React.useMemo(() => {
@@ -631,9 +669,26 @@
                     if (tokens.length > 1 && tokens.every(tok => (t1 + ' ' + t2).includes(tok))) s += 30;
                     if (s > 0) scored.push({...item, score: s});
                 }
+                // the server's hits by MAC, IP or notes, after the name hits; a guest of the
+                // open cluster that already matched here is not listed twice
+                if (remote.q === query.trim()) {
+                    const here = new Set(scored.filter(i => i.kind === 'vm').map(i => i.id));
+                    remote.hits.forEach(h => {
+                        if (h.cluster_id === selectedCluster?.id && here.has(`vm-${h.vmid}`)) return;
+                        scored.push({
+                            kind: 'vm', id: `hit-${h.cluster_id}-${h.vmid}`,
+                            title: h.name || `${h.type === 'ct' ? 'CT' : 'VM'} ${h.vmid}`,
+                            subtitle: [`VMID ${h.vmid}`, h.node, h.cluster_name || h.cluster_id].filter(Boolean).join(' · '),
+                            icon: h.type === 'ct' ? 'Container' : 'VM',
+                            score: 20,
+                            match: { field: h.match_field, value: h.match_value || '', net: h.match_net || '' },
+                            pick: () => onPickHit && onPickHit(h),
+                        });
+                    });
+                }
                 scored.sort((a, b) => b.score - a.score);
                 return scored.slice(0, 50);
-            }, [query, catalog]);
+            }, [query, catalog, remote, selectedCluster, onPickHit]);
 
             // reset highlight on query change
             useEffect(() => { setHighlight(0); }, [query]);
@@ -697,6 +752,16 @@
                                         <div className="flex-1 min-w-0">
                                             <div className="text-sm text-white truncate">{r.title}</div>
                                             <div className="text-xs text-gray-500 truncate">{r.subtitle}</div>
+                                            {r.match && (
+                                                <div className="flex items-center gap-1.5 mt-0.5 min-w-0" data-cmdpal-match={r.match.field}>
+                                                    <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 flex-shrink-0">
+                                                        {searchMatchLabel(t, r.match.field)}
+                                                    </span>
+                                                    <span className={`text-xs text-gray-300 truncate ${r.match.field === 'notes' ? '' : 'font-mono'}`}>
+                                                        {r.match.value}{r.match.net ? ` (${r.match.net})` : ''}
+                                                    </span>
+                                                </div>
+                                            )}
                                         </div>
                                         <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded"
                                               style={{color: kindColor, background: `${kindColor}15`}}>{r.kind}</span>
@@ -707,6 +772,11 @@
                         <div className="border-t border-proxmox-border px-3 py-1.5 text-[11px] text-gray-500 flex items-center gap-4">
                             <span><kbd className="px-1.5 py-0.5 rounded bg-proxmox-dark border border-proxmox-border">↑</kbd> <kbd className="px-1.5 py-0.5 rounded bg-proxmox-dark border border-proxmox-border">↓</kbd> {t('navigate') || 'navigate'}</span>
                             <span><kbd className="px-1.5 py-0.5 rounded bg-proxmox-dark border border-proxmox-border">↵</kbd> {t('select') || 'select'}</span>
+                            {remoteLoading ? (
+                                <span data-cmdpal-searching>{t('cmdPalSearchingIndex')}</span>
+                            ) : !query.trim() && (
+                                <span>{t('cmdPalIndexHint')}</span>
+                            )}
                             <span className="ml-auto">{results.length} {t('results') || 'results'}</span>
                         </div>
                     </div>
@@ -739,7 +809,7 @@
                                 <span className={`font-medium ${expired ? 'text-red-400' : 'text-yellow-400'}`}>
                                     {expired 
                                         ? (t('passwordExpired') || 'Ihr Passwort ist abgelaufen!')
-                                        : (t('passwordExpiresIn') || `Ihr Passwort läuft in ${days_until_expiry} Tagen ab`).replace('{days}', days_until_expiry)
+                                        : (t('passwordExpiresIn') || `Ihr Passwort läuft in ${days_until_expiry} Tagen ab`).replace('{days}', () => days_until_expiry)
                                     }
                                 </span>
                                 <span className="text-gray-400 ml-2 text-sm">
@@ -776,12 +846,341 @@
             );
         }
 
+        // LW Oct 2026 - the broadcast banners an admin writes under Settings > Banners. The server
+        // sends the ones meant for this user that still run. Each can be closed, for this user in
+        // this browser, until the admin changes its text (rev goes up). The text goes in as a text
+        // node, never as markup. Read once a minute while the page is shown, again when it comes
+        // back, when one runs out, and when the settings page saved a change.
+        const BROADCAST_TONE = { info: 'blue', warning: 'yellow', critical: 'red' };
+        const BROADCAST_CLOSED_MAX = 100;
+
+        function broadcastClosedKey(username) {
+            return 'pegaprox-banners-closed:' + username;
+        }
+
+        function readBroadcastClosed(username) {
+            try {
+                const v = JSON.parse(localStorage.getItem(broadcastClosedKey(username)) || '{}');
+                return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+            } catch (_) {
+                return {};
+            }
+        }
+
+        function BroadcastBanners({ cloud = false }) {
+            const { t } = useTranslation();
+            const { user, isAuthenticated } = useAuth();
+            const username = typeof user?.username === 'string' ? user.username : '';
+            const [items, setItems] = useState([]);
+            const [closed, setClosed] = useState(() => readBroadcastClosed(username));
+
+            useEffect(() => { setClosed(readBroadcastClosed(username)); }, [username]);
+
+            useEffect(() => {
+                setItems([]);
+                if (!isAuthenticated || !username) return;
+                let alive = true, timer = null, seq = 0;
+                const load = async () => {
+                    const mine = ++seq;
+                    clearTimeout(timer);
+                    let next = 60000;
+                    let list = null;
+                    try {
+                        const r = await fetch(`${API_URL}/banners`, { credentials: 'include' });
+                        if (r.ok) {
+                            const d = await r.json();
+                            list = (Array.isArray(d?.banners) ? d.banners : []).filter(b =>
+                                b && typeof b.id === 'string' && typeof b.text === 'string' && b.text);
+                        }
+                    } catch (_) {}
+                    if (!alive || mine !== seq) return;
+                    if (list) {
+                        const now = Date.now();
+                        setItems(list.map(b => {
+                            const left = typeof b.expires_in === 'number' ? Math.max(0, b.expires_in) : null;
+                            if (left !== null) next = Math.min(next, left * 1000 + 500);
+                            return { ...b, endsAt: left !== null ? now + left * 1000 : null };
+                        }));
+                    }
+                    if (!document.hidden) timer = setTimeout(load, next);
+                };
+                const onShow = () => { if (!document.hidden) load(); };
+                load();
+                document.addEventListener('visibilitychange', onShow);
+                window.addEventListener('pegaprox-banners-changed', load);
+                return () => {
+                    alive = false;
+                    clearTimeout(timer);
+                    document.removeEventListener('visibilitychange', onShow);
+                    window.removeEventListener('pegaprox-banners-changed', load);
+                };
+            }, [isAuthenticated, username]);
+
+            const close = (b) => {
+                setClosed(prev => {
+                    const next = { ...prev };
+                    delete next[b.id];
+                    next[b.id] = b.rev;
+                    const keys = Object.keys(next);
+                    keys.slice(0, Math.max(0, keys.length - BROADCAST_CLOSED_MAX)).forEach(k => { delete next[k]; });
+                    try { localStorage.setItem(broadcastClosedKey(username), JSON.stringify(next)); } catch (_) {}
+                    return next;
+                });
+            };
+
+            const now = Date.now();
+            const shown = items.filter(b => closed[b.id] !== b.rev && (b.endsAt === null || b.endsAt > now));
+            if (!shown.length) return null;
+
+            return shown.map(b => {
+                const severity = BROADCAST_TONE[b.severity] ? b.severity : 'info';
+                const tone = HA_BANNER_TONE[BROADCAST_TONE[severity]];
+                const icon = severity === 'critical' ? <Icons.AlertCircle /> : severity === 'warning' ? <Icons.AlertTriangle /> : <Icons.Info />;
+                const data = {
+                    'data-broadcast-banner': b.id, 'data-broadcast-severity': severity,
+                    'data-broadcast-layout': cloud ? 'cloud' : 'classic',
+                    role: severity === 'critical' ? 'alert' : 'status',
+                };
+                const closeButton = (
+                    <button onClick={() => close(b)} title={t('close')} aria-label={t('close')}
+                        className={cloud ? 'cloud-btn cloud-btn-sm' : 'flex-shrink-0 p-1 rounded text-gray-400 hover:text-white'}
+                        style={cloud ? { whiteSpace: 'nowrap' } : undefined}>
+                        <Icons.X />
+                    </button>
+                );
+                if (cloud) {
+                    return (
+                        <div key={b.id} {...data}
+                            style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 16px', fontSize: 13,
+                                     background: tone.cloud[0], borderBottom: `1px solid ${tone.cloud[1]}`, color: tone.cloud[2] }}>
+                            <span style={{ display: 'inline-flex', flexShrink: 0 }}>{icon}</span>
+                            <span style={{ flex: '1 1 auto', minWidth: 0, overflowWrap: 'anywhere' }}>{b.text}</span>
+                            {closeButton}
+                        </div>
+                    );
+                }
+                return (
+                    <div key={b.id} {...data} className={`px-4 py-2 border-b ${tone.box}`}>
+                        <div className="flex items-center gap-3 text-sm">
+                            <span className={`flex-shrink-0 ${tone.icon}`}>{icon}</span>
+                            <span className={`flex-1 min-w-0 ${tone.text}`} style={{ overflowWrap: 'anywhere' }}>{b.text}</span>
+                            {closeButton}
+                        </div>
+                    </div>
+                );
+            });
+        }
+
+        // LW Sep 2026 (#625) - on a standby every page says where its configuration comes
+        // from and that changes belong on the active one. Admins get a way to the HA tab.
+        // Cloud passes cloud so it picks up the shell's own tokens.
+        // A standby that forwards says that what is done here is carried out there.
+        // A member that serves users is an active instance to them: it names the leader
+        // that runs the automation, or says so when the leader stops answering.
+        function HaStandbyBanner({ onOpenHa, cloud = false }) {
+            const { t, language } = useTranslation();
+            const { ha, isAdmin } = useAuth();
+            const [, setTick] = useState(0);
+            const standby = ha?.role === 'standby';
+
+            // "2 minutes ago" has to move on between two /auth/check polls
+            useEffect(() => {
+                if (!standby) return;
+                const h = setInterval(() => setTick(n => n + 1), 30000);
+                return () => clearInterval(h);
+            }, [standby]);
+
+            if (!standby) return null;
+
+            const serving = ha.serving === true;
+            const leaderDown = serving && ha.leader_reachable === false;
+            const text = t(leaderDown ? 'pgHaBannerLeaderDown'
+                    : serving ? 'pgHaBannerServing'
+                    : ha.forwarding === true ? 'pgHaBannerForwarding' : 'pgHaBannerStandby')
+                .replace('{url}', () => ha.peer_url || '-')
+                .replace('{time}', ha.last_sync_at ? haRelTime(ha.last_sync_at, language) : t('pgHaNotYet'));
+            // yellow on a standby, blue on a serving member, red while its leader is away
+            const tone = leaderDown ? 'red' : serving ? 'blue' : 'yellow';
+            const icon = leaderDown ? <Icons.AlertTriangle /> : <Icons.Layers />;
+            const button = isAdmin && onOpenHa && (
+                <button onClick={onOpenHa}
+                    className={cloud ? 'cloud-btn cloud-btn-sm' : `px-3 py-1 rounded-lg text-xs font-medium text-white whitespace-nowrap ${HA_BANNER_TONE[tone].button}`}
+                    style={cloud ? { whiteSpace: 'nowrap' } : undefined}>
+                    {t('pgHaTab')}
+                </button>
+            );
+            const data = {
+                'data-ha-forwarding': ha.forwarding === true ? 'on' : 'off',
+                'data-ha-serving': serving ? 'on' : 'off',
+                'data-ha-leader': leaderDown ? 'down' : undefined,
+            };
+
+            if (cloud) {
+                const c = HA_BANNER_TONE[tone].cloud;
+                return (
+                    <div data-ha-banner="cloud" {...data} role="status"
+                        style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 16px', fontSize: 13,
+                                 background: c[0], borderBottom: `1px solid ${c[1]}`, color: c[2] }}>
+                        <span style={{ display: 'inline-flex', flexShrink: 0 }}>{icon}</span>
+                        <span style={{ flex: '1 1 auto', minWidth: 0 }}>{text}</span>
+                        {button}
+                    </div>
+                );
+            }
+            return (
+                <div data-ha-banner="classic" {...data} role="status" className={`px-4 py-2 border-b ${HA_BANNER_TONE[tone].box}`}>
+                    <div className="flex items-center gap-3 text-sm">
+                        <span className={`flex-shrink-0 ${HA_BANNER_TONE[tone].icon}`}>{icon}</span>
+                        <span className={`flex-1 min-w-0 ${HA_BANNER_TONE[tone].text}`}>{text}</span>
+                        {button}
+                    </div>
+                </div>
+            );
+        }
+
+        const HA_BANNER_TONE = {
+            yellow: { box: 'bg-yellow-500/10 border-yellow-500/40', icon: 'text-yellow-400', text: 'text-yellow-300',
+                      button: 'bg-yellow-600 hover:bg-yellow-700',
+                      cloud: ['rgba(245,185,69,0.14)', 'rgba(245,185,69,0.42)', 'var(--cloud-warning, #e0a82e)'] },
+            blue: { box: 'bg-blue-500/10 border-blue-500/40', icon: 'text-blue-400', text: 'text-blue-300',
+                    button: 'bg-blue-600 hover:bg-blue-700',
+                    cloud: ['rgba(56,189,248,0.12)', 'rgba(56,189,248,0.40)', 'var(--cloud-info, #38bdf8)'] },
+            red: { box: 'bg-red-500/10 border-red-500/50', icon: 'text-red-400', text: 'text-red-300',
+                   button: 'bg-red-600 hover:bg-red-700',
+                   cloud: ['rgba(248,113,113,0.14)', 'rgba(248,113,113,0.42)', 'var(--cloud-error, #f87171)'] },
+        };
+
+        // LW Oct 2026 (#625) - copies of what a sync replaced here wait until an admin looks at
+        // them, in every role. The banner object counts them; only admins see this line, and
+        // its button opens the HA tab where the list is.
+        function HaCopiesBanner({ onOpenHa, cloud = false }) {
+            const { t } = useTranslation();
+            const { ha, isAdmin } = useAuth();
+            const n = typeof ha?.orphans === 'number' ? ha.orphans : 0;
+            if (!isAdmin || n < 1) return null;
+
+            const text = n === 1 ? t('haCopiesBannerOne') : t('haCopiesBanner').replace('{n}', n);
+            const tone = HA_BANNER_TONE.yellow;
+            const button = onOpenHa && (
+                <button onClick={onOpenHa}
+                    className={cloud ? 'cloud-btn cloud-btn-sm' : `px-3 py-1 rounded-lg text-xs font-medium text-white whitespace-nowrap ${tone.button}`}
+                    style={cloud ? { whiteSpace: 'nowrap' } : undefined}>
+                    {t('pgHaTab')}
+                </button>
+            );
+            if (cloud) {
+                return (
+                    <div data-ha-copies-banner="cloud" data-ha-copies-count={n} role="status"
+                        style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 16px', fontSize: 13,
+                                 background: tone.cloud[0], borderBottom: `1px solid ${tone.cloud[1]}`, color: tone.cloud[2] }}>
+                        <span style={{ display: 'inline-flex', flexShrink: 0 }}><Icons.Archive /></span>
+                        <span style={{ flex: '1 1 auto', minWidth: 0 }}>{text}</span>
+                        {button}
+                    </div>
+                );
+            }
+            return (
+                <div data-ha-copies-banner="classic" data-ha-copies-count={n} role="status" className={`px-4 py-2 border-b ${tone.box}`}>
+                    <div className="flex items-center gap-3 text-sm">
+                        <span className={`flex-shrink-0 ${tone.icon}`}><Icons.Archive /></span>
+                        <span className={`flex-1 min-w-0 ${tone.text}`}>{text}</span>
+                        {button}
+                    </div>
+                </div>
+            );
+        }
+
+        // LW Oct 2026 (#625) - a group that fails over automatically tells every signed-in user
+        // when it has no leader (changes and automation wait, consoles go on), when a new one is
+        // taking over and, for ten minutes, that the leader changed. The first two stay while
+        // they hold; the change can be closed, and a later change shows again. Admins get a way
+        // to the HA tab. The addresses come only to an admin the HA tab is open to, every other
+        // user reads the same without them; whatever the server sends goes in as it is.
+        function HaLeaderBanner({ onOpenHa, cloud = false }) {
+            const { t } = useTranslation();
+            const { ha, isAdmin } = useAuth();
+            const [closed, setClosed] = useState('');          // the change of the leader the user closed
+            const [, setTick] = useState(0);
+            const automatic = ha?.automatic === true;
+            const named = (v) => typeof v === 'string' && v ? v : '';
+            const takeover = automatic && ha.takeover && typeof ha.takeover === 'object' ? ha.takeover : null;
+            const changed = automatic && ha.leader_changed && typeof ha.leader_changed === 'object' && named(ha.leader_changed.at)
+                ? ha.leader_changed : null;
+            const noLeader = automatic && ha.no_leader === true;
+            // resume_in counts from the answer that brought it, and on between two polls
+            const heardAt = useMemo(() => Date.now(), [takeover?.resume_in, takeover?.leader]);
+            useEffect(() => {
+                if (!takeover) return;
+                const h = setInterval(() => setTick(n => n + 1), 1000);
+                return () => clearInterval(h);
+            }, [!!takeover]);
+            const changeKey = changed ? `${changed.at}|${named(changed.to)}` : '';
+            const lines = [];
+            if (noLeader) {
+                lines.push({ kind: 'no-leader', tone: 'red', icon: <Icons.AlertTriangle />, text: t('haNoLeader') });
+            } else if (takeover) {
+                const left = Math.max(1, Math.round((Number(takeover.resume_in) || 0) - (Date.now() - heardAt) / 1000));
+                lines.push({ kind: 'takeover', tone: 'blue', icon: <Icons.RefreshCw />,
+                             text: (named(takeover.leader) ? t('haTakeover').replace('{leader}', () => takeover.leader) : t('haTakeoverUnnamed'))
+                                 .replace('{n}', left) });
+            }
+            if (changed && closed !== changeKey) {
+                lines.push({ kind: 'leader-changed', tone: 'blue', icon: <Icons.Info />, close: true,
+                             text: (named(changed.to) ? t('haLeaderChanged').replace('{to}', () => changed.to) : t('haLeaderChangedAt'))
+                                 .replace('{time}', () => fmtTime(changed.at) || '-') });
+            }
+            if (!lines.length) return null;
+
+            return lines.map(line => {
+                const tone = HA_BANNER_TONE[line.tone];
+                const button = isAdmin && onOpenHa && line.kind !== 'leader-changed' && (
+                    <button onClick={onOpenHa}
+                        className={cloud ? 'cloud-btn cloud-btn-sm' : `px-3 py-1 rounded-lg text-xs font-medium text-white whitespace-nowrap ${tone.button}`}
+                        style={cloud ? { whiteSpace: 'nowrap' } : undefined}>
+                        {t('pgHaTab')}
+                    </button>
+                );
+                const close = line.close && (
+                    <button onClick={() => setClosed(changeKey)} title={t('close')} aria-label={t('close')}
+                        className={cloud ? 'cloud-btn cloud-btn-sm' : 'flex-shrink-0 p-1 rounded text-gray-400 hover:text-white'}
+                        style={cloud ? { whiteSpace: 'nowrap' } : undefined}>
+                        <Icons.X />
+                    </button>
+                );
+                if (cloud) {
+                    return (
+                        <div key={line.kind} data-ha-lease-banner={line.kind} data-ha-lease-banner-layout="cloud" role="status"
+                            style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 16px', fontSize: 13,
+                                     background: tone.cloud[0], borderBottom: `1px solid ${tone.cloud[1]}`, color: tone.cloud[2] }}>
+                            <span style={{ display: 'inline-flex', flexShrink: 0 }}>{line.icon}</span>
+                            <span style={{ flex: '1 1 auto', minWidth: 0, overflowWrap: 'anywhere' }}>{line.text}</span>
+                            {button}
+                            {close}
+                        </div>
+                    );
+                }
+                return (
+                    <div key={line.kind} data-ha-lease-banner={line.kind} data-ha-lease-banner-layout="classic" role="status"
+                        className={`px-4 py-2 border-b ${tone.box}`}>
+                        <div className="flex items-center gap-3 text-sm">
+                            <span className={`flex-shrink-0 ${tone.icon}`}>{line.icon}</span>
+                            <span className={`flex-1 min-w-0 ${tone.text}`} style={{ overflowWrap: 'anywhere' }}>{line.text}</span>
+                            {button}
+                            {close}
+                        </div>
+                    </div>
+                );
+            });
+        }
+
         // Cluster Sidebar Item Component - NS Jan 2026
-        function ClusterSidebarItem({ cluster, idx, selectedCluster, setSelectedCluster, nodeAlerts, clusterGroups, isAdmin, handleDeleteCluster, setShowAssignGroup, setRenamingCluster, setRenameValue, setReconfigureCluster, t, getAuthHeaders, fetchClusters, addToast, isCorporate, expandedSidebarClusters, toggleSidebarCluster, onContextMenu, hwHealth }) {
+        function ClusterSidebarItem({ cluster, idx, selectedCluster, setSelectedCluster, nodeAlerts, clusterGroups, isAdmin, handleDeleteCluster, setShowAssignGroup, setRenamingCluster, setRenameValue, setReconfigureCluster, t, getAuthHeaders, fetchClusters, addToast, isCorporate, expandedSidebarClusters, toggleSidebarCluster, onContextMenu, hwHealth, onCheckConnection }) {
             const offlineNodesCount = Object.values(nodeAlerts || {})
                 .filter(alert => alert.cluster_id === cluster.id && alert.status === 'offline')
                 .length;
             const hasOfflineNodes = offlineNodesCount > 0;
+            // rename, re-configure, delete and regroup belong on the active instance (#625)
+            const { haReadOnly } = useAuth();
 
             const statusColor = cluster.connected === false
                 ? 'bg-red-500' : hasOfflineNodes
@@ -846,6 +1245,7 @@
                                 <p className="text-xs text-gray-500 truncate">{cluster.host}</p>
                             </div>
                         </div>
+                        {!haReadOnly && (
                         <div className="flex gap-0.5 flex-shrink-0">
                             <button
                                 onClick={(e) => { e.stopPropagation(); setRenamingCluster(cluster); setRenameValue(cluster.display_name || cluster.name || ''); }}
@@ -861,6 +1261,15 @@
                                     title={t('reconfigureCluster') || 'Re-configure'}
                                 >
                                     <Icons.Settings className="w-3.5 h-3.5" />
+                                </button>
+                            )}
+                            {isAdmin && onCheckConnection && cluster.cluster_type !== 'xcpng' && (
+                                <button
+                                    onClick={(e) => { e.stopPropagation(); onCheckConnection(cluster); }}
+                                    className="p-1 rounded hover:bg-green-500/10 text-gray-500 hover:text-green-400 transition-colors"
+                                    title={t('connCheckTitle')}
+                                >
+                                    <Icons.Activity className="w-3.5 h-3.5" />
                                 </button>
                             )}
                             <button
@@ -886,6 +1295,7 @@
                                 </button>
                             )}
                         </div>
+                        )}
                     </div>
                     {/* Status Tags */}
                     <div className="flex gap-1 mt-2 flex-wrap">
@@ -906,6 +1316,243 @@
                         {!cluster.enabled && (
                             <span className="text-[10px] bg-gray-500/10 text-gray-400 px-1.5 py-0.5 rounded">Paused</span>
                         )}
+                    </div>
+                </div>
+            );
+        }
+
+        // LW Oct 2026 - one row of the corporate sidebar's Tools section, same height and
+        // icon column as the PBS rows. The icon gets its colour through currentColor here,
+        // most of our icons ignore a style prop.
+        function CorpSidebarToolRow({ id, active, icon, label, onClick }) {
+            return (
+                <button
+                    onClick={onClick}
+                    data-corp-tool={id}
+                    title={label}
+                    className="w-full flex items-center gap-1.5 pl-3 pr-2 py-0.5 text-[13px] leading-5"
+                    style={active ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}}
+                    onMouseEnter={(e) => { if (!active) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }}}
+                    onMouseLeave={(e) => { if (!active) { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; }}}
+                >
+                    <span className="flex flex-shrink-0" style={{color: active ? 'var(--corp-accent)' : 'var(--corp-text-muted)'}}>{icon}</span>
+                    <span className="flex-1 text-left truncate">{label}</span>
+                </button>
+            );
+        }
+
+        // LW Oct 2026 - the connection check of one PVE cluster: read-only probes on the
+        // server (core/conncheck.py), started here by the admin and never on a timer. The
+        // server answers with codes; the words and the fix for each come from translations.
+        const CONN_CHECK_HINTS = {
+            api_unreachable: 'connCheckHintApiUnreachable', api_tls_untrusted: 'connCheckHintApiTlsUntrusted',
+            api_tls_mismatch: 'connCheckHintApiTlsMismatch', api_auth: 'connCheckHintApiAuth',
+            api_http: 'connCheckHintApiHttp', api_slow: 'connCheckHintApiSlow', api_no_fallback: 'connCheckHintApiNoFallback',
+            cred_not_connected: 'connCheckHintCredNotConnected', cred_needs_2fa: 'connCheckHintCredNeeds2fa',
+            cred_auth_backoff: 'connCheckHintCredAuthBackoff', cred_token_rejected: 'connCheckHintCredTokenRejected',
+            cred_token_note: 'connCheckHintCredTokenNote', cred_password_note: 'connCheckHintCredPasswordNote',
+            priv_missing: 'connCheckHintPrivMissing', priv_unreadable: 'connCheckHintPrivUnreadable',
+            ver_mixed: 'connCheckHintVerMixed', ver_old: 'connCheckHintVerOld', ver_unknown: 'connCheckHintNoAnswer',
+            clock_skew: 'connCheckHintClockSkew', clock_unknown: 'connCheckHintNoAnswer',
+            quorum_lost: 'connCheckHintQuorumLost', quorum_offline: 'connCheckHintQuorumOffline',
+            quorum_standalone: 'connCheckHintQuorumStandalone',
+            ssh_disabled: 'connCheckHintSshDisabled', ssh_no_credentials: 'connCheckHintSshNoCredentials',
+            ssh_backoff: 'connCheckHintSshBackoff', ssh_node_offline: 'connCheckHintSshNodeOffline',
+            ssh_no_ip: 'connCheckHintSshNoIp', ssh_auth_refused: 'connCheckHintSshAuthRefused',
+            ssh_host_key: 'connCheckHintSshHostKey', ssh_unreachable: 'connCheckHintSshUnreachable',
+            ssh_key_unusable: 'connCheckHintSshKeyUnusable', ssh_sudo: 'connCheckHintSshSudo', ssh_error: 'connCheckHintSshError',
+            needs_connection: 'connCheckHintNeedsConnection', status_unreadable: 'connCheckHintStatusUnreadable',
+        };
+        const CONN_CHECK_FEATURES = {
+            monitoring: 'connCheckFeatMonitoring', guests: 'connCheckFeatGuests', power: 'connCheckFeatPower',
+            migration: 'connCheckFeatMigration', consoles: 'connCheckFeatConsoles', snapshots: 'connCheckFeatSnapshots',
+            backups: 'connCheckFeatBackups', create: 'connCheckFeatCreate', clone: 'connCheckFeatClone',
+            hardware: 'connCheckFeatHardware', agent: 'connCheckFeatAgent', storage: 'connCheckFeatStorage',
+            disks: 'connCheckFeatDisks', uploads: 'connCheckFeatUploads', nodePower: 'connCheckFeatNodePower',
+            nodeConfig: 'connCheckFeatNodeConfig', syslog: 'connCheckFeatSyslog', sdn: 'connCheckFeatSdn',
+        };
+        const CONN_CHECK_SECTIONS = [
+            ['credentials', 'connCheckSecCredentials', ['credentials']],
+            ['api', 'connCheckSecApi', ['api_host', 'api_fallbacks']],
+            ['privileges', 'connCheckSecPrivileges', ['privileges']],
+            ['quorum', 'connCheckSecQuorum', ['quorum']],
+            ['versions', 'connCheckSecVersions', ['versions']],
+            ['clock', 'connCheckSecClock', ['clock']],
+            ['ssh', 'connCheckSecSsh', ['ssh']],
+        ];
+        const CONN_CHECK_TONE = {
+            ok: { icon: 'CheckCircle', cls: 'text-green-400' },
+            warn: { icon: 'AlertTriangle', cls: 'text-yellow-400' },
+            fail: { icon: 'XCircle', cls: 'text-red-400' },
+            skip: { icon: 'Info', cls: 'text-gray-500' },
+        };
+
+        function ConnectionCheckModal({ cluster, onClose, authFetch, apiUrl, t }) {
+            const [withSsh, setWithSsh] = React.useState(true);
+            const [running, setRunning] = React.useState(false);
+            const [report, setReport] = React.useState(null);
+            const [error, setError] = React.useState('');
+
+            const run = async () => {
+                setRunning(true); setError('');
+                try {
+                    const res = await authFetch(`${apiUrl}/clusters/${cluster.id}/connection-check`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ssh: withSsh }),
+                    });
+                    const body = res ? await res.json().catch(() => ({})) : {};
+                    if (res && res.ok) setReport(body);
+                    else setError(body.error || t('connCheckFailed'));
+                } catch (e) {
+                    setError(t('connCheckFailed'));
+                }
+                setRunning(false);
+            };
+
+            const hint = (it) => {
+                const key = it.hint && CONN_CHECK_HINTS[it.hint];
+                if (!key) return null;
+                return t(key).replace('{seconds}', String(it.retry_in ?? ''));
+            };
+            const mono = (s) => <span className="font-mono">{s}</span>;
+            const chips = (obj, fmt) => (
+                <div className="flex flex-wrap gap-1.5 mt-1">
+                    {Object.entries(obj || {}).sort(([a], [b]) => a.localeCompare(b)).map(([n, v]) => (
+                        <span key={n} className="text-xs px-2 py-0.5 rounded bg-proxmox-dark border border-proxmox-border">{n} {mono(fmt(v))}</span>
+                    ))}
+                </div>
+            );
+
+            const body = (it) => {
+                switch (it.kind) {
+                    case 'credentials': {
+                        const label = it.type === 'api_token' ? t('connCheckCredToken') : it.type === 'minted_token' ? t('connCheckCredMinted') : t('connCheckCredPassword');
+                        return (<div>
+                            <div className="text-sm font-medium">{label}</div>
+                            <div className="text-xs text-gray-400">{mono(it.token_id || it.user || '')}{it.active ? <span> - {t('connCheckInUse')}: {mono(it.active)}</span> : null}</div>
+                        </div>);
+                    }
+                    case 'api_host': {
+                        const tls = it.tls === 'match' ? t('connCheckTlsMatch') : it.tls === 'mismatch' ? t('connCheckTlsMismatch') : t('connCheckTlsUnknown');
+                        return (<div>
+                            <div className="text-sm font-medium flex flex-wrap items-center gap-2">
+                                {mono(it.host)}
+                                <span className="text-xs px-1.5 py-0.5 rounded bg-proxmox-dark border border-proxmox-border">{it.role === 'primary' ? t('connCheckPrimary') : t('connCheckFallback')}</span>
+                                {it.node && <span className="text-xs text-gray-400">{it.node}</span>}
+                                {it.ms != null && <span className="text-xs text-gray-400">{it.ms} ms</span>}
+                                {it.http != null && <span className="text-xs text-gray-400">HTTP {it.http}</span>}
+                            </div>
+                            {it.fingerprint && <div className="text-xs text-gray-400 truncate" title={it.fingerprint}>{tls} - {mono(it.fingerprint)}</div>}
+                        </div>);
+                    }
+                    case 'api_fallbacks':
+                        return <div className="text-sm font-medium">{t('connCheckOneAddress')}</div>;
+                    case 'privileges':
+                        if (!it.missing) return null;
+                        if (!it.missing.length) return <div className="text-sm">{t('connCheckPrivAll').replace('{n}', String(it.checked))}</div>;
+                        return (<div className="space-y-1.5">
+                            {it.missing.map(m => (
+                                <div key={m.privs.join('|') + m.path} className="text-sm">
+                                    {mono(m.privs.join(' / '))} <span className="text-xs text-gray-400">{t('connCheckOnPath')} {mono(m.path)}{m.partial ? ` (${t('connCheckPartial')})` : ''}</span>
+                                    <div className="text-xs text-gray-400">{t('connCheckDisables')}: {m.features.map(f => t(CONN_CHECK_FEATURES[f] || f)).join(', ')}</div>
+                                </div>
+                            ))}
+                        </div>);
+                    case 'quorum':
+                        if (it.quorate == null) return null;
+                        return (<div>
+                            <div className="text-sm font-medium">{it.standalone ? t('connCheckStandalone') : it.quorate
+                                ? t('connCheckQuorate').replace('{online}', String(it.nodes_online)).replace('{total}', String(it.nodes_total))
+                                : t('connCheckNoQuorum')}</div>
+                            {(it.offline || []).length > 0 && <div className="text-xs text-gray-400">{t('connCheckOffline')}: {mono(it.offline.join(', '))}</div>}
+                        </div>);
+                    case 'versions':
+                        return it.nodes ? chips(it.nodes, v => v) : null;
+                    case 'clock':
+                        if (!it.nodes) return null;
+                        return (<div>
+                            {it.max_skew != null && <div className="text-sm">{t('connCheckMaxSkew').replace('{s}', String(it.max_skew))}</div>}
+                            {chips(it.nodes, v => `${v > 0 ? '+' : ''}${v} s`)}
+                        </div>);
+                    case 'ssh':
+                        return (<div>
+                            <div className="text-sm font-medium flex flex-wrap items-center gap-2">
+                                {it.node ? mono(it.node) : null}
+                                {it.code && <span className="text-xs px-1.5 py-0.5 rounded bg-proxmox-dark border border-proxmox-border font-mono">{it.code}</span>}
+                                {it.status === 'ok' && <span className="text-xs text-gray-400">{t('connCheckSshOk')}</span>}
+                            </div>
+                            {it.user && it.ip && <div className="text-xs text-gray-400">{mono(`${it.user}@${it.ip}`)} - {it.method === 'key' ? t('connCheckSshKey') : t('connCheckSshPassword')}</div>}
+                        </div>);
+                    default:
+                        return null;
+                }
+            };
+
+            const row = (it, i) => {
+                const tone = CONN_CHECK_TONE[it.status] || CONN_CHECK_TONE.skip;
+                const Icon = Icons[tone.icon];
+                const h = hint(it);
+                return (
+                    <div key={it.id} data-check-item={it.id} data-check-status={it.status} className={`flex gap-3 py-2 ${i ? 'border-t border-proxmox-border' : ''}`}>
+                        <Icon className={`w-4 h-4 mt-0.5 flex-shrink-0 ${tone.cls}`} />
+                        <div className="min-w-0 flex-1">
+                            {body(it)}
+                            {h && <div className={`text-xs mt-1 ${it.status === 'fail' ? 'text-red-300' : it.status === 'warn' ? 'text-yellow-300' : 'text-gray-400'}`}>{h}</div>}
+                            {it.detail && <div className="text-xs text-gray-500 mt-0.5 font-mono break-all">{it.detail}</div>}
+                        </div>
+                    </div>
+                );
+            };
+
+            const s = report?.summary;
+            return (
+                <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
+                    <div data-conn-check={cluster.id} className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-3xl shadow-2xl flex flex-col" style={{ maxHeight: '88vh' }} onClick={e => e.stopPropagation()}>
+                        <div className="flex items-center justify-between px-6 py-4 border-b border-proxmox-border">
+                            <div className="flex items-center gap-2 min-w-0">
+                                <Icons.Activity className="w-5 h-5 text-proxmox-orange flex-shrink-0" />
+                                <h3 className="text-lg font-semibold truncate">{t('connCheckTitle')} - {cluster.display_name || cluster.name}</h3>
+                            </div>
+                            <button onClick={onClose} className="text-gray-400 hover:text-white" title={t('close')}><Icons.X className="w-4 h-4" /></button>
+                        </div>
+                        <div className="px-6 py-4 overflow-y-auto">
+                            <p className="text-sm text-gray-400">{t('connCheckIntro')}</p>
+                            <p className="text-xs text-gray-500 mt-1">{t('connCheckPveOnly')}</p>
+                            <div className="flex flex-wrap items-center justify-between gap-3 mt-4">
+                                <label className="flex items-center gap-2 text-sm cursor-pointer">
+                                    <input type="checkbox" checked={withSsh} disabled={running} onChange={e => setWithSsh(e.target.checked)} />
+                                    {t('connCheckWithSsh')}
+                                </label>
+                                <button onClick={run} disabled={running}
+                                    className="px-4 py-2 rounded-lg text-sm font-medium bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 flex items-center gap-2">
+                                    {running ? <Icons.Loader className="w-4 h-4 animate-spin" /> : <Icons.Activity className="w-4 h-4" />}
+                                    {running ? t('connCheckRunning') : report ? t('connCheckRunAgain') : t('connCheckRun')}
+                                </button>
+                            </div>
+                            {error && <div className="mt-4 p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-sm text-red-300">{error}</div>}
+                            {report && (
+                                <div className="mt-4">
+                                    <div className="flex flex-wrap gap-2 text-xs">
+                                        <span className="px-2 py-1 rounded bg-green-500/10 text-green-400">{s.ok} {t('connCheckPassed')}</span>
+                                        <span className="px-2 py-1 rounded bg-yellow-500/10 text-yellow-400">{s.warn} {t('connCheckWarnings')}</span>
+                                        <span className="px-2 py-1 rounded bg-red-500/10 text-red-400">{s.fail} {t('connCheckFailedCount')}</span>
+                                        {s.skip > 0 && <span className="px-2 py-1 rounded bg-gray-500/10 text-gray-400">{s.skip} {t('connCheckSkipped')}</span>}
+                                    </div>
+                                    {CONN_CHECK_SECTIONS.map(([sid, titleKey, kinds]) => {
+                                        const items = (report.items || []).filter(i => kinds.includes(i.kind));
+                                        if (!items.length && !(sid === 'ssh' && report.ssh_checked === false)) return null;
+                                        return (
+                                            <div key={sid} data-check-section={sid} className="mt-4">
+                                                <div className="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-1">{t(titleKey)}</div>
+                                                {items.map(row)}
+                                                {!items.length && <div className="text-xs text-gray-500 py-2">{t('connCheckSshNotRun')}</div>}
+                                            </div>
+                                        );
+                                    })}
+                                    <div className="text-xs text-gray-500 mt-4">{t('connCheckCheckedAt').replace('{time}', new Date(report.checked_at).toLocaleString()).replace('{s}', (report.duration_ms / 1000).toFixed(1))}</div>
+                                </div>
+                            )}
+                        </div>
                     </div>
                 </div>
             );
@@ -3847,6 +4494,9 @@
         // MK May 2026 — Power & Carbon Tracking. Same shape as Cost Dashboard
         // (rates editor + summary + per-VM table) but in kWh / kg CO₂.
         function PowerCarbonTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin }) {
+            // the admin buttons here change things: on a standby they are the active's (#625)
+            const { haReadOnly } = useAuth();
+            const canAct = isAdmin && !haReadOnly;
             const [summary, setSummary] = React.useState(null);
             const [rows, setRows] = React.useState([]);
             const [loading, setLoading] = React.useState(false);
@@ -4064,7 +4714,7 @@
                                 <option value={7}>{t('last7Days') || 'last 7 days'}</option>
                                 <option value={30}>{t('last30Days') || 'last 30 days'}</option>
                             </select>
-                            {isAdmin && (
+                            {canAct && (
                                 <button onClick={openRates}
                                     className="px-3 py-1.5 bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white rounded-lg text-sm flex items-center gap-1.5">
                                     <Icons.Settings className="w-3.5 h-3.5" />
@@ -4223,6 +4873,9 @@
         }
 
         function CostDashboardTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin }) {
+            // the admin buttons here change things: on a standby they are the active's (#625)
+            const { haReadOnly } = useAuth();
+            const canAct = isAdmin && !haReadOnly;
             const [summary, setSummary] = React.useState(null);
             const [rows, setRows] = React.useState([]);
             const [loading, setLoading] = React.useState(false);
@@ -4451,7 +5104,7 @@
                                 <option value={14}>{t('last14Days') || 'last 14 days'}</option>
                                 <option value={30}>{t('last30Days') || 'last 30 days'}</option>
                             </select>
-                            {isAdmin && (
+                            {canAct && (
                                 <button onClick={openRates}
                                     className="px-3 py-1.5 bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white rounded-lg text-sm flex items-center gap-1.5">
                                     <Icons.Settings className="w-3.5 h-3.5" />
@@ -4638,31 +5291,191 @@
             );
         }
 
+        // LW Oct 2026 (#811) - the guests that sit off their plb_pin_ node, and the tags that name
+        // no node at all. Read when the cluster settings open, not polled: the scan walks every
+        // guest of the cluster. "Move back now" is the reconcile route with force; the server
+        // says whether this caller may (can_reconcile), the browser cannot tell a scoped one
+        const PIN_ROWS_SHOWN = 50;
+        function ProxlbPinGuests({ clusterId, authFetch, addToast, t, canMigrate, dryRun, resources }) {
+            const [data, setData] = React.useState(null);
+            const [failed, setFailed] = React.useState(false);
+            const [loading, setLoading] = React.useState(false);
+            const [moving, setMoving] = React.useState(false);
+            const [lastRun, setLastRun] = React.useState(null);
+            const [showAll, setShowAll] = React.useState(false);
+            const gen = React.useRef(0);
+
+            const load = React.useCallback(async (retry) => {
+                const mine = ++gen.current;
+                setLoading(true);
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/proxlb-pins/violations`);
+                    const d = r && r.ok ? await r.json().catch(() => null) : null;
+                    if (mine !== gen.current) return;
+                    setFailed(!d);
+                    if (!d) return;
+                    setData(d);
+                    // the tags were just switched on and their save is still on its way
+                    if (retry && d.enabled === false) setTimeout(() => { if (mine === gen.current) load(false); }, 1500);
+                } finally {
+                    if (mine === gen.current) setLoading(false);
+                }
+            }, [clusterId, authFetch]);
+
+            React.useEffect(() => {
+                setData(null); setLastRun(null); setShowAll(false);
+                load(true);
+                return () => { gen.current += 1; };
+            }, [load]);
+
+            const rows = (data && data.violations) || [];
+            const unresolved = (data && data.unresolved) || [];
+            // what the reconcile itself leaves alone: no pinned node up, plb_ignore, not running
+            const movable = rows.filter(v => v.reason === 'drift' && !v.ignored && v.status === 'running').length;
+            const canMove = canMigrate && !!data && data.can_reconcile === true && movable > 0;
+
+            const nameOf = React.useMemo(() => {
+                const want = new Set(unresolved.map(u => u.vmid));
+                const out = {};
+                if (want.size) (resources || []).forEach(r => { if (want.has(r.vmid)) out[r.vmid] = r.name; });
+                return out;
+            }, [data, resources]);
+
+            const moveBack = async () => {
+                if (moving) return;
+                setMoving(true);
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/proxlb-pins/reconcile`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ force: true }),
+                    });
+                    const d = r ? await r.json().catch(() => null) : null;
+                    if (!r || !r.ok || !d) {
+                        addToast((d && d.error) || t('proxlbPinMoveFailed'), 'error');
+                        return;
+                    }
+                    const n = { moved: (d.migrated || []).length, failed: (d.failed || []).length, deferred: (d.deferred || []).length };
+                    setLastRun({ ...n, rows: d.failed || [] });
+                    addToast(t('proxlbPinMoveDone').replace('{moved}', () => n.moved).replace('{failed}', () => n.failed)
+                        .replace('{deferred}', () => n.deferred), n.failed ? 'error' : 'success');
+                } finally {
+                    setMoving(false);
+                    load(false);
+                }
+            };
+
+            const why = (v) => v.reason === 'unavailable' ? ['proxlbPinWhyUnavailable', 'text-gray-400']
+                : v.ignored ? ['proxlbPinWhyIgnored', 'text-gray-400']
+                : v.status !== 'running' ? ['proxlbPinWhyStopped', 'text-gray-400']
+                : ['proxlbPinWhyDrift', 'text-yellow-400'];
+            const cut = (list) => showAll ? list : list.slice(0, PIN_ROWS_SHOWN);
+            const longest = Math.max(rows.length, unresolved.length);
+
+            return (
+                <div className="mt-3 ml-12 space-y-2 min-w-0" data-proxlb-pin-guests>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                        <h5 className="text-sm font-medium text-gray-300 flex items-center gap-2">
+                            <span className="text-blue-400 flex-shrink-0"><Icons.Tag /></span>
+                            {t('proxlbPinOffTitle')}
+                            {rows.length > 0 && (
+                                <span className="text-xs px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-400" data-pin-count>{rows.length}</span>
+                            )}
+                        </h5>
+                        <div className="flex items-center gap-2">
+                            {canMove && (
+                                <button type="button" onClick={moveBack} disabled={moving || dryRun} data-pin-move-back
+                                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-proxmox-orange/20 text-proxmox-orange hover:bg-proxmox-orange/30 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
+                                    {moving ? <Icons.RotateCw /> : <Icons.ArrowLeft />}
+                                    {moving ? t('proxlbPinMoving') : t('proxlbPinMoveBack')}
+                                </button>
+                            )}
+                            <button type="button" onClick={() => load(false)} disabled={loading} title={t('refresh')}
+                                className="p-1 text-gray-400 hover:text-white disabled:opacity-40" data-pin-refresh>
+                                {loading ? <Icons.RotateCw /> : <Icons.RefreshCw />}
+                            </button>
+                        </div>
+                    </div>
+                    {canMove && dryRun && <div className="text-xs text-yellow-400">{t('proxlbPinDryRun')}</div>}
+                    {failed && <div className="text-xs text-red-400">{t('proxlbPinLoadError')}</div>}
+                    {!data && !failed && <div className="text-xs text-gray-500">{t('loading')}...</div>}
+                    {data && rows.length === 0 && unresolved.length === 0 && (
+                        <div className="text-xs text-gray-500 p-2 bg-proxmox-dark rounded-lg">{t('proxlbPinOffNone')}</div>
+                    )}
+                    {cut(rows).map(v => {
+                        const [key, tone] = why(v);
+                        return (
+                            <div key={`v${v.vmid}`} data-pin-row={v.vmid}
+                                className="flex flex-wrap items-center gap-x-4 gap-y-1 bg-proxmox-dark rounded-lg px-2 py-1.5 text-xs min-w-0">
+                                <span className="text-sm text-gray-200 truncate">{v.name || `VM ${v.vmid}`} <span className="text-gray-500">({v.vmid})</span></span>
+                                <span className="text-gray-400">
+                                    {t('proxlbPinOffWhere').replace('{node}', () => v.node || '?').replace('{nodes}', () => (v.pinned_nodes || []).join(', '))}
+                                </span>
+                                <span className={tone} data-pin-why={v.reason}>{t(key)}</span>
+                            </div>
+                        );
+                    })}
+                    {cut(unresolved).map(u => (
+                        <div key={`u${u.vmid}-${u.node}`} data-pin-unresolved={u.vmid}
+                            className="flex flex-wrap items-center gap-x-4 gap-y-1 bg-proxmox-dark rounded-lg px-2 py-1.5 text-xs min-w-0">
+                            <span className="text-sm text-gray-200 truncate">{nameOf[u.vmid] || `VM ${u.vmid}`} <span className="text-gray-500">({u.vmid})</span></span>
+                            <code className="font-mono text-gray-400">plb_pin_{u.node}</code>
+                            <span className="text-orange-400">{t('proxlbPinUnresolved')}</span>
+                        </div>
+                    ))}
+                    {longest > PIN_ROWS_SHOWN && (
+                        <button type="button" onClick={() => setShowAll(s => !s)} className="text-xs text-blue-400 hover:text-blue-300">
+                            {showAll ? t('showLess') : t('proxlbPinShowAll').replace('{n}', () => longest)}
+                        </button>
+                    )}
+                    {lastRun && lastRun.rows.length > 0 && (
+                        <div className="space-y-0.5" data-pin-last-failed>
+                            {lastRun.rows.map(f => (
+                                <div key={`f${f.vmid}`} className="text-xs text-red-400">{f.name || `VM ${f.vmid}`} ({f.vmid}): {f.error}</div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         // NS May 2026 — Config Drift Detection.
         // Tracks open events grouped by kind (vm_config, storage, network, cluster_options).
         // Admin can rescan, set baseline, acknowledge/promote events.
         function DriftTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin }) {
+            // the admin buttons here change things: a standby hands them to the active (#625)
+            const { haReadOnly } = useAuth();
+            const canAct = isAdmin && !haReadOnly;
             const [status, setStatus] = React.useState(null);
             const [events, setEvents] = React.useState([]);
             const [filter, setFilter] = React.useState('open');
             const [busy, setBusy] = React.useState(false);
             const [scanning, setScanning] = React.useState(false);
             const [expanded, setExpanded] = React.useState({});
+            // #625: only the leader keeps the drift rows; a member says so while it is away
+            // and drops what it showed, an ack must never name a row from elsewhere
+            const [leaderAway, setLeaderAway] = React.useState(false);
 
             const refresh = async () => {
                 if (!clusterId) return;
                 setBusy(true);
                 try {
-                    const [s, e] = await Promise.all([
-                        authFetch(`${API_URL}/clusters/${clusterId}/drift/status`).then(r => r?.json()).catch(() => null),
-                        authFetch(`${API_URL}/clusters/${clusterId}/drift/events?status=${filter}&limit=200`).then(r => r?.json()).catch(() => null),
+                    const [sr, er] = await Promise.all([
+                        authFetch(`${API_URL}/clusters/${clusterId}/drift/status`),
+                        authFetch(`${API_URL}/clusters/${clusterId}/drift/events?status=${filter}&limit=200`),
                     ]);
+                    const away = (await haLeaderAway(sr)) || (await haLeaderAway(er));
+                    setLeaderAway(away);
+                    if (away) { setStatus(null); setEvents([]); return; }
+                    const s = await sr?.json().catch(() => null);
+                    const e = await er?.json().catch(() => null);
                     if (s && !s.error) setStatus(s);
                     if (e && e.events) setEvents(e.events);
                 } finally { setBusy(false); }
             };
 
-            React.useEffect(() => { refresh(); /* eslint-disable-line */ }, [clusterId, filter]);
+            // again when forwarding comes or goes: the list is the leader's then, or not
+            React.useEffect(() => { refresh(); /* eslint-disable-line */ }, [clusterId, filter, haReadOnly]);
 
             const scan = async () => {
                 setScanning(true);
@@ -4678,6 +5491,11 @@
                             ? `${t('driftSeeded') || 'baseline seeded'}: ${j.seeded_baselines}`
                             : `${j.events_count || 0} ${t('driftEvents') || 'events'}`;
                         addToast(`${t('driftScanned') || 'Scan complete'} — ${m}`, 'success');
+                        // LW Oct 2026 - a read that failed kept its baselines, so "0 events"
+                        // is not all clear for it: say which kinds
+                        if (Array.isArray(j.unread) && j.unread.length) {
+                            addToast(`${t('driftNotRead') || 'Not read this time, baselines kept'}: ${j.unread.map(kindLabel).join(', ')}`, 'warning');
+                        }
                         await refresh();
                     } else {
                         addToast(t('driftScanFailed') || 'Scan failed', 'error');
@@ -4726,10 +5544,13 @@
                 'cluster_options': t('driftKindCluster') || 'Cluster Options',
             }[k] || k);
 
+            // LW Oct 2026 - 'unknown' is a scope on a node that did not answer (#968):
+            // not checked, so the old value is not struck through
             const opLabel = (op) => ({
                 'added': t('driftOpAdded') || 'added',
                 'removed': t('driftOpRemoved') || 'removed',
                 'changed': t('driftOpChanged') || 'changed',
+                'unknown': t('nodeOffline') || 'Node offline',
             }[op] || op);
 
             const fmtVal = (v) => {
@@ -4757,7 +5578,7 @@
                                 <option value="acknowledged">{t('driftAcknowledged2') || 'acknowledged'}</option>
                                 <option value="all">{t('all') || 'all'}</option>
                             </select>
-                            {isAdmin && (
+                            {canAct && (
                                 <>
                                     <button onClick={setBaseline} disabled={busy}
                                         className="px-3 py-1.5 bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white rounded-lg text-sm flex items-center gap-1.5 disabled:opacity-50">
@@ -4811,7 +5632,11 @@
                         </div>
                     )}
 
-                    {events.length === 0 ? (
+                    {leaderAway ? (
+                        <div data-ha-leader-away="drift" className="bg-proxmox-card border border-proxmox-border rounded-xl p-6 text-center text-sm text-gray-400">
+                            {t('pgHaLeaderAwayView')}
+                        </div>
+                    ) : events.length === 0 ? (
                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-6 text-center text-sm text-gray-500">
                             {filter === 'open' ? (t('driftNoOpen') || 'No open drift events. Cluster matches baseline.')
                                               : (t('driftNoEvents') || 'No events for this filter.')}
@@ -4834,7 +5659,7 @@
                                                 </span>
                                             </div>
                                             <div className="flex items-center gap-2 flex-shrink-0">
-                                                {isAdmin && ev.status === 'open' && (
+                                                {canAct && ev.status === 'open' && (
                                                     <>
                                                         <button onClick={e => { e.stopPropagation(); ack(ev.id, false); }}
                                                             className="text-[11px] px-2 py-0.5 bg-proxmox-darker border border-proxmox-border rounded text-gray-300 hover:text-white">
@@ -4853,9 +5678,9 @@
                                             <div className="mt-2 pl-3 border-l-2 border-proxmox-border space-y-1 text-[11px]">
                                                 {(ev.diff || []).map((d, i) => (
                                                     <div key={i} className="grid grid-cols-12 gap-2">
-                                                        <div className="col-span-3 text-gray-400 font-mono">{d.path}</div>
+                                                        <div className="col-span-3 text-gray-400 font-mono">{d.op === 'unknown' && d['node-offline'] ? d['node-offline'] : d.path}</div>
                                                         <div className="col-span-1 text-gray-500">{opLabel(d.op)}</div>
-                                                        <div className="col-span-4 text-red-400 font-mono break-all line-through opacity-60">{fmtVal(d.before)}</div>
+                                                        <div className={`col-span-4 font-mono break-all ${d.op === 'unknown' ? 'text-gray-400' : 'text-red-400 line-through opacity-60'}`}>{fmtVal(d.before)}</div>
                                                         <div className="col-span-4 text-green-400 font-mono break-all">{fmtVal(d.after)}</div>
                                                     </div>
                                                 ))}
@@ -4880,6 +5705,8 @@
         // recent inbox). Subscribes via SW + VAPID, persists subscription on the
         // server. Wake-up pushes hit the SW, which fetches /api/push/inbox.
         function PushBellButton({ authFetch, addToast, t }) {
+            // clearing the inbox goes through the active like any change (#625)
+            const { haReadOnly } = useAuth();
             const [open, setOpen] = React.useState(false);
             const [supported, setSupported] = React.useState(true);
             const [permission, setPermission] = React.useState(typeof Notification !== 'undefined' ? Notification.permission : 'default');
@@ -4887,6 +5714,7 @@
             const [items, setItems] = React.useState([]);
             const [unread, setUnread] = React.useState(0);
             const [busy, setBusy] = React.useState(false);
+            const [leaderAway, setLeaderAway] = React.useState(false);  // the inbox is the leader's (#625)
 
             const checkSubState = async () => {
                 if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
@@ -4902,6 +5730,9 @@
             const refreshInbox = async () => {
                 try {
                     const r = await authFetch(`${API_URL}/push/inbox`);
+                    const away = await haLeaderAway(r);
+                    setLeaderAway(away);
+                    if (away) { setItems([]); setUnread(0); return; }
                     if (r?.ok) {
                         const d = await r.json();
                         const list = d.items || [];
@@ -5029,7 +5860,7 @@
                             <div className="absolute right-0 top-full mt-2 w-80 bg-proxmox-card border border-proxmox-border rounded-xl shadow-xl z-50 overflow-hidden">
                                 <div className="px-3 py-2 border-b border-proxmox-border flex items-center justify-between">
                                     <div className="text-sm font-semibold text-white">{t('notifications') || 'Notifications'}</div>
-                                    {items.length > 0 && (
+                                    {items.length > 0 && !haReadOnly && (
                                         <button onClick={clearInbox} className="text-[10px] text-gray-500 hover:text-white">
                                             {t('markAllRead') || 'mark read'}
                                         </button>
@@ -5073,7 +5904,12 @@
 
                                 {/* Inbox */}
                                 <div className="max-h-72 overflow-y-auto">
-                                    {items.length === 0 && (
+                                    {leaderAway && (
+                                        <div data-ha-leader-away="inbox" className="px-3 py-6 text-center text-xs text-gray-400">
+                                            {t('pgHaLeaderAwayView')}
+                                        </div>
+                                    )}
+                                    {items.length === 0 && !leaderAway && (
                                         <div className="px-3 py-6 text-center text-xs text-gray-500">
                                             {t('inboxEmpty') || 'No notifications yet'}
                                         </div>
@@ -5114,6 +5950,9 @@
         // backend SSHs in and runs the qm pipeline (download → import → cloudinit drive
         // → template). Live deployment status polled from /api/templates/deployments/<id>.
         function TemplatesLibraryTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin, isCorporate }) {
+            // the admin buttons here change things: on a standby they are the active's (#625)
+            const { haReadOnly } = useAuth();
+            const canAct = isAdmin && !haReadOnly;
             const [catalog, setCatalog] = React.useState([]);
             const [deployments, setDeployments] = React.useState([]);
             const [existing, setExisting] = React.useState([]);
@@ -5303,7 +6142,7 @@
                             </p>
                         </div>
                         <div className="flex gap-2">
-                            {isAdmin && (
+                            {canAct && (
                                 <button onClick={() => setShowAdd(true)}
                                     className="px-3 py-1.5 bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white rounded-lg text-sm flex items-center gap-1.5">
                                     <Icons.Plus className="w-3.5 h-3.5" />
@@ -5325,7 +6164,7 @@
                             const owned = existing.some(e => (e.name || '').includes(tpl.distro) && (e.name || '').includes(tpl.version.replace(/\./g, '')));
                             return (
                                 <div key={tpl.id} className={`bg-proxmox-card border ${distroColor(tpl.distro)} rounded-xl p-4 flex flex-col relative`}>
-                                    {tpl.custom && isAdmin && (
+                                    {tpl.custom && canAct && (
                                         <button
                                             onClick={() => deleteCustom(tpl)}
                                             className="absolute top-2 right-2 p-1 text-gray-500 hover:text-red-400 rounded"
@@ -5362,7 +6201,7 @@
                                     <div className="mt-auto flex items-center gap-2">
                                         <button
                                             onClick={() => openDeploy(tpl)}
-                                            disabled={!isAdmin || (dep && dep.status === 'running')}
+                                            disabled={!canAct || (dep && dep.status === 'running')}
                                             className="flex-1 px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm rounded flex items-center justify-center gap-1.5">
                                             {dep && dep.status === 'running'
                                                 ? <><Icons.RotateCw className="w-3.5 h-3.5 animate-spin" /> {dep.progress}%</>
@@ -5569,6 +6408,422 @@
             );
         }
 
+        // LW Oct 2026 - app containers from OCI images. Proxmox VE 9.1 pulls an image onto a
+        // storage and creates a container from it (a technology preview there, so here too).
+        // The server checks each node's version, the storages and the caller; this only
+        // offers what it said yes to (api/oci_catalog.py).
+        function OciCatalogTab({ clusters, clusterId, authFetch, addToast, t }) {
+            const { haReadOnly } = useAuth();
+            const pveClusters = (clusters || []).filter(c => c && (c.cluster_type || 'proxmox') === 'proxmox');
+            const [cid, setCid] = React.useState(clusterId || (pveClusters[0] && pveClusters[0].id) || '');
+            const cidRef = React.useRef(cid);
+            cidRef.current = cid;
+            React.useEffect(() => { if (clusterId) setCid(clusterId); }, [clusterId]);
+            const [images, setImages] = React.useState([]);
+            const [minPve, setMinPve] = React.useState('9.1');
+            const [support, setSupport] = React.useState(null);
+            const [jobs, setJobs] = React.useState([]);
+            const [custom, setCustom] = React.useState('');
+            const [dialog, setDialog] = React.useState(null);
+            const [form, setForm] = React.useState({});
+            const [storages, setStorages] = React.useState([]);
+            const [bridges, setBridges] = React.useState([]);
+            const [submitting, setSubmitting] = React.useState(false);
+            const [formError, setFormError] = React.useState('');
+
+            const fill = (key, vars) => Object.entries(vars || {}).reduce((s, [k, v]) => s.split(`{${k}}`).join(String(v)), t(key));
+            const nodesHere = (support && support.nodes) || [];
+            const readyNodes = nodesHere.filter(n => n.supported);
+            const canAct = !haReadOnly && readyNodes.length > 0;
+            const running = (j) => ['queued', 'pulling', 'creating'].includes(j.status);
+
+            React.useEffect(() => {
+                authFetch(`${API_URL}/oci/catalog`).then(r => (r && r.ok ? r.json() : null)).then(d => {
+                    if (d) { setImages(d.images || []); setMinPve(d.min_pve || '9.1'); }
+                }).catch(() => {});
+            }, []); // eslint-disable-line
+
+            const loadJobs = async () => {
+                const asked = cidRef.current;
+                if (!asked) return;
+                const r = await authFetch(`${API_URL}/clusters/${asked}/oci/jobs`);
+                const d = r && r.ok ? await r.json().catch(() => ({})) : null;
+                // another cluster may have been picked while this one answered
+                if (d && cidRef.current === asked) setJobs(d.jobs || []);
+            };
+
+            const loadSupport = async () => {
+                const asked = cidRef.current;
+                if (!asked) return;
+                const r = await authFetch(`${API_URL}/clusters/${asked}/oci/nodes`);
+                const d = r ? await r.json().catch(() => ({})) : {};
+                if (cidRef.current !== asked) return;
+                if (r && r.ok) setSupport(d);
+                else if (r && r.status === 403) setSupport({ denied: true });
+                else setSupport({ error: d.error || t('ociNodesFailed') });
+            };
+
+            React.useEffect(() => {
+                setSupport(null);
+                setJobs([]);
+                loadSupport();
+                loadJobs();
+            }, [cid]); // eslint-disable-line
+
+            // follow a run while it is on its way
+            React.useEffect(() => {
+                if (!jobs.some(running)) return;
+                const id = setInterval(loadJobs, 4000);
+                return () => clearInterval(id);
+            }, [jobs, cid]); // eslint-disable-line
+
+            const openDialog = (img) => {
+                const ref = img.reference;
+                const last = ref.replace(/:[^:/]*$/, '').split('/').pop() || '';
+                setFormError('');
+                setStorages([]);
+                setBridges([]);
+                setForm({
+                    reference: ref, node: readyNodes[0] ? readyNodes[0].node : '',
+                    storage: '', rootfs_storage: '', disk_gb: img.disk_gb || 4,
+                    bridge: '', vlan: '', ipMode: 'dhcp', ip: '', gw: '',
+                    hostname: img.id || last.replace(/[^a-zA-Z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 63),
+                    vmid: '', cores: img.cores || 1, memory: img.memory || 512, swap: 512, env: '', start: true,
+                });
+                setDialog(img);
+            };
+
+            // the storages and bridges of the chosen node
+            React.useEffect(() => {
+                if (!dialog || !form.node) return;
+                let gone = false;
+                (async () => {
+                    const node = encodeURIComponent(form.node);
+                    const [rs, rn] = await Promise.all([
+                        authFetch(`${API_URL}/clusters/${cid}/nodes/${node}/storage`),
+                        authFetch(`${API_URL}/clusters/${cid}/nodes/${node}/networks`),
+                    ]);
+                    const list = rs && rs.ok ? await rs.json().catch(() => []) : [];
+                    const nets = rn && rn.ok ? await rn.json().catch(() => []) : [];
+                    if (gone) return;
+                    const usable = (Array.isArray(list) ? list : []).filter(s => s && s.enabled !== 0 && s.active !== 0);
+                    const takes = (c) => usable.filter(s => String(s.content || '').split(',').includes(c)).map(s => s.storage);
+                    const tpl = takes('vztmpl');
+                    const root = takes('rootdir');
+                    const br = (Array.isArray(nets) ? nets : []).map(n => n && n.iface).filter(Boolean);
+                    setStorages(usable);
+                    setBridges(br);
+                    setForm(f => ({
+                        ...f,
+                        storage: tpl.includes(f.storage) ? f.storage : (tpl.includes('local') ? 'local' : (tpl[0] || '')),
+                        rootfs_storage: root.includes(f.rootfs_storage) ? f.rootfs_storage : (root.includes('local-lvm') ? 'local-lvm' : (root[0] || '')),
+                        bridge: br.includes(f.bridge) ? f.bridge : (br.includes('vmbr0') ? 'vmbr0' : (br[0] || '')),
+                    }));
+                })();
+                return () => { gone = true; };
+            }, [dialog, form.node, cid]); // eslint-disable-line
+
+            const storagesFor = (c) => storages.filter(s => String(s.content || '').split(',').includes(c)).map(s => s.storage);
+
+            // a double click lands before the disabled button renders; one container per click
+            const sending = React.useRef(false);
+            const submit = async () => {
+                if (sending.current) return;
+                sending.current = true;
+                setSubmitting(true);
+                setFormError('');
+                try {
+                    const body = {
+                        reference: form.reference.trim(), node: form.node, storage: form.storage,
+                        rootfs_storage: form.rootfs_storage, disk_gb: form.disk_gb, bridge: form.bridge,
+                        hostname: form.hostname.trim(), cores: form.cores, memory: form.memory, swap: form.swap,
+                        ip: form.ipMode === 'static' ? form.ip.trim() : 'dhcp', start: !!form.start,
+                        env: form.env.split('\n').map(s => s.trim()).filter(Boolean),
+                    };
+                    if (form.ipMode === 'static' && form.gw.trim()) body.gw = form.gw.trim();
+                    if (String(form.vlan).trim()) body.vlan = form.vlan;
+                    if (String(form.vmid).trim()) body.vmid = form.vmid;
+                    const r = await authFetch(`${API_URL}/clusters/${cid}/oci/deploy`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    const d = r ? await r.json().catch(() => ({})) : {};
+                    if (r && r.ok) {
+                        addToast(fill('ociStarted', { vmid: d.job ? d.job.vmid : '' }), 'success');
+                        setDialog(null);
+                        loadJobs();
+                    } else {
+                        setFormError(d.error || t('ociDeployFailed'));
+                    }
+                } finally {
+                    sending.current = false;
+                    setSubmitting(false);
+                }
+            };
+
+            const statusLabel = (s) => ({
+                queued: t('ociStatusQueued'), pulling: t('ociStatusPulling'), creating: t('ociStatusCreating'),
+                completed: t('ociStatusCompleted'), failed: t('ociStatusFailed'),
+            }[s] || s);
+            const statusColor = (s) => ({
+                queued: 'bg-gray-500/20 text-gray-400', pulling: 'bg-blue-500/20 text-blue-400',
+                creating: 'bg-blue-500/20 text-blue-400', completed: 'bg-green-500/20 text-green-400',
+                failed: 'bg-red-500/20 text-red-400',
+            }[s] || 'bg-gray-500/20 text-gray-400');
+            const nodeNote = (n) => n.reason === 'too_old'
+                ? fill('ociNodeTooOld', { version: n.pve_version || '?', min: minPve })
+                : (n.reason === 'offline' ? t('ociNodeOffline') : t('ociNodeUnknown'));
+            const field = 'w-full px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm';
+            const label = 'text-xs text-gray-400 block mb-1';
+            const standbyTitle = haReadOnly ? t('pgHaStandbyRefused') : undefined;
+            // the server checks the reference as PVE would; this only waits for a tag
+            const customOk = /^\S+:\w[\w.-]*$/.test(custom.trim());
+            const tplStorages = storagesFor('vztmpl');
+            const rootStorages = storagesFor('rootdir');
+
+            return (
+                <div className="space-y-4" data-oci-catalog>
+                    <div className="flex items-start justify-between flex-wrap gap-2">
+                        <div>
+                            <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+                                <Icons.Container className="w-5 h-5 text-proxmox-orange" />
+                                {t('ociTitle')}
+                                <span data-oci-preview className="text-[10px] px-1.5 py-0.5 bg-yellow-500/20 text-yellow-400 rounded uppercase">
+                                    {t('ociTechPreview')}
+                                </span>
+                            </h2>
+                            <p className="text-xs text-gray-500 mt-0.5">{fill('ociDesc', { min: minPve })}</p>
+                        </div>
+                        <div className="flex gap-2 items-center">
+                            {pveClusters.length > 1 && (
+                                <select data-oci-cluster value={cid} onChange={e => setCid(e.target.value)}
+                                    className="px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm">
+                                    {pveClusters.map(c => <option key={c.id} value={c.id}>{c.display_name || c.name || c.id}</option>)}
+                                </select>
+                            )}
+                            <button onClick={() => { loadSupport(); loadJobs(); }}
+                                className="px-3 py-1.5 bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white rounded-lg text-sm flex items-center gap-1.5">
+                                <Icons.RefreshCw className="w-3.5 h-3.5" />
+                                {t('refresh')}
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="bg-yellow-500/5 border border-yellow-500/20 rounded-lg p-3 text-xs text-yellow-300 flex items-start gap-2">
+                        <Icons.AlertTriangle className="w-4 h-4 flex-shrink-0" />
+                        <span>{t('ociPreviewNote')}</span>
+                    </div>
+
+                    {support && support.denied && (
+                        <div data-oci-denied className="bg-proxmox-card border border-proxmox-border rounded-lg p-3 text-xs text-gray-400 flex items-start gap-2">
+                            <Icons.Lock className="w-4 h-4 flex-shrink-0" />
+                            <span>{t('ociDenied')}</span>
+                        </div>
+                    )}
+                    {support && support.error && (
+                        <div className="bg-red-500/5 border border-red-500/20 rounded-lg p-3 text-xs text-red-300">{support.error}</div>
+                    )}
+                    {support && support.nodes && readyNodes.length === 0 && (
+                        <div data-oci-no-node className="bg-red-500/5 border border-red-500/20 rounded-lg p-3 text-xs text-red-300">
+                            <div>{fill('ociNoNode', { min: minPve })}</div>
+                            <div className="mt-1 text-gray-400">{nodesHere.map(n => `${n.node}: ${nodeNote(n)}`).join(' · ')}</div>
+                        </div>
+                    )}
+                    {readyNodes.length > 0 && readyNodes.length < nodesHere.length && (
+                        <div data-oci-some-nodes className="text-xs text-gray-400" title={nodesHere.filter(n => !n.supported).map(n => `${n.node}: ${nodeNote(n)}`).join('\n')}>
+                            {fill('ociSomeNodes', { ready: readyNodes.length, total: nodesHere.length, min: minPve })}
+                        </div>
+                    )}
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                        {images.map(img => (
+                            <div key={img.id} data-oci-image={img.id} className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 flex flex-col">
+                                <div className="text-sm font-semibold text-white">{img.name}</div>
+                                <div className="text-xs text-gray-500 mt-0.5">{img.description}</div>
+                                <code className="text-[11px] text-gray-400 mt-2 break-all">{img.reference}</code>
+                                <div className="text-xs text-gray-500 mt-2 mb-3">
+                                    {fill('ociResources', { cores: img.cores, memory: img.memory, disk: img.disk_gb })}
+                                    {(img.ports || []).length > 0 && ` · ${fill('ociListens', { ports: img.ports.join(', ') })}`}
+                                </div>
+                                <div className="flex-1" />
+                                <button data-oci-deploy={img.id} onClick={() => openDialog(img)} disabled={!canAct} title={standbyTitle}
+                                    className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm rounded flex items-center justify-center gap-1.5">
+                                    <Icons.Download className="w-3.5 h-3.5" /> {t('ociCreate')}
+                                </button>
+                            </div>
+                        ))}
+                        <div data-oci-image="custom" className="bg-proxmox-card border border-dashed border-proxmox-border rounded-xl p-4 flex flex-col">
+                            <div className="text-sm font-semibold text-white">{t('ociAnyImage')}</div>
+                            <div className="text-xs text-gray-500 mt-0.5">{t('ociAnyImageDesc')}</div>
+                            <input data-oci-custom-ref type="text" value={custom} onChange={e => setCustom(e.target.value)}
+                                placeholder="ghcr.io/owner/app:1.0" className={`${field} mt-2 mb-3`} />
+                            <div className="flex-1" />
+                            <button data-oci-deploy="custom" onClick={() => openDialog({ id: '', name: custom.trim(), reference: custom.trim() })}
+                                disabled={!canAct || !customOk} title={standbyTitle}
+                                className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm rounded flex items-center justify-center gap-1.5">
+                                <Icons.Download className="w-3.5 h-3.5" /> {t('ociCreate')}
+                            </button>
+                        </div>
+                    </div>
+
+                    {jobs.length > 0 && (
+                        <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
+                            <h3 className="text-sm font-semibold text-white mb-2">{t('ociJobs')}</h3>
+                            <div className="space-y-1.5">
+                                {jobs.slice(0, 10).map(j => (
+                                    <div key={j.id} data-oci-job={j.id} data-oci-job-status={j.status}
+                                        className="flex items-center justify-between text-xs gap-2 bg-proxmox-dark border border-proxmox-border rounded px-3 py-2">
+                                        <div className="flex items-center gap-2 min-w-0 flex-1">
+                                            <span className={`px-1.5 py-0.5 rounded flex-shrink-0 ${statusColor(j.status)}`}>
+                                                {running(j) && <Icons.RotateCw className="w-3 h-3 inline mr-1 animate-spin" />}
+                                                {statusLabel(j.status)}
+                                            </span>
+                                            <span className="text-gray-300 truncate">{j.reference}</span>
+                                            <span className="text-gray-500 flex-shrink-0">CT {j.vmid} · {j.node}</span>
+                                            {j.reused && <span className="text-gray-500 flex-shrink-0">({t('ociReused')})</span>}
+                                            {j.started_by && (
+                                                <span className="text-gray-500 flex-shrink-0 flex items-center gap-1">
+                                                    <Icons.User className="w-3 h-3" />{j.started_by}
+                                                </span>
+                                            )}
+                                        </div>
+                                        {j.status === 'failed' && j.error && (
+                                            <span data-oci-job-error className="text-red-400 truncate max-w-xs" title={j.error}>{j.error}</span>
+                                        )}
+                                        <span className="text-gray-600 flex-shrink-0">{(j.started_at || '').replace('T', ' ').slice(0, 16)}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+
+                    {dialog && (
+                        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" onClick={() => !submitting && setDialog(null)}>
+                            <div data-oci-dialog className="bg-proxmox-card border border-proxmox-border rounded-xl p-5 w-full max-w-xl max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+                                <h3 className="text-base font-semibold text-white mb-1 flex items-center gap-2">
+                                    <Icons.Container className="w-4 h-4 text-proxmox-orange" />
+                                    {fill('ociDialogTitle', { image: dialog.name || dialog.reference })}
+                                </h3>
+                                <code className="text-[11px] text-gray-400 break-all">{form.reference}</code>
+                                <div className="space-y-3 mt-4">
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <div>
+                                            <label className={label}>{t('node')}</label>
+                                            <select data-oci-field="node" value={form.node} onChange={e => setForm({ ...form, node: e.target.value })} className={field}>
+                                                {nodesHere.map(n => (
+                                                    <option key={n.node} value={n.node} disabled={!n.supported}>
+                                                        {n.supported ? `${n.node} (PVE ${n.pve_version})` : `${n.node} - ${nodeNote(n)}`}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label className={label}>{t('hostname')}</label>
+                                            <input data-oci-field="hostname" type="text" value={form.hostname} onChange={e => setForm({ ...form, hostname: e.target.value })} className={field} />
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <label className={label}>{t('ociImageStorage')}</label>
+                                        <select data-oci-field="storage" value={form.storage} onChange={e => setForm({ ...form, storage: e.target.value })} className={field}>
+                                            {tplStorages.length === 0 && <option value="">{t('ociNoStorage')}</option>}
+                                            {tplStorages.map(s => <option key={s} value={s}>{s}</option>)}
+                                        </select>
+                                        <div className="text-[10px] text-gray-600 mt-1">{t('ociImageStorageHint')}</div>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <div>
+                                            <label className={label}>{t('ociRootStorage')}</label>
+                                            <select data-oci-field="rootfs_storage" value={form.rootfs_storage} onChange={e => setForm({ ...form, rootfs_storage: e.target.value })} className={field}>
+                                                {rootStorages.length === 0 && <option value="">{t('ociNoStorage')}</option>}
+                                                {rootStorages.map(s => <option key={s} value={s}>{s}</option>)}
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label className={label}>{t('ociDiskGb')}</label>
+                                            <input data-oci-field="disk_gb" type="number" min="1" value={form.disk_gb} onChange={e => setForm({ ...form, disk_gb: e.target.value })} className={field} />
+                                        </div>
+                                    </div>
+                                    <div className="grid grid-cols-3 gap-2">
+                                        <div>
+                                            <label className={label}>{t('cores')}</label>
+                                            <input data-oci-field="cores" type="number" min="1" value={form.cores} onChange={e => setForm({ ...form, cores: e.target.value })} className={field} />
+                                        </div>
+                                        <div>
+                                            <label className={label}>{t('ociMemoryMb')}</label>
+                                            <input data-oci-field="memory" type="number" min="16" step="64" value={form.memory} onChange={e => setForm({ ...form, memory: e.target.value })} className={field} />
+                                        </div>
+                                        <div>
+                                            <label className={label}>{t('ociSwapMb')}</label>
+                                            <input data-oci-field="swap" type="number" min="0" step="64" value={form.swap} onChange={e => setForm({ ...form, swap: e.target.value })} className={field} />
+                                        </div>
+                                    </div>
+                                    <div className="grid grid-cols-3 gap-2">
+                                        <div className="col-span-2">
+                                            <label className={label}>{t('ociBridge')}</label>
+                                            <select data-oci-field="bridge" value={form.bridge} onChange={e => setForm({ ...form, bridge: e.target.value })} className={field}>
+                                                {bridges.map(b => <option key={b} value={b}>{b}</option>)}
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label className={label}>{t('ociVlan')} <span className="text-gray-600">({t('optional')})</span></label>
+                                            <input data-oci-field="vlan" type="number" min="1" max="4094" value={form.vlan} onChange={e => setForm({ ...form, vlan: e.target.value })} className={field} />
+                                        </div>
+                                    </div>
+                                    <div>
+                                        <label className={label}>{t('ociIpv4')}</label>
+                                        <div className="flex items-center gap-4 text-sm text-gray-300">
+                                            <label className="flex items-center gap-1.5">
+                                                <input type="radio" name="oci-ip" checked={form.ipMode === 'dhcp'} onChange={() => setForm({ ...form, ipMode: 'dhcp' })} /> {t('ociDhcp')}
+                                            </label>
+                                            <label className="flex items-center gap-1.5">
+                                                <input data-oci-field="static" type="radio" name="oci-ip" checked={form.ipMode === 'static'} onChange={() => setForm({ ...form, ipMode: 'static' })} /> {t('ociStatic')}
+                                            </label>
+                                        </div>
+                                        {form.ipMode === 'static' && (
+                                            <div className="grid grid-cols-2 gap-2 mt-2">
+                                                <input data-oci-field="ip" type="text" value={form.ip} placeholder={`${t('ociAddress')} 10.0.0.5/24`} onChange={e => setForm({ ...form, ip: e.target.value })} className={field} />
+                                                <input data-oci-field="gw" type="text" value={form.gw} placeholder={t('ociGateway')} onChange={e => setForm({ ...form, gw: e.target.value })} className={field} />
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <div>
+                                            <label className={label}>{t('ociCtId')} <span className="text-gray-600">({t('optional')})</span></label>
+                                            <input data-oci-field="vmid" type="number" min="100" value={form.vmid} placeholder={t('ociCtIdAuto')} onChange={e => setForm({ ...form, vmid: e.target.value })} className={field} />
+                                        </div>
+                                        <label className="flex items-center gap-2 text-sm text-gray-300 mt-6">
+                                            <input data-oci-field="start" type="checkbox" checked={!!form.start} onChange={e => setForm({ ...form, start: e.target.checked })} />
+                                            {t('ociStartAfter')}
+                                        </label>
+                                    </div>
+                                    <div>
+                                        <label className={label}>{t('ociEnv')} <span className="text-gray-600">({t('optional')})</span></label>
+                                        <textarea data-oci-field="env" rows="3" value={form.env} onChange={e => setForm({ ...form, env: e.target.value })}
+                                            placeholder="TZ=Europe/Vienna" className={`${field} font-mono`} />
+                                        <div className="text-[10px] text-gray-600 mt-1">{t('ociEnvHint')}</div>
+                                    </div>
+                                </div>
+                                {formError && <div data-oci-error className="mt-3 text-xs text-red-400">{formError}</div>}
+                                <div className="flex justify-end gap-2 mt-4">
+                                    <button onClick={() => setDialog(null)} disabled={submitting} className="px-3 py-1.5 text-sm text-gray-400 hover:text-white">
+                                        {t('cancel')}
+                                    </button>
+                                    <button data-oci-submit onClick={submit}
+                                        disabled={submitting || !canAct || !form.node || !form.storage || !form.rootfs_storage || !form.bridge
+                                            || (form.ipMode === 'static' && !form.ip.trim())}
+                                        className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 text-white text-sm rounded flex items-center gap-1.5">
+                                        {submitting ? <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" /> : <Icons.Download className="w-3.5 h-3.5" />}
+                                        {t('ociSubmit')}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         // NS Apr 2026 — Compliance Dashboard (top-level read-only audit view).
         // Aggregates per-cluster hardening scores, BSI/ISO/NIS2 mapping, audit activity.
         // Available to ops/Compliance Officers without admin rights (admin.audit or
@@ -5578,6 +6833,10 @@
         // Reads /insights/right-sizing + /insights/forecast endpoints, fed by the
         // 5-min metrics_history collector. Force-snapshot button is admin-only.
         function InsightsTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin }) {
+            // the admin button here writes this instance's own metrics: no standby takes the
+            // snapshot, forwarding or not (#625)
+            const { haStandby } = useAuth();
+            const canAct = isAdmin && !haStandby;
             const [rs, setRs] = React.useState(null);
             const [fc, setFc] = React.useState(null);
             // LW May 2026 — top-N noisy neighbors card
@@ -5917,7 +7176,7 @@
                             </p>
                         </div>
                         <div className="flex gap-2">
-                            {isAdmin && (
+                            {canAct && (
                                 <button onClick={forceSnap} disabled={forcing}
                                     className="px-3 py-1.5 bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white rounded-lg text-sm flex items-center gap-1.5 disabled:opacity-50">
                                     {forcing ? <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" /> : <Icons.RefreshCw className="w-3.5 h-3.5" />}
@@ -7106,10 +8365,124 @@
             );
         }
 
+        // jsPDF's Helvetica has no glyph for these, so an evidence PDF gets plain ones
+        function pdfSafeText(s) {
+            return String(s ?? '')
+                .replace(/[≥]/g, '>=').replace(/[≤]/g, '<=')
+                .replace(/[→]/g, '->').replace(/[·]/g, '*')
+                .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '');
+        }
+
+        function fillText(s, vals) {
+            return Object.entries(vals).reduce((out, [k, v]) => out.split(`{${k}}`).join(String(v)), s);
+        }
+
+        // LW Oct 2026 - one boot screenshot of a test failover. The picture has a route of its
+        // own that asks vm.console like the console tile does, so one the viewer may not see
+        // (or one no longer kept) says why instead of showing nothing
+        function SrBootShot({ planId, eventId, row, authFetch, t }) {
+            const [src, setSrc] = useState(null);
+            const [why, setWhy] = useState('');
+            useEffect(() => {
+                let gone = false, url = null;
+                (async () => {
+                    try {
+                        const r = await authFetch(`${API_URL}/site-recovery/plans/${planId}/events/${eventId}/screenshots/${row.vmid}`);
+                        if (gone) return;
+                        if (r && r.ok) {
+                            const blob = await r.blob();
+                            if (gone) return;
+                            url = URL.createObjectURL(blob);
+                            setSrc(url);
+                        } else {
+                            setWhy(r?.status === 403 ? t('srShotsNoPermission') : r?.status === 404 ? t('srShotsGone') : t('srShotsLoadFailed'));
+                        }
+                    } catch (e) {
+                        if (!gone) setWhy(t('srShotsLoadFailed'));
+                    }
+                })();
+                return () => { gone = true; if (url) URL.revokeObjectURL(url); };
+            }, [planId, eventId, row.vmid]);
+            return (
+                <figure className="bg-proxmox-dark border border-proxmox-border rounded-lg overflow-hidden" data-sr-shot={row.vmid}>
+                    <div className="bg-black flex items-center justify-center h-40">
+                        {src ? <img src={src} alt={`${row.vmid} ${row.vm_name || ''}`} className="max-w-full max-h-40 object-contain" />
+                            : why ? <span className="text-xs text-gray-500 px-3 text-center" data-sr-shot-why="">{why}</span>
+                            : <span className="w-4 h-4 border-2 border-gray-500/30 border-t-transparent rounded-full animate-spin"></span>}
+                    </div>
+                    <figcaption className="px-2 py-1.5 text-xs space-y-0.5">
+                        <div className="flex items-center gap-2 min-w-0">
+                            <span className="font-mono text-gray-400">{row.vmid}</span>
+                            <span className="text-gray-300 truncate">{row.vm_name || '-'}</span>
+                            <span className="ml-auto font-mono text-gray-500" title={t('srTestVmid')}>{row.test_vmid}</span>
+                        </div>
+                        <div className="text-gray-500">{fillText(t('srShotsTiming'), { s: row.after_boot_s ?? '-', ms: row.ms ?? '-' })}</div>
+                    </figcaption>
+                </figure>
+            );
+        }
+
+        // the boot screenshots of one test failover event, what was taken and why the rest was not
+        function SrBootShots({ planId, ev, authFetch, t, onPdf }) {
+            const shots = ev.details?.screenshots;
+            if (!shots) return null;
+            const rows = shots.guests || [];
+            const taken = rows.filter(r => r.status === 'ok');
+            const missed = rows.filter(r => r.status !== 'ok');
+            return (
+                <div className="border-t border-proxmox-border p-3 space-y-3" data-sr-shots={ev.id} data-sr-shots-state={shots.state}>
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                        <div className="flex items-center gap-2 text-sm text-gray-300 flex-wrap">
+                            <span className="text-gray-400"><Icons.Camera /></span>
+                            <span className="font-medium">{t('srShotsTitle')}</span>
+                            {shots.state === 'done' && (
+                                <span className="text-xs text-gray-500" data-sr-shots-summary="">
+                                    {fillText(t('srShotsSummary'), { taken: shots.taken ?? 0, failed: shots.failed ?? 0,
+                                        skipped: shots.skipped ?? 0, s: Math.round((shots.total_ms || 0) / 1000) })}
+                                </span>
+                            )}
+                        </div>
+                        {shots.state !== 'capturing' && onPdf && (
+                            <button onClick={onPdf} data-sr-shots-pdf=""
+                                className="px-3 py-1.5 text-xs rounded-lg bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white flex items-center gap-1.5">
+                                <Icons.Download />{t('drDrillExportPdf')}
+                            </button>
+                        )}
+                    </div>
+                    {shots.state === 'capturing' && (
+                        <div className="flex items-center gap-2 text-xs text-blue-300">
+                            <span className="w-3 h-3 border-2 border-blue-500/40 border-t-transparent rounded-full animate-spin"></span>
+                            {t('srShotsCapturing')}
+                        </div>
+                    )}
+                    {shots.state === 'interrupted' && <p className="text-xs text-yellow-400">{t('srShotsInterrupted')}</p>}
+                    {taken.length > 0 && (
+                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                            {taken.map(r => <SrBootShot key={r.vmid} planId={planId} eventId={ev.id} row={r} authFetch={authFetch} t={t} />)}
+                        </div>
+                    )}
+                    {missed.length > 0 && (
+                        <ul className="space-y-1 text-xs">
+                            {missed.map(r => (
+                                <li key={r.vmid} className="flex items-start gap-2" data-sr-shot-missed={r.vmid}>
+                                    <span className={r.status === 'failed' ? 'text-red-400' : 'text-gray-500'}>{r.status === 'failed' ? t('failed') : t('skipped')}</span>
+                                    <span className="font-mono text-gray-400">{r.vmid}</span>
+                                    <span className="text-gray-300">{r.vm_name || '-'}</span>
+                                    <span className="text-gray-500 break-all">{r.reason}</span>
+                                </li>
+                            ))}
+                        </ul>
+                    )}
+                </div>
+            );
+        }
+
         // NS: Mar 2026 - Site Recovery tab component (#150)
         function SiteRecoveryTab({ clusters, selectedCluster, authFetch, addToast, t, isCorporate, srProgress, user }) {
-            const canManage = user?.permissions?.includes('site_recovery.manage');
-            const canFailover = user?.permissions?.includes('site_recovery.failover');
+            // like can(): a standby reads the plans and changes none of them (#625)
+            const { haReadOnly } = useAuth();
+            const canManage = !haReadOnly && !!user?.permissions?.includes('site_recovery.manage');
+            const canFailover = !haReadOnly && !!user?.permissions?.includes('site_recovery.failover');
             const [plans, setPlans] = useState([]);
             const [loading, setLoading] = useState(true);
             const [selectedPlan, setSelectedPlan] = useState(null);
@@ -7166,6 +8539,14 @@
             useEffect(() => { fetchPlans(); }, []);
             useEffect(() => { if (selectedPlan) { fetchPlanDetail(selectedPlan); setSrSubTab('overview'); } else setPlanDetail(null); }, [selectedPlan]);
             useEffect(() => { if (selectedPlan && srSubTab === 'events') fetchEvents(selectedPlan); }, [srSubTab, selectedPlan]);
+            // a test's boot screenshots arrive after its event completed: while one of the
+            // listed tests still takes them, read the list again every few seconds
+            const shotsPending = srSubTab === 'events' && events.some(ev => ev.details?.screenshots?.state === 'capturing');
+            useEffect(() => {
+                if (!shotsPending || !selectedPlan) return;
+                const timer = setTimeout(() => fetchEvents(selectedPlan), 5000);
+                return () => clearTimeout(timer);
+            }, [shotsPending, events, selectedPlan]);
 
             // LW: fetch source VMs + replication jobs when VMs tab opens
             useEffect(() => {
@@ -7330,10 +8711,7 @@
                     addToast('PDF library not loaded', 'error');
                     return;
                 }
-                const safe = (s) => String(s ?? '')
-                    .replace(/[≥]/g, '>=').replace(/[≤]/g, '<=')
-                    .replace(/[→]/g, '->').replace(/[·]/g, '*')
-                    .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '');
+                const safe = pdfSafeText;
                 const verdict = (s) => ({pass: 'PASS', warn: 'WARN', fail: 'FAIL'}[s] || s);
                 const blocks = [];
                 blocks.push({
@@ -7395,6 +8773,99 @@
                 } catch (e) {
                     console.error('[DR Drill PDF]', e);
                     addToast('PDF export failed', 'error');
+                }
+            };
+            // LW Oct 2026 - the evidence of one test failover: which guests came up on the target,
+            // and the boot screenshot of each with the time it took (background/sr_boot_shots.py)
+            const shotForPdf = async (planId, eventId, vmid) => {
+                const r = await authFetch(`${API_URL}/site-recovery/plans/${planId}/events/${eventId}/screenshots/${vmid}`);
+                if (!(r && r.ok)) {
+                    return { why: r?.status === 403 ? t('srShotsNoPermission') : r?.status === 404 ? t('srShotsGone') : t('srShotsLoadFailed') };
+                }
+                const blob = await r.blob();
+                const dataUrl = await new Promise((resolve, reject) => {
+                    const fr = new FileReader();
+                    fr.onload = () => resolve(fr.result);
+                    fr.onerror = reject;
+                    fr.readAsDataURL(blob);
+                });
+                const size = await new Promise(resolve => {
+                    const img = new Image();
+                    img.onload = () => resolve({ w: img.naturalWidth || 4, h: img.naturalHeight || 3 });
+                    img.onerror = () => resolve({ w: 4, h: 3 });
+                    img.src = dataUrl;
+                });
+                return { dataUrl, ...size };
+            };
+            const exportTestPdf = async (ev) => {
+                if (typeof generatePegaProxPDF !== 'function') { addToast(t('srTestPdfFailed'), 'error'); return; }
+                const pd = planDetail || {};
+                const safe = pdfSafeText;
+                const shots = ev.details?.screenshots || {};
+                const rows = shots.guests || [];
+                const results = ev.details?.results || {};
+                const counts = ev.details?.counts || {};
+                const nameOf = (vmid) => rows.find(r => String(r.vmid) === String(vmid))?.vm_name
+                    || (pd.vms || []).find(v => String(v.vmid) === String(vmid))?.vm_name || '-';
+                const timing = (r) => fillText(t('srShotsTiming'), { s: r.after_boot_s ?? '-', ms: r.ms ?? '-' });
+                const summary = fillText(t('srShotsSummary'), { taken: shots.taken ?? 0, failed: shots.failed ?? 0,
+                    skipped: shots.skipped ?? 0, s: Math.round((shots.total_ms || 0) / 1000) });
+                const blocks = [
+                    { type: 'stats', data: [
+                        { value: `${counts.ok ?? 0}/${counts.total ?? 0}`, label: safe(t('srTestPdfStarted')), color: '#16a34a' },
+                        { value: String(shots.taken ?? 0), label: safe(t('srShotsTitle')), color: '#3b82f6' },
+                        { value: String(shots.failed ?? 0), label: safe(t('failed')), color: '#dc2626' },
+                        { value: String(shots.skipped ?? 0), label: safe(t('skipped')), color: '#6b7280' },
+                    ] },
+                    { type: 'spacer', height: 4 },
+                    { type: 'text', value: safe([
+                        `${t('planName')}: ${pd.name || ''}`,
+                        `${t('sourceCluster')}: ${getClusterName(pd.source_cluster)}`,
+                        `${t('targetCluster')}: ${getClusterName(pd.target_cluster)}`,
+                        `${t('startTime')}: ${ev.started_at || ''}`,
+                        `${t('endTime')}: ${ev.completed_at || ''}`,
+                        `${t('status')}: ${(ev.status || '').toUpperCase()}`,
+                        `${t('srShotsTitle')}: ${summary}`,
+                    ].join('\n')) },
+                    { type: 'spacer', height: 4 },
+                    { type: 'table', title: safe(t('srTestPdfResults')),
+                      columns: [t('vmid'), t('name'), t('srTestVmid'), t('status'), t('error')].map(safe),
+                      rows: Object.entries(results).map(([vmid, r]) => [vmid, safe(nameOf(vmid)), String(r.test_vmid ?? '-'),
+                          r.success ? 'OK' : safe(t('failed')), safe(r.error || '-')]) },
+                ];
+                if (rows.length) {
+                    blocks.push({ type: 'table', title: safe(t('srShotsTitle')),
+                        columns: [t('vmid'), t('name'), t('srTestVmid'), t('status'), t('srShotsAfterStart'),
+                                  t('srShotsGrabTime'), t('size'), t('details')].map(safe),
+                        rows: rows.map(r => [String(r.vmid), safe(r.vm_name || '-'), String(r.test_vmid ?? '-'),
+                            r.status === 'ok' ? 'OK' : safe(r.status === 'failed' ? t('failed') : t('skipped')),
+                            r.after_boot_s != null ? `${r.after_boot_s} s` : '-', r.ms != null ? `${r.ms} ms` : '-',
+                            r.bytes ? `${Math.round(r.bytes / 1024)} KB` : '-', safe(r.reason || '-')]) });
+                }
+                // one after another: at most the cap of a test, and each is a few hundred KB
+                for (const r of rows.filter(x => x.status === 'ok')) {
+                    let shot;
+                    try { shot = await shotForPdf(pd.id, ev.id, r.vmid); } catch (e) { shot = { why: t('srShotsLoadFailed') }; }
+                    const caption = `${r.vmid} ${r.vm_name || ''} -> ${r.test_vmid}: ${timing(r)}`;
+                    blocks.push({ type: 'spacer', height: 4 });
+                    if (shot.dataUrl) {
+                        blocks.push({ type: 'image', dataUrl: shot.dataUrl, caption: safe(caption), width: 120, height: 120 * shot.h / shot.w });
+                    } else {
+                        blocks.push({ type: 'text', value: safe(`${caption}\n${shot.why}`) });
+                    }
+                }
+                try {
+                    await generatePegaProxPDF({
+                        title: safe(t('srTestPdfTitle')),
+                        subtitle: safe(`${pd.name || ''} - ${ev.status || ''}`),
+                        clusterName: '',
+                        filename: `pegaprox-dr-test-${pd.id || 'plan'}-${String(ev.started_at || '').slice(0, 10)}.pdf`,
+                        content: blocks,
+                        orientation: 'portrait',
+                    });
+                } catch (e) {
+                    console.error('[DR Test PDF]', e);
+                    addToast(t('srTestPdfFailed'), 'error');
                 }
             };
             // add VM
@@ -7517,11 +8988,11 @@
                                                         <td className="py-2">{vm.vm_name || '-'}</td>
                                                         <td className="py-2">{editingVm?.id === vm.id && editingVm?.field === 'boot_group'
                                                             ? <input type="number" className="w-16 bg-proxmox-dark border border-proxmox-border rounded px-1 py-0.5 text-xs" defaultValue={vm.boot_group} autoFocus onBlur={e => handleUpdateVm(vm.id, 'boot_group', parseInt(e.target.value))} onKeyDown={e => e.key === 'Enter' && handleUpdateVm(vm.id, 'boot_group', parseInt(e.target.value))} />
-                                                            : <span className="cursor-pointer hover:text-proxmox-orange" onClick={() => setEditingVm({id: vm.id, field: 'boot_group'})}>{vm.boot_group}</span>
+                                                            : <span className="cursor-pointer hover:text-proxmox-orange" onClick={() => canManage && setEditingVm({id: vm.id, field: 'boot_group'})}>{vm.boot_group}</span>
                                                         }</td>
                                                         <td className="py-2">{editingVm?.id === vm.id && editingVm?.field === 'boot_delay'
                                                             ? <input type="number" className="w-16 bg-proxmox-dark border border-proxmox-border rounded px-1 py-0.5 text-xs" defaultValue={vm.boot_delay} autoFocus onBlur={e => handleUpdateVm(vm.id, 'boot_delay', parseInt(e.target.value))} onKeyDown={e => e.key === 'Enter' && handleUpdateVm(vm.id, 'boot_delay', parseInt(e.target.value))} />
-                                                            : <span className="cursor-pointer hover:text-proxmox-orange" onClick={() => setEditingVm({id: vm.id, field: 'boot_delay'})}>{vm.boot_delay}s</span>
+                                                            : <span className="cursor-pointer hover:text-proxmox-orange" onClick={() => canManage && setEditingVm({id: vm.id, field: 'boot_delay'})}>{vm.boot_delay}s</span>
                                                         }</td>
                                                         <td className="py-2"><span className={rpoColor(vm)}>{vm.last_replication ? fmtDate(vm.last_replication) : '-'}</span></td>
                                                         {canManage && <td className="py-2"><button onClick={() => handleRemoveVm(vm.id)} className="text-red-400 hover:text-red-300"><Icons.Trash2 className="w-3.5 h-3.5" /></button></td>}
@@ -7575,7 +9046,7 @@
                                     ))}
                                     <button onClick={() => setStorMapRows(prev => [...prev, {src:'',tgt:''}])} className="text-xs text-proxmox-orange hover:underline">{t('addMapping') || '+ Add Mapping'}</button>
                                 </div>
-                                <div className="flex justify-end"><button onClick={saveMappings} className="px-4 py-1.5 text-sm rounded-lg bg-proxmox-orange text-white hover:bg-proxmox-orange/80">{t('saveMappings') || 'Save Mappings'}</button></div>
+                                {canManage && <div className="flex justify-end"><button onClick={saveMappings} className="px-4 py-1.5 text-sm rounded-lg bg-proxmox-orange text-white hover:bg-proxmox-orange/80">{t('saveMappings') || 'Save Mappings'}</button></div>}
                             </div>
                         )}
 
@@ -7596,6 +9067,9 @@
                                                     <span className={`px-2 py-0.5 rounded text-xs ${statusColors[ev.status] || ''}`}>{ev.status}</span>
                                                     <span className="text-xs text-gray-500">{fmtDate(ev.started_at)}</span>
                                                     {dur !== null && <span className="text-xs text-gray-600">{dur < 60 ? `${dur}s` : `${Math.floor(dur/60)}m ${dur%60}s`}</span>}
+                                                    {ev.details?.screenshots?.taken > 0 && (
+                                                        <span className="text-xs text-gray-500" data-sr-shots-badge={ev.id}>{t('srShotsTitle')}: {ev.details.screenshots.taken}</span>
+                                                    )}
                                                 </div>
                                                 <span className="text-xs text-gray-500">{ev.triggered_by}</span>
                                             </div>
@@ -7612,6 +9086,9 @@
                                                         ))}</tbody>
                                                     </table>
                                                 </div>
+                                            )}
+                                            {expandedEvent === ev.id && (
+                                                <SrBootShots planId={pd.id} ev={ev} authFetch={authFetch} t={t} onPdf={() => exportTestPdf(ev)} />
                                             )}
                                         </div>
                                     );
@@ -7634,7 +9111,7 @@
                                     <div className="flex items-center justify-between pt-2 border-t border-proxmox-border/50"><div><label className="text-sm font-medium">{t('testDisconnectNics') || 'Disconnect NICs on Test Failover'}</label><p className="text-xs text-gray-500">{t('testDisconnectNicsDesc') || 'Bring test-failover clones up with network cables unplugged (link down) so a DR test cannot collide with production IPs.'}</p></div>
                                         <div className={`toggle-switch ${settingsForm.test_disconnect_nics ? 'active' : ''}`} onClick={() => { setSettingsForm(f => ({...f, test_disconnect_nics: !f.test_disconnect_nics})); setSettingsDirty(true); }} />
                                     </div>
-                                    <div className="flex justify-end"><button onClick={saveSettings} disabled={!settingsDirty} className="px-4 py-1.5 text-sm rounded-lg bg-proxmox-orange text-white hover:bg-proxmox-orange/80 disabled:opacity-40">{t('saveSettings') || 'Save'}</button></div>
+                                    {canManage && <div className="flex justify-end"><button onClick={saveSettings} disabled={!settingsDirty} className="px-4 py-1.5 text-sm rounded-lg bg-proxmox-orange text-white hover:bg-proxmox-orange/80 disabled:opacity-40">{t('saveSettings') || 'Save'}</button></div>}
                                 </div>
                                 {canManage && <div className="bg-red-500/5 border border-red-500/20 rounded-xl p-4">
                                     <h4 className="text-sm font-medium text-red-400 mb-2">{t('dangerZone') || 'Danger Zone'}</h4>
@@ -7990,10 +9467,917 @@
             return true;
         }
 
+        // ═══════════════════════════════════════════════
+        // Node HA in the HA settings of a cluster (#625)
+        // LW Oct 2026 - which self-fence agent each node runs, the safety rules of a node
+        // recovery, the fence of each node and the cluster claim. Each part renders from what
+        // the HA status carries and stays away when its key is missing, so the settings of a
+        // server that sends none of it look the way they did.
+        // ═══════════════════════════════════════════════
+
+        const HA_NODE_FENCE_TYPES = ['ipmi', 'ssh', 'proxmox'];
+        const HA_NODE_UNSAFE_WORD = 'UNSAFE';
+        const HA_NODE_CLAIM_WORD = { enable: 'WRITE CLAIM', release: 'RELEASE CLAIM' };
+        // another instance's claim, or a file that is no claim: what a release writes over
+        const HA_NODE_CLAIM_FOREIGN = ['higher', 'same', 'unreadable'];
+        const HA_NODE_CLAIM_LABEL = {
+            off: 'haNodeClaimOff', ours: 'haNodeClaimOurs', foreign: 'haNodeClaimForeign',
+            unreadable: 'haNodeClaimUnreadable', pending: 'haNodeClaimPending', standby: 'haNodeClaimStandby',
+            unknown: 'haNodeClaimUnknown',
+        };
+        const HA_NODE_CLAIM_MEANS = {
+            ours: 'haNodeClaimMeansOurs', higher: 'haNodeClaimMeansHigher', same: 'haNodeClaimMeansSame',
+            unreadable: 'haNodeClaimMeansUnreadable', busy: 'haNodeClaimMeansBusy', readonly: 'haNodeClaimMeansReadonly',
+            failed: 'haNodeClaimMeansFailed', unreachable: 'haNodeClaimMeansUnreachable', standby: 'haNodeClaimMeansStandby',
+            unknown: 'haNodeClaimMeansUnknown',
+        };
+        const HA_NODE_CLAIM_TONE = {
+            off: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
+            ours: 'bg-green-500/20 text-green-300 border-green-500/30',
+            foreign: 'bg-red-500/20 text-red-300 border-red-500/30',
+            unreadable: 'bg-red-500/20 text-red-300 border-red-500/30',
+            pending: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/40',
+            standby: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
+            unknown: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
+        };
+
+        // Whether any of the parts below renders for this status, by the check each of them
+        // starts with. The modal is only made wider for their tables: with a status from
+        // before them it keeps the width it had.
+        function haNodePartsShown(status) {
+            const sbp = status?.split_brain_prevention || {};
+            const isObj = (v) => !!v && typeof v === 'object';
+            return typeof sbp.unsafe_two_node_recovery === 'boolean' || !!sbp.fenced_survivor_note
+                || (sbp.verified_fence_required === true && sbp.verified_fence_configured === false)
+                || isObj(status?.fence_agent) || isObj(sbp.fencing) || isObj(status?.cluster_claim);
+        }
+
+        function haNodeClaimKind(state) {
+            if (state === 'ours' || state === 'off' || state === 'standby' || state === 'unreadable') return state;
+            if (state === 'higher' || state === 'same') return 'foreign';
+            if (['busy', 'readonly', 'failed', 'unreachable'].includes(state)) return 'pending';
+            return 'unknown';
+        }
+
+        // POST/PUT to an HA route of a cluster: the server's own words on a refusal, with its
+        // code. authFetch hands back null for a request that got no answer at all.
+        async function haNodeSend(authFetch, url, method, body, fallback) {
+            const r = await authFetch(url, {
+                method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {})
+            });
+            if (!r) return { ok: false, code: '', error: fallback, data: null };
+            const data = await r.json().catch(() => null);
+            if (!r.ok) {
+                const said = typeof data?.error === 'string' ? data.error.trim() : '';
+                return { ok: false, code: data?.code || '', error: said || fallback, data };
+            }
+            return { ok: true, code: '', error: '', data: data || {} };
+        }
+
+        function HaNodeCommand({ value, t }) {
+            return (
+                <div className="flex items-start gap-2" data-ha-node-command>
+                    <code className="flex-1 min-w-0 px-3 py-2 bg-black/40 rounded text-xs text-gray-200 break-all font-mono select-all">{value}</code>
+                    <span className="shrink-0 inline-flex">
+                        <CopyButton value={value} size="md" title={t('copy')}
+                            className="w-8 h-8 border border-proxmox-border hover:border-gray-500" />
+                    </span>
+                </div>
+            );
+        }
+
+        // The server puts what to run by hand between backticks. Each of those gets a line of
+        // its own with a copy button, the rest stays prose. Unpaired backticks stay text.
+        function HaNodeText({ text, t, className }) {
+            const parts = String(text || '').split('`');
+            if (parts.length % 2 === 0) return <div className={className}>{text}</div>;
+            return (
+                <div className={`space-y-2 ${className || ''}`}>
+                    {parts.map((part, i) => !part.trim() ? null
+                        : i % 2 ? <HaNodeCommand key={i} value={part.trim()} t={t} />
+                        : <p key={i}>{part.trim()}</p>)}
+                </div>
+            );
+        }
+
+        // On top of the settings: a cluster that recovers the old way, at the old risk, and
+        // one that is not recovered at all until a fence is set
+        function HaNodeWarnings({ status, t }) {
+            const sbp = status?.split_brain_prevention || {};
+            const unsafe = sbp.unsafe_two_node_recovery === true;
+            const noFence = sbp.verified_fence_required === true && sbp.verified_fence_configured === false;
+            if (!unsafe && !noFence) return null;
+            return (
+                <div className="space-y-3 mb-4">
+                    {unsafe && (
+                        <div role="alert" data-ha-node-unsafe className="p-4 rounded-xl border bg-red-500/10 border-red-500/50">
+                            <div className="flex items-start gap-3">
+                                <span className="mt-0.5 flex-shrink-0 text-red-400"><Icons.AlertTriangle /></span>
+                                <div className="min-w-0 space-y-1">
+                                    <h4 className="font-medium text-red-300">{t('haNodeUnsafeTitle')}</h4>
+                                    <p className="text-sm text-red-200">{sbp.unsafe_two_node_warning || t('haNodeUnsafeRisk')}</p>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                    {noFence && (
+                        <div role="alert" data-ha-node-no-fence className="p-4 rounded-xl border bg-yellow-500/10 border-yellow-500/40">
+                            <div className="flex items-start gap-3">
+                                <span className="mt-0.5 flex-shrink-0 text-yellow-400"><Icons.AlertTriangle /></span>
+                                <div className="min-w-0 space-y-1">
+                                    <h4 className="font-medium text-yellow-300">{t('haNodeNoFenceTitle')}</h4>
+                                    <p className="text-sm text-yellow-200">{t('haNodeNoFenceText')}</p>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // Which self-fence agent each node runs, from the status, and what the agent check
+        // read on the nodes once it ran. An agent of an earlier PegaProx keeps running as it
+        // is: the install above replaces it.
+        function HaNodeAgents({ t, clusterId, status, check, onCheck, authFetch, onReload, locked }) {
+            const [checking, setChecking] = useState(false);
+            const [error, setError] = useState('');
+            const fa = status?.fence_agent;
+            if (!fa || typeof fa !== 'object') return null;
+
+            const expected = fa.expected_version || 2;
+            const known = fa.nodes && typeof fa.nodes === 'object' ? fa.nodes : {};
+            const unchecked = Array.isArray(fa.unchecked) ? fa.unchecked : [];
+            const found = check && check.nodes && typeof check.nodes === 'object' ? check.nodes : null;
+            const names = Array.from(new Set([
+                ...Object.keys(status.nodes || {}), ...Object.keys(known), ...unchecked,
+                ...(Array.isArray(status.self_fence_nodes) ? status.self_fence_nodes : []),
+                ...Object.keys(found || {}),
+            ])).sort();
+            // the agents ask the PegaProx instances only where quorum cannot decide
+            const asks = Array.isArray(check?.members) && check.members.length > 0;
+            const outdatedText = fa.outdated_warning || check?.outdated_warning;
+
+            const runCheck = async () => {
+                setChecking(true);
+                setError('');
+                const res = await haNodeSend(authFetch, `${API_URL}/clusters/${clusterId}/ha/agent-check`, 'POST', {},
+                                             t('haNodeCheckFailed'));
+                setChecking(false);
+                if (!res.ok) { setError(res.error); return; }
+                onCheck(res.data);
+                // what it found is what the status reports from now on
+                onReload();
+            };
+
+            // the check's answer where there is one, else what the status knows
+            const agentOf = (name) => {
+                const seen = found ? found[name] : undefined;
+                const version = seen && seen.fence_agent ? seen.fence_agent.version : known[name]?.version;
+                if (typeof version !== 'number') return { kind: unchecked.includes(name) ? 'unchecked' : 'none' };
+                if (version <= 0) return { kind: 'none' };
+                return { kind: version < expected ? 'earlier' : 'current', version };
+            };
+            const label = (agent) => agent.kind === 'current' ? t('haNodeAgentCurrent').replace('{version}', agent.version)
+                : agent.kind === 'earlier' ? t('haNodeAgentEarlier').replace('{version}', agent.version)
+                : agent.kind === 'unchecked' ? t('haNodeAgentUnchecked') : t('haNodeAgentNone');
+            const yesNo = (v) => v ? <span className="text-green-300">{t('yes')}</span> : <span className="text-yellow-300">{t('no')}</span>;
+            const cell = 'py-2 pr-4';
+            const silent = Array.isArray(check?.unreachable) ? check.unreachable : [];
+            const notCurrent = Array.isArray(check?.not_current) ? check.not_current : [];
+
+            return (
+                <div className="mt-3 p-3 bg-proxmox-dark border border-proxmox-border rounded-lg space-y-3" data-ha-node-agents>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                        <h5 className="text-sm font-medium text-white">{t('haNodeAgentsTitle')}</h5>
+                        <button type="button" onClick={runCheck} disabled={checking || locked}
+                            className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white hover:border-gray-500 disabled:opacity-50 disabled:cursor-not-allowed">
+                            <span className={`inline-flex ${checking ? 'animate-spin' : ''}`}><Icons.RefreshCw className="w-3 h-3" /></span>
+                            {checking ? t('haNodeChecking') : t('haNodeCheckAgents')}
+                        </button>
+                    </div>
+                    {names.length > 0 && (
+                        <div className="overflow-x-auto">
+                            <table className="w-full text-sm">
+                                <thead>
+                                    <tr className="text-left text-xs text-gray-500 border-b border-proxmox-border">
+                                        <th className={`${cell} font-medium`}>{t('node')}</th>
+                                        <th className={`${cell} font-medium`}>{t('haNodeColAgent')}</th>
+                                        <th className={`${cell} font-medium whitespace-nowrap`} title={t('haNodeColRecoveryHint')}>{t('haNodeColRecovery')}</th>
+                                        {found && (<>
+                                            <th className={`${cell} font-medium`}>{t('haNodeColRuns')}</th>
+                                            <th className={`${cell} font-medium`}>{t('haNodeColMode')}</th>
+                                            <th className={`${cell} font-medium whitespace-nowrap`}>{t('haNodeColCurrent')}</th>
+                                            <th className="py-2 font-medium whitespace-nowrap">{t('haNodeColInstances')}</th>
+                                        </>)}
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {names.map(name => {
+                                        const agent = agentOf(name);
+                                        const seen = found ? found[name] : undefined;
+                                        const recovery = known[name]?.earliest_recovery;
+                                        const away = Array.isArray(seen?.members_unreachable) ? seen.members_unreachable : [];
+                                        return (
+                                            <React.Fragment key={name}>
+                                                <tr data-ha-node-agent={name} data-ha-node-agent-kind={agent.kind}
+                                                    className={away.length ? '' : 'border-b border-proxmox-border'}>
+                                                    <td className={`${cell} font-mono text-xs text-gray-200 whitespace-nowrap`}>{name}</td>
+                                                    <td className={`${cell} text-gray-200`}>
+                                                        <span className="whitespace-nowrap">{label(agent)}</span>
+                                                        {agent.kind === 'earlier' && (
+                                                            <span data-ha-node-outdated title={t('haNodeOutdatedHint')}
+                                                                className="ml-2 px-1.5 py-0.5 rounded-full border text-[11px] bg-yellow-500/20 text-yellow-300 border-yellow-500/40">
+                                                                {t('haNodeOutdated')}
+                                                            </span>
+                                                        )}
+                                                    </td>
+                                                    <td className={`${cell} text-gray-200 whitespace-nowrap`}>
+                                                        {typeof recovery === 'number' ? t('haNodeSeconds').replace('{n}', recovery) : '-'}
+                                                    </td>
+                                                    {found && (seen === null ? (
+                                                        <td colSpan={4} className="py-2 text-xs text-red-300" data-ha-node-silent>{t('haNodeNoAnswer')}</td>
+                                                    ) : seen ? (<>
+                                                        <td className={cell}>{yesNo(seen.fence_agent?.active)}</td>
+                                                        <td className={`${cell} font-mono text-xs text-gray-300`}>{seen.fence_agent?.mode || '-'}</td>
+                                                        <td className={cell}>{seen.fence_agent?.version ? yesNo(seen.fence_agent.current) : '-'}</td>
+                                                        <td className="py-2 text-xs whitespace-nowrap" data-ha-node-unreachable={away.length}>
+                                                            {away.length > 0
+                                                                ? <span className="text-red-300">{t('haNodeOutOfReach').replace('{n}', away.length).replace('{total}', check.members.length)}</span>
+                                                                : asks ? <span className="text-green-300">{t('haNodeAllReachable')}</span>
+                                                                : <span className="text-gray-500" title={t('haNodeAsksNobody')}>-</span>}
+                                                        </td>
+                                                    </>) : (
+                                                        <td colSpan={4} className="py-2 text-gray-500">-</td>
+                                                    ))}
+                                                </tr>
+                                                {/* the addresses on a line of their own, a column would squeeze them */}
+                                                {away.length > 0 && (
+                                                    <tr className="border-b border-proxmox-border" data-ha-node-cannot-reach={name}>
+                                                        <td colSpan={7} className="pb-2 text-xs text-red-300">
+                                                            {t('haNodeCannotReach')} <span className="font-mono break-all">{away.join(', ')}</span>
+                                                        </td>
+                                                    </tr>
+                                                )}
+                                            </React.Fragment>
+                                        );
+                                    })}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+                    {typeof fa.fence_delay === 'number' && (
+                        <p className="text-xs text-gray-400" data-ha-node-fence-delay>
+                            {t('haNodeFenceDelay').replace('{n}', fa.fence_delay).replace('{version}', () => expected)}
+                        </p>
+                    )}
+                    {unchecked.length > 0 && !found && (
+                        <p className="text-xs text-gray-400">{t('haNodeUncheckedHint')}</p>
+                    )}
+                    {(outdatedText || fa.outdated_settings_warning) && (
+                        <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 space-y-2" data-ha-node-outdated-warning>
+                            {outdatedText && <p>{outdatedText}</p>}
+                            {fa.outdated_settings_warning && <p>{fa.outdated_settings_warning}</p>}
+                        </div>
+                    )}
+                    {silent.length > 0 && (
+                        <p className="text-xs text-red-300">{t('haNodeCheckSilent').replace('{nodes}', () => silent.join(', '))}</p>
+                    )}
+                    {notCurrent.length > 0 && (
+                        <p className="text-xs text-yellow-300">{t('haNodeCheckNotCurrent').replace('{nodes}', () => notCurrent.join(', '))}</p>
+                    )}
+                    {error && <p role="alert" className="text-sm text-red-300" data-ha-node-check-error>{error}</p>}
+                </div>
+            );
+        }
+
+        // The switch for unsafe two-node recovery: off at any time, on only with the word
+        // typed out. And what the rules do to the guests of the node that is left.
+        function HaNodeSafety({ t, clusterId, status, authFetch, addToast, onStatus, locked }) {
+            const [asking, setAsking] = useState(false);
+            const [typed, setTyped] = useState('');
+            const [busy, setBusy] = useState(false);
+            const [error, setError] = useState('');
+            const sbp = status?.split_brain_prevention || {};
+            const known = typeof sbp.unsafe_two_node_recovery === 'boolean';
+            if (!known && !sbp.fenced_survivor_note) return null;
+            const unsafe = sbp.unsafe_two_node_recovery === true;
+            // the switch only means something where quorum gets forced
+            const forces = !!(sbp.two_node_mode || sbp.force_quorum_on_failure);
+
+            const save = async (on) => {
+                setBusy(true);
+                setError('');
+                const body = on ? { unsafe_two_node_recovery: true, confirm_unsafe_two_node: typed }
+                    : { unsafe_two_node_recovery: false };
+                const res = await haNodeSend(authFetch, `${API_URL}/clusters/${clusterId}/ha/config`, 'PUT', body, t('operationFailed'));
+                setBusy(false);
+                if (!res.ok) { setError(res.error); return; }
+                setAsking(false);
+                setTyped('');
+                if (res.data.status) onStatus(res.data.status);
+                addToast(t(on ? 'haNodeUnsafeSavedOn' : 'haNodeUnsafeSavedOff'), on ? 'warning' : 'success');
+            };
+            const toggle = () => {
+                setError('');
+                if (unsafe) { save(false); return; }
+                setTyped('');
+                setAsking(a => !a);
+            };
+
+            return (
+                <div className="p-4 bg-proxmox-dark border border-proxmox-border rounded-xl mb-4 space-y-3" data-ha-node-safety>
+                    <h4 className="font-medium text-white flex items-center gap-2">
+                        <Icons.Shield className="w-4 h-4 text-proxmox-orange" />
+                        {t('haNodeSafetyTitle')}
+                    </h4>
+                    {known && (
+                        <div className="flex items-start justify-between gap-4">
+                            <div className="min-w-0">
+                                <label className="block text-sm font-medium text-white" htmlFor="ha-node-unsafe">{t('haNodeUnsafeSwitch')}</label>
+                                <p className="text-xs text-gray-500 mt-1">{t('haNodeUnsafeHint')}</p>
+                                {!unsafe && !forces && <p className="text-xs text-gray-400 mt-1" data-ha-node-unsafe-idle>{t('haNodeUnsafeNeedsForce')}</p>}
+                            </div>
+                            <button id="ha-node-unsafe" type="button" role="switch" aria-checked={unsafe}
+                                onClick={toggle} disabled={busy || locked || (!unsafe && !forces)}
+                                className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${unsafe ? 'active' : ''}`} />
+                        </div>
+                    )}
+                    {asking && !unsafe && (
+                        <div className="rounded-lg p-3 space-y-3 border bg-red-500/10 border-red-500/30" data-ha-node-unsafe-confirm>
+                            <p className="text-sm text-red-300">{t('haNodeUnsafeRisk')}</p>
+                            <div>
+                                <label className="block text-xs text-gray-400 mb-1" htmlFor="ha-node-unsafe-typed">
+                                    {t('pgHaTypeToConfirm').replace('{word}', HA_NODE_UNSAFE_WORD)}
+                                </label>
+                                <input id="ha-node-unsafe-typed" value={typed} onChange={e => setTyped(e.target.value)} autoComplete="off"
+                                    className="w-full max-w-xs bg-proxmox-darker border border-proxmox-border rounded-lg px-3 py-2 text-white text-sm font-mono" />
+                            </div>
+                            <div className="flex flex-wrap justify-end gap-2">
+                                <button type="button" onClick={() => { setAsking(false); setTyped(''); setError(''); }}
+                                    className="px-3 py-1.5 text-sm bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg">
+                                    {t('cancel')}
+                                </button>
+                                <button type="button" onClick={() => save(true)} disabled={typed !== HA_NODE_UNSAFE_WORD || busy || locked}
+                                    className="px-3 py-1.5 text-sm font-medium bg-red-600 hover:bg-red-700 text-white rounded-lg disabled:opacity-50 disabled:cursor-not-allowed">
+                                    {t('haNodeUnsafeTurnOn')}
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                    {error && <p role="alert" className="text-sm text-red-300" style={{ overflowWrap: 'anywhere' }} data-ha-node-unsafe-error>{error}</p>}
+                    {sbp.fenced_survivor_note && (
+                        <div className="flex items-start gap-2 rounded-lg p-3 text-sm border bg-blue-500/10 border-blue-500/30 text-blue-200" data-ha-node-survivor>
+                            <span className="mt-0.5 flex-shrink-0 text-blue-400"><Icons.Info /></span>
+                            <span>{sbp.fenced_survivor_note}</span>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // How PegaProx powers a failed node off: one row per node. The BMC password is never
+        // sent back by the server, so its field only writes; left empty, the stored one stays.
+        function HaNodeFencing({ t, clusterId, status, nodeNames, authFetch, addToast, onStatus, locked }) {
+            const [draft, setDraft] = useState({});           // node -> {type, host, user, password}, what was touched
+            const [busy, setBusy] = useState(false);
+            const [rowError, setRowError] = useState(null);   // {node, error} the server refused
+            const [error, setError] = useState('');
+            const sbp = status?.split_brain_prevention || {};
+            const stored = sbp.fencing;
+            if (!stored || typeof stored !== 'object') return null;
+
+            const types = Array.isArray(sbp.fence_types) && sbp.fence_types.length ? sbp.fence_types : HA_NODE_FENCE_TYPES;
+            const names = Array.from(new Set([
+                ...(nodeNames || []), ...Object.keys(status.nodes || {}), ...Object.keys(stored),
+            ])).sort();
+            const saved = (node) => {
+                const f = stored[node] || {};
+                return { type: f.type || '', host: f.host || '', user: f.user || '', password: '' };
+            };
+            const rowOf = (node) => draft[node] || saved(node);
+            const edit = (node, key, value) => {
+                setDraft(d => ({ ...d, [node]: { ...(d[node] || saved(node)), [key]: value } }));
+                setRowError(e => e && e.node === node ? null : e);
+            };
+            const changed = names.filter(node => {
+                const row = draft[node];
+                if (!row) return false;
+                const was = saved(node);
+                return row.type !== was.type || row.host.trim() !== was.host || row.user.trim() !== was.user || row.password !== '';
+            });
+
+            const save = async () => {
+                setBusy(true);
+                setRowError(null);
+                setError('');
+                const fencing = {};
+                changed.forEach(node => {
+                    const row = draft[node];
+                    // no type takes the fence of the node away
+                    fencing[node] = row.type ? {
+                        type: row.type, host: row.host.trim(), user: row.user.trim(),
+                        ...(row.password ? { password: row.password } : {}),
+                    } : null;
+                });
+                let res;
+                try {
+                    res = await haNodeSend(authFetch, `${API_URL}/clusters/${clusterId}/ha/config`, 'PUT', { fencing }, t('operationFailed'));
+                } finally {
+                    setBusy(false);
+                    // a typed BMC password goes out with this request and no further: after a
+                    // refusal the rows keep the rest, the password is typed again
+                    setDraft(d => Object.fromEntries(Object.entries(d).map(([n, row]) => [n, { ...row, password: '' }])));
+                }
+                if (!res.ok) {
+                    // "fencing: <node>: <why>" says which row it is about
+                    const why = res.error.replace(/^fencing:\s*/, '');
+                    const node = res.code === 'HA_FENCING_INVALID'
+                        ? names.filter(n => why.startsWith(n + ': ')).sort((a, b) => b.length - a.length)[0] : null;
+                    if (node) setRowError({ node, error: why.slice(node.length + 2) });
+                    else setError(res.error);
+                    return;
+                }
+                setDraft({});
+                if (res.data.status) onStatus(res.data.status);
+                addToast(t('haNodeFencingSaved'));
+            };
+
+            const input = 'w-full bg-proxmox-darker border border-proxmox-border rounded px-2 py-1 text-white text-sm disabled:opacity-50';
+            const cell = 'py-2 pr-2';
+            return (
+                <div className="p-4 bg-proxmox-dark border border-proxmox-border rounded-xl mb-4 space-y-3" data-ha-node-fencing>
+                    <h4 className="font-medium text-white flex items-center gap-2">
+                        <Icons.Power className="w-4 h-4 text-proxmox-orange" />
+                        {t('haNodeFencingTitle')}
+                    </h4>
+                    <p className="text-xs text-gray-400">{t('haNodeFencingHint')}</p>
+                    {names.length === 0 ? (
+                        <p className="text-sm text-gray-500">{t('haNodeFencingNoNodes')}</p>
+                    ) : (
+                        <div className="overflow-x-auto">
+                            <table className="w-full text-sm">
+                                <thead>
+                                    <tr className="text-left text-xs text-gray-500 border-b border-proxmox-border">
+                                        <th className={`${cell} font-medium`}>{t('node')}</th>
+                                        <th className={`${cell} font-medium`}>{t('type')}</th>
+                                        <th className={`${cell} font-medium`}>{t('host')}</th>
+                                        <th className={`${cell} font-medium`}>{t('user')}</th>
+                                        <th className="py-2 font-medium">{t('password')}</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {names.map(node => {
+                                        const row = rowOf(node);
+                                        const was = stored[node];
+                                        // the stored password stays only while the type does
+                                        const keeps = !!was?.password_set && row.type === was.type;
+                                        const off = !row.type || locked || busy;
+                                        const bad = rowError && rowError.node === node;
+                                        return (
+                                            <React.Fragment key={node}>
+                                                <tr data-ha-node-fence={node} className={bad ? '' : 'border-b border-proxmox-border'}>
+                                                    <td className={`${cell} whitespace-nowrap`}>
+                                                        <span className="font-mono text-xs text-gray-200">{node}</span>
+                                                        {was && (was.verifiable ? (
+                                                            <span title={t('haNodeFenceVerifiableHint')} data-ha-node-verifiable
+                                                                className="ml-2 px-1.5 py-0.5 rounded-full border text-[11px] bg-green-500/20 text-green-300 border-green-500/30">
+                                                                {t('haNodeFenceVerifiable')}
+                                                            </span>
+                                                        ) : (
+                                                            <span title={t('haNodeFenceUnverifiedHint')}
+                                                                className="ml-2 px-1.5 py-0.5 rounded-full border text-[11px] bg-gray-500/20 text-gray-300 border-gray-500/30">
+                                                                {t('haNodeFenceUnverified')}
+                                                            </span>
+                                                        ))}
+                                                    </td>
+                                                    <td className={cell} style={{ minWidth: 104 }}>
+                                                        <select value={row.type} onChange={e => edit(node, 'type', e.target.value)} disabled={locked || busy}
+                                                            aria-label={`${t('type')} ${node}`} aria-invalid={bad ? 'true' : undefined} className={input}>
+                                                            <option value="">{t('haNodeFenceNone')}</option>
+                                                            {types.map(k => <option key={k} value={k}>{k}</option>)}
+                                                            {row.type && !types.includes(row.type) && <option value={row.type}>{row.type}</option>}
+                                                        </select>
+                                                    </td>
+                                                    <td className={cell} style={{ minWidth: 140 }}>
+                                                        <input value={row.host} onChange={e => edit(node, 'host', e.target.value)} disabled={off}
+                                                            aria-label={`${t('host')} ${node}`} autoComplete="off"
+                                                            placeholder={row.type === 'ipmi' ? t('haNodeFenceBmc') : row.type === 'ssh' ? node : ''}
+                                                            className={input} />
+                                                    </td>
+                                                    <td className={cell} style={{ minWidth: 100 }}>
+                                                        <input value={row.user} onChange={e => edit(node, 'user', e.target.value)} disabled={off}
+                                                            aria-label={`${t('user')} ${node}`} autoComplete="off"
+                                                            placeholder={row.type === 'ipmi' ? 'ADMIN' : row.type === 'ssh' ? 'root' : ''}
+                                                            className={input} />
+                                                    </td>
+                                                    <td className="py-2" style={{ minWidth: 120 }}>
+                                                        <input type="password" value={row.password} onChange={e => edit(node, 'password', e.target.value)}
+                                                            disabled={off} aria-label={`${t('password')} ${node}`}
+                                                            autoComplete="new-password" data-lpignore="true" data-1p-ignore="true" data-bwignore="true"
+                                                            placeholder={keeps ? t('haNodeFenceUnchanged') : ''} className={input} />
+                                                    </td>
+                                                </tr>
+                                                {bad && (
+                                                    <tr className="border-b border-proxmox-border" data-ha-node-fence-error={node}>
+                                                        <td colSpan={5} className="pb-2">
+                                                            <p role="alert" className="rounded px-2 py-1 text-xs border bg-red-500/10 border-red-500/30 text-red-300" style={{ overflowWrap: 'anywhere' }}>
+                                                                {rowError.error}
+                                                            </p>
+                                                        </td>
+                                                    </tr>
+                                                )}
+                                            </React.Fragment>
+                                        );
+                                    })}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+                    {error && <p role="alert" className="text-sm text-red-300" style={{ overflowWrap: 'anywhere' }} data-ha-node-fencing-error>{error}</p>}
+                    {names.length > 0 && (
+                        <div className="flex justify-end">
+                            <button type="button" onClick={save} disabled={!changed.length || busy || locked}
+                                className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-proxmox-orange hover:bg-orange-600 text-white disabled:opacity-50 disabled:cursor-not-allowed">
+                                <Icons.Save className="w-4 h-4" />
+                                {t('haNodeFencingSave')}
+                            </button>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // The cluster claim: off unless an admin writes it, with the account password and
+        // the words typed out. A claim of another instance is taken over the same way, and
+        // switching it off says what became of the file.
+        function HaNodeClaim({ t, clusterId, status, authFetch, addToast, onStatus, locked }) {
+            const { language } = useTranslation();
+            const { user, isAdmin, logout } = useAuth();
+            const [action, setAction] = useState(null);       // 'enable' | 'disable' | 'release' while its form is open
+            const [typed, setTyped] = useState('');
+            const [password, setPassword] = useState('');
+            const [busy, setBusy] = useState(false);
+            const [refused, setRefused] = useState(null);     // {code, error} of the last refusal
+            const [answer, setAnswer] = useState(null);       // {removed, warning, by_hand} of the last switch off
+            const claim = status?.cluster_claim;
+            if (!claim || typeof claim !== 'object') return null;
+
+            const on = claim.enabled === true;
+            const state = on ? (claim.state || 'unknown') : 'off';
+            const kind = haNodeClaimKind(state);
+            const foreign = on && HA_NODE_CLAIM_FOREIGN.includes(state);
+            // SSO accounts have no password here: the server asks for a fresh sign-in instead
+            const sso = ['oidc', 'entra'].includes(user?.auth_source);
+            const word = HA_NODE_CLAIM_WORD[action] || '';
+            const ready = !!action && (sso || !!password) && (!word || typed === word);
+            const open = (what) => {
+                setAction(what);
+                setTyped('');
+                setPassword('');
+                setRefused(null);
+                if (what) setAnswer(null);
+            };
+
+            const send = async () => {
+                const what = action;
+                setBusy(true);
+                setRefused(null);
+                const body = { action: what, ...(word ? { confirm: typed } : {}), ...(sso ? {} : { user_password: password }) };
+                let res;
+                try {
+                    res = await haNodeSend(authFetch, `${API_URL}/clusters/${clusterId}/ha/claim`, 'POST', body, t('operationFailed'));
+                } finally {
+                    setBusy(false);
+                    // the account password is for this request alone, whatever the answer
+                    setPassword('');
+                }
+                // a refusal can carry the claim as it is now too (a release of our own claim)
+                const now = res.data && res.data.claim && typeof res.data.claim === 'object' ? res.data.claim : null;
+                if (now) onStatus(s => ({ ...(s || {}), cluster_claim: now }));
+                if (!res.ok) {
+                    setRefused({ code: res.code, error: res.error });
+                    return;
+                }
+                open(null);
+                if (what === 'disable') {
+                    setAnswer({ removed: res.data.removed, warning: res.data.warning, by_hand: res.data.by_hand });
+                    addToast(t('haNodeClaimSwitchedOff'), res.data.warning ? 'warning' : 'success');
+                    return;
+                }
+                const result = now?.state;
+                if (result === 'ours') addToast(t(what === 'release' ? 'haNodeClaimTakenOver' : 'haNodeClaimSwitchedOn'));
+                else addToast(t(HA_NODE_CLAIM_MEANS[result] || 'haNodeClaimMeansUnknown'), 'warning');
+            };
+
+            const reauth = refused && (refused.code === 'HA_REAUTH' || refused.code === 'HA_REAUTH_RECENT');
+            const field = 'w-full bg-proxmox-darker border border-proxmox-border rounded-lg px-3 py-2 text-white text-sm';
+            return (
+                <div className="p-4 bg-proxmox-dark border border-proxmox-border rounded-xl mb-4 space-y-3" data-ha-node-claim={state}>
+                    <div className="flex items-start justify-between gap-4">
+                        <div className="min-w-0">
+                            <h4 className="font-medium text-white flex flex-wrap items-center gap-2">
+                                <Icons.Lock className="w-4 h-4 text-proxmox-orange" />
+                                <label htmlFor="ha-node-claim">{t('haNodeClaimTitle')}</label>
+                                <span data-ha-node-claim-state={kind}
+                                    className={`px-2 py-0.5 rounded-full border text-xs font-medium ${HA_NODE_CLAIM_TONE[kind]}`}>
+                                    {t(HA_NODE_CLAIM_LABEL[kind])}
+                                </span>
+                            </h4>
+                            <p className="text-xs text-gray-500 font-mono mt-1 break-all">{claim.path || '/etc/pve/pegaprox/claim'}</p>
+                        </div>
+                        <button id="ha-node-claim" type="button" role="switch" aria-checked={on}
+                            title={isAdmin ? undefined : t('haNodeClaimAdminOnly')}
+                            onClick={() => open(action ? null : on ? 'disable' : 'enable')}
+                            disabled={busy || locked || !isAdmin}
+                            className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${on ? 'active' : ''}`} />
+                    </div>
+                    {on && HA_NODE_CLAIM_MEANS[state] && (
+                        <p className={`text-sm ${kind === 'ours' ? 'text-green-300' : kind === 'foreign' || kind === 'unreadable' ? 'text-red-300' : 'text-gray-300'}`}
+                            data-ha-node-claim-means>
+                            {t(HA_NODE_CLAIM_MEANS[state])}
+                        </p>
+                    )}
+                    {on && (claim.instance || claim.checked_at) && (
+                        <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-gray-400">
+                            {claim.instance && (
+                                <span title={claim.instance}>
+                                    {t('haNodeClaimHolder').replace('{instance}', () => String(claim.instance).slice(0, 8))
+                                        .replace('{epoch}', () => claim.epoch ?? '-')}
+                                </span>
+                            )}
+                            {claim.checked_at && (
+                                <span title={fmtDate(claim.checked_at)}>{t('haNodeClaimChecked').replace('{time}', haRelTime(claim.checked_at, language))}</span>
+                            )}
+                        </div>
+                    )}
+                    {claim.warning && <p className="text-xs text-gray-400">{claim.warning}</p>}
+                    {claim.residual && (
+                        <p className="text-xs text-yellow-300" data-ha-node-claim-residual>{claim.residual}</p>
+                    )}
+                    {!isAdmin && <p className="text-xs text-gray-500">{t('haNodeClaimAdminOnly')}</p>}
+                    {foreign && isAdmin && !action && (
+                        <button type="button" onClick={() => open('release')} disabled={busy || locked}
+                            className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-red-600 hover:bg-red-700 text-white disabled:opacity-50 disabled:cursor-not-allowed">
+                            <Icons.Unlock className="w-4 h-4" />
+                            {t('haNodeClaimRelease')}
+                        </button>
+                    )}
+                    {action && (
+                        <div className={`rounded-lg p-3 space-y-3 border ${action === 'disable' ? 'bg-proxmox-darker border-proxmox-border' : 'bg-red-500/10 border-red-500/30'}`}
+                            data-ha-node-claim-form={action}>
+                            <p className={`text-sm ${action === 'disable' ? 'text-gray-300' : 'text-red-300'}`}>
+                                {t(action === 'enable' ? 'haNodeClaimEnableDesc' : action === 'release' ? 'haNodeClaimReleaseDesc' : 'haNodeClaimDisableDesc')}
+                            </p>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                {!sso && (
+                                    <div>
+                                        <label className="block text-xs text-gray-400 mb-1" htmlFor="ha-node-claim-password">{t('pgHaPassword')}</label>
+                                        <input id="ha-node-claim-password" type="password" autoComplete="current-password"
+                                            data-lpignore="true" data-1p-ignore="true" data-bwignore="true"
+                                            value={password} onChange={e => setPassword(e.target.value)}
+                                            aria-invalid={reauth ? 'true' : undefined} className={field} />
+                                    </div>
+                                )}
+                                {word && (
+                                    <div>
+                                        <label className="block text-xs text-gray-400 mb-1" htmlFor="ha-node-claim-typed">
+                                            {t('pgHaTypeToConfirm').replace('{word}', word)}
+                                        </label>
+                                        <input id="ha-node-claim-typed" value={typed} onChange={e => setTyped(e.target.value)} autoComplete="off"
+                                            className={`${field} font-mono`} />
+                                    </div>
+                                )}
+                            </div>
+                            {refused && (
+                                <div role="alert" data-ha-node-claim-refused={refused.code || 'error'}
+                                    className="rounded-lg p-2 text-sm border bg-red-500/10 border-red-500/30 text-red-300 space-y-2">
+                                    <div style={{ overflowWrap: 'anywhere' }}>{refused.error}</div>
+                                    {refused.code === 'HA_REAUTH_RECENT' && (
+                                        <button type="button" onClick={() => logout()}
+                                            className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white hover:border-gray-500">
+                                            <Icons.LogOut />
+                                            {t('pgHaSignInAgain')}
+                                        </button>
+                                    )}
+                                </div>
+                            )}
+                            <div className="flex flex-wrap justify-end gap-2">
+                                <button type="button" onClick={() => open(null)}
+                                    className="px-3 py-1.5 text-sm bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg">
+                                    {t('cancel')}
+                                </button>
+                                <button type="button" onClick={send} disabled={!ready || busy || locked}
+                                    className={`px-3 py-1.5 text-sm font-medium text-white rounded-lg disabled:opacity-50 disabled:cursor-not-allowed ${action === 'disable' ? 'bg-proxmox-orange hover:bg-orange-600' : 'bg-red-600 hover:bg-red-700'}`}>
+                                    {t(action === 'enable' ? 'haNodeClaimEnable' : action === 'release' ? 'haNodeClaimRelease' : 'haNodeClaimDisable')}
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                    {answer && (
+                        <div className={`rounded-lg p-3 text-sm border space-y-2 ${answer.warning ? 'bg-yellow-500/10 border-yellow-500/40 text-yellow-200' : 'bg-green-500/10 border-green-500/30 text-green-300'}`}
+                            data-ha-node-claim-answer={answer.removed || ''}>
+                            {answer.removed === 'removed' && <p>{t('haNodeClaimFileRemoved')}</p>}
+                            {answer.removed === 'absent' && <p>{t('haNodeClaimFileAbsent')}</p>}
+                            {answer.warning && <HaNodeText text={answer.warning} t={t} />}
+                            {answer.by_hand && !String(answer.warning || '').includes(answer.by_hand) && (<>
+                                <p>{t('haNodeByHand')}</p>
+                                <HaNodeCommand value={answer.by_hand} t={t} />
+                            </>)}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // Node recoveries a former leader of an automatic group left half done (design 5.6). Nothing
+        // resumes them on its own: the guests a run moved and did not start get one Start, the
+        // held ones only the note why not, and Dismiss says an admin dealt with the rest. The
+        // routes want ha.config, so the dashboard mounts this only for who holds it.
+        function HaNodeInterrupted({ t, clusterId, status, resources, authFetch, addToast, onReload }) {
+            const { language } = useTranslation();
+            const [busy, setBusy] = useState('');             // the run a request is out for
+            const [asking, setAsking] = useState(null);       // the run whose Dismiss asks first
+            const [results, setResults] = useState({});       // run -> {started, failed} of its last Start
+            const [error, setError] = useState(null);         // {run, text} of the last refusal
+            const alive = useRef(true);
+            useEffect(() => () => { alive.current = false; }, []);
+            const runs = Array.isArray(status?.interrupted_recoveries)
+                ? status.interrupted_recoveries.filter(r => r && typeof r === 'object' && typeof r.run === 'string' && r.run) : [];
+            const ids = (list) => Array.isArray(list) ? list.filter(v => typeof v === 'number' || typeof v === 'string') : [];
+            // the names of the guests shown here only (a started one has left the run by then), looked
+            // up once per status: the cluster may hold thousands
+            const names = useMemo(() => {
+                const want = new Set([...runs.flatMap(r => [...ids(r.moved), ...ids(r.held), ...ids(r.guests_open)]),
+                                      ...Object.values(results).flatMap(r => [...r.started, ...r.failed])].map(String));
+                const out = {};
+                if (want.size && Array.isArray(resources)) {
+                    resources.forEach(v => { if (v && want.has(String(v.vmid)) && typeof v.name === 'string' && v.name) out[v.vmid] = v.name; });
+                }
+                return out;
+            }, [status, resources, results]);
+            if (!runs.length) return null;
+
+            const guest = (vmid) => names[vmid] ? `${vmid} (${names[vmid]})` : String(vmid);
+            const send = async (rec, what) => {
+                setBusy(rec.run);
+                setError(null);
+                const res = await haNodeSend(authFetch, `${API_URL}/clusters/${clusterId}/ha/interrupted-recoveries/${what}`, 'POST',
+                                             { runs: [rec.run] }, t('operationFailed'));
+                // closed or reopened for another cluster meanwhile: this answer fills nothing there
+                if (!alive.current) return;
+                setBusy('');
+                if (!res.ok) { setError({ run: rec.run, text: res.error }); return; }
+                if (what === 'dismiss') {
+                    setAsking(null);
+                    addToast(t('haNodeIrDismissed'));
+                } else {
+                    const started = ids(res.data.started), failed = ids(res.data.failed);
+                    setResults(r => ({ ...r, [rec.run]: { started, failed } }));
+                    addToast(t(failed.length ? 'haNodeIrSomeFailed' : 'haNodeIrStartedAll'), failed.length ? 'warning' : 'success');
+                }
+                onReload();
+            };
+
+            return (
+                <div className="p-4 rounded-xl border bg-yellow-500/10 border-yellow-500/40 mb-4 space-y-3" data-ha-node-interrupted={runs.length}>
+                    <h4 className="font-medium text-yellow-300 flex items-center gap-2">
+                        <Icons.AlertTriangle className="w-4 h-4" />
+                        {t('haNodeIrTitle')}
+                    </h4>
+                    <p className="text-sm text-yellow-200">{t('haNodeIrIntro')}</p>
+                    {runs.map(rec => {
+                        const moved = ids(rec.moved), held = ids(rec.held), open = ids(rec.guests_open);
+                        const done = results[rec.run];
+                        const node = String(rec.node || '-');
+                        return (
+                            <div key={rec.run} data-ha-node-run={rec.run} className="p-3 bg-proxmox-dark border border-proxmox-border rounded-lg space-y-2">
+                                <div className="flex flex-wrap items-start justify-between gap-2">
+                                    <div className="text-sm text-white" style={{ overflowWrap: 'anywhere' }}>
+                                        {t('haNodeIrRun').replace('{node}', () => node)
+                                            .replace('{instance}', () => String(rec.instance_id || '-').slice(0, 8)).replace('{epoch}', () => rec.epoch ?? '-')}
+                                    </div>
+                                    {rec.at && <span className="text-xs text-gray-400" title={fmtDate(rec.at)}>{haRelTime(rec.at, language)}</span>}
+                                </div>
+                                {moved.length > 0 && (
+                                    <div className="space-y-2" data-ha-node-run-moved={moved.join(',')}>
+                                        <p className="text-sm text-gray-200">
+                                            {t('haNodeIrMoved')} <span className="font-mono text-xs">{moved.map(guest).join(', ')}</span>
+                                        </p>
+                                        <button type="button" onClick={() => send(rec, 'start')} disabled={!!busy}
+                                            className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-green-600 hover:bg-green-500 text-white disabled:opacity-50 disabled:cursor-not-allowed">
+                                            <Icons.Play className="w-4 h-4" />
+                                            {t('haNodeIrStart')}
+                                        </button>
+                                    </div>
+                                )}
+                                {held.length > 0 && (
+                                    <div className="space-y-1" data-ha-node-run-held={held.join(',')}>
+                                        <p className="text-sm text-gray-200">
+                                            {t('haNodeIrHeld')} <span className="font-mono text-xs">{held.map(guest).join(', ')}</span>
+                                        </p>
+                                        <p className="text-xs text-yellow-300" data-ha-node-run-held-note>
+                                            {t('haNodeIrHeldNote').replace(/\{node\}/g, () => node)}
+                                        </p>
+                                    </div>
+                                )}
+                                {open.length > 0 && (
+                                    <p className="text-sm text-gray-300" data-ha-node-run-open={open.join(',')}>
+                                        {t('haNodeIrOpen')} <span className="font-mono text-xs">{open.map(guest).join(', ')}</span>
+                                    </p>
+                                )}
+                                {done && (
+                                    <div className="text-xs space-y-0.5" data-ha-node-run-result>
+                                        {done.started.length > 0 && <p className="text-green-300">{t('haNodeIrStarted').replace('{list}', () => done.started.map(guest).join(', '))}</p>}
+                                        {done.failed.length > 0 && <p className="text-red-300">{t('haNodeIrFailed').replace('{list}', () => done.failed.map(guest).join(', '))}</p>}
+                                    </div>
+                                )}
+                                {error && error.run === rec.run && (
+                                    <p role="alert" className="text-sm text-red-300" style={{ overflowWrap: 'anywhere' }} data-ha-node-run-error>{error.text}</p>
+                                )}
+                                {asking === rec.run ? (
+                                    <div className="rounded-lg p-2 space-y-2 border bg-proxmox-darker border-proxmox-border" data-ha-node-run-ask>
+                                        <p className="text-sm text-gray-300">{t('haNodeIrDismissAsk')}</p>
+                                        <div className="flex flex-wrap justify-end gap-2">
+                                            <button type="button" onClick={() => setAsking(null)}
+                                                className="px-3 py-1.5 text-sm bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg">
+                                                {t('cancel')}
+                                            </button>
+                                            <button type="button" onClick={() => send(rec, 'dismiss')} disabled={!!busy}
+                                                className="px-3 py-1.5 text-sm font-medium bg-proxmox-orange hover:bg-orange-600 text-white rounded-lg disabled:opacity-50 disabled:cursor-not-allowed">
+                                                {t('haNodeIrDismiss')}
+                                            </button>
+                                        </div>
+                                    </div>
+                                ) : (
+                                    <button type="button" onClick={() => { setAsking(rec.run); setError(null); }} disabled={!!busy}
+                                        className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white hover:border-gray-500 disabled:opacity-50 disabled:cursor-not-allowed">
+                                        <Icons.X className="w-4 h-4" />
+                                        {t('haNodeIrDismiss')}
+                                    </button>
+                                )}
+                            </div>
+                        );
+                    })}
+                </div>
+            );
+        }
+
+        // HA is off, but the server could not tell for every node that its agents are gone, or
+        // could not take the claim off: its words stay on screen until the admin closes them
+        function HaNodeDisableReport({ report, onClose, t }) {
+            const failed = Array.isArray(report.agents_failed) ? report.agents_failed : [];
+            const unconfirmed = Array.isArray(report.agents_unconfirmed) ? report.agents_unconfirmed : [];
+            const byHand = report.claim && report.claim.by_hand;
+            return (
+                <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={onClose}>
+                    <div role="alertdialog" aria-labelledby="ha-node-disable-title" data-ha-node-disable-report onClick={e => e.stopPropagation()}
+                        className="bg-proxmox-card border border-yellow-500/40 rounded-xl w-full max-w-xl max-h-[85vh] overflow-y-auto">
+                        <div className="flex items-start gap-3 p-4 border-b border-proxmox-border bg-proxmox-dark">
+                            <span className="mt-1 flex-shrink-0 text-yellow-400"><Icons.AlertTriangle /></span>
+                            <div className="min-w-0">
+                                <h2 id="ha-node-disable-title" className="text-lg font-semibold text-white">{t('haNodeDisableTitle')}</h2>
+                                {report.cluster && <p className="text-sm text-gray-500">{report.cluster}</p>}
+                            </div>
+                        </div>
+                        <div className="p-4 space-y-3">
+                            {failed.length > 0 && (
+                                <p className="text-sm text-red-300" data-ha-node-disable-failed>{t('haNodeDisableFailed').replace('{nodes}', () => failed.join(', '))}</p>
+                            )}
+                            {unconfirmed.length > 0 && (
+                                <p className="text-sm text-yellow-300" data-ha-node-disable-unconfirmed>{t('haNodeDisableUnconfirmed').replace('{nodes}', () => unconfirmed.join(', '))}</p>
+                            )}
+                            <HaNodeText text={report.warning} t={t} className="text-sm text-gray-200" />
+                            {byHand && !String(report.warning || '').includes(byHand) && <HaNodeCommand value={byHand} t={t} />}
+                        </div>
+                        <div className="flex justify-end p-4 border-t border-proxmox-border bg-proxmox-dark">
+                            <button type="button" onClick={onClose} autoFocus
+                                className="px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-white">
+                                {t('close')}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
         function PegaProxDashboard() {
             const { t } = useTranslation();
-            const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences } = useAuth();
-            const can = (permission) => isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(permission));
+            const { user, sessionId, logout, getAuthHeaders, isAdmin, passwordExpiry, updatePreferences, ha, haReadOnly, haStandby, haConsolesElsewhere, haServing, refreshHa } = useAuth();
+            // #625: a standby shows the clusters read-only, or none at all with its live view off.
+            // Since forwarding, haReadOnly holds only while it does not forward, haStandby on
+            // every standby, haConsolesElsewhere on one that does not serve users
+            // on a standby only the reading permissions count, for admins too
+            const can = (permission) => (!haReadOnly || haReadPermission(permission)) &&
+                (isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(permission)));
+            // what the account holds, the standby rule aside: only for a tab that just reads,
+            // so a standby keeps showing it (#625); its buttons still ask can()
+            const holds = (permission) => isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes(permission));
+            // #625: the node HA parts of the HA settings write through routes that want
+            // ha.config; with ha.view alone they show what is set and change nothing
+            const haWrite = can('ha.config');
+            // not can(): the auto-install routes also refuse tenant/cluster-confined callers
+            // (capped admins included), the server folds that into this flag for us
+            const canAutoInstall = !!user?.autoinstall_access;
             const { isCorporate, isCloud } = useLayout(); // LW: Feb 2026 - corporate layout / NS 2026-06: + cloud (Preview)
             const [clusters, setClusters] = useState([]);
             const [clusterGroups, setClusterGroups] = useState([]); // NS Jan 2026 - for grouping
@@ -8003,7 +10387,13 @@
             const [selectedGroup, setSelectedGroup] = useState(null); // LW: Feb 2026 - folder overlay
             const [showGroupSettings, setShowGroupSettings] = useState(null); // group settings modal
             const [selectedCluster, setSelectedCluster] = useState(null);
-            const [clusterMetrics, setClusterMetrics] = useState({});
+            // LW Oct 2026 (#625) - on a member that forwards, the maintenance and update of
+            // its nodes are the leader's: they run in its process, and the leader's
+            // /node-progress is laid over what this instance reads itself (haWithLeaderProgress)
+            const [ownClusterMetrics, setClusterMetrics] = useState({});
+            const [leaderNodeProgress, setLeaderNodeProgress] = useState(null);
+            const clusterMetrics = useMemo(() => haWithLeaderProgress(ownClusterMetrics, leaderNodeProgress, selectedCluster?.id),
+                [ownClusterMetrics, leaderNodeProgress, selectedCluster?.id]);
             const [allClusterMetrics, setAllClusterMetrics] = useState({}); // LW: metrics cache for overview page
             const [topGuests, setTopGuests] = useState([]); // top vms for overview table
             const [allClusterGuests, setAllClusterGuests] = useState({}); // NS: Mar 2026 - per-cluster guests for topology
@@ -8033,11 +10423,18 @@
             const [sidebarWorldmap, setSidebarWorldmap] = useState(false);
             const [showUserMenu, setShowUserMenu] = useState(false);
             const [showSettings, setShowSettings] = useState(false);
+            // the modal is always mounted and listens, so the tab switch lands right away
+            const openHaSettings = () => {
+                setShowSettings(true);
+                window.dispatchEvent(new CustomEvent('pegaprox-navigate-ha'));
+            };
             const [showProfile, setShowProfile] = useState(false);
             // LW Apr 2026 — global fuzzy-search palette (Ctrl/Cmd+K)
             const [showCommandPalette, setShowCommandPalette] = useState(false);
             // MK May 2026 — shortcuts overlay (`?`)
             const [showShortcutsModal, setShowShortcutsModal] = useState(false);
+            // LW Oct 2026 - the API reference from the user menu
+            const [showApiReference, setShowApiReference] = useState(false);
             // NS May 2026 — bulk-action selection state for VM list
             const [bulkSelection, setBulkSelection] = useState({});  // { 'clusterId:vmid': true }
             // LW May 2026 — VM quick filter chips
@@ -8226,6 +10623,8 @@
             // LW: Mar 2026 - Cross-Hypervisor Migration (XHM) state
             const [sidebarXHM, setSidebarXHM] = useState(false);
             const [sidebarMultiSdn, setSidebarMultiSdn] = useState(false); // #612 — Multi-Cluster EVPN view
+            const [sidebarAutoInstall, setSidebarAutoInstall] = useState(false);
+            const [autoInstallIntent, setAutoInstallIntent] = useState(null); // {wizard, target_cluster_id} handed to the panel once
             const [xhmMigrations, setXhmMigrations] = useState([]);
             const [xhmSelectedMigration, setXhmSelectedMigration] = useState(null);
             const [xhmMigrationDetail, setXhmMigrationDetail] = useState(null);
@@ -8292,7 +10691,23 @@
             };
 
             // NS: auto-clear topology/xhm sidebar when navigating to something else
-            useEffect(() => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup) { setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); } }, [selectedCluster, selectedPBS, selectedVMware, selectedGroup]);
+            useEffect(() => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup) { setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); } }, [selectedCluster, selectedPBS, selectedVMware, selectedGroup]);
+
+            // All Clusters used to check only XHM, so it stayed lit next to World Map / EVPN
+            const onGlobalView = sidebarTopology || sidebarWorldmap || sidebarXHM || sidebarMultiSdn || sidebarAutoInstall;
+            // one way in for every auto-install shortcut, intent opens the wizard on arrival
+            const openAutoInstall = (intent = null) => {
+                setSidebarAutoInstall(true); setSidebarTopology(false); setSidebarWorldmap(false); setSidebarXHM(false); setSidebarMultiSdn(false);
+                setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null);
+                setAutoInstallIntent(intent);
+            };
+            // the other global views, one place for the Modern rows and the corporate Tools section
+            const openTopology = () => { setSidebarTopology(true); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarWorldmap(false); setSidebarXHM(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); };
+            const openWorldmap = () => { setSidebarWorldmap(true); setSidebarTopology(false); setSidebarXHM(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); };
+            const openXhm = () => { setSidebarXHM(true); setSidebarTopology(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); };
+            const openMultiSdn = () => { setSidebarMultiSdn(true); setSidebarXHM(false); setSidebarTopology(false); setSidebarWorldmap(false); setSidebarAutoInstall(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); };
+            // XHM needs a cluster on each side
+            const hasXhmPair = clusters.some(c => c.type === 'xcpng' || c.cluster_type === 'xcpng') && clusters.some(c => c.type !== 'xcpng' && c.cluster_type !== 'xcpng');
 
             // track selected XHM migration in ref for SSE updates
             useEffect(() => { xhmSelectedMigrationRef.current = xhmSelectedMigration; }, [xhmSelectedMigration]);
@@ -8328,6 +10743,15 @@
                     return updated;
                 });
             }, []);
+            // the Tools section of the corporate sidebar folds away, remembered per browser
+            const [corpToolsCollapsed, setCorpToolsCollapsed] = useState(() => {
+                try { return localStorage.getItem('pegaprox_corp_tools_collapsed') === '1'; } catch (_) { return false; }
+            });
+            const toggleCorpTools = () => {
+                const next = !corpToolsCollapsed;
+                setCorpToolsCollapsed(next);
+                try { localStorage.setItem('pegaprox_corp_tools_collapsed', next ? '1' : '0'); } catch (_) {}
+            };
             const [expandedVmwareSidebarHosts, setExpandedVmwareSidebarHosts] = useState({});
             // LW: Feb 2026 - multi-cluster sidebar expansion (independent of selectedCluster)
             const [expandedSidebarClusters, setExpandedSidebarClusters] = useState({});
@@ -8335,6 +10759,7 @@
             const [loadingSidebarClusters, setLoadingSidebarClusters] = useState({}); // NS: Mar 2026 - spinner while fetching tree data
             const [ctxMenu, setCtxMenu] = useState(null); // LW: Mar 2026 - right-click context menu { type, target, position }
             const [renamingCluster, setRenamingCluster] = useState(null);
+            const [connCheckCluster, setConnCheckCluster] = useState(null);  // LW Oct 2026 - connection check modal
             const [renameValue, setRenameValue] = useState('');
             // #256: Re-configure cluster
             const [reconfigureCluster, setReconfigureCluster] = useState(null);
@@ -8416,6 +10841,7 @@
             // This was causing tasks to "jump back" when SSE and polling raced
             const taskUpdateTimestamp = useRef(0);
             const initialTaskFetchPending = useRef(true);  // NS: skip stale check on initial load
+            const taskFetchGen = useRef(0);  // LW Oct 2026 (#828) - moves on with every cluster switch
             const [showTaskBar, setShowTaskBar] = useState(true);  // localStorage.getItem('showTaskBar') !== 'false'
             const [actionLoading, setActionLoading] = useState({});
             const [warningBannerDismissed, setWarningBannerDismissed] = useState(false);
@@ -8429,6 +10855,8 @@
             useEffect(() => { setMobileSidebarOpen(false); }, [
                 selectedGroup, selectedCluster, selectedPBS, selectedVMware,
                 selectedSidebarVm, selectedSidebarNode, selectedSidebarDatastore, activeTab,
+                // the global views set no selection, so they never closed the drawer
+                sidebarTopology, sidebarWorldmap, sidebarXHM, sidebarMultiSdn, sidebarAutoInstall,
             ]);
             const sidebarResizing = useRef(false);
             const wsRef = useRef(null);
@@ -8459,7 +10887,7 @@
             
             // HA Settings state
             // NS: these defaults should probably come from backend
-            const [haSettings, setHaSettings] = useState({
+            const haSettingsDefaults = {
                 quorum_enabled: true,
                 quorum_hosts: '',
                 quorum_gateway: '',
@@ -8477,9 +10905,15 @@
                 poison_pill_enabled: true,
                 strict_fencing: false,
                 pegaprox_vmid: '',
-            });
+            };
+            const [haSettings, setHaSettings] = useState(haSettingsDefaults);
             const [haStatus, setHaStatus] = useState(null);
+            // the status request of the selected cluster failed: {text} with the server's words
+            const [haStatusError, setHaStatusError] = useState(null);
             const [showHaSettings, setShowHaSettings] = useState(false);
+            // #625: the last agent check of the open HA settings, and what HA disable left behind
+            const [haAgentCheck, setHaAgentCheck] = useState(null);
+            const [haDisableReport, setHaDisableReport] = useState(null);
             
             // NS: Global Search state - Jan 2026
             const [globalSearchQuery, setGlobalSearchQuery] = useState('');
@@ -8488,6 +10922,16 @@
                 const saved = localStorage.getItem('corp-theme');
                 if (saved === 'light') document.body.dataset.corpTheme = 'light';
                 return saved === 'light';
+            });
+            // LW Sep 2026 (#743) - Corporate hides the theme grid (#742), so the
+            // header toggle is the only place a corporate user can reach the new option.
+            // It cycles system -> light -> dark -> system instead of growing a third control.
+            const [corpMode, setCorpMode] = useState(() => {
+                try {
+                    return localStorage.getItem('pegaprox-theme') === 'system'
+                        ? 'system'
+                        : (localStorage.getItem('corp-theme') === 'light' ? 'light' : 'dark');
+                } catch (_) { return 'dark'; }
             });
             const [globalSearchResults, setGlobalSearchResults] = useState(null);
             const [globalSearchLoading, setGlobalSearchLoading] = useState(false);
@@ -8540,9 +10984,15 @@
             const [alertChannels, setAlertChannels] = useState([]);
             const [pickedChannels, setPickedChannels] = useState(['email']);
             const [activeAlerts, setActiveAlerts] = useState([]);  // NS #501 — firing incidents
+            const [activeAlertsAway, setActiveAlertsAway] = useState(false);  // kept by the leader only (#625)
             const [escSteps, setEscSteps] = useState([]);  // NS #501 — escalation steps in the create modal
             const [alertMetricSel, setAlertMetricSel] = useState('cpu');  // #601 — drives the threshold unit (% vs °C)
             const [editingAlert, setEditingAlert] = useState(null);  // #618 — alert being edited (null = create)
+            // LW Oct 2026 - mutes of the cluster, and which mute menu is open ({ kind: 'rule'|'incident', id })
+            const [alertMutes, setAlertMutes] = useState([]);
+            const [muteMenu, setMuteMenu] = useState(null);
+            const [muteWholeObject, setMuteWholeObject] = useState(false);
+            const EVENT_ALERT_METRICS = ['task_failed', 'ceph_health', 'replication', 'snapshot_age', 'backup_coverage', 'zfs_health'];
             const [sessionExpired, setSessionExpired] = useState(false);  // any 401 -> clear "session expired" overlay instead of silent failure
             const [clusterAffinityRules, setClusterAffinityRules] = useState([]);
             const [showAffinityModal, setShowAffinityModal] = useState(false);
@@ -8620,8 +11070,12 @@
             // a new identity, which tore down + re-ran their effects on every SSE-driven render — the
             // 60s poll never elapsed (~4 req/s from one idle tab). Deps: only getAuthHeaders (now
             // stable); setSessionExpired/setConnectionError are stable React setters.
+            // #625 v2 - what authFetch does with a 409 HA_STANDBY, set further down once
+            // addToast and t exist. A ref, because authFetch keeps one identity for good.
+            // And with the 503 HA_ACTIVE_UNREACHABLE of a forwarding standby
+            const haRefusedRef = useRef(null);
             const authFetch = React.useCallback(async (url, opts = {}) => {
-                const { timeout, ...rest } = opts;
+                const { timeout, quiet, ...rest } = opts;
                 let ctrl, timer;
                 if (timeout) {
                     ctrl = new AbortController();
@@ -8643,6 +11097,27 @@
                         setSessionExpired(true);
                     }
                     setConnectionError(null);
+                    // #625 v2 - a standby refuses what acts. One translated toast here, and the
+                    // caller gets the same words as err.error, so its own error toast is the
+                    // same message and addToast drops it. quiet: a background read sent as a POST.
+                    // A forwarding standby answers 503 when the active is out of reach; the
+                    // same, in other words. Not for a read: a list only the leader keeps says
+                    // so itself (haLeaderAway), and a poll would toast every round.
+                    if ((res.status === 409 || res.status === 503) && haRefusedRef.current) {
+                        const body = await res.clone().json().catch(() => null);
+                        const code = body && body.code;
+                        // the leader of an automatic group without its lease, or handing it on: the
+                        // banner (no leader, takeover) is read again; the caller says what failed
+                        if (res.status === 503 && (code === 'HA_NO_LEASE' || code === 'HA_TRANSFER')) {
+                            window.dispatchEvent(new CustomEvent('pegaprox-ha-lease'));
+                        }
+                        if ((res.status === 409 && code === 'HA_STANDBY') || (res.status === 503 && code === 'HA_ACTIVE_UNREACHABLE')) {
+                            const read = res.status === 503 && (rest.method || 'GET').toUpperCase() === 'GET';
+                            const error = haRefusedRef.current(quiet || read, code);
+                            return new Response(JSON.stringify({ ...body, error }),
+                                { status: res.status, statusText: res.statusText, headers: { 'Content-Type': 'application/json' } });
+                        }
+                    }
                     return res;
                 } catch (err) {
                     // an aborted poll is a soft-fail — callers already treat null as "skip this round"
@@ -8668,8 +11143,11 @@
             useEffect(() => { vmwareSelectedMigrationRef.current = vmwareSelectedMigration; }, [vmwareSelectedMigration]);
 
             const addToast = (message, type = 'success') => {
-                const id = Date.now();
-                setToasts(prev => [...prev, { id, message, type }]);
+                const id = Date.now() + Math.random();
+                // the same message twice at once says nothing new (authFetch and its caller
+                // both report a standby refusal, #625). The newer one replaces the older and
+                // gets its own full lifetime, so a retry that fails the same way still shows.
+                setToasts(prev => [...prev.filter(x => x.message !== message || x.type !== type), { id, message, type }]);
                 // auto remove after 5 seconds
                 setTimeout(() => {
                     setToasts(prev => prev.filter(t => t.id !== id));
@@ -8679,6 +11157,27 @@
             const removeToast = (id) => {
                 setToasts(prev => prev.filter(toast => toast.id !== id));
             };
+
+            // the words for a standby refusal (#625), fresh every render for the language.
+            // The active out of reach has its own, and a console refused on a forwarding
+            // standby too. Either answer may mean forwarding just changed, so the banner and
+            // the buttons are read again. A member that serves users is the active instance
+            // to them: its words name the leader.
+            haRefusedRef.current = (quiet = false, code = '') => {
+                const msg = t(code === 'HA_ACTIVE_UNREACHABLE' ? (haServing ? 'pgHaLeaderUnreachable' : 'pgHaActiveUnreachable')
+                    : code === 'console' ? 'pgHaConsoleOnActive' : haServing ? 'pgHaServingRefused' : 'pgHaStandbyRefused');
+                if (!quiet) addToast(msg, 'error');
+                if (!quiet && code !== 'console') refreshHa?.();
+                return msg;
+            };
+
+            // #625 - a context menu entry for where a console or shell entry sits on the
+            // active: the same view there, in a new tab. Only for who holds the permission,
+            // as the entry it replaces; the active checks it again anyway.
+            const onActiveItems = (permission, search, disabled = false) => !holds(permission) ? [] : [{
+                label: t('pgHaOpenOnActive'), icon: <Icons.ExternalLink className="w-3.5 h-3.5" />, disabled,
+                onClick: () => { if (!haOpenOnActive(ha?.peer_url, search)) haRefusedRef.current?.(false, 'console'); },
+            }];
 
             // MK May 2026 — one-time discoverability hint for the new ?-shortcuts.
             // localStorage flag survives reloads; per-browser, not per-user (simple).
@@ -8732,6 +11231,133 @@
                 return React.createElement(React.Fragment, null, text.slice(0, idx), React.createElement('span', {style: {color: 'var(--corp-accent)', fontWeight: 600}}, text.slice(idx, idx + search.length)), text.slice(idx + search.length));
             };
             const isSidebarGuestTemplate = (guest = {}) => guest.template === 1 || guest.template === '1' || guest.template === true;
+
+            // LW Oct 2026 - starred clusters, nodes and guests, flat rows at the top of the
+            // sidebar. Opening one goes where the tree and the global search go.
+            const openFavorite = (kind, f) => {
+                setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null);
+                if (kind === 'cluster') {
+                    const c = clusters.find(cl => cl.id === f);
+                    if (c) setSelectedCluster(c);
+                    return;
+                }
+                if (isCorporate) setExpandedSidebarClusters(prev => ({ ...prev, [f.cluster_id]: true }));
+                if (kind === 'node') { navigateToResult({ type: 'node', cluster_id: f.cluster_id, name: f.node }); return; }
+                const live = favoriteGuestLive[`${f.cluster_id}:${f.vmid}`];
+                navigateToResult({ type: f.type === 'lxc' ? 'lxc' : 'qemu', cluster_id: f.cluster_id, vmid: f.vmid,
+                    node: live?.node, name: live?.name || f.name, status: live?.status });
+            };
+            const unstarFavorite = (kind, f) => {
+                if (kind === 'cluster') toggleFavorite('cluster', f);
+                else if (kind === 'node') toggleNodeFavorite(f.cluster_id, f.node);
+                else toggleFavorite('vm', f.cluster_id, f.vmid, f.type === 'lxc' ? 'lxc' : 'qemu');
+            };
+            const renderFavoritesGroup = () => {
+                const byId = new Map(clusters.map(c => [c.id, c]));
+                const rows = [];
+                (favorites.clusters || []).forEach(cid => {
+                    const c = byId.get(cid);
+                    if (c) rows.push({ key: `c:${cid}`, kind: 'cluster', fav: cid, label: clusterLabel(c), sub: '' });
+                });
+                (favorites.nodes || []).forEach(f => {
+                    const c = byId.get(f.cluster_id);
+                    if (c) rows.push({ key: `n:${f.cluster_id}:${f.node}`, kind: 'node', fav: f, label: f.node, sub: clusterLabel(c) });
+                });
+                (favorites.vms || []).forEach(f => {
+                    const c = byId.get(f.cluster_id);
+                    if (!c) return;
+                    const live = favoriteGuestLive[`${f.cluster_id}:${f.vmid}`];
+                    rows.push({ key: `v:${f.cluster_id}:${f.vmid}`, kind: 'vm', fav: f, sub: clusterLabel(c), ct: f.type === 'lxc',
+                        label: (live && live.name) || f.name || `${f.type === 'lxc' ? 'CT' : 'VM'} ${f.vmid}`,
+                        running: live ? live.status === 'running' : null });
+                });
+                if (!rows.length) return null;
+                const kindIcon = (row) => row.kind === 'cluster' ? <Icons.Database /> : row.kind === 'node' ? <Icons.Server />
+                    : row.ct ? <Icons.Box className="w-4 h-4" /> : <Icons.Monitor />;
+                const open = (row) => openFavorite(row.kind, row.fav);
+                // LW Oct 2026 - corporate: a favorite opens the right-click menu its row in the tree
+                // has. A guest whose cluster is not loaded yet has nothing to show: browser menu then
+                const onCtx = (row) => (e) => {
+                    const position = { x: e.clientX, y: e.clientY };
+                    let menu = null;
+                    if (row.kind === 'cluster') {
+                        const c = byId.get(row.fav);
+                        if (c) menu = { type: 'cluster', target: c, position };
+                    } else if (row.kind === 'node') {
+                        const cid = row.fav.cluster_id;
+                        const met = (selectedCluster && selectedCluster.id === cid ? clusterMetrics : sidebarClusterData[cid]?.metrics) || {};
+                        const m = met[row.fav.node];
+                        menu = { type: 'node', position,
+                            target: { nodeName: row.fav.node, clusterId: cid, online: !!m && m.status !== 'offline', maintenance: !!(m && m.maintenance_mode) } };
+                    } else {
+                        const live = favoriteGuestLive[`${row.fav.cluster_id}:${row.fav.vmid}`];
+                        if (live) menu = { type: 'vm', target: { ...live, _clusterId: row.fav.cluster_id }, position };
+                    }
+                    if (menu) { e.preventDefault(); setCtxMenu(menu); }
+                };
+                const onKey = (row) => (e) => { if (e.key === 'Enter') { e.preventDefault(); open(row); } };
+                const unstar = (row) => !haReadOnly && (
+                    <button onClick={(e) => { e.stopPropagation(); unstarFavorite(row.kind, row.fav); }}
+                        className="flex-shrink-0 opacity-60 hover:opacity-80" title={t('favRemove')} data-unstar={row.key}>
+                        <Icons.Star className="w-3.5 h-3.5 fill-yellow-400 text-yellow-400" />
+                    </button>
+                );
+                const dot = (row) => row.running === null || row.running === undefined ? null : (
+                    <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: row.running ? '#22c55e' : '#6b7280' }} />
+                );
+                const header = (
+                    <div role="button" tabIndex={0} aria-expanded={!favoritesCollapsed} data-testid="sidebar-favorites-toggle"
+                        onClick={toggleFavoritesCollapsed}
+                        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleFavoritesCollapsed(); } }}
+                        className={`flex items-center gap-1.5 cursor-pointer ${isCorporate ? 'px-1 py-0.5' : 'px-3 py-2'}`}>
+                        {favoritesCollapsed ? <Icons.ChevronRight className="w-3 h-3 text-gray-500" /> : <Icons.ChevronDown className="w-3 h-3 text-gray-500" />}
+                        <Icons.Star className="w-3.5 h-3.5 fill-yellow-400 text-yellow-400" />
+                        <h2 className="flex-1 text-sm font-semibold text-gray-400 uppercase tracking-wider">{t('favoritesGroup')}</h2>
+                        <span className="text-xs text-gray-500">{rows.length}</span>
+                    </div>
+                );
+                if (isCorporate) {
+                    return (
+                        <div className="pb-1" data-testid="sidebar-favorites">
+                            {header}
+                            {!favoritesCollapsed && rows.map(row => (
+                                <div key={row.key} tabIndex={0} data-fav-row={row.key}
+                                    className="corp-tree-child flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5 cursor-pointer"
+                                    style={{ color: 'var(--corp-text-secondary)' }}
+                                    onClick={() => open(row)} onKeyDown={onKey(row)} onContextMenu={onCtx(row)}
+                                    onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }}
+                                    onMouseLeave={(e) => { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; }}>
+                                    <span className="flex flex-shrink-0" style={{ color: 'var(--corp-accent)' }}>{kindIcon(row)}</span>
+                                    <span className="truncate flex-1">{row.label}</span>
+                                    {dot(row)}
+                                    {row.sub && <span className="text-[11px] truncate" style={{ color: 'var(--corp-text-muted)', maxWidth: '45%' }}>{row.sub}</span>}
+                                    {unstar(row)}
+                                </div>
+                            ))}
+                        </div>
+                    );
+                }
+                return (
+                    <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden" data-testid="sidebar-favorites">
+                        {header}
+                        {!favoritesCollapsed && (
+                            <div className="border-t border-proxmox-border py-1">
+                                {rows.map(row => (
+                                    <div key={row.key} role="button" tabIndex={0} data-fav-row={row.key}
+                                        className="flex items-center gap-2 px-3 py-1.5 text-sm text-gray-300 hover:bg-proxmox-hover hover:text-white cursor-pointer"
+                                        onClick={() => open(row)} onKeyDown={onKey(row)}>
+                                        <span className="flex flex-shrink-0 text-gray-400">{kindIcon(row)}</span>
+                                        <span className="truncate flex-1">{row.label}</span>
+                                        {dot(row)}
+                                        {row.sub && <span className="text-xs text-gray-500 truncate" style={{ maxWidth: '40%' }}>{row.sub}</span>}
+                                        {unstar(row)}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                );
+            };
 
             // LW: Feb 2026 - corporate inline inventory tree: nodes + VMs flat under cluster
             const renderInlineNodeTree = (clusterId) => {
@@ -9582,11 +12208,15 @@
             
             // NS: Toggle favorite
             const toggleFavorite = async (type, clusterId, vmid = null, vmType = null, nodeName = null) => {
+                // LW Oct 2026 - a container row of the search says 'ct', its star is a VM favorite
+                // (lxc). The server keeps at most so many per kind and only what this user may see,
+                // and a refusal says why instead of leaving the star as it was without a word.
+                if (type === 'ct') type = 'vm';
                 const currentFavs = favorites[type + 's'] || [];
                 let isFavorite = false;
                 
                 if (type === 'vm') {
-                    isFavorite = currentFavs.some(f => f.cluster_id === clusterId && f.vmid === vmid);
+                    isFavorite = currentFavs.some(f => f.cluster_id === clusterId && String(f.vmid) === String(vmid));
                 } else if (type === 'node') {
                     isFavorite = currentFavs.some(f => f.cluster_id === clusterId && f.node === nodeName);
                 } else if (type === 'cluster') {
@@ -9599,7 +12229,7 @@
                     const body = { action, type, cluster_id: clusterId };
                     if (vmid) body.vmid = vmid;
                     if (vmType) body.vm_type = vmType;
-                    if (nodeName) body.node = nodeName;
+                    if (nodeName && type === 'node') body.node = nodeName;
                     
                     const response = await authFetch(`${API_URL}/user/favorites`, {
                         method: 'POST',
@@ -9610,6 +12240,8 @@
                     if (response && response.ok) {
                         const data = await response.json();
                         setFavorites(data.favorites);
+                    } else if (response) {
+                        addToast(await PegaProxApiErrors.message(response, t('actionFailed')), 'error');
                     }
                 } catch (err) {
                     console.error('Toggle favorite error:', err);
@@ -9618,8 +12250,8 @@
             
             // NS: Check if item is favorite
             const isFavorite = (type, clusterId, vmid = null, nodeName = null) => {
-                if (type === 'vm') {
-                    return (favorites.vms || []).some(f => f.cluster_id === clusterId && f.vmid === vmid);
+                if (type === 'vm' || type === 'ct') {
+                    return (favorites.vms || []).some(f => f.cluster_id === clusterId && String(f.vmid) === String(vmid));
                 } else if (type === 'node') {
                     return (favorites.nodes || []).some(f => f.cluster_id === clusterId && f.node === nodeName);
                 } else if (type === 'cluster') {
@@ -9627,6 +12259,49 @@
                 }
                 return false;
             };
+            // LW Oct 2026 - the favorites group at the top of the sidebar and the stars of the
+            // right-click menus. A starred guest shows its live row where the sidebar holds
+            // its cluster anyway, the stored name otherwise; only the clusters with a starred
+            // guest are walked, and only when their list changes.
+            const favoriteGuestLive = useMemo(() => {
+                const want = {};
+                (favorites.vms || []).forEach(f => { (want[f.cluster_id] = want[f.cluster_id] || new Set()).add(String(f.vmid)); });
+                const live = {};
+                Object.keys(want).forEach(cid => {
+                    const list = selectedCluster && selectedCluster.id === cid ? clusterResources : (sidebarClusterData[cid]?.resources || []);
+                    (list || []).forEach(r => {
+                        if ((r.type === 'qemu' || r.type === 'lxc') && want[cid].has(String(r.vmid))) live[`${cid}:${r.vmid}`] = r;
+                    });
+                });
+                return live;
+            }, [favorites, clusterResources, sidebarClusterData, selectedCluster?.id]);
+            // open or shut per viewer, in this browser
+            const favCollapseKey = `pegaprox-sidebar-favorites-${user?.username || '_'}`;
+            const [favoritesCollapsed, setFavoritesCollapsed] = useState(() => {
+                try { return localStorage.getItem(favCollapseKey) === '1'; } catch (e) { return false; }
+            });
+            const toggleFavoritesCollapsed = () => {
+                const next = !favoritesCollapsed;
+                setFavoritesCollapsed(next);
+                try { localStorage.setItem(favCollapseKey, next ? '1' : '0'); } catch (e) {}
+            };
+            const toggleGuestFavorite = (vm) => toggleFavorite('vm', vm._clusterId || selectedCluster?.id, vm.vmid, vm.type === 'lxc' ? 'lxc' : 'qemu');
+            const toggleNodeFavorite = (clusterId, nodeName) => toggleFavorite('node', clusterId, null, null, nodeName);
+            // a star writes the caller's own row: not where this standby refuses writes (#625)
+            const favMenuItems = (on, onClick) => haReadOnly ? [] : [{
+                label: on ? t('favRemove') : t('favAdd'),
+                icon: <Icons.Star className={`w-3.5 h-3.5 ${on ? 'fill-yellow-400 text-yellow-400' : ''}`} />,
+                onClick,
+            }];
+            // start, shut down or migrate all guests of a node ({action, clusterId, node})
+            const [nodeGuests, setNodeGuests] = useState(null);
+            // the bulk dialog of the Cloud list ({action, guests}); the table has its own
+            const [cloudBulk, setCloudBulk] = useState(null);
+            // #952: the bulk migration whose progress is open, a bump to read the runs again
+            // after one started, and the guests the Cloud list hands to the migrate dialog
+            const [bulkRunOpen, setBulkRunOpen] = useState(null);
+            const [bulkRunsTick, setBulkRunsTick] = useState(0);
+            const [cloudBulkMigrate, setCloudBulkMigrate] = useState(null);
             
             // NS: Load datacenter summary
             const loadDatacenterSummary = async () => {
@@ -9739,7 +12414,8 @@
                     const res = await authFetch(`${API_URL}/snapshots/overview`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(body)
+                        body: JSON.stringify(body),
+                        quiet: true  // a read; a standby refusing it is not the user's doing
                     });
                     if (res && res.ok) {
                         const data = await res.json();
@@ -9760,6 +12436,12 @@
             
             // #696 — stable per-row key for multi-select (the render idx is unstable across sorts)
             const snapKey = (s) => `${s.cluster_id || ''}:${s.node || ''}:${s.vm_type || ''}:${s.vmid}:${s.snapshot_name}`;
+            // selecting and deleting rows is for who may snapshot; a standby only lists (#625)
+            const canDeleteSnaps = can('vm.snapshot');
+
+            // what a refused delete says: the reason per snapshot when the server lists them,
+            // else its error (on a standby that is already the translated refusal, #625)
+            const snapDeleteError = (data, fallback) => ((data && data.errors) || []).join('; ') || (data && data.error) || fallback;
 
             // #696 — bulk-delete the checked snapshots (backend /snapshots/delete already loops an array)
             const deleteSelectedSnapshots = async (clusterId) => {
@@ -9769,12 +12451,18 @@
                     return;
                 }
                 try {
-                    await authFetch(`${API_URL}/snapshots/delete`, {
+                    const res = await authFetch(`${API_URL}/snapshots/delete`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ snapshots: chosen.map(s => ({ ...s, cluster_id: s.cluster_id || clusterId })) })
                     });
-                    addToast(`${chosen.length} snapshot(s) deleted`, 'success');
+                    const data = res ? await res.json().catch(() => ({})) : {};
+                    if (!res || !res.ok) {
+                        addToast(snapDeleteError(data, 'Failed to delete selected snapshots'), 'error');
+                        return;
+                    }
+                    addToast(`${data.deleted ?? chosen.length} snapshot(s) deleted`, 'success');
+                    if (data.errors && data.errors.length) addToast(data.errors.join('; '), 'error');
                     setSelectedSnaps({});
                     await fetchGlobalSnapshots(clusterId, snapshotFilterDate || null);
                 } catch (err) {
@@ -9788,11 +12476,16 @@
                     return;
                 }
                 try {
-                    await authFetch(`${API_URL}/snapshots/delete`, {
+                    const res = await authFetch(`${API_URL}/snapshots/delete`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ snapshots: [snap] })
                     });
+                    if (!res || !res.ok) {
+                        const data = res ? await res.json().catch(() => ({})) : {};
+                        addToast(snapDeleteError(data, 'Failed to delete snapshot'), 'error');
+                        return;
+                    }
                     addToast('Snapshot deleted', 'success');
                     await fetchGlobalSnapshots(clusterId, snapshotFilterDate || null);
                 } catch (err) {
@@ -10033,6 +12726,10 @@
                         setShowAlertModal(false);
                         loadClusterAlerts(selectedCluster.id);
                         addToast(t('alertCreated') || 'Alert created', 'success');
+                    } else if (response) {
+                        // the dialog stays open with what was typed; the server says what it refused
+                        const d = await response.json().catch(() => ({}));
+                        addToast(d.error || t('error') || 'Error', 'error');
                     }
                 } catch (err) {
                     console.error('Failed to create alert:', err);
@@ -10053,6 +12750,9 @@
                         setEditingAlert(null);
                         loadClusterAlerts(selectedCluster.id);
                         addToast(t('alertUpdated') || 'Alert updated', 'success');
+                    } else if (response) {
+                        const d = await response.json().catch(() => ({}));
+                        addToast(d.error || t('error') || 'Error', 'error');
                     }
                 } catch (err) {
                     console.error('Failed to update alert:', err);
@@ -10111,6 +12811,7 @@
                 if (!clusterId) return;
                 try {
                     const r = await authFetch(`${API_URL}/clusters/${clusterId}/active-alerts`);
+                    setActiveAlertsAway(await haLeaderAway(r));
                     if (r && r.ok) { const d = await r.json(); setActiveAlerts(d.active_alerts || []); }
                     else setActiveAlerts([]);
                 } catch (e) { setActiveAlerts([]); }
@@ -10121,6 +12822,83 @@
                     const r = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/active-alerts/${firedId}/ack`, { method: 'POST' });
                     if (r && r.ok) { addToast(t('alertAcked') || 'Alert acknowledged', 'success'); loadActiveAlerts(selectedCluster.id); }
                 } catch (e) { console.error('Failed to ack alert:', e); }
+            };
+
+            // LW Oct 2026 - mutes: a rule, an incident or everything about one guest or node, for a while
+            const loadAlertMutes = async (clusterId) => {
+                if (!clusterId) return;
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/alert-mutes`);
+                    if (r && r.ok) { const d = await r.json(); setAlertMutes(d.mutes || []); }
+                    else setAlertMutes([]);
+                } catch (e) { setAlertMutes([]); }
+            };
+            const muteAlert = async (body) => {
+                if (!selectedCluster?.id) return;
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/alert-mutes`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body)
+                    });
+                    setMuteMenu(null);
+                    if (r && r.ok) {
+                        addToast(t('alertMuteDone'), 'success');
+                        loadAlertMutes(selectedCluster.id);
+                        loadActiveAlerts(selectedCluster.id);
+                    } else if (r) {
+                        const d = await r.json().catch(() => ({}));
+                        addToast(d.error || t('error') || 'Error', 'error');
+                    }
+                } catch (e) { console.error('Failed to mute alert:', e); }
+            };
+            const unmuteAlert = async (muteId) => {
+                if (!selectedCluster?.id || !muteId) return;
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/alert-mutes/${encodeURIComponent(muteId)}`, { method: 'DELETE' });
+                    if (r && r.ok) {
+                        addToast(t('alertUnmuteDone'), 'success');
+                        setAlertMutes(prev => prev.filter(m => m.id !== muteId));
+                        loadActiveAlerts(selectedCluster.id);
+                    }
+                } catch (e) { console.error('Failed to lift mute:', e); }
+            };
+            const ruleMute = (ruleId) => alertMutes.find(m => m.rule_id === ruleId && !m.object_key);
+            // body() is read when a duration is picked, so the "every rule" box counts as it is then
+            const renderMuteChoices = (body, wholeName) => (
+                <div data-mute-menu className="mt-2 p-2 rounded-lg border border-proxmox-border bg-proxmox-darker space-y-2">
+                    <div className="text-xs text-gray-400">{t('alertMuteFor')}</div>
+                    <div className="flex flex-wrap gap-1">
+                        {[[60, 'alertMute1h'], [240, 'alertMute4h'], [1440, 'alertMute1d'], [10080, 'alertMute7d']].map(([minutes, key]) => (
+                            <button key={key} type="button" onClick={() => muteAlert({ ...body(), minutes })} className="px-2.5 py-1 text-xs bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg">
+                                {t(key)}
+                            </button>
+                        ))}
+                    </div>
+                    {wholeName && (
+                        <label className="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                            <input type="checkbox" checked={muteWholeObject} onChange={e => setMuteWholeObject(e.target.checked)} />
+                            {t('alertMuteWholeObject').replace('{name}', wholeName)}
+                        </label>
+                    )}
+                </div>
+            );
+            const fmtMuteUntil = (iso) => {
+                const d = new Date(iso);
+                return isNaN(d.getTime()) ? String(iso || '') : d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+            };
+            const alertRuleSummary = (alert) => {
+                const n = alert.threshold;
+                if (alert.metric === 'task_failed') return t('alertSummaryTask').replace('{type}', alert.task_type || 'vzdump') + (alert.task_status ? ` (${alert.task_status})` : '');
+                if (alert.metric === 'ceph_health') return `${t('alertMetricCeph')}: ${Number(n) >= 1 ? t('alertCephErrOnly') : t('alertCephWarnPlus')}`;
+                if (alert.metric === 'replication') return t('alertSummaryRepl').replace('{n}', n);
+                if (alert.metric === 'snapshot_age') return t('alertSummarySnap').replace('{n}', n);
+                if (alert.metric === 'backup_coverage') {
+                    const tags = alert.backup_exclude_tags || [];
+                    return t('backupCoverageSummary').replace('{n}', n) + (tags.length ? ` - ${t('backupCoverageExcept').replace('{tags}', tags.join(', '))}` : '');
+                }
+                if (alert.metric === 'zfs_health') return `${t('zfsAlertTitle')}: ${Number(n) >= 1 ? t('zfsAlertStateOnly') : t('zfsAlertAny')}`;
+                return `${alert.metric?.toUpperCase()} ${alert.operator} ${alert.threshold}%`;
             };
 
             // ============================================
@@ -10222,6 +13000,7 @@
             const runCveScan = async (clusterId = null) => {
                 const clId = clusterId || selectedCluster?.id;
                 if (!clId) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // debsecan runs on the nodes, from the active (#625)
 
                 setCveScanLoading(true);
                 setCveResults(null);
@@ -10249,6 +13028,7 @@
             };
 
             const installDebsecan = async (clusterId = null) => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 const clId = clusterId || selectedCluster?.id;
                 if (!clId) return;
                 setDebsecanInstalling(true);
@@ -10311,6 +13091,7 @@
             // Opens the gated confirmation modal instead of a bare confirm(), so a click-happy user
             // has to read + tick before anything touches the node (#16745 A/C).
             const applyHardening = () => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 if (!selectedCluster?.id || !hardenNode) return;
                 const toApply = Object.keys(hardenSelected).filter(k => hardenSelected[k]);
                 if (!toApply.length) { addToast(t('noControlsSelected') || 'No controls selected', 'warning'); return; }
@@ -10376,6 +13157,7 @@
 
             // NS #386: restore selected controls to their pre-apply snapshot.
             const rollbackHardening = async () => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 if (!selectedCluster?.id || !hardenNode) return;
                 const toRoll = Object.keys(hardenSelected).filter(k => hardenSelected[k]);
                 if (!toRoll.length) { addToast(t('noControlsSelected') || 'No controls selected', 'warning'); return; }
@@ -10427,6 +13209,7 @@
                     loadClusterTags(selectedCluster.id);
                     loadClusterAlerts(selectedCluster.id);
                     loadActiveAlerts(selectedCluster.id);  // NS #501
+                    loadAlertMutes(selectedCluster.id);
                     loadClusterAffinityRules(selectedCluster.id);
                     loadCustomScripts(selectedCluster.id);
                 }
@@ -10457,11 +13240,19 @@
             // HA Settings functions
             const fetchHAStatus = async (clusterId) => {
                 if (!clusterId) return;
+                // the HA settings show this instead of a form while no status has come
+                const failed = (text) => {
+                    if (selectedClusterRef.current?.id === clusterId) setHaStatusError({ text });
+                };
                 try {
                     const response = await authFetch(`${API_URL}/clusters/${clusterId}/ha/status`);
                     if (response && response.ok) {
                         const data = await response.json();
+                        // an answer for a cluster that is no longer the selected one fills
+                        // nothing: the HA settings would show it and write to the other (#625)
+                        if (selectedClusterRef.current?.id !== clusterId) return;
                         setHaStatus(data);
+                        setHaStatusError(null);
                         setHaSettings({
                             quorum_enabled: data.split_brain_prevention?.quorum_enabled ?? true,
                             quorum_hosts: (data.split_brain_prevention?.quorum_hosts || []).join(', '),
@@ -10505,14 +13296,54 @@
                             });
                             setNodeAlerts(newAlerts);
                         }
+                    } else {
+                        failed(await PegaProxApiErrors.message(response, ''));
                     }
                 } catch (err) {
                     console.error('fetching HA status:', err);
+                    failed('');
+                }
+            };
+
+            // the node HA parts read the status again after a change of theirs; unlike
+            // fetchHAStatus this leaves the form above them as the admin typed it
+            const reloadHaStatus = async () => {
+                const id = selectedCluster?.id;
+                if (!id) return;
+                const r = await authFetch(`${API_URL}/clusters/${id}/ha/status`);
+                if (r && r.ok && selectedClusterRef.current?.id === id) {
+                    const data = await r.json();
+                    setHaStatus(s => s ? data : s);
+                }
+            };
+
+            // what a node part was answered goes to the cluster it asked for; an answer that
+            // comes once another cluster is selected would fill that one's settings
+            const haFor = (id, set) => (v) => { if (selectedClusterRef.current?.id === id) set(v); };
+            // and it only updates a status that was loaded: an answer that lands while the
+            // settings were reopened and are still loading would show a form of defaults
+            const haStatusFor = (id) => haFor(id, (v) => setHaStatus(s => s ? (typeof v === 'function' ? v(s) : v) : s));
+
+            const installSelfFence = async () => {
+                try {
+                    const res = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/ha/install-self-fence`, { method: 'POST' });
+                    if (res && res.ok) {
+                        addToast(t('selfFenceInstalling'), 'success');
+                        // what the last check read is out of date once the agents are replaced
+                        setHaAgentCheck(null);
+                        setTimeout(() => fetchHAStatus(selectedCluster.id), 5000);
+                    } else {
+                        // a refused upgrade said nothing before
+                        addToast(await PegaProxApiErrors.message(res, t('operationFailed')), 'error');
+                    }
+                } catch (e) {
+                    addToast(t('error') + ': ' + e.message, 'error');
                 }
             };
 
             const handleSaveHASettings = async () => {
-                if (!selectedCluster) return;
+                // the form holds this cluster's values only once its status is here
+                if (!selectedCluster || !haStatus || !haWrite || haReadOnly) return;
                 try {
                     const response = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/ha/config`, {
                         method: 'PUT',
@@ -10529,6 +13360,11 @@
                             // 2-Node Cluster Mode - uses cluster credentials automatically
                             two_node_mode: haSettings.two_node_mode,
                             force_quorum_on_failure: haSettings.two_node_mode,
+                            // #625: what the status shows as off is saved as off. A flag stored on
+                            // under a 2-node mode that was off must not come back with it; going
+                            // unsafe is the switch below, with its word typed out. Never true from here.
+                            ...(haStatus?.split_brain_prevention?.unsafe_two_node_recovery === false
+                                ? { unsafe_two_node_recovery: false } : {}),
                             // Storage-based Split-Brain Protection - NS Jan 2026
                             storage_heartbeat_enabled: haSettings.storage_heartbeat_enabled,
                             storage_heartbeat_path: haSettings.storage_heartbeat_path,
@@ -10606,10 +13442,14 @@
             const fetchTasks = async (clusterId) => {
                 const fetchStartTime = Date.now();
                 const isInitialFetch = initialTaskFetchPending.current;
+                const gen = taskFetchGen.current;
                 try {
                     const response = await authFetch(`${API_URL}/clusters/${clusterId}/tasks`);
                     if (response && response.ok) {
                         const data = await response.json();
+                        // a cluster switch since this was asked makes it another cluster's list,
+                        // the initial fetch too, which skips the timestamp check below
+                        if (gen !== taskFetchGen.current || selectedClusterRef.current?.id !== clusterId) return;
 
                         if (Array.isArray(data)) {
                             // NS: On initial fetch, always accept response (no stale check)
@@ -10651,8 +13491,12 @@
 
             // Fetch tasks when cluster changes
             useEffect(() => {
+                // LW Oct 2026 (#625) - the HA settings belong to the cluster they were opened
+                // for: a switch through the palette must not leave them open on another one
+                setShowHaSettings(false);
                 if (selectedCluster) {
                     console.log('Cluster changed, fetching tasks for:', selectedCluster.id);
+                    taskFetchGen.current++;
                     taskUpdateTimestamp.current = 0;
                     initialTaskFetchPending.current = true;
                     setTasks([]);
@@ -10665,6 +13509,7 @@
 
                     return () => clearInterval(haInterval);
                 } else {
+                    taskFetchGen.current++;
                     setTasks([]);
                     setNodeAlerts({});
                 }
@@ -11584,9 +14429,12 @@
                 } catch (e) { addToast('Delete failed: ' + e.message, 'error'); }
             };
             
-            const handleTestPBS = async (config) => {
+            // LW Oct 2026 (#805) - an edit form holds '********' for stored secrets, so test
+            // through the server's own route, which fills the mask in for the same host
+            const handleTestPBS = async (config, pbsId) => {
                 try {
-                    const resp = await authFetch(`${API_URL}/pbs/test-connection`, {
+                    const url = pbsId ? `${API_URL}/pbs/${encodeURIComponent(pbsId)}/test` : `${API_URL}/pbs/test-connection`;
+                    const resp = await authFetch(url, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(config),
@@ -11745,6 +14593,7 @@
             };
             
             const toggleVMwareDRS = async (vmwId, clusterId, enabled, automation) => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 try {
                     const resp = await authFetch(`${API_URL}/vmware/${vmwId}/clusters/${clusterId}/drs`, {
                         method: 'POST', headers: {'Content-Type':'application/json'},
@@ -11761,6 +14610,7 @@
             };
             
             const toggleVMwareHA = async (vmwId, clusterId, enabled) => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 try {
                     const resp = await authFetch(`${API_URL}/vmware/${vmwId}/clusters/${clusterId}/ha`, {
                         method: 'POST', headers: {'Content-Type':'application/json'},
@@ -11788,6 +14638,7 @@
             
             const vmwarePowerAction = async (vmId, action) => {
                 if (!selectedVMware) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 // #147: confirm disruptive ESXi actions
                 if (['stop', 'reset', 'suspend'].includes(action)) {
                     if (!confirm(`${action.charAt(0).toUpperCase() + action.slice(1)} VM?`)) return;
@@ -11809,6 +14660,7 @@
             };
             
             const vmwareSnapshotAction = async (vmId, action, data = {}) => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 if (!selectedVMware) return;
                 try {
                     const method = action === 'delete' ? 'DELETE' : 'POST';
@@ -11871,6 +14723,7 @@
             };
             
             const handleDeleteVMware = async (vmwId) => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 if (!confirm(t('deleteEsxiServerConfirm'))) return;
                 try {
                     const resp = await authFetch(`${API_URL}/vmware/${vmwId}`, { method: 'DELETE' });
@@ -11944,9 +14797,10 @@
                     return () => {
                         clearInterval(renewInterval);
                         clearInterval(fallbackInterval);
-                        // Unwatch
+                        // Unwatch - quiet: a view that closes has nothing to tell the user (#625)
                         authFetch(`${API_URL}/vmware/${selectedVMware.id}/vms/${vmwareSelectedVm}/watch`, {
-                            method: 'DELETE'
+                            method: 'DELETE',
+                            quiet: true
                         }).catch(() => {});
                     };
                 } else {
@@ -12237,6 +15091,7 @@
                 finally { setXhmLoading(false); }
             };
             const startXhmMigration = async () => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 setXhmLoading(true);
                 try {
                     const body = { ...xhmForm };
@@ -12295,6 +15150,7 @@
 
             // VMware Console Ticket
             const openVmwareConsole = async (vmId) => {
+                if (haConsolesElsewhere) { haRefusedRef.current?.(false, 'console'); return; }  // consoles only on the active (#625)
                 try {
                     const resp = await authFetch(`${API_URL}/vmware/${selectedVMware.id}/vms/${vmId}/console`, { method: 'POST' });
                     if (resp?.ok) {
@@ -12419,6 +15275,27 @@
                     };
                 }
             }, [selectedCluster?.id]);
+
+            // LW Oct 2026 (#625) - the leader's node progress (see ownClusterMetrics), every 5 s
+            // like the task list, while this member forwards. When the leader does not answer
+            // the read comes from here and adds nothing
+            useEffect(() => {
+                setLeaderNodeProgress(null);
+                const clusterId = selectedCluster?.id;
+                if (!clusterId || !haStandby || haReadOnly) return;
+                let gone = false;
+                const poll = async () => {
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/node-progress`, { timeout: POLL_TIMEOUT_MS });
+                    if (gone || !r || !r.ok) return;
+                    const data = await r.json().catch(() => null);
+                    if (!gone && data && data.nodes && typeof data.nodes === 'object') {
+                        setLeaderNodeProgress({ cluster: clusterId, nodes: data.nodes });
+                    }
+                };
+                poll();
+                const timer = setInterval(poll, 5000);
+                return () => { gone = true; clearInterval(timer); };
+            }, [selectedCluster?.id, haStandby, haReadOnly]);
 
             const fetchClusters = async () => {
                 try {
@@ -12747,7 +15624,8 @@
                     authFetch(`${API_URL}/sse/subscribe`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ client_id: cid, clusters })
+                        body: JSON.stringify({ client_id: cid, clusters }),
+                        quiet: true
                     }).catch(() => {});  // best effort
                 }, 300);
             }, []);
@@ -12808,6 +15686,7 @@
             };
 
             const handleDeleteCluster = async (clusterId) => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 if (!window.confirm(t('deleteClusterConfirm'))) return;
                 
                 try {
@@ -12842,6 +15721,7 @@
             // NS: Mar 2026 - rename cluster (display_name)
             const handleRenameCluster = async () => {
                 if (!renamingCluster) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }
                 const newName = renameValue.trim();
                 const msg = newName
                     ? `${t('confirmRename') || 'Rename cluster to'} "${newName}"?`
@@ -12872,6 +15752,7 @@
             // MK: #294 — OIDC/Entra users don't have local passwords, skip prompt
             const handleReconfigureAuth = async () => {
                 if (!reconfigureCluster) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }
                 const isExternalAuth = user?.auth_source && !['local', 'ldap'].includes(user.auth_source);
                 if (!isExternalAuth && !reconfigurePassword) return;
                 setReconfigureLoading(true);
@@ -12960,6 +15841,7 @@
             
             // #149 - manual balance trigger
             const handleBalanceNow = async () => {
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 if (!selectedCluster || balanceRunning) return;
                 setBalanceRunning(true);
                 try {
@@ -12988,7 +15870,11 @@
                     
                     if (response && response.ok) {
                         setSelectedCluster(prev => prev ? {...prev, ha_enabled: enable} : prev);
-                        addToast(enable ? t('haEnabled') : t('haDisabled'));
+                        // #625: HA is off, but agents the server could not confirm as gone, or a
+                        // cluster claim it could not remove, are still out there. Its words stay up.
+                        const done = enable ? null : await response.json().catch(() => null);
+                        if (done && done.warning) setHaDisableReport({ ...done, cluster: selectedCluster.name });
+                        else addToast(enable ? t('haEnabled') : t('haDisabled'));
                         
                         // Also update the clusters list
                         setClusters(prev => prev.map(c => 
@@ -13022,8 +15908,11 @@
                 } catch (_) { return ''; }
             };
 
-            const handleMaintenanceToggle = async (nodeName, enable) => {
+            // LW Oct 2026 (#763, #954) - options: the evacuation options the maintenance dialog of a
+            // node was left with ({ migrate_templates, relax_anti_affinity }), sent as they are
+            const handleMaintenanceToggle = async (nodeName, enable, options) => {
                 if (!selectedCluster) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 // #147
                 const msg = enable
                     ? `${t('startingMaintenanceMode') || 'Enable maintenance mode'}: "${nodeName}"? VMs will be evacuated.`
@@ -13037,7 +15926,11 @@
                         const response = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/nodes/${nodeName}/maintenance`, {
                             method: 'PUT',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ enable: true })
+                            body: JSON.stringify({
+                                enable: true,
+                                migrate_templates: options?.migrate_templates === true,
+                                relax_anti_affinity: options?.relax_anti_affinity === true,
+                            })
                         });
                         
                         if (response && response.ok) {
@@ -13067,6 +15960,7 @@
 
             const handleStartUpdate = async (nodeName, reboot) => {
                 if (!selectedCluster) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 
                 try {
                     addToast(t('startingUpdateFor') + ` ${nodeName}...`, 'info');
@@ -13090,6 +15984,7 @@
 
             const handleNodeAction = async (nodeName, action) => {
                 if (!selectedCluster) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
 
                 try {
                     const actionText = action === 'reboot' ? t('rebootNode') : t('shutdownNode');
@@ -13141,7 +16036,9 @@
                     'resume': 'running'
                 };
                 
-                if (expectedStatus[action]) {
+                // not on a standby (#625): the answer is a refusal, a flipped status would lie
+                const flipped = !!expectedStatus[action] && !haReadOnly;
+                if (flipped) {
                     setClusterResources(prev => 
                         prev.map(r => 
                             r.vmid === resource.vmid && r.node === resource.node 
@@ -13151,6 +16048,19 @@
                     );
                 }
                 
+                // a failed action puts the old status back itself: the refetch below only
+                // repaints when the server list changed, and after a failure it did not
+                const unflip = () => {
+                    if (!flipped) return;
+                    setClusterResources(prev =>
+                        prev.map(r =>
+                            r.vmid === resource.vmid && r.node === resource.node && r._optimistic
+                                ? { ...r, status: resource.status, _optimistic: false }
+                                : r
+                        )
+                    );
+                };
+
                 // LW: Feb 2026 - track task for corporate panel
                 const taskId = addRecentTask(`${action} VM`, resource.name || `VM ${resource.vmid}`, 'running');
                 try {
@@ -13164,16 +16074,19 @@
                         updateRecentTask(taskId, 'completed');
                         // NS: SSE push_immediate_update will send real status within 500ms
                     } else if (response) {
+                        unflip();
                         const err = await response.json();
                         addToast(err.error || `${action} ${t('actionFailed')}`, 'error');
                         updateRecentTask(taskId, 'failed');
                         fetchClusterResources(selectedCluster.id);
                     } else {
+                        unflip();
                         addToast(t('connectionError'), 'error');
                         updateRecentTask(taskId, 'failed');
                         fetchClusterResources(selectedCluster.id);
                     }
                 } catch (error) {
+                    unflip();
                     addToast(t('connectionError'), 'error');
                     updateRecentTask(taskId, 'failed');
                     // Revert optimistic update on error
@@ -13220,35 +16133,33 @@
                 }
             };
 
-            const handleBulkMigrate = async (vms, targetNode, online) => {
-                if (!selectedCluster) return;
-                // #147
-                if (!confirm(`${t('startingBulkMigration') || 'Bulk migrate'} ${vms.length} VMs → ${targetNode}?`)) return;
-
+            // LW Oct 2026 (#952) - a bulk migration is a run on the server: this starts it and
+            // opens its progress. The dialog it comes from is the confirmation (#147), and
+            // its answer is {ok} or {error} for that dialog to show
+            const handleBulkMigrate = async ({ clusterId, vms, target, online, withLocalDisks, mode, parallel }) => {
+                const cid = clusterId || selectedCluster?.id;
+                if (!cid) return { error: t('bulkMigrationFailed') };
                 try {
-                    addToast(`${t('startingBulkMigration')} ${vms.length} VMs...`);
-                    const response = await authFetch(
-                        `${API_URL}/clusters/${selectedCluster.id}/vms/bulk-migrate`,
-                        {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ vms, target: targetNode, online })
-                        }
-                    );
-                    
+                    const body = { vms: vms.map(v => ({ vmid: v.vmid, node: v.node, type: v.type })), target,
+                        online: online !== false, with_local_disks: !!withLocalDisks, mode };
+                    if (mode === 'parallel') body.parallel = parallel;
+                    const response = await authFetch(`${API_URL}/clusters/${encodeURIComponent(cid)}/vms/bulk-migrate`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+                    });
                     if (response && response.ok) {
-                        const result = await response.json();
-                        addToast(`${result.successful}/${result.total} ${t('migrationsStarted') || 'migrations started'}`);
-                        setTimeout(() => fetchClusterResources(selectedCluster.id), 3000);
-                    } else if (response) {
-                        const err = await response.json();
-                        addToast(err.error || t('bulkMigrationFailed'), 'error');
-                    } else {
-                        addToast(t('connectionError'), 'error');
+                        const data = await response.json().catch(() => ({}));
+                        setBulkRunsTick(n => n + 1);
+                        if (data.run) setBulkRunOpen(data.run.id);
+                        return { ok: true };
                     }
+                    return { error: response ? await PegaProxApiErrors.message(response, t('bulkMigrationFailed')) : t('connectionError') };
                 } catch (error) {
-                    addToast(t('connectionError'), 'error');
+                    return { error: t('connectionError') };
                 }
+            };
+            const bulkRunSettled = (cid) => {
+                if (selectedCluster?.id === cid) fetchClusterResources(cid);
+                else fetchSidebarClusterData(cid);
             };
 
             const handleCreateVm = async (vmType, node, config) => {
@@ -13351,6 +16262,7 @@
             const handleForceStop = async (resource) => {
                 const cId = resource._clusterId || selectedCluster?.id;
                 if (!cId) return;
+                if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
 
                 if (!confirm(`${resource.name || resource.vmid} ${t('forceStopConfirm')}`)) return;
 
@@ -13470,6 +16382,7 @@
             const handleOpenSpice = async (resource) => {
                 const cId = resource._clusterId || selectedCluster?.id;
                 if (!cId) return;
+                if (haConsolesElsewhere) { haRefusedRef.current?.(false, 'console'); return; }  // consoles only on the active (#625)
                 try {
                     const r = await authFetch(`${API_URL}/clusters/${cId}/vms/${resource.node}/${resource.type}/${resource.vmid}/spice`);
                     if (!r.ok) {
@@ -13492,6 +16405,7 @@
             const handleOpenConsole = async (resource) => {
                 const cId = resource._clusterId || selectedCluster?.id;
                 if (!cId) return;
+                if (haConsolesElsewhere) { haRefusedRef.current?.(false, 'console'); return; }  // a forwarding standby too, unless it serves users (#625)
                 // NS: Feb 2026 - Use correct cluster's host for cross-cluster console
                 const cluster = clusters.find(c => c.id === cId) || selectedCluster;
                 const info = {
@@ -13581,8 +16495,12 @@
                         { perm: 'cluster.config', label: t('assignToGroup') || 'Assign to Group', icon: <Icons.FolderPlus className="w-3.5 h-3.5" />, onClick: () => setShowAssignGroup(cluster) },
                         { perm: 'vm.migrate', label: t('bulkMigration') || 'Bulk Migration', icon: <Icons.ArrowRight className="w-3.5 h-3.5" />, onClick: () => { setSelectedCluster(cluster); setActiveTab('resources'); setResourcesSubTab('management'); } },
                         { separator: true },
+                        ...favMenuItems(isFavorite('cluster', cluster.id), () => toggleFavorite('cluster', cluster.id)),
                         { label: t('refreshData') || 'Refresh', icon: <Icons.RefreshCw className="w-3.5 h-3.5" />, onClick: () => { fetchSidebarClusterData(cluster.id); if (selectedCluster?.id === cluster.id) { fetchClusterMetrics(cluster.id); fetchClusterResources(cluster.id); } } },
                         { separator: true },
+                        ...(cluster.cluster_type === 'xcpng' ? [] : [
+                            { perm: 'cluster.config', label: t('connCheckTitle'), icon: <Icons.Activity className="w-3.5 h-3.5" />, onClick: () => setConnCheckCluster(cluster) },
+                        ]),
                         { perm: 'cluster.config', label: t('reconfigureCluster') || 'Re-configure', icon: <Icons.Settings className="w-3.5 h-3.5" />, onClick: () => setReconfigureCluster(cluster) },
                         { perm: 'cluster.config', label: t('repinHostKeys') || 'Re-pin SSH host keys', icon: <Icons.Key className="w-3.5 h-3.5" />, onClick: () => handleRepinHostKeys(cluster.id) },
                         { perm: 'cluster.delete', label: t('deleteCluster') || 'Remove Cluster', icon: <Icons.Trash className="w-3.5 h-3.5" />, danger: true, onClick: () => handleDeleteCluster(cluster.id) },
@@ -13625,8 +16543,16 @@
                                 fetchSidebarClusterData(clusterId);
                             } catch (e) { addToast(t('connectionError'), 'error'); }
                         }, disabled: !online },
-                        { perm: 'node.shell', label: t('sshConsole') || 'SSH Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => { selectCluster(); const c = clusters.find(cl => cl.id === clusterId); if (c) { setConsoleInfo({ vmid: 0, node: nodeName, type: 'node', host: c.host }); setConsoleVm({ vmid: 0, node: nodeName, type: 'node', name: nodeName }); } }, disabled: !online },
+                        ...(haConsolesElsewhere ? onActiveItems('node.shell', '', !online) : [
+                        { perm: 'node.shell', label: t('sshConsole') || 'SSH Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => { selectCluster(); const c = clusters.find(cl => cl.id === clusterId); if (c) { setConsoleInfo({ vmid: 0, node: nodeName, type: 'node', host: c.host }); setConsoleVm({ vmid: 0, node: nodeName, type: 'node', name: nodeName }); } }, disabled: !online, console: true },
+                        ]),
+                        { label: t('nodeGuestsMenu'), icon: <Icons.Layers />, submenu: [
+                            { perm: 'vm.start', label: t('nodeGuestsStartAll'), icon: <Icons.PlayCircle />, onClick: () => setNodeGuests({ action: 'startall', clusterId, node: nodeName }), disabled: !online },
+                            { perm: 'vm.stop', label: t('nodeGuestsStopAll'), icon: <Icons.Power />, onClick: () => setNodeGuests({ action: 'stopall', clusterId, node: nodeName }), disabled: !online },
+                            { perm: 'vm.migrate', label: t('nodeGuestsMigrateAll'), icon: <Icons.ArrowRight />, onClick: () => setNodeGuests({ action: 'migrateall', clusterId, node: nodeName }), disabled: !online },
+                        ]},
                         { separator: true },
+                        ...favMenuItems(isFavorite('node', clusterId, null, nodeName), () => toggleNodeFavorite(clusterId, nodeName)),
                         { label: t('refreshData') || 'Refresh', icon: <Icons.RefreshCw className="w-3.5 h-3.5" />, onClick: () => { fetchSidebarClusterData(clusterId); } },
                     ];
                 }
@@ -13687,8 +16613,10 @@
                     const items = [
                         { label: t('power') || 'Power', icon: <Icons.Power className="w-3.5 h-3.5" />, submenu: powerItems },
                         { separator: true },
-                        { perm: 'vm.console', label: t('console') || 'Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => handleOpenConsole(vm), disabled: !isRunning },
-                        ...(vm.type === 'qemu' ? [{ perm: 'vm.console', label: t('spiceConsole') || 'SPICE', icon: <Icons.ExternalLink className="w-3.5 h-3.5" />, onClick: () => handleOpenSpice(vm), disabled: !isRunning }] : []),
+                        ...(haConsolesElsewhere ? onActiveItems('vm.console', haConsoleSearch(vm), !isRunning) : [
+                        { perm: 'vm.console', label: t('console') || 'Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => handleOpenConsole(vm), disabled: !isRunning, console: true },
+                        ...(vm.type === 'qemu' ? [{ perm: 'vm.console', label: t('spiceConsole') || 'SPICE', icon: <Icons.ExternalLink className="w-3.5 h-3.5" />, onClick: () => handleOpenSpice(vm), disabled: !isRunning, console: true }] : []),
+                        ]),
                         // NS May 2026 — VNC ↔ Term toggle now lives inside the Console modal,
                         // so the separate Terminal entry was removed (one entry point = clearer UX).
                         { perm: 'vm.config', label: t('editSettings') || 'Settings', icon: <Icons.Settings className="w-3.5 h-3.5" />, onClick: () => handleOpenConfig(vm) },
@@ -13792,6 +16720,7 @@
                         { perm: 'vm.snapshot', label: t('snapshot') || 'Snapshot', icon: <Icons.Camera className="w-3.5 h-3.5" />, onClick: () => {
                             setDashSnapshotVm(vm);
                         }},
+                        ...favMenuItems(isFavorite('vm', cId, vm.vmid), () => toggleGuestFavorite(vm)),
                         { separator: true },
                         { perm: 'vm.delete', label: t('delete') || 'Delete', icon: <Icons.Trash className="w-3.5 h-3.5" />, onClick: () => {
                             if (isCorporate) { setDashDeleteVm(vm); }
@@ -13812,12 +16741,16 @@
             // whose endpoint forgot its own check would go unnoticed. Each entry above carries the
             // permission its endpoint requires; this drops the ones the caller lacks, so that
             // table is the single place to audit instead of 25 call sites.
+            // #625: a console entry asks what the account holds, not can(). It is only in the
+            // menu where this instance opens consoles, and a serving member does so with its
+            // leader away too, while can() keeps only the reading permissions then.
+            const menuAllows = (i) => !i.perm || (i.console ? holds(i.perm) : can(i.perm));
             const buildContextMenuItems = (type, target) => {
-                const kept = buildContextMenuItemsRaw(type, target).filter(i => !i.perm || can(i.perm));
+                const kept = buildContextMenuItemsRaw(type, target).filter(menuAllows);
                 const out = [];
                 for (const item of kept) {
                     if (item.submenu) {
-                        const sub = item.submenu.filter(i => !i.perm || can(i.perm));
+                        const sub = item.submenu.filter(menuAllows);
                         if (!sub.length) continue;          // no children left, drop the parent
                         out.push({ ...item, submenu: sub });
                         continue;
@@ -13829,6 +16762,24 @@
                 while (out.length && out[out.length - 1].separator) out.pop();
                 return out;
             };
+
+            // One toast stack for every layout. Cloud returns early below and never reached the
+            // one in the main return, so whatever it reported through addToast stayed invisible.
+            // A portal to document.body keeps it clear of the corporate z-index/overflow rules.
+            // The bulk migrations (#952) sit on top of the stack: from every page of every
+            // layout, and clear of the toasts below them
+            const toastPortal = ReactDOM.createPortal(
+                React.createElement('div', {
+                    style: { position: 'fixed', bottom: isCorporate ? 64 : 24, right: 24, zIndex: 99999, display: 'flex', flexDirection: 'column', gap: 8 }
+                },
+                    React.createElement(BulkMigrateRuns, { key: 'bulk-runs', authFetch, openId: bulkRunOpen, onOpen: setBulkRunOpen,
+                        tick: bulkRunsTick, canAct: !haReadOnly, onSettled: bulkRunSettled }),
+                    toasts.map(toast =>
+                        React.createElement(Toast, { key: toast.id, message: toast.message, type: toast.type, onClose: () => removeToast(toast.id) })
+                    )
+                ),
+                document.body
+            );
 
             // NS 2026-06-05 — Cloud skin (Preview): the whole console layout is its own
             // self-contained shell (cloud.js). Mount it instead of the Modern/Corporate
@@ -13850,6 +16801,8 @@
                     del: (vm) => setDashDeleteVm(vm),
                     crossMigrate: (vm) => setDashCrossClusterVm(vm),
                     snapshot: (vm) => setDashSnapshotVm(vm),
+                    bulkGuests: (rows, action) => setCloudBulk({ action, guests: rows.map(r => ({ ...r, _clusterId: r._clusterId || selectedCluster?.id })) }),
+                    bulkMigrate: (rows) => setCloudBulkMigrate(rows.map(r => ({ vmid: r.vmid, node: r.node, type: r.type, name: r.name }))),
                     createVm: (type) => setShowCreateVm(type || 'qemu'),
                     nodeAction: handleNodeAction,                     // (nodeName, 'reboot'|'shutdown')
                     maintenanceToggle: handleMaintenanceToggle,       // (nodeName, enable)
@@ -13867,6 +16820,18 @@
                         fetchTasks(selectedCluster.id);
                     },
                 };
+                // #625 v2 - a standby hands the shell what reads and nothing that acts;
+                // cloud.js leaves out every entry whose handler is missing
+                // A forwarding standby hands over the actions again, a console only when it
+                // serves users
+                if (haConsolesElsewhere) {
+                    ['openConsole', 'openSpice', 'openLxcShell'].forEach(k => { delete cloudActions[k]; });
+                }
+                if (haReadOnly) {
+                    ['vmAction', 'forceStop', 'migrate', 'clone', 'del', 'bulkGuests', 'bulkMigrate',
+                     'crossMigrate', 'snapshot', 'createVm', 'nodeAction', 'maintenanceToggle', 'startUpdate']
+                        .forEach(k => { delete cloudActions[k]; });
+                }
                 return (
                     <div style={{ height: '100vh', overflow: 'hidden' }}>
                         <CloudShell
@@ -13893,6 +16858,7 @@
                             onExitCloud={() => updatePreferences({ ui_layout: 'modern', theme: 'proxmoxDark' })}
                             onOpenSettings={() => setShowSettings(true)}
                             onOpenProfile={() => setShowProfile(true)}
+                            onOpenApiReference={() => setShowApiReference(true)}
                             onLogout={logout}
                         />
                         {/* Resource-action modals — shared dashboard state, mounted here too so
@@ -13900,6 +16866,15 @@
                             return; the skins are mutually exclusive so only one set ever mounts. */}
                         {configVm && (configVm._clusterId || selectedCluster) && (
                             <ConfigModal vm={configVm} clusterId={configVm._clusterId || selectedCluster.id} allClusters={clusters} dashboardAuthFetch={authFetch} onClose={handleCloseConfig} addToast={addToast} isCorporate={false} />
+                        )}
+                        {cloudBulk && (
+                            <GuestBulkActionModal action={cloudBulk.action} guests={cloudBulk.guests} authFetch={authFetch}
+                                onFinished={() => { const cid = selectedCluster?.id; if (cid) setTimeout(() => fetchClusterResources(cid), 1500); }}
+                                onClose={() => setCloudBulk(null)} />
+                        )}
+                        {cloudBulkMigrate && selectedCluster && (
+                            <BulkMigrateModal vms={cloudBulkMigrate} nodes={Object.keys(clusterMetrics)} clusterId={selectedCluster.id}
+                                onMigrate={handleBulkMigrate} onClose={() => setCloudBulkMigrate(null)} />
                         )}
                         {configNode && selectedCluster && (
                             <NodeModal node={configNode} clusterId={selectedCluster.id} clusterType={selectedCluster.cluster_type || 'proxmox'} onClose={() => setConfigNode(null)} addToast={addToast} />
@@ -13938,6 +16913,8 @@
                             (they self-gate on isOpen + pull all context from the app providers). */}
                         <UserProfileModal isOpen={showProfile} onClose={() => setShowProfile(false)} addToast={addToast} />
                         <PegaProxSettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} addToast={addToast} onGroupsChanged={fetchClusterGroups} />
+                        {showApiReference && <ApiReferenceModal onClose={() => setShowApiReference(false)} />}
+                        {toastPortal}
                     </div>
                 );
             }
@@ -13948,9 +16925,13 @@
             // visible so the page still scrolls vertically and fixed-position modals are unaffected.
             return (
                 <div className={`min-h-screen bg-proxmox-darker text-white ${isCorporate ? 'pb-7' : ''}`} style={{ overflowX: 'clip' }}>
+                    <BroadcastBanners />
                     {/* LW: Password Expiry Warning */}
                     <PasswordExpiryBanner onChangePassword={() => setShowProfile(true)} />
-                    
+                    <HaStandbyBanner onOpenHa={openHaSettings} />
+                    <HaCopiesBanner onOpenHa={openHaSettings} />
+                    <HaLeaderBanner onOpenHa={openHaSettings} />
+
                     {/* Node Offline Alert Banner */}
                     <NodeAlertBanner 
                         alerts={nodeAlerts} 
@@ -14145,6 +17126,12 @@
                                                                             {result.match_field === 'tag' && (
                                                                                 <span className="px-1.5 py-0.5 text-xs rounded bg-purple-500/20 text-purple-400">Tag-Match</span>
                                                                             )}
+                                                                            {/* LW Oct 2026 - a hit by MAC, notes or an address other than the one shown below */}
+                                                                            {SEARCH_INDEX_FIELDS.includes(result.match_field) && result.match_value && result.match_value !== result.ip && (
+                                                                                <span className="px-1.5 py-0.5 text-xs rounded bg-purple-500/20 text-purple-400 truncate max-w-full" data-search-match={result.match_field}>
+                                                                                    {searchMatchLabel(t, result.match_field)}: {result.match_value}{result.match_net ? ` (${result.match_net})` : ''}
+                                                                                </span>
+                                                                            )}
                                                                         </div>
                                                                         <div className="text-xs text-gray-500 flex items-center gap-2 mt-0.5">
                                                                             <span>{result.cluster_name}</span>
@@ -14218,11 +17205,22 @@
                                     {isCorporate && (
                                         <button
                                             onClick={() => {
-                                                const next = !corpLight;
-                                                document.body.dataset.corpTheme = next ? 'light' : '';
-                                                localStorage.setItem('corp-theme', next ? 'light' : '');
-                                                applyTheme(next ? 'corporateLight' : 'corporateDark');
-                                                setCorpLight(next);
+                                                const order = { system: 'light', light: 'dark', dark: 'system' };
+                                                const next = order[corpMode] || 'system';
+                                                const theme = next === 'system' ? 'system'
+                                                            : (next === 'light' ? 'corporateLight' : 'corporateDark');
+                                                // in system mode applyTheme() owns data-corp-theme and the
+                                                // local toggle must stop claiming to know better
+                                                if (next === 'system') {
+                                                    localStorage.removeItem('corp-theme');
+                                                } else {
+                                                    document.body.dataset.corpTheme = next === 'light' ? 'light' : '';
+                                                    localStorage.setItem('corp-theme', next === 'light' ? 'light' : '');
+                                                }
+                                                applyTheme(theme);
+                                                setCorpMode(next);
+                                                setCorpLight(next === 'light' ||
+                                                    (next === 'system' && document.body.dataset.corpTheme === 'light'));
                                                 // MK May 2026 — also persist on server so checkSession on next
                                                 // F5 doesn't apply a stale user.theme that mismatches the local
                                                 // corp-theme toggle (caused taskbar bg-proxmox-dark/50 to render
@@ -14230,13 +17228,16 @@
                                                 fetch(`${API_URL}/user/preferences`, {
                                                     method: 'PUT', credentials: 'include',
                                                     headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
-                                                    body: JSON.stringify({ theme: next ? 'corporateLight' : 'corporateDark' })
+                                                    body: JSON.stringify({ theme })
                                                 }).catch(() => {});
                                             }}
                                             className="p-1.5 rounded hover:bg-white/10 text-gray-400 hover:text-white transition-colors"
-                                            title={corpLight ? 'Dark Mode' : 'Light Mode'}
+                                            title={corpMode === 'system' ? (t('lightMode') || 'Light Mode')
+                                                 : corpMode === 'light' ? (t('darkMode') || 'Dark Mode')
+                                                 : (t('followSystem') || 'Follow system')}
                                         >
-                                            {corpLight ? <Icons.Moon /> : <Icons.Sun />}
+                                            {corpMode === 'system' ? <Icons.Monitor />
+                                             : corpMode === 'light' ? <Icons.Moon /> : <Icons.Sun />}
                                         </button>
                                     )}
 
@@ -14266,8 +17267,8 @@
                                         </div>
                                     )}
 
-                                    {/* Add Cluster Dropdown (corporate: via sidebar or right-click) */}
-                                    {!isCorporate && isAdmin && (
+                                    {/* Add Cluster Dropdown (corporate: via sidebar or right-click); a read-only standby adds nothing (#625) */}
+                                    {!isCorporate && isAdmin && !haReadOnly && (
                                         <div className="relative">
                                             <button
                                                 onClick={() => setShowAddDropdown(!showAddDropdown)}
@@ -14336,6 +17337,7 @@
                                     <div className="relative z-50">
                                         <button
                                             onClick={() => setShowUserMenu(!showUserMenu)}
+                                            data-user-menu=""
                                             className={`flex items-center gap-2 ${isCorporate ? 'px-2 py-1' : 'px-3 py-2'} bg-proxmox-dark border border-proxmox-border rounded-lg hover:border-proxmox-orange/50 transition-colors`}
                                         >
                                             <UserAvatar
@@ -14386,6 +17388,13 @@
                                                             <Icons.Keyboard />
                                                             <span className="flex-1">{t('keyboardShortcuts') || 'Keyboard shortcuts'}</span>
                                                             <kbd className="text-[10px] opacity-60 px-1 rounded" style={{ border: '1px solid #485764' }}>?</kbd>
+                                                        </button>
+                                                        <button
+                                                            onClick={() => { setShowUserMenu(false); setShowApiReference(true); }}
+                                                            className="w-full px-4 py-2 text-left text-gray-300 hover:bg-proxmox-hover transition-colors flex items-center gap-2"
+                                                        >
+                                                            <Icons.Book />
+                                                            {t('apiRefTitle')}
                                                         </button>
                                                         <button
                                                             onClick={() => {
@@ -14536,11 +17545,13 @@
                                             </div>
                                         </div>
                                     )}
+                                    {renderFavoritesGroup()}
                                     {/* LW: Feb 2026 - group management header, compact in corporate */}
                                     <div className="flex items-center justify-between px-1">
                                         <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">{t('clusters')}</h2>
                                         <div className="flex items-center gap-1">
-                                            {isAdmin && (
+                                            {/* #625: cluster and group changes are made on the active instance */}
+                                            {isAdmin && !haReadOnly && (
                                                 isCorporate ? (
                                                     <>
                                                     <button
@@ -14576,6 +17587,9 @@
                                             <div className="w-12 h-12 mx-auto mb-3 rounded-full bg-proxmox-dark flex items-center justify-center">
                                                 <Icons.Server />
                                             </div>
+                                            {haStandby ? (
+                                                <p className="text-gray-400 text-sm">{ha.live_view === false ? t('pgHaNoClustersLiveOff') : haServing ? t('pgHaNoClustersServing') : t('pgHaNoClustersHere')}</p>
+                                            ) : (<>
                                             <p className="text-gray-400 text-sm">{t('noClusterSelected')}</p>
                                             <button
                                                 onClick={() => setShowAddModal(true)}
@@ -14583,30 +17597,42 @@
                                             >
                                                 {t('addFirstCluster')}
                                             </button>
+                                            </>)}
+                                            {/* bare-metal first: the global entry below is hidden until a cluster
+                                                exists, so this is the way in - a manager straight into the wizard,
+                                                a view-only account onto the page to watch the runs */}
+                                            {canAutoInstall && !haStandby && (
+                                                <button
+                                                    onClick={() => openAutoInstall(user?.autoinstall_access === 'manage' ? { wizard: true } : null)}
+                                                    className="block mx-auto mt-2 text-xs text-gray-400 hover:text-proxmox-orange hover:underline"
+                                                >
+                                                    {user?.autoinstall_access === 'manage' ? t('autoInstallFirstHost') : t('autoInstall')}
+                                                </button>
+                                            )}
                                         </div>
                                     ) : (
-                                        <div className="space-y-3">
+                                        <div className={isCorporate ? 'space-y-0' : 'space-y-3'}>
                                             {/* MK: overview button, LW: compact for corporate */}
                                             <button
-                                                onClick={() => { setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); }}
+                                                onClick={() => { setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); }}
                                                 className={`w-full flex items-center ${
                                                     isCorporate
                                                         ? 'gap-1.5 pl-1 pr-2 py-0.5 text-[13px] leading-5'
                                                         : `gap-3 px-3 py-2.5 rounded-xl transition-all ${
-                                                            !selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !sidebarXHM
+                                                            !selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !onGlobalView
                                                                 ? 'bg-gradient-to-r from-proxmox-orange/20 to-orange-600/10 border border-proxmox-orange/30 text-white'
                                                                 : 'bg-proxmox-card border border-proxmox-border hover:border-proxmox-orange/30 text-gray-300 hover:text-white'
                                                           }`
                                                 }`}
-                                                style={isCorporate ? (!selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !sidebarTopology && !sidebarXHM ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}) : undefined}
-                                                onMouseEnter={isCorporate ? (e) => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup || sidebarTopology || sidebarXHM) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }} : undefined}
-                                                onMouseLeave={isCorporate ? (e) => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup || sidebarTopology || sidebarXHM) { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; }} : undefined}
+                                                style={isCorporate ? (!selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !onGlobalView ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}) : undefined}
+                                                onMouseEnter={isCorporate ? (e) => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup || onGlobalView) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }} : undefined}
+                                                onMouseLeave={isCorporate ? (e) => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup || onGlobalView) { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; }} : undefined}
                                             >
                                                 {isCorporate ? (
                                                     <Icons.Database className="w-4 h-4 flex-shrink-0" style={{color: 'var(--corp-accent)'}} />
                                                 ) : (
                                                     <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${
-                                                        !selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !sidebarXHM ? 'bg-proxmox-orange/20' : 'bg-proxmox-dark'
+                                                        !selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !onGlobalView ? 'bg-proxmox-orange/20' : 'bg-proxmox-dark'
                                                     }`}>
                                                         <Icons.Grid className="w-4 h-4" />
                                                     </div>
@@ -14619,110 +17645,89 @@
                                                         </div>
                                                     )}
                                                 </span>
-                                                {!isCorporate && !selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !sidebarXHM && (
+                                                {!isCorporate && !selectedCluster && !selectedPBS && !selectedVMware && !selectedGroup && !onGlobalView && (
                                                     <div className="w-2 h-2 rounded-full bg-proxmox-orange" />
                                                 )}
                                             </button>
 
-                                            {/* NS: Mar 2026 - Topology sidebar entry (#142) */}
-                                            {isCorporate && (
-                                                <button
-                                                    onClick={() => { setSidebarTopology(true); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarWorldmap(false); setSidebarXHM(false); setSidebarMultiSdn(false); }}
-                                                    className="w-full flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5"
-                                                    style={sidebarTopology ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}}
-                                                    onMouseEnter={(e) => { if (!sidebarTopology) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }}}
-                                                    onMouseLeave={(e) => { if (!sidebarTopology) { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; }}}
-                                                >
-                                                    <Icons.Network className="w-4 h-4 flex-shrink-0" style={{color: sidebarTopology ? 'var(--corp-accent)' : 'var(--corp-text-muted)'}} />
-                                                    <span className="flex-1 text-left truncate">{t('topologyView') || 'Topology'}</span>
-                                                </button>
-                                            )}
-
+                                            {/* the global views sit here in Modern, corporate lists them in its Tools section at the top */}
                                             {/* MK May 2026 — Worldmap sidebar entry (offline cluster geo-view) */}
-                                            <button
-                                                onClick={() => { setSidebarWorldmap(true); setSidebarTopology(false); setSidebarXHM(false); setSidebarMultiSdn(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
-                                                className={isCorporate
-                                                    ? 'w-full flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5'
-                                                    : `w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all mt-1 ${
+                                            {!isCorporate && (<>
+                                                <button
+                                                    onClick={openWorldmap}
+                                                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all mt-1 ${
                                                         sidebarWorldmap
                                                             ? 'bg-gradient-to-r from-blue-500/20 to-cyan-600/10 border border-blue-500/30 text-white'
                                                             : 'bg-proxmox-card border border-proxmox-border hover:border-blue-500/30 text-gray-300 hover:text-white'
-                                                      }`
-                                                }
-                                                style={isCorporate ? (sidebarWorldmap ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}) : undefined}
-                                                onMouseEnter={isCorporate ? (e) => { if (!sidebarWorldmap) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }} : undefined}
-                                                onMouseLeave={isCorporate ? (e) => { if (!sidebarWorldmap) { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; }} : undefined}
-                                            >
-                                                {isCorporate ? (
-                                                    <Icons.Globe className="w-4 h-4 flex-shrink-0" style={{color: sidebarWorldmap ? 'var(--corp-accent)' : 'var(--corp-text-muted)'}} />
-                                                ) : (
+                                                      }`}
+                                                >
                                                     <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${sidebarWorldmap ? 'bg-blue-500/20' : 'bg-proxmox-dark'}`}>
                                                         <Icons.Globe className="w-4 h-4 text-blue-400" />
                                                     </div>
-                                                )}
-                                                <span className={isCorporate ? 'flex-1 text-left truncate' : 'flex-1 text-left'}>
-                                                    {isCorporate ? (t('worldMap') || 'World Map') : (
+                                                    <span className="flex-1 text-left">
                                                         <div>
                                                             <div className="text-sm font-medium">{t('worldMap') || 'World Map'}</div>
                                                             <div className="text-xs text-gray-500">{t('worldMapHint') || 'Cluster locations'}</div>
                                                         </div>
-                                                    )}
-                                                </span>
-                                            </button>
+                                                    </span>
+                                                </button>
 
-                                            {/* LW: Mar 2026 - XHM sidebar (only when both PVE + XCP-ng clusters exist) */}
-                                            {clusters.some(c => c.type === 'xcpng' || c.cluster_type === 'xcpng') && clusters.some(c => c.type !== 'xcpng' && c.cluster_type !== 'xcpng') && (
-                                                <button
-                                                    onClick={() => { setSidebarXHM(true); setSidebarTopology(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
-                                                    className={isCorporate
-                                                        ? 'w-full flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5'
-                                                        : `w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all mt-1 ${
+                                                {/* LW Sep 2026 - automated installs, next to World Map because that row is always there once a cluster exists; the empty-sidebar card above covers the rest. Not on a standby (#625). */}
+                                                {canAutoInstall && !haStandby && (
+                                                    <button
+                                                        onClick={() => openAutoInstall()}
+                                                        className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all mt-1 ${
+                                                            sidebarAutoInstall
+                                                                ? 'bg-gradient-to-r from-emerald-500/20 to-green-600/10 border border-emerald-500/30 text-white'
+                                                                : 'bg-proxmox-card border border-proxmox-border hover:border-emerald-500/30 text-gray-300 hover:text-white'
+                                                          }`}
+                                                    >
+                                                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${sidebarAutoInstall ? 'bg-emerald-500/20' : 'bg-proxmox-dark'}`}>
+                                                            <Icons.Disc className="w-4 h-4 text-emerald-400" />
+                                                        </div>
+                                                        <span className="flex-1 text-left">
+                                                            <div>
+                                                                <div className="text-sm font-medium">{t('autoInstall')}</div>
+                                                                <div className="text-xs text-gray-500">{t('autoInstallHint')}</div>
+                                                            </div>
+                                                        </span>
+                                                    </button>
+                                                )}
+
+                                                {/* LW: Mar 2026 - XHM sidebar (only when both PVE + XCP-ng clusters exist) */}
+                                                {hasXhmPair && (
+                                                    <button
+                                                        onClick={openXhm}
+                                                        className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all mt-1 ${
                                                             sidebarXHM
                                                                 ? 'bg-gradient-to-r from-purple-500/20 to-violet-600/10 border border-purple-500/30 text-white'
                                                                 : 'bg-proxmox-card border border-proxmox-border hover:border-purple-500/30 text-gray-300 hover:text-white'
-                                                          }`
-                                                    }
-                                                    style={isCorporate ? (sidebarXHM ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}) : undefined}
-                                                    onMouseEnter={isCorporate ? (e) => { if (!sidebarXHM) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }} : undefined}
-                                                    onMouseLeave={isCorporate ? (e) => { if (!sidebarXHM) { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; }} : undefined}
-                                                >
-                                                    {isCorporate ? (
-                                                        <Icons.FolderInput className="w-4 h-4 flex-shrink-0" style={{color: sidebarXHM ? 'var(--corp-accent)' : 'var(--corp-text-muted)'}} />
-                                                    ) : (
+                                                          }`}
+                                                    >
                                                         <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${sidebarXHM ? 'bg-purple-500/20' : 'bg-proxmox-dark'}`}>
                                                             <Icons.FolderInput className="w-4 h-4 text-purple-400" />
                                                         </div>
-                                                    )}
-                                                    <span className={isCorporate ? 'flex-1 text-left truncate' : 'flex-1 text-left text-sm font-medium'}>{t('xhmTitle') || 'Hypervisor Migration'}</span>
-                                                </button>
-                                            )}
+                                                        <span className="flex-1 text-left text-sm font-medium">{t('xhmTitle') || 'Hypervisor Migration'}</span>
+                                                    </button>
+                                                )}
 
-                                            {/* #612: Multi-Cluster EVPN sidebar (only when ≥2 clusters exist) */}
-                                            {clusters.length >= 2 && (
-                                                <button
-                                                    onClick={() => { setSidebarMultiSdn(true); setSidebarXHM(false); setSidebarTopology(false); setSidebarWorldmap(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); }}
-                                                    className={isCorporate
-                                                        ? 'w-full flex items-center gap-1.5 pl-5 pr-2 py-0.5 text-[13px] leading-5'
-                                                        : `w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all mt-1 ${
+                                                {/* #612: Multi-Cluster EVPN sidebar (only when ≥2 clusters exist) */}
+                                                {clusters.length >= 2 && (
+                                                    <button
+                                                        onClick={openMultiSdn}
+                                                        className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all mt-1 ${
                                                             sidebarMultiSdn
                                                                 ? 'bg-gradient-to-r from-cyan-500/20 to-sky-600/10 border border-cyan-500/30 text-white'
                                                                 : 'bg-proxmox-card border border-proxmox-border hover:border-cyan-500/30 text-gray-300 hover:text-white'
-                                                          }`
-                                                    }
-                                                    style={isCorporate ? (sidebarMultiSdn ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}) : undefined}
-                                                    onMouseEnter={isCorporate ? (e) => { if (!sidebarMultiSdn) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; }} : undefined}
-                                                    onMouseLeave={isCorporate ? (e) => { if (!sidebarMultiSdn) { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; }} : undefined}
-                                                >
-                                                    {isCorporate ? (
-                                                        <Icons.Network className="w-4 h-4 flex-shrink-0" style={{color: sidebarMultiSdn ? 'var(--corp-accent)' : 'var(--corp-text-muted)'}} />
-                                                    ) : (
+                                                          }`}
+                                                    >
                                                         <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${sidebarMultiSdn ? 'bg-cyan-500/20' : 'bg-proxmox-dark'}`}>
                                                             <Icons.Network className="w-4 h-4 text-cyan-400" />
                                                         </div>
-                                                    )}
-                                                    <span className={isCorporate ? 'flex-1 text-left truncate' : 'flex-1 text-left text-sm font-medium'}>{t('mcevpnTitle') || 'Multi-Cluster EVPN'}</span>
-                                                </button>
-                                            )}
+                                                        <span className="flex-1 text-left text-sm font-medium">{t('mcevpnTitle') || 'Multi-Cluster EVPN'}</span>
+                                                    </button>
+                                                )}
+                                            </>)}
 
                                             {/* Grouped Clusters */}
                                             {clusterGroups.map(group => {
@@ -14731,8 +17736,9 @@
 
                                                 const isCollapsed = collapsedGroups[group.id];
 
+                                                // corporate: the list has no gap of its own, a group keeps its 12px through padding
                                                 return (
-                                                    <div key={group.id} className="space-y-2">
+                                                    <div key={group.id} className={isCorporate ? 'space-y-2 pt-3' : 'space-y-2'}>
                                                         {/* Group Header - NS: split chevron vs folder click */}
                                                         <div className={`w-full flex items-center gap-2 px-2 ${isCorporate ? 'py-1' : 'py-1.5 rounded-lg'} hover:bg-proxmox-hover transition-colors ${
                                                             selectedGroup?.id === group.id ? (isCorporate ? 'bg-proxmox-hover text-white' : 'bg-proxmox-orange/5 border-l-2 border-l-proxmox-orange') : ''
@@ -14782,6 +17788,7 @@
                                                                             toggleSidebarCluster={toggleSidebarCluster}
                                                                             hwHealth={allClusterMetrics[cluster.id]?.data?.hardware?.health}
                                                                             onContextMenu={(type, target, pos) => setCtxMenu({type, target, position: pos})}
+                                                                            onCheckConnection={setConnCheckCluster}
                                                                         />
                                                                         {sidebarViewMode === 'datastores' ? renderDatastoreTree(cluster.id) : sidebarViewMode === 'pools' ? renderPoolTree(cluster.id) : sidebarViewMode === 'networks' ? renderNetworkTree(cluster.id) : renderInlineNodeTree(cluster.id)}
                                                                         {expandedSidebarClusters[cluster.id] && <div className="h-px my-0.5" style={{background: 'var(--corp-border-subtle)', marginLeft: '20px'}} />}
@@ -14799,7 +17806,7 @@
                                                 if (ungroupedClusters.length === 0) return null;
                                                 
                                                 return (
-                                                    <div className={isCorporate ? 'space-y-0' : 'space-y-1.5'}>
+                                                    <div className={isCorporate ? (clusterGroups.length > 0 ? 'space-y-0 pt-3' : 'space-y-0') : 'space-y-1.5'}>
                                                         {clusterGroups.length > 0 && (
                                                             <div className={`flex items-center gap-2 px-2 ${isCorporate ? 'py-0.5' : 'py-1.5'} text-gray-500`}>
                                                                 <Icons.Server className={isCorporate ? 'w-3.5 h-3.5' : 'w-4 h-4'} />
@@ -14830,6 +17837,7 @@
                                                                     toggleSidebarCluster={toggleSidebarCluster}
                                                                     hwHealth={allClusterMetrics[cluster.id]?.data?.hardware?.health}
                                                                     onContextMenu={(type, target, pos) => setCtxMenu({type, target, position: pos})}
+                                                                    onCheckConnection={setConnCheckCluster}
                                                                 />
                                                                 {sidebarViewMode === 'datastores' ? renderDatastoreTree(cluster.id) : sidebarViewMode === 'pools' ? renderPoolTree(cluster.id) : sidebarViewMode === 'networks' ? renderNetworkTree(cluster.id) : renderInlineNodeTree(cluster.id)}
                                                                         {expandedSidebarClusters[cluster.id] && <div className="h-px my-0.5" style={{background: 'var(--corp-border-subtle)', marginLeft: '20px'}} />}
@@ -14841,12 +17849,56 @@
                                         </div>
                                     )}
 
+                                    {/* LW Oct 2026 - corporate: the global views get a section of their own instead of
+                                        hanging off All Clusters, under the clusters and above Backup Servers like the
+                                        other sections. Same conditions as in Modern, so nothing here before the first
+                                        cluster; the empty card has the auto-install link. */}
+                                    {isCorporate && clusters.length > 0 && (() => {
+                                        const tools = [
+                                            { id: 'topology', show: true, active: sidebarTopology, label: t('topologyView') || 'Topology', onClick: openTopology,
+                                              icon: <Icons.Network className="w-4 h-4" /> },
+                                            // Globe always draws at w-5, zoom puts it in the 16px column of the others
+                                            { id: 'worldmap', show: true, active: sidebarWorldmap, label: t('worldMap') || 'World Map', onClick: openWorldmap,
+                                              icon: <span className="flex" style={{zoom: 0.8}}><Icons.Globe /></span> },
+                                            // not on a standby (#625)
+                                            { id: 'autoinstall', show: canAutoInstall && !haStandby, active: sidebarAutoInstall, label: t('autoInstall'), onClick: () => openAutoInstall(),
+                                              icon: <Icons.Disc className="w-4 h-4" /> },
+                                            { id: 'xhm', show: hasXhmPair, active: sidebarXHM, label: t('xhmTitle') || 'Hypervisor Migration', onClick: openXhm,
+                                              icon: <Icons.FolderInput /> },
+                                            // Network is taken by Topology right above
+                                            { id: 'mcevpn', show: clusters.length >= 2, active: sidebarMultiSdn, label: t('mcevpnTitle') || 'Multi-Cluster EVPN', onClick: openMultiSdn,
+                                              icon: <Icons.Layers /> },
+                                        ].filter(tool => tool.show);
+                                        if (tools.length === 0) return null;
+                                        // folded with one of its views open: the header keeps the accent
+                                        const lit = corpToolsCollapsed && tools.some(tool => tool.active);
+                                        return (
+                                            <div className="mt-4 pt-4 border-t border-proxmox-border" data-corp-tools="">
+                                                <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider px-1 mb-2">
+                                                    {/* the whole header folds, the chevron sits where the + of the other headers is */}
+                                                    <button type="button" onClick={toggleCorpTools} aria-expanded={!corpToolsCollapsed}
+                                                            className="w-full flex items-center justify-between gap-2 py-1 uppercase"
+                                                            style={lit ? {color: 'var(--corp-accent)'} : undefined}>
+                                                        <span className="min-w-0 truncate">{t('sidebarToolsSection')}</span>
+                                                        <span className="flex flex-shrink-0 mr-2" style={{color: lit ? 'var(--corp-accent)' : 'var(--corp-text-muted)'}}>
+                                                            {corpToolsCollapsed ? <Icons.ChevronRight className="w-3 h-3" /> : <Icons.ChevronDown className="w-3 h-3" />}
+                                                        </span>
+                                                    </button>
+                                                </h2>
+                                                {!corpToolsCollapsed && (
+                                                    <div className="space-y-1.5">
+                                                        {tools.map(tool => <CorpSidebarToolRow key={tool.id} {...tool} />)}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        );
+                                    })()}
                                 {/* LW: Feb 2026 - Proxmox Backup Servers */}
                                 {pbsServers.length > 0 && (
                                     <div className="mt-4 pt-4 border-t border-proxmox-border">
                                         <div className="flex items-center justify-between px-1 mb-2">
                                             <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">{t('backupServers') || 'Backup Servers'}</h2>
-                                            {isAdmin && (
+                                            {isAdmin && !haReadOnly && (
                                                 <button onClick={() => setShowAddPBS(true)} className="p-1 text-gray-500 hover:text-proxmox-orange rounded transition-colors" title="Add PBS">
                                                     <Icons.Plus className="w-4 h-4" />
                                                 </button>
@@ -14888,7 +17940,7 @@
                                 )}
                                 
                                 {/* add PBS button - hidden in corporate */}
-                                {!isCorporate && pbsServers.length === 0 && isAdmin && (
+                                {!isCorporate && pbsServers.length === 0 && isAdmin && !haReadOnly && (
                                     <div className="mt-4 pt-4 border-t border-proxmox-border">
                                         <button onClick={() => setShowAddPBS(true)} className="w-full flex items-center gap-2 px-3 py-2 rounded-xl bg-proxmox-card border border-dashed border-proxmox-border text-gray-500 hover:text-blue-400 hover:border-blue-500/30 transition-all text-sm">
                                             <Icons.Shield className="w-4 h-4" />
@@ -14902,7 +17954,7 @@
                                     <div className="mt-4 pt-4 border-t border-proxmox-border">
                                         <div className="flex items-center justify-between px-1 mb-2">
                                             <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider">ESXi</h2>
-                                            {isAdmin && (
+                                            {isAdmin && !haReadOnly && (
                                                 <button onClick={() => { setEditingVMware(null); setVmwareForm({ name: '', host: '', port: 443, username: 'root', password: '', ssl_verify: false, notes: '' }); setShowAddVMware(true); }} className="p-1 text-gray-500 hover:text-proxmox-orange rounded transition-colors" title={t('addEsxiServer')}>
                                                     <Icons.Plus className="w-4 h-4" />
                                                 </button>
@@ -15065,7 +18117,7 @@
                                 )}
 
                                 {/* add VMware button - hidden in corporate */}
-                                {!isCorporate && vmwareServers.length === 0 && isAdmin && (
+                                {!isCorporate && vmwareServers.length === 0 && isAdmin && !haReadOnly && (
                                     <div className="mt-4 pt-4 border-t border-proxmox-border">
                                         <button onClick={() => { setEditingVMware(null); setVmwareForm({ name: '', host: '', port: 443, username: 'root', password: '', ssl_verify: false, notes: '' }); setShowAddVMware(true); }} className="w-full flex items-center gap-2 px-3 py-2 rounded-xl bg-proxmox-card border border-dashed border-proxmox-border text-gray-500 hover:text-emerald-400 hover:border-emerald-500/30 transition-all text-sm">
                                             <Icons.Cloud className="w-4 h-4" />
@@ -15169,8 +18221,10 @@
                                                 // render when the manifest declared has_frontend AND the
                                                 // server normalised frontend_route to /api/plugins/<id>/...
                                                 // (server-side validation in pegaprox/api/plugins.py).
+                                                // #642 - and only on the clusters it was limited to
                                                 const pluginFrontendTabs = (enabledPlugins || [])
                                                     .filter(p => p && p.has_frontend && p.frontend_route)
+                                                    .filter(p => pluginAppliesToCluster(p, selectedCluster?.id))
                                                     .map(p => ({
                                                         id: `plugin:${p.id}`,
                                                         label: p.name || p.id,  // shown verbatim
@@ -15194,7 +18248,8 @@
                                                 // #390 — admin role always passes (matches backend has_permission shortcut).
                                                 if (tab.id === 'site-recovery') return can('site_recovery.view');
                                                 if (tab.id === 'plugins') return can('plugins.view');
-                                                if (tab.id === 'compliance') return can('admin.audit') || can('node.maintenance');
+                                                // compliance only reads, so a standby keeps it (#625)
+                                                if (tab.id === 'compliance') return holds('admin.audit') || holds('node.maintenance');
                                                 if (typeof tab.id === 'string' && tab.id.startsWith('plugin:')) return can('plugins.view');
                                                 return true;
                                             }).map(tab => (
@@ -15243,6 +18298,8 @@
                                                         <div className="flex items-center gap-2">
                                                             <Icons.Database className="w-4 h-4" style={{color: 'var(--corp-accent)'}} />
                                                             <span className="corp-header-title">{selectedCluster.display_name || selectedCluster.name}</span>
+                                                            {/* rename, re-configure and delete belong on the active instance (#625) */}
+                                                            {!haReadOnly && (<>
                                                             <button onClick={() => { setRenamingCluster(selectedCluster); setRenameValue(selectedCluster.display_name || selectedCluster.name || ''); }} className="corp-rename-btn" title={t('renameCluster') || 'Rename'} style={{background:'none', border:'none', cursor:'pointer', padding:'2px', color:'var(--corp-text-muted)', display:'inline-flex', alignItems:'center'}}>
                                                                 <Icons.Edit className="w-3 h-3" />
                                                             </button>
@@ -15252,6 +18309,7 @@
                                                             {isAdmin && <button onClick={() => handleDeleteCluster(selectedCluster.id)} title={t('deleteCluster') || 'Remove Cluster'} style={{background:'none', border:'none', cursor:'pointer', padding:'2px', color:'var(--corp-text-muted)', display:'inline-flex', alignItems:'center'}} onMouseEnter={(e) => e.currentTarget.style.color='#f54f47'} onMouseLeave={(e) => e.currentTarget.style.color='var(--corp-text-muted)'}>
                                                                 <Icons.Trash className="w-3 h-3" />
                                                             </button>}
+                                                            </>)}
                                                             <span className="corp-badge" style={selectedCluster.connected
                                                                 ? {background: 'rgba(96,181,21,0.15)', color: '#60b515', border: '1px solid rgba(96,181,21,0.3)'}
                                                                 : {background: 'rgba(245,79,71,0.15)', color: '#f54f47', border: '1px solid rgba(245,79,71,0.3)'}
@@ -15443,6 +18501,10 @@
                                                                     onNodeAction={handleNodeAction}
                                                                     onRemoveNode={(nodeName) => { setNodeToRemoveDash({ name: nodeName }); setShowRemoveNodeDash(true); }}
                                                                     onMoveNode={(nodeName) => { setNodeToMoveDash(nodeName); setShowMoveNodeDash(true); }}
+                                                                    isFavorite={isFavorite('node', selectedCluster.id, null, node)}
+                                                                    onToggleFavorite={(nodeName) => toggleNodeFavorite(selectedCluster.id, nodeName)}
+                                                                    guestActions={[['startall', 'vm.start'], ['stopall', 'vm.stop'], ['migrateall', 'vm.migrate']].filter(([, perm]) => can(perm)).map(([a]) => a)}
+                                                                    onGuestsAction={(nodeName, action) => setNodeGuests({ action, clusterId: selectedCluster.id, node: nodeName })}
                                                                 />
                                                             ))}
                                                             {/* Offline nodes from knownNodes */}
@@ -15781,6 +18843,10 @@
                                                             pendingVmAction={pendingVmAction}
                                                             onPendingActionConsumed={() => setPendingVmAction(null)}
                                                             backupStatus={vmsBackupStatus}
+                                                            authFetch={authFetch}
+                                                            onBulkDone={() => { const cid = selectedCluster.id; setTimeout(() => fetchClusterResources(cid), 1500); }}
+                                                            favorites={favorites}
+                                                            onToggleFavorite={toggleGuestFavorite}
                                                             onVmNavigate={isCorporate ? (vm) => {
                                                                 setSelectedSidebarVm({...vm, _clusterId: selectedCluster.id});
                                                                 setSelectedSidebarNode(null);
@@ -15790,8 +18856,9 @@
                                                             } : undefined}
                                                         />
                                                         
-                                                        {/* Create VM/CT Buttons */}
+                                                        {/* Create VM/CT Buttons - not on a standby (#625), the export stays */}
                                                         <div className={`flex gap-3 ${isCorporate ? 'mt-2' : 'mt-4'}`}>
+                                                            {!haReadOnly && (<>
                                                             <button
                                                                 onClick={() => setShowCreateVm('qemu')}
                                                                 className={isCorporate
@@ -15812,35 +18879,19 @@
                                                                 <Icons.Plus className={isCorporate ? 'w-3 h-3' : ''} />
                                                                 {t('createContainer')}
                                                             </button>
-                                                            {/* LW — quick CSV export of the current VM list */}
-                                                            <button
-                                                                onClick={() => {
-                                                                    const rows = (clusterResources || []).filter(r => r.type === 'qemu' || r.type === 'lxc');
-                                                                    if (!rows.length) { addToast?.(t('noResources') || 'No VMs to export', 'info'); return; }
-                                                                    const cols = [
-                                                                        { key: 'vmid', label: 'VMID' },
-                                                                        { key: 'name', label: 'Name' },
-                                                                        { key: 'type', label: 'Type' },
-                                                                        { key: 'node', label: 'Node' },
-                                                                        { key: 'status', label: 'Status' },
-                                                                        { key: 'cpu', label: 'CPU%', map: r => r.cpu != null ? Math.round(r.cpu * 100) : '' },
-                                                                        { key: 'mem', label: 'Mem (MiB)', map: r => r.mem != null ? Math.round(r.mem / 1048576) : '' },
-                                                                        { key: 'maxmem', label: 'MemMax (MiB)', map: r => r.maxmem != null ? Math.round(r.maxmem / 1048576) : '' },
-                                                                        { key: 'tags', label: 'Tags', map: r => Array.isArray(r.tags) ? r.tags.join(';') : (r.tags || '') },
-                                                                    ];
-                                                                    const fname = `pegaprox-${selectedCluster?.name || 'cluster'}-vms-${new Date().toISOString().slice(0,10)}.csv`;
-                                                                    window.PegaProxDownloadCsv?.(fname, rows, cols);
-                                                                    addToast?.(`Exported ${rows.length} rows`, 'success');
-                                                                }}
+                                                            </>)}
+                                                            {/* LW Oct 2026 - quick CSV export of the current VM list, with the inventory of each guest (ui.js) */}
+                                                            <InventoryCsvButton
+                                                                clusterId={selectedCluster.id}
+                                                                clusters={clusters}
+                                                                fileName={`pegaprox-${selectedCluster?.name || 'cluster'}-vms-${new Date().toISOString().slice(0,10)}.csv`}
+                                                                addToast={addToast}
                                                                 className={isCorporate
-                                                                    ? 'flex items-center gap-1.5 px-3 py-1.5 text-[13px] hover:bg-[#29414e] border border-[#485764]'
-                                                                    : 'flex items-center gap-2 px-4 py-2 bg-proxmox-darker rounded-lg text-gray-200 hover:bg-proxmox-card border border-proxmox-border transition-colors'
+                                                                    ? 'corp-vm-btn corp-vm-btn-ghost disabled:opacity-50'
+                                                                    : 'flex items-center gap-2 px-4 py-2 bg-proxmox-darker rounded-lg text-gray-200 hover:bg-proxmox-hover border border-proxmox-border transition-colors'
                                                                 }
-                                                                title={t('exportCsv') || 'Export CSV'}
-                                                            >
-                                                                <Icons.Download className={isCorporate ? 'w-3 h-3' : 'w-4 h-4'} />
-                                                                {t('exportCsv') || 'Export CSV'}
-                                                            </button>
+                                                                label={t('exportCsv') || 'Export CSV'}
+                                                            />
                                                         </div>
                                                     </div>
                                                 )}
@@ -15921,7 +18972,7 @@
                                                         {/* #696 — bulk actions bar (shows once one or more snapshots are checked; works in both layouts) */}
                                                         {(() => {
                                                             const selCount = (sortedSnapshots || []).filter(s => selectedSnaps[snapKey(s)]).length;
-                                                            return selCount > 0 ? (
+                                                            return canDeleteSnaps && selCount > 0 ? (
                                                                 <div className="flex items-center gap-3 mb-3 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/30">
                                                                     <span className="text-sm text-gray-200">{selCount} {t('selected') || 'selected'}</span>
                                                                     <button
@@ -15963,6 +19014,7 @@
                                                                 <table className={isCorporate ? 'corp-snap-table' : 'min-w-full text-sm'}>
                                                                     <thead className={isCorporate ? '' : 'bg-black/40 text-gray-400'}>
                                                                         <tr>
+                                                                            {canDeleteSnaps && (
                                                                             <th className={isCorporate ? '' : 'px-4 py-3 text-left w-8'}>
                                                                                 {/* #696 — select-all across the currently listed snapshots */}
                                                                                 <input type="checkbox"
@@ -15973,6 +19025,7 @@
                                                                                     }}
                                                                                     className="rounded" title={t('selectAll') || 'Select all'} />
                                                                             </th>
+                                                                            )}
                                                                             <th onClick={() => toggleSnapshotSort('vmid')} className={isCorporate ? '' : 'px-4 py-3 text-left cursor-pointer hover:text-white'}>
                                                                                 VM ID {snapshotSortBy === 'vmid' && (snapshotSortDir === 'asc' ? '↑' : '↓')}
                                                                             </th>
@@ -15994,7 +19047,7 @@
                                                                             <th onClick={() => toggleSnapshotSort('age')} className={isCorporate ? '' : 'px-4 py-3 text-left cursor-pointer hover:text-white'}>
                                                                                 {t('snapshotsAge') || 'Age'} {snapshotSortBy === 'age' && (snapshotSortDir === 'asc' ? '↑' : '↓')}
                                                                             </th>
-                                                                            <th className={isCorporate ? 'corp-snap-action' : 'px-4 py-3 text-right w-12'}>{t('snapshotsAction') || 'Action'}</th>
+                                                                            {canDeleteSnaps && <th className={isCorporate ? 'corp-snap-action' : 'px-4 py-3 text-right w-12'}>{t('snapshotsAction') || 'Action'}</th>}
                                                                         </tr>
                                                                     </thead>
                                                                     <tbody className={isCorporate ? '' : 'divide-y divide-gray-800'}>
@@ -16003,6 +19056,7 @@
                                                                                 key={`${snap.vmid}-${snap.snapshot_name}-${idx}`}
                                                                                 className={isCorporate ? 'group' : 'group hover:bg-white/5 transition-colors'}
                                                                             >
+                                                                                {canDeleteSnaps && (
                                                                                 <td className={isCorporate ? '' : 'px-4 py-3'}>
                                                                                     {/* #696 — per-row select */}
                                                                                     <input type="checkbox"
@@ -16010,6 +19064,7 @@
                                                                                         onChange={(e) => setSelectedSnaps(prev => { const n = {...prev}; if (e.target.checked) n[snapKey(snap)] = true; else delete n[snapKey(snap)]; return n; })}
                                                                                         className="rounded" />
                                                                                 </td>
+                                                                                )}
                                                                                 <td className={isCorporate ? '' : 'px-4 py-3 text-gray-300'}>{snap.vmid ?? '-'}</td>
                                                                                 <td className={isCorporate ? '' : 'px-4 py-3 text-gray-200'}>{snap.vm_name ?? '-'}</td>
                                                                                 <td className={isCorporate ? '' : 'px-4 py-3'}>
@@ -16027,8 +19082,9 @@
                                                                                 </td>
                                                                                 <td className={isCorporate ? '' : 'px-4 py-3 text-gray-300'}>{snap.node ?? '-'}</td>
                                                                                 <td className={isCorporate ? 'corp-snap-mono' : 'px-4 py-3 font-mono text-gray-200'}>{snap.snapshot_name ?? '-'}</td>
-                                                                                <td className={isCorporate ? '' : 'px-4 py-3 text-gray-300'}>{snap.snapshot_date ?? '-'}</td>
+                                                                                <td className={isCorporate ? '' : 'px-4 py-3 text-gray-300'}>{snap.snapshot_ts ? fmtDate(snap.snapshot_ts) : (snap.snapshot_date ?? '-')}</td>
                                                                                 <td className={isCorporate ? 'corp-snap-age' : 'px-4 py-3 text-yellow-400'}>{snap.age ?? '-'}</td>
+                                                                                {canDeleteSnaps && (
                                                                                 <td className={isCorporate ? 'corp-snap-action' : 'px-4 py-3 text-right'}>
                                                                                     <button
                                                                                         onClick={() => deleteGlobalSnapshot(snap, selectedCluster.id)}
@@ -16040,6 +19096,7 @@
                                                                                         <Icons.Trash className="w-4 h-4" />
                                                                                     </button>
                                                                                 </td>
+                                                                                )}
                                                                             </tr>
                                                                         ))}
                                                                     </tbody>
@@ -16242,7 +19299,7 @@
                                                                                 return (
                                                                                     <tr key={event.id} className={`hover:bg-white/5 transition-colors align-top ${rowBg}`}>
                                                                                         <td className="px-4 py-2.5 text-gray-400 whitespace-nowrap text-xs font-mono">
-                                                                                            {event.timestamp ? new Date(event.timestamp).toLocaleString([], {month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '-'}
+                                                                                            {event.timestamp ? fmtClock(event.timestamp, { month: 'short', day: '2-digit', second: '2-digit' }) || '-' : '-'}
                                                                                         </td>
                                                                                         <td className="px-3 py-2.5">
                                                                                             <span className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium border ${badgeBg}`}>
@@ -16340,6 +19397,7 @@
                                                         { id: 'snapshots', label: t('snapPoliciesTitle') || 'Snapshots', icon: Icons.Camera },
                                                         { id: 'replication', label: t('replicationOverview') || 'Replication', icon: Icons.RefreshCw },
                                                         { id: 'templates', label: t('templateLibrary') || 'Templates', icon: Icons.Package },
+                                                        { id: 'apps', label: t('ociTabLabel'), icon: Icons.Container },
                                                         { id: 'hardening', label: t('hardenNode') || 'Harden PVE Node', icon: Icons.Shield }
                                                     ].map(sub => (
                                                         <button
@@ -16365,12 +19423,14 @@
                                                     <div className="space-y-4">
                                                         <div className="flex justify-between items-center">
                                                             <p className="text-sm text-gray-400">{t('schedulesDesc') || 'Automatically start, stop, reboot or snapshot VMs on a schedule'}</p>
+                                                            {!haReadOnly && (
                                                             <button
                                                                 onClick={() => { setEditingSchedule(null); setShowScheduleModal(true); }}
                                                                 className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm"
                                                             >
                                                                 <Icons.Plus /> {t('newSchedule') || 'New Schedule'}
                                                             </button>
+                                                            )}
                                                         </div>
                                                         
                                                         {schedules.filter(s => s.cluster_id === selectedCluster?.id).length === 0 ? (
@@ -16398,6 +19458,7 @@
                                                                                 <td className="p-3">
                                                                                     <button
                                                                                         onClick={() => toggleScheduleEnabled(schedule.id, !schedule.enabled)}
+                                                                                        disabled={haReadOnly}
                                                                                         className={`w-9 h-5 rounded-full relative transition-colors ${schedule.enabled ? 'bg-green-500' : 'bg-gray-600'}`}
                                                                                     >
                                                                                         <span className={`absolute top-0.5 w-4 h-4 bg-white rounded-full transition-transform ${schedule.enabled ? 'left-4' : 'left-0.5'}`} />
@@ -16425,12 +19486,14 @@
                                                                                     {schedule.run_count > 0 && ` (${schedule.run_count}x)`}
                                                                                 </td>
                                                                                 <td className="p-3 flex gap-1">
+                                                                                    {!haReadOnly && (<>
                                                                                     <button onClick={() => { setEditingSchedule(schedule); setShowScheduleModal(true); }} className="p-1 hover:bg-blue-500/20 rounded text-gray-500 hover:text-blue-400" title="Edit">
                                                                                         <Icons.Edit className="w-4 h-4" />
                                                                                     </button>
                                                                                     <button onClick={() => deleteSchedule(schedule.id)} className="p-1 hover:bg-red-500/20 rounded text-gray-500 hover:text-red-400">
                                                                                         <Icons.Trash className="w-4 h-4" />
                                                                                     </button>
+                                                                                    </>)}
                                                                                 </td>
                                                                             </tr>
                                                                         ))}
@@ -16479,6 +19542,7 @@
                                                     <div className="space-y-4">
                                                         <div className="flex justify-between items-center">
                                                             <p className="text-sm text-gray-400">{t('alertsDesc') || 'Get notified when resources exceed thresholds'}</p>
+                                                            {!haReadOnly && (
                                                             <button
                                                                 onClick={async () => {
                                                                     setEditingAlert(null);  // #618 — fresh create
@@ -16498,9 +19562,16 @@
                                                             >
                                                                 <Icons.Plus /> {t('newAlert') || 'New Alert'}
                                                             </button>
+                                                            )}
                                                         </div>
                                                         
                                                         {/* NS #501 — currently firing incidents (severity + ack) */}
+                                                        {activeAlertsAway && (
+                                                            <div data-ha-leader-away="alerts" className="flex items-center gap-2 p-3 rounded-lg border border-proxmox-border bg-proxmox-dark text-sm text-gray-400">
+                                                                <Icons.AlertTriangle className="w-4 h-4 text-gray-500 shrink-0" />
+                                                                <span>{t('pgHaLeaderAwayView')}</span>
+                                                            </div>
+                                                        )}
                                                         {activeAlerts.length > 0 && (
                                                             <div className="space-y-2">
                                                                 <div className="text-sm font-semibold text-gray-300 flex items-center gap-2">
@@ -16508,7 +19579,8 @@
                                                                     {t('activeAlerts') || 'Active Alerts'} <span className="text-xs text-gray-500">({activeAlerts.length})</span>
                                                                 </div>
                                                                 {activeAlerts.map(a => (
-                                                                    <div key={a.id} className={`flex items-center justify-between p-3 rounded-lg border ${a.acked_at ? 'bg-proxmox-darker border-proxmox-darker opacity-70' : 'bg-amber-500/10 border-amber-500/30'}`}>
+                                                                    <div key={a.id} data-active-alert={a.id} className={`p-3 rounded-lg border ${a.acked_at || a.muted_until ? 'bg-proxmox-darker border-proxmox-darker opacity-70' : 'bg-amber-500/10 border-amber-500/30'}`}>
+                                                                    <div className="flex items-center justify-between">
                                                                         <div className="flex items-center gap-3 min-w-0">
                                                                             <span className={`px-1.5 py-0.5 text-[10px] rounded uppercase font-mono shrink-0 ${
                                                                                 a.severity === 'critical' ? 'bg-red-500/20 text-red-400' :
@@ -16521,14 +19593,32 @@
                                                                                     {fmtDate ? fmtDate(a.triggered_at) : a.triggered_at}
                                                                                     {a.escalation_step > 0 && <span className="text-amber-400 ml-2">↑ {t('escStep') || 'esc'} {a.escalation_step}</span>}
                                                                                     {a.acked_at && <span className="text-green-400 ml-2">✓ {t('acked') || 'acked'}{a.acked_by ? ` (${a.acked_by})` : ''}</span>}
+                                                                                    {a.muted_until && <span data-alert-muted className="text-gray-400 ml-2 inline-flex items-center gap-1"><Icons.BellOff className="w-3 h-3" />{t('alertMuted').replace('{time}', fmtMuteUntil(a.muted_until))}</span>}
                                                                                 </div>
                                                                             </div>
                                                                         </div>
-                                                                        {!a.acked_at && (
-                                                                            <button onClick={() => ackAlert(a.id)} className="px-3 py-1.5 text-xs bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg shrink-0">
-                                                                                {t('acknowledge') || 'Acknowledge'}
-                                                                            </button>
+                                                                        {!haReadOnly && (
+                                                                        <div className="flex items-center gap-1 shrink-0">
+                                                                            {!a.muted_until && (
+                                                                                <button
+                                                                                    onClick={() => { setMuteWholeObject(false); setMuteMenu(muteMenu && muteMenu.kind === 'incident' && muteMenu.id === a.id ? null : { kind: 'incident', id: a.id }); }}
+                                                                                    title={t('alertMute')}
+                                                                                    className="p-1.5 hover:bg-proxmox-hover rounded text-gray-500 hover:text-proxmox-orange"
+                                                                                >
+                                                                                    <Icons.BellOff className="w-4 h-4" />
+                                                                                </button>
+                                                                            )}
+                                                                            {!a.acked_at && !haReadOnly && (
+                                                                                <button onClick={() => ackAlert(a.id)} className="px-3 py-1.5 text-xs bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg shrink-0">
+                                                                                    {t('acknowledge') || 'Acknowledge'}
+                                                                                </button>
+                                                                            )}
+                                                                        </div>
                                                                         )}
+                                                                    </div>
+                                                                    {muteMenu && muteMenu.kind === 'incident' && muteMenu.id === a.id && !haReadOnly && renderMuteChoices(
+                                                                        () => (muteWholeObject ? { active_alert_id: a.id, whole_object: true } : { active_alert_id: a.id }),
+                                                                        (a.target_type === 'vm' || a.target_type === 'node') && a.target_name ? a.target_name : null)}
                                                                     </div>
                                                                 ))}
                                                             </div>
@@ -16542,10 +19632,12 @@
                                                         ) : (
                                                             <div className="space-y-2">
                                                                 {clusterAlerts.map(alert => (
-                                                                    <div key={alert.id} className={`flex items-center justify-between p-3 rounded-lg border ${alert.enabled ? 'bg-proxmox-dark border-proxmox-border' : 'bg-proxmox-darker border-proxmox-darker opacity-60'}`}>
+                                                                    <div key={alert.id} data-alert-rule={alert.id} className={`p-3 rounded-lg border ${alert.enabled ? 'bg-proxmox-dark border-proxmox-border' : 'bg-proxmox-darker border-proxmox-darker opacity-60'}`}>
+                                                                    <div className="flex items-center justify-between">
                                                                         <div className="flex items-center gap-3">
                                                                             <button
                                                                                 onClick={() => toggleAlertEnabled(alert.id, !alert.enabled)}
+                                                                                disabled={haReadOnly}
                                                                                 className={`w-9 h-5 rounded-full relative transition-colors ${alert.enabled ? 'bg-green-500' : 'bg-gray-600'}`}
                                                                             >
                                                                                 <span className={`absolute top-0.5 w-4 h-4 bg-white rounded-full transition-transform ${alert.enabled ? 'left-4' : 'left-0.5'}`} />
@@ -16563,37 +19655,87 @@
                                                                                          t('cluster') || 'Cluster'}
                                                                                     </span>
                                                                                 </div>
-                                                                                <div className="text-xs text-gray-500">
-                                                                                    {alert.metric?.toUpperCase()} {alert.operator} {alert.threshold}%
+                                                                                <div className="text-xs text-gray-500 flex items-center gap-2 flex-wrap">
+                                                                                    <span>{alertRuleSummary(alert)}</span>
+                                                                                    {ruleMute(alert.id) && (
+                                                                                        <span data-rule-muted className="inline-flex items-center gap-1 text-gray-400">
+                                                                                            <Icons.BellOff className="w-3 h-3" />{t('alertMuted').replace('{time}', fmtMuteUntil(ruleMute(alert.id).until))}
+                                                                                        </span>
+                                                                                    )}
                                                                                 </div>
                                                                             </div>
                                                                         </div>
+                                                                        {!haReadOnly && (
                                                                         <div className="flex items-center gap-1">
                                                                             <button onClick={() => openEditAlert(alert)} title={t('editAlert') || 'Edit Alert'} className="p-1.5 hover:bg-proxmox-hover rounded text-gray-500 hover:text-proxmox-orange">
                                                                                 <Icons.Edit className="w-4 h-4" />
                                                                             </button>
+                                                                            {ruleMute(alert.id) ? (
+                                                                                <button onClick={() => unmuteAlert(ruleMute(alert.id).id)} title={t('alertUnmute')} className="p-1.5 hover:bg-proxmox-hover rounded text-proxmox-orange">
+                                                                                    <Icons.BellOff className="w-4 h-4" />
+                                                                                </button>
+                                                                            ) : (
+                                                                                <button onClick={() => { setMuteWholeObject(false); setMuteMenu(muteMenu && muteMenu.kind === 'rule' && muteMenu.id === alert.id ? null : { kind: 'rule', id: alert.id }); }} title={t('alertMute')} className="p-1.5 hover:bg-proxmox-hover rounded text-gray-500 hover:text-proxmox-orange">
+                                                                                    <Icons.BellOff className="w-4 h-4" />
+                                                                                </button>
+                                                                            )}
                                                                             <button onClick={() => deleteClusterAlert(alert.id)} title={t('delete') || 'Delete'} className="p-1.5 hover:bg-red-500/20 rounded text-gray-500 hover:text-red-400">
                                                                                 <Icons.Trash className="w-4 h-4" />
                                                                             </button>
                                                                         </div>
+                                                                        )}
+                                                                    </div>
+                                                                    {muteMenu && muteMenu.kind === 'rule' && muteMenu.id === alert.id && !haReadOnly && renderMuteChoices(() => ({ rule_id: alert.id }), null)}
                                                                     </div>
                                                                 ))}
                                                             </div>
                                                         )}
+
+                                                        {/* LW Oct 2026 - what is muted right now; lifting one is an action, so not on a standby */}
+                                                        {alertMutes.length > 0 && (
+                                                            <div data-alert-mutes className="space-y-2">
+                                                                <div className="text-sm font-semibold text-gray-300 flex items-center gap-2">
+                                                                    <Icons.BellOff className="w-4 h-4 text-gray-400" />
+                                                                    {t('alertMutes')} <span className="text-xs text-gray-500">({alertMutes.length})</span>
+                                                                </div>
+                                                                {alertMutes.map(m => {
+                                                                    const rule = m.rule_id ? clusterAlerts.find(a => a.id === m.rule_id) : null;
+                                                                    const what = [m.rule_id ? (rule ? rule.name : m.rule_id) : t('alertMuteEveryRule'),
+                                                                                  m.object_key ? (m.object_label || m.object_key) : null].filter(Boolean).join(' / ');
+                                                                    return (
+                                                                        <div key={m.id} data-alert-mute={m.id} className="flex items-center justify-between p-3 rounded-lg border bg-proxmox-darker border-proxmox-border">
+                                                                            <div className="min-w-0">
+                                                                                <div className="text-sm truncate">{what}</div>
+                                                                                <div className="text-xs text-gray-500">
+                                                                                    {t('alertMuted').replace('{time}', fmtMuteUntil(m.until))}{m.created_by ? ` - ${m.created_by}` : ''}
+                                                                                </div>
+                                                                            </div>
+                                                                            {!haReadOnly && (
+                                                                                <button onClick={() => unmuteAlert(m.id)} className="px-3 py-1.5 text-xs bg-proxmox-dark hover:bg-proxmox-hover border border-proxmox-border rounded-lg shrink-0">
+                                                                                    {t('alertUnmute')}
+                                                                                </button>
+                                                                            )}
+                                                                        </div>
+                                                                    );
+                                                                })}
+                                                            </div>
+                                                        )}
                                                     </div>
                                                 )}
-                                                
+
                                                 {/* Affinity Sub-Tab */}
                                                 {automationSubTab === 'affinity' && (
                                                     <div className="space-y-4">
                                                         <div className="flex justify-between items-center">
                                                             <p className="text-sm text-gray-400">{t('affinityDesc') || 'Keep VMs together or separate across nodes'}</p>
+                                                            {!haReadOnly && (
                                                             <button
                                                                 onClick={() => setShowAffinityModal(true)}
                                                                 className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm"
                                                             >
                                                                 <Icons.Plus /> {t('newRule') || 'New Rule'}
                                                             </button>
+                                                            )}
                                                         </div>
                                                         
                                                         {clusterAffinityRules.length === 0 ? (
@@ -16613,9 +19755,11 @@
                                                                             <span className="text-sm text-white font-medium">{rule.name || rule.id}</span>
                                                                             <span className="text-sm text-gray-400">VMs: {(rule.vm_ids || rule.vms || []).join(', ')}</span>
                                                                         </div>
+                                                                        {!haReadOnly && (
                                                                         <button onClick={() => deleteClusterAffinityRule(rule.id)} className="p-1.5 hover:bg-red-500/20 rounded text-gray-500 hover:text-red-400">
                                                                             <Icons.Trash className="w-4 h-4" />
                                                                         </button>
+                                                                        )}
                                                                     </div>
                                                                 ))}
                                                             </div>
@@ -16636,12 +19780,14 @@
                                                                 >
                                                                     <Icons.RefreshCw className="w-4 h-4" />
                                                                 </button>
+                                                                {!haReadOnly && (
                                                                 <button
                                                                     onClick={() => { setEditingScript(null); setShowScriptModal(true); }}
                                                                     className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm"
                                                                 >
                                                                     <Icons.Plus /> {t('newScript') || 'New Script'}
                                                                 </button>
+                                                                )}
                                                             </div>
                                                         </div>
                                                         
@@ -16673,6 +19819,7 @@
                                                                             </div>
                                                                             <div className="flex items-center gap-2">
                                                                                 {/* Run Script - opens password confirmation */}
+                                                                                {!haReadOnly && (
                                                                                 <button
                                                                                     onClick={() => setShowScriptRunModal(script)}
                                                                                     className="p-2 rounded-lg bg-green-500/20 text-green-400 hover:bg-green-500/30"
@@ -16681,6 +19828,7 @@
                                                                                 >
                                                                                     <Icons.Play className="w-4 h-4" />
                                                                                 </button>
+                                                                                )}
                                                                                 {/* View Last Output */}
                                                                                 {script.last_run && (
                                                                                     <button
@@ -16701,6 +19849,7 @@
                                                                                         <Icons.FileText className="w-4 h-4" />
                                                                                     </button>
                                                                                 )}
+                                                                                {!haReadOnly && (<>
                                                                                 <button
                                                                                     onClick={() => { setEditingScript(script); setShowScriptModal(true); }}
                                                                                     className="p-2 rounded-lg bg-proxmox-dark text-gray-400 hover:bg-proxmox-hover hover:text-white"
@@ -16725,6 +19874,7 @@
                                                                                 >
                                                                                     <Icons.Trash className="w-4 h-4" />
                                                                                 </button>
+                                                                                </>)}
                                                                             </div>
                                                                         </div>
                                                                         {script.description && (
@@ -16792,6 +19942,16 @@
                                                         t={t}
                                                         isAdmin={isAdmin}
                                                         isCorporate={isCorporate}
+                                                    />
+                                                )}
+
+                                                {automationSubTab === 'apps' && (
+                                                    <OciCatalogTab
+                                                        clusters={clusters}
+                                                        clusterId={selectedCluster?.id}
+                                                        authFetch={authFetch}
+                                                        addToast={addToast}
+                                                        t={t}
                                                     />
                                                 )}
 
@@ -17188,6 +20348,7 @@
                                                                         className="px-2.5 py-1 text-xs rounded border border-proxmox-border text-gray-400 hover:text-white hover:border-gray-500 whitespace-nowrap"
                                                                         title={t('exportPdf') || 'Export as PDF'}
                                                                     >PDF</button>
+                                                                    {!haReadOnly && (<>
                                                                     <button
                                                                         onClick={applyHardening}
                                                                         disabled={hardenApplying || selectedCount === 0}
@@ -17211,6 +20372,7 @@
                                                                     >
                                                                         <Icons.RotateCcw className="w-4 h-4" /> {t('rollbackSelected') || 'Rollback Selected'} ({selectedCount})
                                                                     </button>
+                                                                    </>)}
                                                                 </div>
 
                                                                 {/* #16745 (A/C) — gated apply confirmation: click-happy users must read + tick before anything touches the node */}
@@ -17218,7 +20380,7 @@
                                                                     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/60 p-4" onClick={() => setHardenConfirm(null)}>
                                                                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl max-w-lg w-full p-5" onClick={e => e.stopPropagation()}>
                                                                             <h3 className="text-base font-semibold text-white mb-2 flex items-center gap-2"><Icons.Shield className="w-4 h-4 text-green-400" /> {t('hardenApplyTitle') || 'Apply hardening controls'}</h3>
-                                                                            <p className="text-sm text-gray-400 mb-3">{(t('hardenApplyBody') || 'This applies {n} control(s) to "{node}". System configuration files will be modified; some changes may require a reboot.').replace('{n}', hardenConfirm.toApply.length).replace('{node}', hardenNode)}</p>
+                                                                            <p className="text-sm text-gray-400 mb-3">{(t('hardenApplyBody') || 'This applies {n} control(s) to "{node}". System configuration files will be modified; some changes may require a reboot.').replace('{n}', hardenConfirm.toApply.length).replace('{node}', () => hardenNode)}</p>
                                                                             {hardenConfirm.needsLockoutAck && (
                                                                                 <div className="rounded-lg bg-red-500/10 border border-red-500/40 p-3 mb-3">
                                                                                     <p className="text-xs text-red-300 mb-2 leading-snug">⚠ {t('cmSshdRootLockoutNote')}</p>
@@ -17629,18 +20791,21 @@
                                                                             <Icons.HardDrive className="text-yellow-400 w-4 h-4" />
                                                                             {t('storageOverview') || 'Node Storage'}
                                                                         </h3>
-                                                                        <div className="space-y-2">
+                                                                        {/* Name column is one grid track, so the longest node name sets its
+                                                                            width for every row instead of a fixed w-28 clipping them all. */}
+                                                                        {/* LW Oct 2026 - gap-2 then gap-x-4: gap-y-2 is not in the static Tailwind build */}
+                                                                        <div className="grid items-center gap-2 gap-x-4 text-sm" style={{gridTemplateColumns: 'minmax(0, max-content) minmax(6rem, 1fr) max-content'}}>
                                                                             {Object.entries(clusterMetrics).filter(([, m]) => m && m.disk_percent != null && m.disk_total > 0).map(([name, m]) => (
-                                                                                <div key={name} className="flex items-center gap-3 text-sm">
-                                                                                    <span className="w-28 truncate text-gray-400">{name}</span>
-                                                                                    <div className="flex-1 h-2.5 bg-proxmox-dark rounded-full overflow-hidden">
+                                                                                <React.Fragment key={name}>
+                                                                                    <span className="truncate text-gray-400" title={name}>{name}</span>
+                                                                                    <div className="h-2.5 bg-proxmox-dark rounded-full overflow-hidden">
                                                                                         <div className="h-full rounded-full" style={{
                                                                                             width: `${m.disk_percent}%`,
                                                                                             background: m.disk_percent > 90 ? '#ef4444' : m.disk_percent > 70 ? '#eab308' : '#22c55e'
                                                                                         }} />
                                                                                     </div>
                                                                                     <span className="font-mono text-xs text-gray-400 w-14 text-right">{m.disk_percent?.toFixed(1)}%</span>
-                                                                                </div>
+                                                                                </React.Fragment>
                                                                             ))}
                                                                         </div>
                                                                     </div>
@@ -17725,6 +20890,7 @@
                                                                         >PDF</button>
                                                                     </>
                                                                 )}
+                                                                {!haReadOnly && (
                                                                 <button
                                                                     onClick={() => runCveScan()}
                                                                     disabled={cveScanLoading}
@@ -17737,6 +20903,7 @@
                                                                     <Icons.Shield className={`w-4 h-4 ${cveScanLoading ? 'animate-pulse' : ''}`} />
                                                                     {cveScanLoading ? (t('scanning') || 'Scanning...') : (t('scanAllNodes') || 'Scan All Nodes')}
                                                                 </button>
+                                                                )}
                                                             </div>
                                                         </div>
 
@@ -17769,6 +20936,7 @@
                                                                                     </p>
                                                                                 </div>
                                                                             </div>
+                                                                            {!haReadOnly && (
                                                                             <button
                                                                                 onClick={() => installDebsecan()}
                                                                                 disabled={debsecanInstalling}
@@ -17784,6 +20952,7 @@
                                                                                     <><Icons.Download className="w-4 h-4" /> {t('installDebsecan') || 'Install debsecan'}</>
                                                                                 )}
                                                                             </button>
+                                                                            )}
                                                                         </div>
                                                                     </div>
                                                                 )}
@@ -17893,7 +21062,7 @@
                                                                                     <div className="px-4 py-2 bg-proxmox-dark/50 flex gap-6 text-xs text-gray-500">
                                                                                         {node.os && <span>OS: {node.os}</span>}
                                                                                         {node.kernel && <span>Kernel: {node.kernel}</span>}
-                                                                                        {node.timestamp && <span>{t('scannedAt') || 'Scanned at'}: {new Date(node.timestamp).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: localStorage.getItem('pegaprox-time-format') === '12h' })}</span>}
+                                                                                        {node.timestamp && <span>{t('scannedAt') || 'Scanned at'}: {fmtTime(node.timestamp)}</span>}
                                                                                     </div>
 
                                                                                     {/* CVE table from debsecan */}
@@ -18421,6 +21590,7 @@
                                                                 onChange={v => updateConfig('auto_migrate', v)}
                                                                 label={t('autoMigrate')}
                                                             />
+                                                            {!haReadOnly && (
                                                             <button
                                                                 onClick={handleBalanceNow}
                                                                 disabled={balanceRunning || !selectedCluster.connected}
@@ -18433,6 +21603,7 @@
                                                                 }
                                                                 {t('balanceNow') || 'Balance Now'}
                                                             </button>
+                                                            )}
                                                         </div>
                                                         <Toggle
                                                             checked={selectedCluster.dry_run}
@@ -18522,6 +21693,33 @@
                                                                     <div><code className="font-mono">plb_pin_&lt;node&gt;</code> — {t('proxlbTagPin') || 'restrict this guest to the named node'}</div>
                                                                 </div>
                                                             )}
+                                                            {/* LW Oct 2026 (#811) - what a pin does in a node drain, whether a guest goes
+                                                                back on its own, and who is off their pin now. PVE tags, so not on XCP-ng */}
+                                                            {selectedCluster.proxlb_tags_enabled && (selectedCluster.cluster_type || 'proxmox') === 'proxmox' && (<>
+                                                                <fieldset disabled={haReadOnly} className="mt-3 ml-12 space-y-3 min-w-0" data-ha-locked={haReadOnly ? '' : undefined} data-proxlb-pin-switches>
+                                                                    {[
+                                                                        ['proxlb_pins_strict', 'proxlbPinsStrict', 'proxlbPinsStrictDesc'],
+                                                                        ['proxlb_pins_auto_migrate', 'proxlbPinsAutoMigrate', 'proxlbPinsAutoMigrateDesc'],
+                                                                    ].map(([field, label, hint]) => (
+                                                                        <div key={field}>
+                                                                            <div className="flex items-center gap-3">
+                                                                                <button id={`pin-switch-${field}`} type="button" role="switch" aria-checked={!!selectedCluster[field]}
+                                                                                    data-pin-switch={field} disabled={!can('cluster.config')}
+                                                                                    onClick={() => updateConfig(field, !selectedCluster[field])}
+                                                                                    className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${selectedCluster[field] ? 'active' : ''}`} />
+                                                                                <label htmlFor={`pin-switch-${field}`} className="text-sm text-gray-300 cursor-pointer">{t(label)}</label>
+                                                                            </div>
+                                                                            <div className="text-xs text-gray-500 pl-12 mt-1">{t(hint)}</div>
+                                                                        </div>
+                                                                    ))}
+                                                                    {selectedCluster.proxlb_pins_auto_migrate && (!selectedCluster.auto_migrate || selectedCluster.dry_run) && (
+                                                                        <div className="text-xs text-yellow-400 pl-12" data-pin-held-back>{t('proxlbPinsHeldBack')}</div>
+                                                                    )}
+                                                                </fieldset>
+                                                                <ProxlbPinGuests key={selectedCluster.id} clusterId={selectedCluster.id} authFetch={authFetch}
+                                                                    addToast={addToast} t={t} canMigrate={can('vm.migrate')} dryRun={!!selectedCluster.dry_run}
+                                                                    resources={clusterResources} />
+                                                            </>)}
                                                         </div>
 
                                                         {/* LW: collapsible advanced LB settings */}
@@ -18653,11 +21851,14 @@
                                                     <div className="pt-4 border-t border-proxmox-border">
                                                         <h4 className="text-sm font-medium text-gray-400 mb-3">{t('highAvailability')}</h4>
                                                         <div className="space-y-3">
-                                                            <Toggle
-                                                                checked={selectedCluster.ha_enabled || false}
-                                                                onChange={v => updateConfig('ha_enabled', v)}
-                                                                label={t('haEnabled')}
-                                                            />
+                                                            {/* LW Oct 2026 (#625) - switching HA on or off wants ha.config */}
+                                                            <div className={haWrite ? '' : 'opacity-50 pointer-events-none'} aria-disabled={!haWrite}>
+                                                                <Toggle
+                                                                    checked={selectedCluster.ha_enabled || false}
+                                                                    onChange={v => { if (haWrite) updateConfig('ha_enabled', v); }}
+                                                                    label={t('haEnabled')}
+                                                                />
+                                                            </div>
                                                             <div className="text-xs text-gray-500 pl-12">
                                                                 {t('haMonitorDesc')}
                                                             </div>
@@ -18701,7 +21902,7 @@
                                                             {/* Split-Brain Prevention Settings Button */}
                                                             {selectedCluster.ha_enabled && (
                                                                 <button
-                                                                    onClick={() => { setShowHaSettings(true); fetchHAStatus(selectedCluster.id); }}
+                                                                    onClick={() => { setShowHaSettings(true); setHaAgentCheck(null); setHaStatus(null); setHaStatusError(null); setHaSettings(haSettingsDefaults); fetchHAStatus(selectedCluster.id); }}
                                                                     className="ml-12 mt-2 text-xs text-proxmox-orange hover:text-orange-400 flex items-center gap-1"
                                                                 >
                                                                     <Icons.Settings className="w-3 h-3" />
@@ -18833,7 +22034,8 @@
                                                 </div>
                                             </div>
                                             <div className={isCorporate ? 'corp-toolbar flex items-center gap-1' : 'flex items-center gap-2'}>
-                                                {isAdmin && (
+                                                {/* editing the server and its keys is the active's (#625) */}
+                                                {isAdmin && !haReadOnly && (
                                                     <>
                                                         <button onClick={() => { setEditingPBS(selectedPBS); setPbsForm({ name: selectedPBS.name, host: selectedPBS.host, port: selectedPBS.port, user: selectedPBS.user, password: '********', api_token_id: selectedPBS.api_token_id || '', api_token_secret: selectedPBS.using_api_token ? '********' : '', fingerprint: selectedPBS.fingerprint || '', ssl_verify: selectedPBS.ssl_verify || false, linked_clusters: selectedPBS.linked_clusters || [], notes: selectedPBS.notes || '', ssh_user: selectedPBS.ssh_user || '', ssh_port: selectedPBS.ssh_port || 22, ssh_key: selectedPBS.has_ssh_key ? '********' : '', _showSsh: !!selectedPBS.ssh_user }); setShowAddPBS(true); }} className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-white hover:border-blue-500/30 transition-all text-sm flex items-center gap-2'}>
                                                             <Icons.Edit className="w-4 h-4" /> {t('edit') || 'Edit'}
@@ -18844,7 +22046,7 @@
                                                     </>
                                                 )}
                                                 {/* LW May 2026 — Encryption Key generator */}
-                                                {isAdmin && (
+                                                {isAdmin && !haReadOnly && (
                                                     <button onClick={() => setShowEncryptionKeyModal(true)}
                                                         className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-yellow-400 hover:border-yellow-500/30 transition-all text-sm flex items-center gap-2'}
                                                         title={t('encryptionKey') || 'Encryption Key'}>
@@ -18852,7 +22054,7 @@
                                                     </button>
                                                 )}
                                                 {/* NS May 2026 — Auto-Verify schedule settings */}
-                                                {isAdmin && (
+                                                {isAdmin && !haReadOnly && (
                                                     <button onClick={() => setShowVerifyScheduleModal(true)}
                                                         className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-cyan-400 hover:border-cyan-500/30 transition-all text-sm flex items-center gap-2'}
                                                         title={t('autoVerify') || 'Auto Verify'}>
@@ -20236,16 +23438,16 @@
                                                     <div className={`flex items-center gap-3 ${isCorporate ? 'text-[12px]' : 'text-sm'}`} style={{color: '#adbbc4'}}>
                                                         <span>{selectedVMware.host}:{selectedVMware.port || 443}</span>
                                                         <span>•</span>
-                                                        <span>{vmwareVms.length} VMs</span>
+                                                        <span>{t('vms')}: {vmwareVms.length}</span>
                                                         <span>•</span>
-                                                        <span>{vmwareHosts.length} Hosts</span>
+                                                        <span>{t('hosts')}: {vmwareHosts.length}</span>
                                                         <span>•</span>
-                                                        <span>{vmwareDatastores.length} Datastores</span>
+                                                        <span>{t('datastores')}: {vmwareDatastores.length}</span>
                                                     </div>
                                                 </div>
                                             </div>
                                             <div className={isCorporate ? 'corp-toolbar flex items-center gap-1' : 'flex items-center gap-2'}>
-                                                {isAdmin && (
+                                                {isAdmin && !haReadOnly && (
                                                     <>
                                                         <button onClick={() => { setEditingVMware(selectedVMware); setVmwareForm({ name: selectedVMware.name || '', host: selectedVMware.host, port: selectedVMware.port || 443, username: selectedVMware.username || 'root', password: '', ssl_verify: selectedVMware.ssl_verify || false, notes: selectedVMware.notes || '' }); setShowAddVMware(true); }} className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-white text-sm'}>
                                                             <Icons.Settings className="w-4 h-4" />
@@ -20389,7 +23591,7 @@
                                                                                 <td className="p-3 text-gray-400 text-sm">{(vm.host || vm.host_name || '-').split('.')[0]}</td>
                                                                                 <td className="p-3 text-right" onClick={e => e.stopPropagation()}>
                                                                                     <div className="flex items-center justify-end gap-1">
-                                                                                        {!isOn ? (
+                                                                                        {!haReadOnly && (!isOn ? (
                                                                                             <button onClick={() => vmwarePowerAction(vm.vm || vm.vm_id || vm.id, 'start')} disabled={!!actionLoading} className="p-1.5 rounded-lg text-green-400 hover:bg-green-500/10 disabled:opacity-50" title={t('start')}>
                                                                                                 {actionLoading === 'start' ? <Icons.RefreshCw className="w-4 h-4 animate-spin" /> : <Icons.Play className="w-4 h-4" />}
                                                                                             </button>
@@ -20405,7 +23607,7 @@
                                                                                                     <Icons.Pause className="w-4 h-4" />
                                                                                                 </button>
                                                                                             </>
-                                                                                        )}
+                                                                                        ))}
                                                                                     </div>
                                                                                 </td>
                                                                             </tr>
@@ -20486,6 +23688,8 @@
                                                                             </div>
                                                                         </div>
                                                                     </div>
+                                                                    {/* power, console, rename, clone, migrate and delete are the active's (#625) */}
+                                                                    {!haReadOnly && (
                                                                     <div className="flex items-center gap-2">
                                                                         {/* Power Actions */}
                                                                         {!isOn ? (
@@ -20506,11 +23710,14 @@
                                                                             </>
                                                                         )}
                                                                         <div className="w-px h-8 bg-proxmox-border mx-1" />
-                                                                        {/* Console */}
-                                                                        {isOn && (
+                                                                        {/* Console; a standby links to the active's start page instead, unless it serves users (#625) */}
+                                                                        {isOn && !haConsolesElsewhere && (
                                                                             <button onClick={() => openVmwareConsole(vmwareSelectedVm)} className="p-2 rounded-lg bg-purple-500/10 text-purple-400 hover:bg-purple-500/20" title={t('vmwareConsoleVmrc')}>
                                                                                 <Icons.Terminal className="w-4 h-4" />
                                                                             </button>
+                                                                        )}
+                                                                        {isOn && haConsolesElsewhere && (
+                                                                            <HaOnActiveLink iconOnly iconClass="w-4 h-4" className="p-2 rounded-lg bg-purple-500/10 text-purple-400 hover:bg-purple-500/20" />
                                                                         )}
                                                                         {/* More Actions Dropdown */}
                                                                         <div className="relative group">
@@ -20536,6 +23743,7 @@
                                                                             </div>
                                                                         </div>
                                                                     </div>
+                                                                    )}
                                                                 </div>
                                                             </div>
                                                             
@@ -20674,8 +23882,9 @@
                                                                 const initNotes = vmwareConfigEdit.notes !== undefined && vmwareConfigEdit.notes !== '' ? vmwareConfigEdit.notes : (vm.annotation || vm.notes || vm.config?.annotation || '');
                                                                 const perfData = vm.performance || {};
                                                                 
+                                                                // #625: on a standby the settings show, but nothing here saves
                                                                 return (
-                                                                    <div className="space-y-4">
+                                                                    <fieldset disabled={haReadOnly} className="space-y-4 min-w-0" data-ha-locked={haReadOnly ? '' : undefined}>
                                                                         {/* Power State Warning */}
                                                                         {isOn && (
                                                                             <div className="bg-yellow-500/10 border border-yellow-500/20 rounded-xl p-3">
@@ -20839,6 +24048,7 @@
                                                                         )}
                                                                         
                                                                         {/* Save Button */}
+                                                                        {!haReadOnly && (
                                                                         <div className="flex justify-end gap-3">
                                                                             <button onClick={() => setVmwareConfigEdit({ cpu: '', memory: '', notes: '', cpu_hot_add: false, memory_hot_add: false })}
                                                                                 className="px-4 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-white text-sm">
@@ -20851,7 +24061,8 @@
                                                                                 {t('saveChanges')}
                                                                             </button>
                                                                         </div>
-                                                                    </div>
+                                                                        )}
+                                                                    </fieldset>
                                                                 );
                                                             })()}
                                                             
@@ -20946,6 +24157,7 @@
                                                                                     </div>
                                                                                 </div>
                                                                             )}
+                                                                            {!haReadOnly && (
                                                                             <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
                                                                                 <h3 className="text-sm font-semibold text-gray-400 uppercase mb-4">{t('quickActions') || 'Quick Actions'}</h3>
                                                                                 <div className="space-y-2">
@@ -20967,6 +24179,7 @@
                                                                                     </button>
                                                                                 </div>
                                                                             </div>
+                                                                            )}
                                                                         </div>
                                                                     </div>
                                                                 </div>
@@ -20977,7 +24190,7 @@
                                                                 <div className="space-y-4">
                                                                     <div className="flex items-center justify-between">
                                                                         <h3 className="text-sm font-semibold text-gray-400">{t('snapshots')} ({snapsList.length})</h3>
-                                                                        <button onClick={async () => {
+                                                                        {!haReadOnly && <button onClick={async () => {
                                                                             const name = prompt(`${t('snapshotName')}:`);
                                                                             if (name) {
                                                                                 await vmwareSnapshotAction(vmwareSelectedVm, 'create', { name, description: '' });
@@ -20985,7 +24198,7 @@
                                                                             }
                                                                         }} className="px-3 py-1.5 rounded-lg bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 text-sm font-medium">
                                                                             + {t('createSnapshot')}
-                                                                        </button>
+                                                                        </button>}
                                                                     </div>
                                                                     {snapsList.length > 0 ? (
                                                                         <div className="space-y-2">
@@ -21001,9 +24214,9 @@
                                                                                             {snap.created && <div className="text-xs text-gray-600">{fmtDate(snap.created)}</div>}
                                                                                         </div>
                                                                                     </div>
-                                                                                    <button onClick={() => vmwareSnapshotAction(vmwareSelectedVm, 'delete', { snapshot_id: snap.id || snap.snapshot })} className="p-2 text-red-400 hover:bg-red-500/10 rounded-lg" title={t('deleteSnapshot')}>
+                                                                                    {!haReadOnly && <button onClick={() => vmwareSnapshotAction(vmwareSelectedVm, 'delete', { snapshot_id: snap.id || snap.snapshot })} className="p-2 text-red-400 hover:bg-red-500/10 rounded-lg" title={t('deleteSnapshot')}>
                                                                                         <Icons.Trash className="w-4 h-4" />
-                                                                                    </button>
+                                                                                    </button>}
                                                                                 </div>
                                                                             ))}
                                                                         </div>
@@ -21053,9 +24266,9 @@
                                                                             <div>4. {t('migStep4') || 'Atomic cutover and start VM on Proxmox'}</div>
                                                                         </div>
                                                                         
-                                                                        <button onClick={() => fetchMigrationPlan(vmwareSelectedVm)} disabled={vmwareMigrateLoading} className="w-full py-2.5 rounded-lg bg-emerald-500 text-white font-medium hover:bg-emerald-600 disabled:opacity-50 text-sm">
+                                                                        {!haReadOnly && <button onClick={() => fetchMigrationPlan(vmwareSelectedVm)} disabled={vmwareMigrateLoading} className="w-full py-2.5 rounded-lg bg-emerald-500 text-white font-medium hover:bg-emerald-600 disabled:opacity-50 text-sm">
                                                                             {vmwareMigrateLoading ? 'Loading Migration Plan...' : 'Start Migration Wizard'}
-                                                                        </button>
+                                                                        </button>}
                                                                     </div>
                                                                     
                                                                     {/* Active Migrations */}
@@ -21080,7 +24293,7 @@
                                                                                             </div>
                                                                                         )}
                                                                                         {m.current_step && <div className="text-xs text-gray-500 mt-1">{m.current_step}</div>}
-                                                                                        {m.phase === 'awaiting_confirmation' && (
+                                                                                        {m.phase === 'awaiting_confirmation' && !haReadOnly && (
                                                                                             <div className="mt-2 flex items-center gap-2">
                                                                                                 <span className="text-xs text-amber-300 flex-1">{t('awaitingCutoverShort') || 'Ready to switch over — source still running.'}</span>
                                                                                                 <button onClick={() => confirmVmwareCutover(m.id)} className="px-2 py-1 rounded text-xs font-semibold bg-emerald-500/20 text-emerald-300 hover:bg-emerald-500/30 border border-emerald-500/40">{t('commitSwitchover') || 'Commit switchover now'}</button>
@@ -21268,16 +24481,16 @@
                                                                 <div>
                                                                     <label className="text-xs text-gray-500 mb-1 block">{t('transferMode') || 'Transfer Mode'}</label>
                                                                     <select value={vmwareMigrateForm.transfer_mode} onChange={e => setVmwareMigrateForm({...vmwareMigrateForm, transfer_mode: e.target.value})} className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm">
-                                                                        <option value="vmkfstools_clone">{t('transferModeVmkClone') || 'Live Clone — Near-Zero Downtime (recommended)'}</option>
+                                                                        <option value="vmkfstools_clone">{t('transferModeVmkClone') || 'Live Clone (recommended)'}</option>
                                                                         <option value="auto">{t('transferModeAuto') || 'Auto (Pre-Sync + Delta)'}</option>
                                                                         <option value="sshfs_boot">{t('transferModeSshfsBoot') || 'Live Mirror — Near-Zero Downtime'}</option>
                                                                         <option value="snapshot_zero">{t('transferModeSnapshotZero') || 'Snapshot-Iterative — Zero Downtime (experimental)'}</option>
                                                                         <option value="offline">{t('transferModeOffline') || 'Offline Copy (Full Downtime)'}</option>
                                                                     </select>
                                                                     <p className="text-xs text-gray-300 mt-1 leading-relaxed">
-                                                                        {vmwareMigrateForm.transfer_mode === 'auto' && (t('transferModeAutoDesc') || 'Tries pre-sync while VM runs, falls back to live-mirror if VMDK is locked')}
+                                                                        {vmwareMigrateForm.transfer_mode === 'auto' && (t('transferModeAutoDesc') || 'Uses Live Clone. If the VM cannot be snapshotted or cloned, it copies the disks while the VM runs and carries over the changed blocks at the switchover (pre-sync + delta), and switches to Live Mirror if a disk is locked.')}
                                                                         {vmwareMigrateForm.transfer_mode === 'sshfs_boot' && (t('transferModeSshfsBootDesc') || 'QEMU drive-mirror live-pivots disks from SSHFS-mounted source to local LVM. ~30s real downtime. Multi-disk capable. Recommended for most workloads — limit to 1-2 concurrent VMs to keep mirror throughput high.')}
-                                                                        {vmwareMigrateForm.transfer_mode === 'vmkfstools_clone' && (t('transferModeVmkCloneDesc') || 'Snapshots the running VM and clones the frozen base disk at the vmkernel level on the ESXi host, then imports to Proxmox and cuts over. VM stays up until a short cutover. Works where Live-Mirror / Snapshot-Iterative fail (no locked-base-disk problem). Supports all Proxmox storage types (Ceph/RBD, LVM, LVM-Thin, dir). Needs ESXi SSH enabled.')}
+                                                                        {vmwareMigrateForm.transfer_mode === 'vmkfstools_clone' && (t('transferModeVmkCloneDesc') || 'Snapshots the running VM, clones the frozen base disk at the vmkernel level on the ESXi host and imports it to Proxmox while the VM keeps running. At the switchover the source VM is stopped and every block changed since the snapshot is copied over. That reads each disk once on the ESXi host, so the downtime grows with disk size - for the shortest downtime on large disks use Live Mirror. Works where Live-Mirror / Snapshot-Iterative fail (no locked-base-disk problem). Supports all Proxmox storage types (Ceph/RBD, LVM, LVM-Thin, dir). Needs ESXi SSH enabled.')}
                                                                         {vmwareMigrateForm.transfer_mode === 'snapshot_zero' && (t('transferModeSnapshotZeroDesc') || 'ESXi snapshot rotation — VM stays running through pre-sync + iterative delta sync, only ~10s downtime at cutover. ⚠️ May not work on your system (e.g. ESXi 6.x or VMFS6 with strict locking) — requires ESXi setup that releases base-VMDK lock after snapshot.')}
                                                                         {vmwareMigrateForm.transfer_mode === 'offline' && (t('transferModeOfflineDesc') || 'Stops ESXi VM, copies disks via SSH dd, then starts on Proxmox (full downtime ~ disk-size / network-speed)')}
                                                                     </p>
@@ -21660,8 +24873,8 @@
                                                             <th className="text-left p-3 text-xs font-semibold text-gray-500 uppercase">{t('status')}</th>
                                                             <th className="text-left p-3 text-xs font-semibold text-gray-500 uppercase">{t('name')}</th>
                                                             <th className="text-left p-3 text-xs font-semibold text-gray-500 uppercase">{t('model')}</th>
-                                                            <th className="text-left p-3 text-xs font-semibold text-gray-500 uppercase">CPUs</th>
-                                                            <th className="text-left p-3 text-xs font-semibold text-gray-500 uppercase">Memory</th>
+                                                            <th className="text-left p-3 text-xs font-semibold text-gray-500 uppercase">{t('esxiCpus')}</th>
+                                                            <th className="text-left p-3 text-xs font-semibold text-gray-500 uppercase">{t('memory')}</th>
                                                             <th className="text-left p-3 text-xs font-semibold text-gray-500 uppercase">{t('vms')}</th>
                                                         </tr>
                                                     </thead>
@@ -21672,7 +24885,7 @@
                                                                 <td className="p-3 text-white text-sm font-medium">{host.name}</td>
                                                                 <td className="p-3 text-gray-400 text-sm">{host.model || '-'}</td>
                                                                 <td className="p-3 text-gray-400 text-sm">
-                                                                    <div>{host.cpu_cores || host.num_cpu_cores || '-'} cores</div>
+                                                                    <div>{host.cpu_cores || host.num_cpu_cores || '-'} {t('cpuCoresUnit')}</div>
                                                                     {host.cpu_usage !== undefined && (
                                                                         <div className="w-20 h-1.5 bg-proxmox-dark rounded-full mt-1 overflow-hidden">
                                                                             <div className={`h-full rounded-full ${host.cpu_usage > 80 ? 'bg-red-400' : host.cpu_usage > 60 ? 'bg-yellow-400' : 'bg-emerald-400'}`} style={{width: `${Math.min(100, host.cpu_usage || 0)}%`}} />
@@ -21692,7 +24905,7 @@
                                                         ))}
                                                     </tbody>
                                                 </table>
-                                                {vmwareHosts.length === 0 && <div className="text-center py-8 text-gray-500">No hosts found</div>}
+                                                {vmwareHosts.length === 0 && <div className="text-center py-8 text-gray-500">{t('noHostsFound')}</div>}
                                             </div>
                                         )}
                                         
@@ -21723,15 +24936,15 @@
                                                                         <div className={`h-full rounded-full ${parseInt(pct) > 85 ? 'bg-red-400' : parseInt(pct) > 65 ? 'bg-yellow-400' : 'bg-emerald-400'}`} style={{width: `${pct}%`}} />
                                                                     </div>
                                                                     <div className="flex justify-between text-xs text-gray-500 mt-1">
-                                                                        <span>{usedGB} GB used</span>
-                                                                        <span>{freeGB} GB free / {capGB} GB</span>
+                                                                        <span>{usedGB} GB {t('used')}</span>
+                                                                        <span>{freeGB} GB {t('free')} / {capGB} GB</span>
                                                                     </div>
                                                                 </div>
                                                             )}
                                                         </div>
                                                     );
                                                 })}
-                                                {vmwareDatastores.length === 0 && <div className="col-span-3 text-center py-12 text-gray-500">No datastores found</div>}
+                                                {vmwareDatastores.length === 0 && <div className="col-span-3 text-center py-12 text-gray-500">{t('noDatastores')}</div>}
                                             </div>
                                         )}
                                         
@@ -21752,7 +24965,7 @@
                                             return (
                                                 <div className="space-y-4">
                                                     <button onClick={() => { setVmwareSelectedDs(null); setVmwareDsDetail(null); }} className="flex items-center gap-2 text-gray-400 hover:text-white text-sm">
-                                                        <span style={{display:"inline-block",transform:"rotate(180deg)"}}><Icons.ChevronRight className="w-4 h-4" /></span> Back to Datastores
+                                                        <span style={{display:"inline-block",transform:"rotate(180deg)"}}><Icons.ChevronRight className="w-4 h-4" /></span> {t('backToDatastores')}
                                                     </button>
                                                     <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-5">
                                                         <div className="flex items-center gap-4 mb-4">
@@ -21761,20 +24974,20 @@
                                                             </div>
                                                             <div>
                                                                 <h2 className="text-xl font-bold text-white">{ds.name}</h2>
-                                                                <div className="text-sm text-gray-500">{ds.type || detail.type || 'VMFS'} • {capGB} GB total{detail.multiple_host_access ? ' • Shared' : ''}</div>
+                                                                <div className="text-sm text-gray-500">{ds.type || detail.type || 'VMFS'} • {capGB} GB {t('total')}{detail.multiple_host_access ? ` • ${t('shared')}` : ''}</div>
                                                             </div>
                                                         </div>
                                                         <div className="mb-4">
                                                             <div className="h-4 bg-proxmox-dark rounded-full overflow-hidden">
                                                                 <div className={`h-full rounded-full ${parseInt(pct) > 85 ? 'bg-red-400' : parseInt(pct) > 65 ? 'bg-yellow-400' : 'bg-emerald-400'}`} style={{width: `${pct}%`}} />
                                                             </div>
-                                                            <div className="flex justify-between mt-1 text-sm"><span className="text-gray-400">{usedGB} GB used ({pct}%)</span><span className="text-emerald-400">{freeGB} GB free</span></div>
+                                                            <div className="flex justify-between mt-1 text-sm"><span className="text-gray-400">{usedGB} GB {t('used')} ({pct}%)</span><span className="text-emerald-400">{freeGB} GB {t('free')}</span></div>
                                                         </div>
                                                         <div className="grid grid-cols-4 gap-3">
-                                                            {[['Capacity', capGB, 'text-white'], ['Used', usedGB, 'text-white'], ['Free', freeGB, 'text-emerald-400'], ['VMs', dsVms.length, 'text-white']].map(([l, v, c]) => (
-                                                                <div key={l} className="bg-proxmox-dark rounded-lg p-3 text-center">
+                                                            {[['capacity', t('capacity'), capGB, 'text-white'], ['used', t('usedSpace'), usedGB, 'text-white'], ['free', t('freeSpace'), freeGB, 'text-emerald-400'], ['vms', t('vms'), dsVms.length, 'text-white']].map(([key, label, v, c]) => (
+                                                                <div key={key} className="bg-proxmox-dark rounded-lg p-3 text-center">
                                                                     <div className={`text-lg font-bold ${c}`}>{v}</div>
-                                                                    <div className="text-xs text-gray-500">{l === 'VMs' ? l : `GB ${l}`}</div>
+                                                                    <div className="text-xs text-gray-500">{key === 'vms' ? label : `${label} (GB)`}</div>
                                                                 </div>
                                                             ))}
                                                         </div>
@@ -21784,7 +24997,7 @@
                                                     {dsHosts.length > 0 && (
                                                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                             <div className="p-4 border-b border-proxmox-border">
-                                                                <h3 className="text-sm font-semibold text-gray-400 uppercase">Connected Hosts ({dsHosts.length})</h3>
+                                                                <h3 className="text-sm font-semibold text-gray-400 uppercase">{t('connectedHosts').replace('{count}', () => String(dsHosts.length))}</h3>
                                                             </div>
                                                             <div className="divide-y divide-proxmox-border/50">
                                                                 {dsHosts.map(h => (
@@ -21800,14 +25013,14 @@
                                                     {/* VMs on Datastore */}
                                                     <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                         <div className="p-4 border-b border-proxmox-border">
-                                                            <h3 className="text-sm font-semibold text-gray-400 uppercase">VMs on {ds.name} ({dsVms.length})</h3>
+                                                            <h3 className="text-sm font-semibold text-gray-400 uppercase">{t('vmsOnDatastore').replace('{datastore}', () => ds.name).replace('{count}', () => String(dsVms.length))}</h3>
                                                         </div>
                                                         {dsVms.length > 0 ? (
                                                             <table className="w-full">
                                                                 <thead><tr className="border-b border-proxmox-border">
                                                                     <th className="text-left p-3 text-xs font-semibold text-gray-500 uppercase">{t('status')}</th>
                                                                     <th className="text-left p-3 text-xs font-semibold text-gray-500 uppercase">{t('name')}</th>
-                                                                    <th className="text-left p-3 text-xs font-semibold text-gray-500 uppercase">OS</th>
+                                                                    <th className="text-left p-3 text-xs font-semibold text-gray-500 uppercase">{t('os')}</th>
                                                                 </tr></thead>
                                                                 <tbody>
                                                                     {dsVms.map(vm => (
@@ -21820,7 +25033,7 @@
                                                                     ))}
                                                                 </tbody>
                                                             </table>
-                                                        ) : <div className="p-8 text-center text-gray-500 text-sm">No VMs on this datastore</div>}
+                                                        ) : <div className="p-8 text-center text-gray-500 text-sm">{t('noVmsOnDatastore')}</div>}
                                                     </div>
                                                 </div>
                                             );
@@ -21847,7 +25060,7 @@
                                                         ))}
                                                     </tbody>
                                                 </table>
-                                                {vmwareNetworks.length === 0 && <div className="text-center py-8 text-gray-500">No networks found</div>}
+                                                {vmwareNetworks.length === 0 && <div className="text-center py-8 text-gray-500">{t('noNetworks')}</div>}
                                             </div>
                                         )}
                                         
@@ -21857,8 +25070,8 @@
                                                 {vmwareClusters.length === 0 ? (
                                                     <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-8 text-center text-gray-500">
                                                         <Icons.Layers className="w-12 h-12 mx-auto mb-3 opacity-30" />
-                                                        <p>No compute clusters found</p>
-                                                        <p className="text-xs mt-1">Clusters are only available on connected management servers (not on standalone hosts)</p>
+                                                        <p>{t('noComputeClusters')}</p>
+                                                        <p className="text-xs mt-1">{t('computeClustersManagementOnly')}</p>
                                                     </div>
                                                 ) : (
                                                     vmwareClusters.map(cl => (
@@ -21871,7 +25084,7 @@
                                                                         </div>
                                                                         <div>
                                                                             <h3 className="text-white font-semibold">{cl.name}</h3>
-                                                                            <p className="text-xs text-gray-500">{cl.num_hosts || 0} Hosts • {cl.cluster}</p>
+                                                                            <p className="text-xs text-gray-500">{t('hosts')}: {cl.num_hosts || 0} • {cl.cluster}</p>
                                                                         </div>
                                                                     </div>
                                                                     <button onClick={() => fetchVMwareClusters(selectedVMware.id)} className="text-gray-500 hover:text-white">
@@ -21887,11 +25100,11 @@
                                                                     <div className="text-sm text-white font-medium">{cl.total_cpu ? (cl.total_cpu / 1000).toFixed(1) + ' GHz' : 'N/A'}</div>
                                                                 </div>
                                                                 <div className="text-center">
-                                                                    <div className="text-xs text-gray-500">Memory</div>
+                                                                    <div className="text-xs text-gray-500">{t('memory')}</div>
                                                                     <div className="text-sm text-white font-medium">{cl.total_memory ? (cl.total_memory / (1024**3)).toFixed(0) + ' GB' : 'N/A'}</div>
                                                                 </div>
                                                                 <div className="text-center">
-                                                                    <div className="text-xs text-gray-500">Hosts</div>
+                                                                    <div className="text-xs text-gray-500">{t('hosts')}</div>
                                                                     <div className="text-sm text-white font-medium">{cl.num_hosts || 0}</div>
                                                                 </div>
                                                             </div>
@@ -21905,12 +25118,14 @@
                                                                             <Icons.RotateCw className={`w-4 h-4 ${cl.drs_enabled ? 'text-blue-400' : 'text-gray-600'}`} />
                                                                         </div>
                                                                         <div>
-                                                                            <div className="text-sm text-white font-medium">DRS (Distributed Resource Scheduler)</div>
+                                                                            <div className="text-sm text-white font-medium">{t('drsFullName')}</div>
                                                                             <div className="text-xs text-gray-500">
-                                                                                {cl.drs_enabled ? `Active - ${(cl.drs_automation || 'MANUAL').replace(/_/g, ' ').toLowerCase()}` : 'Disabled'}
+                                                                                {cl.drs_enabled ? t('active') + ' - ' + (cl.drs_automation === 'FULLY_AUTOMATED' ? t('fullyAutomated') : cl.drs_automation === 'PARTIALLY_AUTOMATED' ? t('partiallyAutomated') : !cl.drs_automation || cl.drs_automation === 'MANUAL' ? t('manual') : cl.drs_automation.replace(/_/g, ' ').toLowerCase()) : t('disabled')}
                                                                             </div>
                                                                         </div>
                                                                     </div>
+                                                                    {/* switching DRS and HA is the active's (#625) */}
+                                                                    {!haReadOnly && (
                                                                     <div className="flex items-center gap-2">
                                                                         {cl.drs_enabled && (
                                                                             <select 
@@ -21918,8 +25133,8 @@
                                                                                 onChange={(e) => toggleVMwareDRS(selectedVMware.id, cl.cluster, true, e.target.value)}
                                                                                 className="bg-proxmox-card border border-proxmox-border rounded px-2 py-1 text-xs text-gray-300"
                                                                             >
-                                                                                <option value="FULLY_AUTOMATED">Fully Automated</option>
-                                                                                <option value="PARTIALLY_AUTOMATED">Partially Automated</option>
+                                                                                <option value="FULLY_AUTOMATED">{t('fullyAutomated')}</option>
+                                                                                <option value="PARTIALLY_AUTOMATED">{t('partiallyAutomated')}</option>
                                                                                 <option value="MANUAL">{t('manual')}</option>
                                                                             </select>
                                                                         )}
@@ -21931,9 +25146,10 @@
                                                                                     : 'bg-blue-500/20 text-blue-400 hover:bg-blue-500/30'
                                                                             }`}
                                                                         >
-                                                                            {cl.drs_enabled ? 'Disable' : 'Enable'}
+                                                                            {cl.drs_enabled ? t('disable') : t('enable')}
                                                                         </button>
                                                                     </div>
+                                                                    )}
                                                                 </div>
                                                                 
                                                                 {/* HA */}
@@ -21943,15 +25159,15 @@
                                                                             <Icons.Shield className={`w-4 h-4 ${cl.ha_enabled ? 'text-green-400' : 'text-gray-600'}`} />
                                                                         </div>
                                                                         <div>
-                                                                            <div className="text-sm text-white font-medium">HA (High Availability)</div>
+                                                                            <div className="text-sm text-white font-medium">{t('haFullName')}</div>
                                                                             <div className="text-xs text-gray-500">
                                                                                 {cl.ha_enabled 
-                                                                                    ? `Active${cl.ha_admission_control ? ' - Admission Control enabled' : ''}`
-                                                                                    : 'Disabled'}
+                                                                                    ? t('active') + (cl.ha_admission_control ? ' - ' + t('admissionControlEnabled') : '')
+                                                                                    : t('disabled')}
                                                                             </div>
                                                                         </div>
                                                                     </div>
-                                                                    <button 
+                                                                    {!haReadOnly && <button 
                                                                         onClick={() => toggleVMwareHA(selectedVMware.id, cl.cluster, !cl.ha_enabled)}
                                                                         className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
                                                                             cl.ha_enabled 
@@ -21959,14 +25175,14 @@
                                                                                 : 'bg-green-500/20 text-green-400 hover:bg-green-500/30'
                                                                         }`}
                                                                     >
-                                                                        {cl.ha_enabled ? 'Disable' : 'Enable'}
-                                                                    </button>
+                                                                        {cl.ha_enabled ? t('disable') : t('enable')}
+                                                                    </button>}
                                                                 </div>
                                                                 
                                                                 {/* Cluster Hosts */}
                                                                 {cl.hosts && cl.hosts.length > 0 && (
                                                                     <div className="mt-2">
-                                                                        <div className="text-xs text-gray-500 mb-2 font-semibold uppercase">Cluster Hosts</div>
+                                                                        <div className="text-xs text-gray-500 mb-2 font-semibold uppercase">{t('clusterHosts')}</div>
                                                                         <div className="space-y-1">
                                                                             {cl.hosts.map(h => (
                                                                                 <div key={h.host || h.name} className="flex items-center justify-between py-1.5 px-2 rounded bg-proxmox-dark/30">
@@ -22046,7 +25262,7 @@
                                                                             </div>
                                                                         )}
                                                                         {/* #562 — cutover gate: commit / cancel the switchover */}
-                                                                        {isAwaiting && (
+                                                                        {isAwaiting && !haReadOnly && (
                                                                             <div className="mt-3 p-3 rounded-lg bg-amber-500/10 border border-amber-500/30" onClick={e => e.stopPropagation()}>
                                                                                 <div className="flex items-start gap-2 text-xs text-amber-300 mb-2">
                                                                                     <Icons.AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
@@ -22470,9 +25686,9 @@
                                                             </label>
                                                         </div>
 
-                                                        <button onClick={startXhmMigration} disabled={xhmLoading || !xhmForm.target_storage || (xhmPlan?.direction === 'xcpng_to_pve' && !xhmForm.target_node)} className="w-full py-2.5 rounded-lg bg-purple-500 text-white font-medium hover:bg-purple-600 disabled:opacity-50 text-sm">
+                                                        {!haReadOnly && <button onClick={startXhmMigration} disabled={xhmLoading || !xhmForm.target_storage || (xhmPlan?.direction === 'xcpng_to_pve' && !xhmForm.target_node)} className="w-full py-2.5 rounded-lg bg-purple-500 text-white font-medium hover:bg-purple-600 disabled:opacity-50 text-sm">
                                                             {xhmLoading ? 'Starting...' : (t('xhmStartMigration') || 'Start Migration')}
-                                                        </button>
+                                                        </button>}
                                                     </div>
                                                 )}
                                             </div>
@@ -22584,9 +25800,31 @@
                                             authFetch={authFetch}
                                             API_URL={API_URL}
                                             addToast={addToast}
-                                            canAdminSettings={isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes('admin.settings'))}
-                                            canManage={isAdmin || (Array.isArray(user?.permissions) && user.permissions.includes('sdn.manage') && user.permissions.includes('admin.settings'))}
+                                            canAdminSettings={can('admin.settings')}
+                                            canManage={can('sdn.manage') && can('admin.settings')}
                                         />
+                                    </div>
+                                ) : sidebarAutoInstall ? (
+                                    <div className={isCorporate ? '' : 'space-y-4'}>
+                                        {isCorporate && (
+                                            <div className="corp-content-header">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="flex" style={{color: 'var(--corp-accent)'}}><Icons.Disc className="w-4 h-4" /></span>
+                                                    <span className="corp-header-title">{t('autoInstall')}</span>
+                                                </div>
+                                            </div>
+                                        )}
+                                        <div className={isCorporate ? 'p-3' : ''}>
+                                            <AutoInstallPanel
+                                                t={t}
+                                                addToast={addToast}
+                                                getAuthHeaders={getAuthHeaders}
+                                                clusters={clusters}
+                                                heading={!isCorporate}
+                                                intent={autoInstallIntent}
+                                                onIntentConsumed={() => setAutoInstallIntent(null)}
+                                            />
+                                        </div>
                                     </div>
                                 ) : (
                                     <AllClustersOverview
@@ -22596,6 +25834,7 @@
                                         topGuests={topGuests}
                                         allClusterGuests={allClusterGuests}
                                         pbsServers={pbsServers}
+                                        addToast={addToast}
                                         onSelectCluster={setSelectedCluster}
                                         onSelectVm={(cluster, vmid, node, guest) => {
                                             setSelectedCluster(cluster);
@@ -22604,6 +25843,7 @@
                                             setActiveTab('resources');
                                             setResourcesSubTab('management');
                                         }}
+                                        onAutoInstall={user?.autoinstall_access === 'manage' ? () => openAutoInstall({ wizard: true }) : undefined}
                                     />
                                 )}
                             </div>
@@ -22739,7 +25979,7 @@
                                         {pbsTestResult && (
                                             <div className={`p-3 rounded-lg text-sm ${pbsTestResult.success ? 'bg-green-500/10 border border-green-500/30 text-green-400' : 'bg-red-500/10 border border-red-500/30 text-red-400'}`}>
                                                 {pbsTestResult.success ? (
-                                                    <span>{(t('pbsConnectionSuccessful') || 'Connection successful! PBS v{version} - {datastores} datastore(s)').replace('{version}', pbsTestResult.version?.version ?? '').replace('{datastores}', pbsTestResult.datastores ?? '')}</span>
+                                                    <span>{(t('pbsConnectionSuccessful') || 'Connection successful! PBS v{version} - {datastores} datastore(s)').replace('{version}', () => pbsTestResult.version?.version ?? '').replace('{datastores}', () => pbsTestResult.datastores ?? '')}</span>
                                                 ) : (
                                                     <span>{t('connectionFailed') || 'Connection failed'}: {pbsTestResult.error}</span>
                                                 )}
@@ -22750,7 +25990,7 @@
                                     <div className="flex justify-between mt-6">
                                         <button onClick={async () => {
                                             setPbsTestLoading(true); setPbsTestResult(null);
-                                            const result = await handleTestPBS(pbsForm);
+                                            const result = await handleTestPBS(pbsForm, editingPBS?.id);
                                             setPbsTestResult(result);
                                             setPbsTestLoading(false);
                                         }} disabled={pbsTestLoading || !pbsForm.host} className="px-4 py-2 rounded-lg bg-proxmox-dark border border-proxmox-border text-gray-300 hover:text-white text-sm flex items-center gap-2 disabled:opacity-50">
@@ -23064,6 +26304,27 @@
                         />
                     )}
 
+                    {nodeGuests && (() => {
+                        const cid = nodeGuests.clusterId;
+                        const sel = selectedCluster && selectedCluster.id === cid;
+                        const res = (sel ? clusterResources : sidebarClusterData[cid]?.resources) || [];
+                        const met = (sel ? clusterMetrics : sidebarClusterData[cid]?.metrics) || {};
+                        return (
+                            <NodeGuestsModal
+                                action={nodeGuests.action}
+                                clusterId={cid}
+                                node={nodeGuests.node}
+                                guests={res.filter(r => r.node === nodeGuests.node && (r.type === 'qemu' || r.type === 'lxc'))}
+                                nodes={Object.entries(met).filter(([n, m]) => n !== 'error' && n !== 'offline' && m)
+                                    .map(([n, m]) => ({ name: n, online: m.status !== 'offline' && !m.offline }))}
+                                authFetch={authFetch}
+                                onBulkMigrate={handleBulkMigrate}
+                                onClose={() => setNodeGuests(null)}
+                                onDone={() => setTimeout(() => { if (selectedCluster?.id === cid) fetchClusterResources(cid); else fetchSidebarClusterData(cid); }, 1500)}
+                            />
+                        );
+                    })()}
+
                     {/* Add/Edit VMware Server Modal */}
                     {showAddVMware && (
                         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4">
@@ -23226,7 +26487,7 @@
                     {/* HA Split-Brain Prevention Settings Modal */}
                     {showHaSettings && selectedCluster && (
                         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={() => setShowHaSettings(false)}>
-                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-xl max-h-[85vh] overflow-hidden" onClick={e => e.stopPropagation()}>
+                            <div data-ha-cluster-settings className={`bg-proxmox-card border border-proxmox-border rounded-xl w-full ${haNodePartsShown(haStatus) ? 'max-w-3xl' : 'max-w-xl'} max-h-[85vh] overflow-hidden`} onClick={e => e.stopPropagation()}>
                                 <div className="flex justify-between items-center p-4 border-b border-proxmox-border bg-proxmox-dark">
                                     <div>
                                         <h2 className="text-lg font-semibold text-white flex items-center gap-2">
@@ -23241,248 +26502,301 @@
                                 </div>
                                 
                                 <div className="p-4 overflow-y-auto" style={{ maxHeight: 'calc(85vh - 140px)' }}>
-                                    {/* MK 2026-06-03: HA fence-strategy banner — surfaces the result of
-                                        _ha_detect_fence_strategy from the server. 'wait' = 2-node-no-qdevice,
-                                        we explicitly skip auto-fencing so a planned reboot can't take the cluster
-                                        down. Banner is the load-bearing signal: admins reading the HA dashboard
-                                        now SEE that auto-fencing is disabled and why, instead of having to grep
-                                        /var/log/pegaprox-agent.log on each node. */}
-                                    {(() => {
-                                        const fs = haStatus?.split_brain_prevention?.fence_strategy;
-                                        const warn = haStatus?.split_brain_prevention?.fence_strategy_warning;
-                                        if (!fs && !warn) return null;
-                                        const strat = fs?.strategy || 'unknown';
-                                        const colour = (
-                                            strat === 'wait'    ? 'bg-yellow-500/10 border-yellow-500/30 text-yellow-300' :
-                                            strat === 'quorum'  ? 'bg-blue-500/10 border-blue-500/30 text-blue-300' :
-                                                                  'bg-gray-500/10 border-gray-500/30 text-gray-300'
-                                        );
-                                        const icon = strat === 'wait' ? '⚠️' : strat === 'quorum' ? '🛡️' : 'ℹ️';
-                                        return (
-                                            <div className={`p-4 ${colour} border rounded-xl mb-4`}>
-                                                <div className="flex items-center gap-2 mb-2">
-                                                    <span className="text-xl">{icon}</span>
-                                                    <h4 className="font-medium">
-                                                        {t('fenceStrategyLabel') || 'Fence strategy'}: <span className="font-mono text-sm uppercase">{strat}</span>
-                                                    </h4>
-                                                    {fs?.expected_votes != null && (
-                                                        <span className="text-xs opacity-70 ml-auto">
-                                                            {fs.expected_votes} votes · qdevice: {fs.has_qdevice ? 'yes' : 'no'}
-                                                        </span>
-                                                    )}
-                                                </div>
-                                                {warn && (
-                                                    <p className="text-sm mb-2">{warn}</p>
-                                                )}
-                                                {fs?.reason && (
-                                                    <p className="text-xs opacity-80">{fs.reason}</p>
-                                                )}
-                                                {fs?.detected_at && (
-                                                    <p className="text-xs opacity-60 mt-2">
-                                                        {t('detectedAt') || 'detected'}: {new Date(fs.detected_at).toLocaleString()}
-                                                    </p>
-                                                )}
-                                            </div>
-                                        );
-                                    })()}
-
-                                    {/* SELF-FENCE - Main Feature */}
-                                    <div className="p-4 bg-green-500/10 border border-green-500/30 rounded-xl mb-4">
-                                        <div className="flex items-center gap-2 mb-3">
-                                            <span className="text-2xl">🛡️</span>
-                                            <h4 className="text-green-400 font-medium">{t('selfFenceProtection')}</h4>
-                                            <span className="px-2 py-1 rounded text-xs bg-green-500/20 text-green-400 ml-auto">
-                                                {t('recommended')}
-                                            </span>
-                                        </div>
-                                        
-                                        <p className="text-sm text-gray-300 mb-3">
-                                            {t('selfFenceExplain')}
-                                        </p>
-                                        
-                                        {/* Status */}
-                                        {haStatus?.self_fence_installed ? (
-                                            <div className="p-3 bg-green-500/20 rounded-lg">
-                                                <div className="flex items-center justify-between">
-                                                    <div>
-                                                        <p className="text-green-400 font-medium">✅ {t('selfFenceActive')}</p>
-                                                        <p className="text-xs text-gray-400 mt-1">
-                                                            {t('agentInstalledOnNodes')}: {haStatus.self_fence_nodes?.join(', ') || t('allNodes')}
-                                                        </p>
-                                                    </div>
-                                                    <button
-                                                        onClick={async () => {
-                                                            if (!confirm(t('confirmUninstallAgent'))) return;
-                                                            try {
-                                                                const res = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/ha/uninstall-self-fence`, { method: 'POST' });
-                                                                if (res.ok) {
-                                                                    addToast(t('selfFenceUninstalling'), 'success');
-                                                                    setTimeout(() => fetchHAStatus(selectedCluster.id), 3000);
-                                                                }
-                                                            } catch (e) {
-                                                                addToast(t('error') + ': ' + e.message, 'error');
-                                                            }
-                                                        }}
-                                                        className="px-3 py-1 text-xs bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-lg"
-                                                    >
-                                                        {t('uninstall')}
-                                                    </button>
-                                                </div>
+                                    {/* the form fills from this cluster's status: until that is here it shows nothing
+                                        and Save stays off, so no value of the cluster before is written to this one */}
+                                    {!haStatus ? (
+                                        haStatusError ? (
+                                            <div role="alert" data-ha-settings-error className="p-3 rounded-lg border bg-red-500/10 border-red-500/30 text-sm text-red-300 space-y-1">
+                                                <p>{t('haSettingsLoadFailed')}</p>
+                                                {haStatusError.text && <p style={{ overflowWrap: 'anywhere' }}>{haStatusError.text}</p>}
                                             </div>
                                         ) : (
-                                            <div className="space-y-3">
+                                            <p data-ha-settings-loading className="flex items-center gap-2 text-sm text-gray-400">
+                                                <span className="inline-flex animate-spin"><Icons.RefreshCw className="w-4 h-4" /></span>
+                                                {t('loading')}
+                                            </p>
+                                        )
+                                    ) : (<>
+                                        <HaNodeWarnings status={haStatus} t={t} />
+                                        {/* LW Oct 2026 (#625) - runs a former leader left half done: its routes want ha.config */}
+                                        {haWrite && (
+                                            <HaNodeInterrupted key={selectedCluster.id} t={t} clusterId={selectedCluster.id} status={haStatus}
+                                                resources={clusterResources} authFetch={authFetch} addToast={addToast} onReload={reloadHaStatus} />
+                                        )}
+
+                                        {/* MK 2026-06-03: HA fence-strategy banner - surfaces the result of
+                                            _ha_detect_fence_strategy from the server. 'wait' = 2-node-no-qdevice,
+                                            we explicitly skip auto-fencing so a planned reboot can't take the cluster
+                                            down. Banner is the load-bearing signal: admins reading the HA dashboard
+                                            now SEE that auto-fencing is disabled and why, instead of having to grep
+                                            /var/log/pegaprox-agent.log on each node. */}
+                                        {(() => {
+                                            const fs = haStatus?.split_brain_prevention?.fence_strategy;
+                                            const warn = haStatus?.split_brain_prevention?.fence_strategy_warning;
+                                            if (!fs && !warn) return null;
+                                            const strat = fs?.strategy || 'unknown';
+                                            const colour = (
+                                                strat === 'wait'    ? 'bg-yellow-500/10 border-yellow-500/30 text-yellow-300' :
+                                                strat === 'quorum'  ? 'bg-blue-500/10 border-blue-500/30 text-blue-300' :
+                                                                      'bg-gray-500/10 border-gray-500/30 text-gray-300'
+                                            );
+                                            const icon = strat === 'wait' ? '⚠️' : strat === 'quorum' ? '🛡️' : 'ℹ️';
+                                            return (
+                                                <div className={`p-4 ${colour} border rounded-xl mb-4`}>
+                                                    <div className="flex items-center gap-2 mb-2">
+                                                        <span className="text-xl">{icon}</span>
+                                                        <h4 className="font-medium">
+                                                            {t('fenceStrategyLabel') || 'Fence strategy'}: <span className="font-mono text-sm uppercase">{strat}</span>
+                                                        </h4>
+                                                        {fs?.expected_votes != null && (
+                                                            <span className="text-xs opacity-70 ml-auto">
+                                                                {fs.expected_votes} votes · qdevice: {fs.has_qdevice ? 'yes' : 'no'}
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                    {warn && (
+                                                        <p className="text-sm mb-2">{warn}</p>
+                                                    )}
+                                                    {fs?.reason && (
+                                                        <p className="text-xs opacity-80">{fs.reason}</p>
+                                                    )}
+                                                    {fs?.detected_at && (
+                                                        <p className="text-xs opacity-60 mt-2">
+                                                            {t('detectedAt') || 'detected'}: {new Date(fs.detected_at).toLocaleString()}
+                                                        </p>
+                                                    )}
+                                                </div>
+                                            );
+                                        })()}
+
+                                        {/* SELF-FENCE - Main Feature */}
+                                        <div className="p-4 bg-green-500/10 border border-green-500/30 rounded-xl mb-4">
+                                            <div className="flex items-center gap-2 mb-3">
+                                                <span className="text-2xl">🛡️</span>
+                                                <h4 className="text-green-400 font-medium">{t('selfFenceProtection')}</h4>
+                                                <span className="px-2 py-1 rounded text-xs bg-green-500/20 text-green-400 ml-auto">
+                                                    {t('recommended')}
+                                                </span>
+                                            </div>
+
+                                            <p className="text-sm text-gray-300 mb-3">
+                                                {t('selfFenceExplain')}
+                                            </p>
+
+                                            {/* Status */}
+                                            {haStatus?.self_fence_installed ? (
+                                                <div className="p-3 bg-green-500/20 rounded-lg">
+                                                    <div className="flex items-center justify-between">
+                                                        <div>
+                                                            <p className="text-green-400 font-medium">✅ {t('selfFenceActive')}</p>
+                                                            <p className="text-xs text-gray-400 mt-1">
+                                                                {t('agentInstalledOnNodes')}: {haStatus.self_fence_nodes?.join(', ') || t('allNodes')}
+                                                            </p>
+                                                        </div>
+                                                        {/* the route wants ha.config, as the install does */}
+                                                        {haWrite && (
+                                                            <button
+                                                                onClick={async () => {
+                                                                    if (!confirm(t('confirmUninstallAgent'))) return;
+                                                                    try {
+                                                                        const res = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/ha/uninstall-self-fence`, { method: 'POST' });
+                                                                        if (res.ok) {
+                                                                            addToast(t('selfFenceUninstalling'), 'success');
+                                                                            setTimeout(() => fetchHAStatus(selectedCluster.id), 3000);
+                                                                        }
+                                                                    } catch (e) {
+                                                                        addToast(t('error') + ': ' + e.message, 'error');
+                                                                    }
+                                                                }}
+                                                                className="px-3 py-1 text-xs bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-lg"
+                                                            >
+                                                                {t('uninstall')}
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                </div>
+                                            ) : (
                                                 <div className="p-3 bg-yellow-500/20 rounded-lg">
                                                     <p className="text-yellow-400 font-medium">⚡ {t('selfFenceNotInstalled')}</p>
                                                     <p className="text-xs text-gray-300 mt-1">{t('selfFenceInstallHint')}</p>
                                                 </div>
-                                                <button
-                                                    onClick={async () => {
-                                                        try {
-                                                            const res = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/ha/install-self-fence`, { method: 'POST' });
-                                                            if (res.ok) {
-                                                                addToast(t('selfFenceInstalling'), 'success');
-                                                                setTimeout(() => fetchHAStatus(selectedCluster.id), 5000);
+                                            )}
+
+                                            {/* the install is also how an agent of an earlier PegaProx is replaced,
+                                                and how what the agent check found is put right (#625) */}
+                                            {(() => {
+                                                const fa = haStatus?.fence_agent;
+                                                const upgrade = Array.isArray(fa?.outdated) && fa.outdated.length > 0;
+                                                const repair = !!haAgentCheck && Object.values(haAgentCheck.nodes || {})
+                                                    .some(n => n && n.fence_agent && !n.fence_agent.current);
+                                                if (!haWrite || (haStatus?.self_fence_installed && !upgrade && !repair)) return null;
+                                                return (
+                                                    <button
+                                                        onClick={installSelfFence}
+                                                        data-ha-node-install={upgrade ? 'upgrade' : repair && haStatus?.self_fence_installed ? 'again' : 'install'}
+                                                        className="w-full mt-3 px-4 py-2 bg-green-600 hover:bg-green-500 rounded-lg text-white font-medium"
+                                                    >
+                                                        🛡️ {upgrade ? t('haNodeUpgradeAgent').replace('{version}', () => fa.expected_version || 2)
+                                                            : repair && haStatus?.self_fence_installed ? t('haNodeInstallAgain')
+                                                            : t('installSelfFenceAgent')}
+                                                    </button>
+                                                );
+                                            })()}
+
+                                            <HaNodeAgents t={t} clusterId={selectedCluster.id} status={haStatus}
+                                                check={haAgentCheck} onCheck={haFor(selectedCluster.id, setHaAgentCheck)} authFetch={authFetch}
+                                                onReload={reloadHaStatus} locked={haReadOnly || !haWrite} />
+
+                                            <div className="mt-3 text-xs text-gray-400">
+                                                ✓ {t('noSharedStorageNeeded')} • ✓ {t('worksWithLvmIscsi')}
+                                            </div>
+
+                                            {/* PegaProx VM Auto-Recovery */}
+                                            {haStatus?.self_fence_installed && (
+                                                <div className="mt-3 p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg">
+                                                    <label className="block text-sm text-blue-400 font-medium mb-1">
+                                                        {t('pegaproxVmRecovery')}
+                                                    </label>
+                                                    <p className="text-xs text-gray-400 mb-2">{t('pegaproxVmRecoveryDesc')}</p>
+                                                    <fieldset disabled={!haWrite || haReadOnly} className="min-w-0">
+                                                        <select
+                                                            value={haSettings.pegaprox_vmid}
+                                                            onChange={(e) => setHaSettings({...haSettings, pegaprox_vmid: e.target.value})}
+                                                            className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white text-sm disabled:opacity-50"
+                                                        >
+                                                            <option value="">{t('noVmSelected')}</option>
+                                                            {(clusterResources || [])
+                                                                .filter(v => v.type === 'qemu')
+                                                                .sort((a, b) => a.vmid - b.vmid)
+                                                                .map(v => (
+                                                                    <option key={v.vmid} value={v.vmid}>
+                                                                        {v.vmid} - {v.name} ({v.node})
+                                                                    </option>
+                                                                ))
                                                             }
-                                                        } catch (e) {
-                                                            addToast(t('error') + ': ' + e.message, 'error');
-                                                        }
-                                                    }}
-                                                    className="w-full px-4 py-2 bg-green-600 hover:bg-green-500 rounded-lg text-white font-medium"
-                                                >
-                                                    🛡️ {t('installSelfFenceAgent')}
-                                                </button>
-                                            </div>
-                                        )}
-                                        
-                                        <div className="mt-3 text-xs text-gray-400">
-                                            ✓ {t('noSharedStorageNeeded')} • ✓ {t('worksWithLvmIscsi')}
+                                                        </select>
+                                                    </fieldset>
+                                                    {haSettings.pegaprox_vmid && (
+                                                        <p className="text-xs text-blue-300 mt-1">{t('pegaproxVmRecoveryActive')}</p>
+                                                    )}
+                                                </div>
+                                            )}
                                         </div>
 
-                                        {/* PegaProx VM Auto-Recovery */}
-                                        {haStatus?.self_fence_installed && (
-                                            <div className="mt-3 p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg">
-                                                <label className="block text-sm text-blue-400 font-medium mb-1">
-                                                    {t('pegaproxVmRecovery')}
-                                                </label>
-                                                <p className="text-xs text-gray-400 mb-2">{t('pegaproxVmRecoveryDesc')}</p>
-                                                <select
-                                                    value={haSettings.pegaprox_vmid}
-                                                    onChange={(e) => setHaSettings({...haSettings, pegaprox_vmid: e.target.value})}
-                                                    className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white text-sm"
-                                                >
-                                                    <option value="">{t('noVmSelected')}</option>
-                                                    {(clusterResources || [])
-                                                        .filter(v => v.type === 'qemu')
-                                                        .sort((a, b) => a.vmid - b.vmid)
-                                                        .map(v => (
-                                                            <option key={v.vmid} value={v.vmid}>
-                                                                {v.vmid} - {v.name} ({v.node})
-                                                            </option>
-                                                        ))
-                                                    }
-                                                </select>
-                                                {haSettings.pegaprox_vmid && (
-                                                    <p className="text-xs text-blue-300 mt-1">{t('pegaproxVmRecoveryActive')}</p>
-                                                )}
+                                        {/* 2-Node Cluster Mode */}
+                                        <fieldset disabled={!haWrite || haReadOnly} className="min-w-0">
+                                            <label className="flex items-center gap-3 p-3 bg-proxmox-dark border border-proxmox-border rounded-xl mb-4 cursor-pointer hover:border-proxmox-orange/50">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={haSettings.two_node_mode}
+                                                    onChange={(e) => setHaSettings({...haSettings, two_node_mode: e.target.checked})}
+                                                    className="w-5 h-5 rounded border-proxmox-border bg-proxmox-darker text-proxmox-orange disabled:opacity-50"
+                                                />
+                                                <div>
+                                                    <span className="text-white font-medium">{t('enable2NodeMode')}</span>
+                                                    <p className="text-xs text-gray-500">{t('twoNodeModeDesc')}</p>
+                                                </div>
+                                            </label>
+                                        </fieldset>
+
+                                        <HaNodeSafety t={t} clusterId={selectedCluster.id} status={haStatus} authFetch={authFetch}
+                                            addToast={addToast} onStatus={haStatusFor(selectedCluster.id)} locked={haReadOnly || !haWrite} />
+
+                                        <fieldset disabled={!haWrite || haReadOnly} className="min-w-0">
+                                            {/* Basic Settings */}
+                                            <div className="grid grid-cols-2 gap-4 mb-4">
+                                                <div>
+                                                    <label className="block text-sm text-gray-400 mb-1">{t('recoveryDelay')}</label>
+                                                    <input
+                                                        type="number"
+                                                        min="10"
+                                                        max="300"
+                                                        value={haSettings.recovery_delay}
+                                                        onChange={(e) => setHaSettings({...haSettings, recovery_delay: parseInt(e.target.value) || 30})}
+                                                        className="w-full bg-proxmox-dark border border-proxmox-border rounded-lg px-3 py-2 text-white disabled:opacity-50"
+                                                    />
+                                                    <p className="text-xs text-gray-500 mt-1">{t('recoveryDelayHint')}</p>
+                                                </div>
+                                                <div>
+                                                    <label className="block text-sm text-gray-400 mb-1">{t('failureThreshold')}</label>
+                                                    <input
+                                                        type="number"
+                                                        min="1"
+                                                        max="10"
+                                                        value={haSettings.failure_threshold}
+                                                        onChange={(e) => setHaSettings({...haSettings, failure_threshold: parseInt(e.target.value) || 3})}
+                                                        className="w-full bg-proxmox-dark border border-proxmox-border rounded-lg px-3 py-2 text-white disabled:opacity-50"
+                                                    />
+                                                    <p className="text-xs text-gray-500 mt-1">{t('failureThresholdHint')}</p>
+                                                </div>
+                                            </div>
+
+                                            {/* Advanced Settings - Collapsed */}
+                                            {/* MK #652: native <details> needs the `group` class + group-open:rotate on the
+                                                chevron, otherwise the arrow stays put and never signals the open state */}
+                                            <details className="group bg-proxmox-dark border border-proxmox-border rounded-xl overflow-hidden">
+                                                <summary className="p-3 cursor-pointer hover:bg-proxmox-hover flex items-center justify-between text-sm">
+                                                    <span className="text-gray-400">{t('advancedSettings')}</span>
+                                                    <Icons.ChevronDown className="w-4 h-4 text-gray-400 transition-transform group-open:rotate-180" />
+                                                </summary>
+                                                <div className="p-3 pt-0 space-y-3 border-t border-proxmox-border">
+                                                    <div className="grid grid-cols-2 gap-3">
+                                                        <label className="flex items-center gap-2 p-2 bg-proxmox-darker rounded-lg">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={haSettings.self_fence_enabled}
+                                                                onChange={(e) => setHaSettings({...haSettings, self_fence_enabled: e.target.checked})}
+                                                                className="w-4 h-4 rounded disabled:opacity-50"
+                                                            />
+                                                            <span className="text-sm text-white">{t('selfFencing')}</span>
+                                                        </label>
+                                                        <label className="flex items-center gap-2 p-2 bg-proxmox-darker rounded-lg">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={haSettings.verify_network}
+                                                                onChange={(e) => setHaSettings({...haSettings, verify_network: e.target.checked})}
+                                                                className="w-4 h-4 rounded disabled:opacity-50"
+                                                            />
+                                                            <span className="text-sm text-white">{t('networkCheck')}</span>
+                                                        </label>
+                                                    </div>
+
+                                                    <div>
+                                                        <label className="block text-xs text-gray-400 mb-1">{t('additionalQuorumHosts')}</label>
+                                                        <input
+                                                            type="text"
+                                                            value={haSettings.quorum_hosts}
+                                                            onChange={(e) => setHaSettings({...haSettings, quorum_hosts: e.target.value})}
+                                                            placeholder="8.8.8.8, 1.1.1.1"
+                                                            className="w-full bg-proxmox-darker border border-proxmox-border rounded-lg px-3 py-2 text-white text-sm disabled:opacity-50"
+                                                        />
+                                                    </div>
+
+                                                    <div>
+                                                        <label className="block text-xs text-gray-400 mb-1">{t('gatewayIp')}</label>
+                                                        <input
+                                                            type="text"
+                                                            value={haSettings.quorum_gateway}
+                                                            onChange={(e) => setHaSettings({...haSettings, quorum_gateway: e.target.value})}
+                                                            placeholder="192.168.1.1"
+                                                            className="w-full bg-proxmox-darker border border-proxmox-border rounded-lg px-3 py-2 text-white text-sm disabled:opacity-50"
+                                                        />
+                                                    </div>
+                                                </div>
+                                            </details>
+                                        </fieldset>
+
+                                        {/* each saves on its own, apart from the form above */}
+                                        {(haStatus?.split_brain_prevention?.fencing || haStatus?.cluster_claim) && (
+                                            <div className="mt-4">
+                                                <HaNodeFencing t={t} clusterId={selectedCluster.id} status={haStatus}
+                                                    nodeNames={Object.keys(clusterMetrics || {})} authFetch={authFetch}
+                                                    addToast={addToast} onStatus={haStatusFor(selectedCluster.id)} locked={haReadOnly || !haWrite} />
+                                                <HaNodeClaim t={t} clusterId={selectedCluster.id} status={haStatus} authFetch={authFetch}
+                                                    addToast={addToast} onStatus={haStatusFor(selectedCluster.id)} locked={haReadOnly} />
                                             </div>
                                         )}
-                                    </div>
-
-                                    {/* 2-Node Cluster Mode */}
-                                    <label className="flex items-center gap-3 p-3 bg-proxmox-dark border border-proxmox-border rounded-xl mb-4 cursor-pointer hover:border-proxmox-orange/50">
-                                        <input
-                                            type="checkbox"
-                                            checked={haSettings.two_node_mode}
-                                            onChange={(e) => setHaSettings({...haSettings, two_node_mode: e.target.checked})}
-                                            className="w-5 h-5 rounded border-proxmox-border bg-proxmox-darker text-proxmox-orange"
-                                        />
-                                        <div>
-                                            <span className="text-white font-medium">{t('enable2NodeMode')}</span>
-                                            <p className="text-xs text-gray-500">{t('twoNodeModeDesc')}</p>
-                                        </div>
-                                    </label>
-                                    
-                                    {/* Basic Settings */}
-                                    <div className="grid grid-cols-2 gap-4 mb-4">
-                                        <div>
-                                            <label className="block text-sm text-gray-400 mb-1">{t('recoveryDelay')}</label>
-                                            <input
-                                                type="number"
-                                                min="10"
-                                                max="300"
-                                                value={haSettings.recovery_delay}
-                                                onChange={(e) => setHaSettings({...haSettings, recovery_delay: parseInt(e.target.value) || 30})}
-                                                className="w-full bg-proxmox-dark border border-proxmox-border rounded-lg px-3 py-2 text-white"
-                                            />
-                                            <p className="text-xs text-gray-500 mt-1">{t('recoveryDelayHint')}</p>
-                                        </div>
-                                        <div>
-                                            <label className="block text-sm text-gray-400 mb-1">{t('failureThreshold')}</label>
-                                            <input
-                                                type="number"
-                                                min="1"
-                                                max="10"
-                                                value={haSettings.failure_threshold}
-                                                onChange={(e) => setHaSettings({...haSettings, failure_threshold: parseInt(e.target.value) || 3})}
-                                                className="w-full bg-proxmox-dark border border-proxmox-border rounded-lg px-3 py-2 text-white"
-                                            />
-                                            <p className="text-xs text-gray-500 mt-1">{t('failureThresholdHint')}</p>
-                                        </div>
-                                    </div>
-                                    
-                                    {/* Advanced Settings - Collapsed */}
-                                    {/* MK #652: native <details> needs the `group` class + group-open:rotate on the
-                                        chevron, otherwise the arrow stays put and never signals the open state */}
-                                    <details className="group bg-proxmox-dark border border-proxmox-border rounded-xl overflow-hidden">
-                                        <summary className="p-3 cursor-pointer hover:bg-proxmox-hover flex items-center justify-between text-sm">
-                                            <span className="text-gray-400">{t('advancedSettings')}</span>
-                                            <Icons.ChevronDown className="w-4 h-4 text-gray-400 transition-transform group-open:rotate-180" />
-                                        </summary>
-                                        <div className="p-3 pt-0 space-y-3 border-t border-proxmox-border">
-                                            <div className="grid grid-cols-2 gap-3">
-                                                <label className="flex items-center gap-2 p-2 bg-proxmox-darker rounded-lg">
-                                                    <input
-                                                        type="checkbox"
-                                                        checked={haSettings.self_fence_enabled}
-                                                        onChange={(e) => setHaSettings({...haSettings, self_fence_enabled: e.target.checked})}
-                                                        className="w-4 h-4 rounded"
-                                                    />
-                                                    <span className="text-sm text-white">{t('selfFencing')}</span>
-                                                </label>
-                                                <label className="flex items-center gap-2 p-2 bg-proxmox-darker rounded-lg">
-                                                    <input
-                                                        type="checkbox"
-                                                        checked={haSettings.verify_network}
-                                                        onChange={(e) => setHaSettings({...haSettings, verify_network: e.target.checked})}
-                                                        className="w-4 h-4 rounded"
-                                                    />
-                                                    <span className="text-sm text-white">{t('networkCheck')}</span>
-                                                </label>
-                                            </div>
-                                            
-                                            <div>
-                                                <label className="block text-xs text-gray-400 mb-1">{t('additionalQuorumHosts')}</label>
-                                                <input
-                                                    type="text"
-                                                    value={haSettings.quorum_hosts}
-                                                    onChange={(e) => setHaSettings({...haSettings, quorum_hosts: e.target.value})}
-                                                    placeholder="8.8.8.8, 1.1.1.1"
-                                                    className="w-full bg-proxmox-darker border border-proxmox-border rounded-lg px-3 py-2 text-white text-sm"
-                                                />
-                                            </div>
-                                            
-                                            <div>
-                                                <label className="block text-xs text-gray-400 mb-1">{t('gatewayIp')}</label>
-                                                <input
-                                                    type="text"
-                                                    value={haSettings.quorum_gateway}
-                                                    onChange={(e) => setHaSettings({...haSettings, quorum_gateway: e.target.value})}
-                                                    placeholder="192.168.1.1"
-                                                    className="w-full bg-proxmox-darker border border-proxmox-border rounded-lg px-3 py-2 text-white text-sm"
-                                                />
-                                            </div>
-                                        </div>
-                                    </details>
+                                    </>)}
                                 </div>
                                 
                                 {/* Footer */}
@@ -23495,7 +26809,8 @@
                                     </button>
                                     <button
                                         onClick={handleSaveHASettings}
-                                        className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg"
+                                        disabled={!haStatus || !haWrite || haReadOnly}
+                                        className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed"
                                     >
                                         <Icons.Save className="w-4 h-4" />
                                         {t('saveSettings')}
@@ -23503,6 +26818,10 @@
                                 </div>
                             </div>
                         </div>
+                    )}
+
+                    {haDisableReport && (
+                        <HaNodeDisableReport report={haDisableReport} onClose={() => setHaDisableReport(null)} t={t} />
                     )}
 
                     {/* Sponsor footer.
@@ -23618,16 +26937,7 @@
                     )}
 
                     {/* Toast Notifications — rendered via portal to document.body to avoid corporate layout z-index/overflow issues */}
-                    {ReactDOM.createPortal(
-                        React.createElement('div', {
-                            style: { position: 'fixed', bottom: isCorporate ? 64 : 24, right: 24, zIndex: 99999, display: 'flex', flexDirection: 'column', gap: 8 }
-                        },
-                            toasts.map(toast =>
-                                React.createElement(Toast, { key: toast.id, message: toast.message, type: toast.type, onClose: () => removeToast(toast.id) })
-                            )
-                        ),
-                        document.body
-                    )}
+                    {toastPortal}
 
                     {/* Session-expired overlay — any 401 (server restart, idle timeout, revoked token)
                         surfaces this instead of silently failing every poll. Portal to body so it sits
@@ -23870,18 +27180,28 @@
                                     const legacyAction = channels.length === 0 ? 'log'
                                         : (channels.length === 1 && channels[0] === 'email') ? 'email'
                                         : 'all';
+                                    const isEvent = EVENT_ALERT_METRICS.includes(alertMetricSel);
                                     const payload = {
                                         name: form.name.value,
-                                        target_type: form.target_type.value,
-                                        target_id: form.target_id.value || null,
+                                        target_type: form.target_type ? form.target_type.value : 'cluster',
+                                        target_id: (form.target_id && form.target_id.value) || null,
                                         metric: form.metric.value,
-                                        operator: form.operator.value,
-                                        threshold: parseInt(form.threshold.value),
+                                        operator: (alertMetricSel === 'rolling_update' || isEvent) ? 'event' : form.operator.value,
+                                        threshold: (alertMetricSel === 'rolling_update' || !form.threshold) ? 1 : parseInt(form.threshold.value),
                                         channels,
                                         severity: form.severity.value,  // NS #501
                                         escalation: escSteps.filter(s => s.after_minutes > 0),  // NS #501
                                         action: legacyAction
                                     };
+                                    // LW Oct 2026 - the event rules' own fields; the server checks the patterns and the ranges
+                                    if (form.notify_resolved) payload.notify_resolved = form.notify_resolved.checked;
+                                    if (alertMetricSel === 'task_failed') {
+                                        payload.task_type = form.task_type.value.trim() || 'vzdump';
+                                        payload.task_status = form.task_status.value.trim();
+                                        payload.task_warnings = form.task_warnings.checked;
+                                    }
+                                    if (alertMetricSel === 'snapshot_age') payload.snapshot_ignore_policy = form.snapshot_ignore_policy.checked;
+                                    if (alertMetricSel === 'backup_coverage') payload.backup_exclude_tags = form.backup_exclude_tags.value;
                                     if (editingAlert) {  // #618 — edit keeps the alert's current enabled state
                                         await updateClusterAlert(editingAlert.id, payload);
                                     } else {
@@ -23894,13 +27214,14 @@
                                     </div>
                                     
                                     {/* Target Type Selection */}
+                                    {alertMetricSel !== 'ceph_health' && (
                                     <div className="grid grid-cols-2 gap-3">
                                         <div>
                                             <label className="block text-sm text-gray-400 mb-1">{t('targetType') || 'Apply to'}</label>
                                             <select name="target_type" defaultValue={editingAlert ? editingAlert.target_type : 'cluster'} className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg">
                                                 <option value="cluster">{t('entireCluster') || 'Entire Cluster'}</option>
                                                 <option value="node">{t('specificNode') || 'Specific Node'}</option>
-                                                <option value="vm">{t('specificVm') || 'Specific VM'}</option>
+                                                {alertMetricSel !== 'zfs_health' && <option value="vm">{t('specificVm') || 'Specific VM'}</option>}
                                             </select>
                                         </div>
                                         <div>
@@ -23908,7 +27229,8 @@
                                             <input name="target_id" placeholder="node1 or VMID" defaultValue={editingAlert ? (editingAlert.target_id || '') : ''} className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg" />
                                         </div>
                                     </div>
-                                    
+                                    )}
+
                                     <div className="grid grid-cols-3 gap-3">
                                         <div>
                                             <label className="block text-sm text-gray-400 mb-1">{t('metric') || 'Metric'}</label>
@@ -23916,12 +27238,33 @@
                                                 <option value="cpu">CPU</option>
                                                 <option value="memory">Memory</option>
                                                 <option value="disk">Disk</option>
+                                                <option value="rolling_update">{t('rollingUpdates') || 'Rolling Updates'}</option>
                                                 <option value="temperature">{t('temperatureC') || 'Temperature (°C)'}</option>
                                                 <option value="hardware_health">{t('hardwareHealth') || 'Hardware health'}</option>
                                                 <option value="backup_sla_breached_pct">{t('backupSlaBreachedPct') || 'Backup SLA breached %'}</option>
                                                 <option value="backup_sla_compliance_pct">{t('backupSlaCompliancePct') || 'Backup SLA compliance %'}</option>
+                                                <option value="task_failed">{t('failedTasks')}</option>
+                                                <option value="ceph_health">{t('alertMetricCeph')}</option>
+                                                <option value="replication">{t('replication')}</option>
+                                                <option value="snapshot_age">{t('alertMetricSnapshots')}</option>
+                                                <option value="backup_coverage">{t('backupCoverageTitle')}</option>
+                                                <option value="zfs_health">{t('zfsAlertTitle')}</option>
                                             </select>
                                         </div>
+                                        {alertMetricSel === 'rolling_update' ? (
+                                            <div className="col-span-2 rounded-lg border border-proxmox-border bg-proxmox-dark px-3 py-2 text-sm text-gray-400">
+                                                {t('rollingUpdateAlarmHelp') || 'Fires when a selected node is rebooted during a rolling update.'}
+                                            </div>
+                                        ) : EVENT_ALERT_METRICS.includes(alertMetricSel) ? (
+                                            <div data-event-help className="col-span-2 rounded-lg border border-proxmox-border bg-proxmox-dark px-3 py-2 text-xs text-gray-400">
+                                                {alertMetricSel === 'task_failed' ? t('alertTaskHelp')
+                                                    : alertMetricSel === 'ceph_health' ? t('alertCephHelp')
+                                                    : alertMetricSel === 'replication' ? t('alertReplHelp')
+                                                    : alertMetricSel === 'backup_coverage' ? t('backupCoverageHelp')
+                                                    : alertMetricSel === 'zfs_health' ? t('zfsAlertHelp')
+                                                    : t('alertSnapHelp')}
+                                            </div>
+                                        ) : <>
                                         <div>
                                             <label className="block text-sm text-gray-400 mb-1">{t('condition') || 'Condition'}</label>
                                             <select name="operator" defaultValue={editingAlert ? editingAlert.operator : '>'} className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg">
@@ -23941,7 +27284,97 @@
                                                 <input name="threshold" type="number" min="0" max={alertMetricSel === 'temperature' ? 150 : 100} defaultValue={editingAlert ? editingAlert.threshold : 80} required className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg" />
                                             )}
                                         </div>
+                                        </>}
                                     </div>
+                                    {/* LW Oct 2026 - what an event rule watches, and whether the all-clear is sent too */}
+                                    {(() => {
+                                        const isEvent = EVENT_ALERT_METRICS.includes(alertMetricSel);
+                                        // the saved values only while the rule stays on the metric it was saved with
+                                        const saved = editingAlert && editingAlert.metric === alertMetricSel ? editingAlert : null;
+                                        const field = 'w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg';
+                                        return (<>
+                                            {alertMetricSel === 'task_failed' && (
+                                                <div data-event-fields="task_failed" className="space-y-3">
+                                                    <div className="grid grid-cols-2 gap-3">
+                                                        <div>
+                                                            <label className="block text-sm text-gray-400 mb-1">{t('alertTaskType')}</label>
+                                                            <input name="task_type" maxLength={120} defaultValue={saved ? (saved.task_type || 'vzdump') : 'vzdump'} className={`${field} font-mono text-sm`} />
+                                                        </div>
+                                                        <div>
+                                                            <label className="block text-sm text-gray-400 mb-1">{t('alertTaskStatus')}</label>
+                                                            <input name="task_status" maxLength={120} placeholder="job errors" defaultValue={saved ? (saved.task_status || '') : ''} className={`${field} font-mono text-sm`} />
+                                                        </div>
+                                                    </div>
+                                                    <p className="text-xs text-gray-500">{t('alertPatternHelp')}</p>
+                                                    <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                                                        <input type="checkbox" name="task_warnings" defaultChecked={saved ? !!saved.task_warnings : false} />
+                                                        {t('alertTaskWarnings')}
+                                                    </label>
+                                                </div>
+                                            )}
+                                            {alertMetricSel === 'ceph_health' && (
+                                                <div data-event-fields="ceph_health">
+                                                    <label className="block text-sm text-gray-400 mb-1">{t('alertCephLevel')}</label>
+                                                    <select name="threshold" defaultValue={saved ? String(saved.threshold) : '0'} className={field}>
+                                                        <option value="0">{t('alertCephWarnPlus')}</option>
+                                                        <option value="1">{t('alertCephErrOnly')}</option>
+                                                    </select>
+                                                </div>
+                                            )}
+                                            {alertMetricSel === 'replication' && (
+                                                <div data-event-fields="replication">
+                                                    <label className="block text-sm text-gray-400 mb-1">{t('alertReplLag')}</label>
+                                                    <input name="threshold" type="number" min="1" max="10080" required defaultValue={saved ? saved.threshold : 60} className={field} />
+                                                </div>
+                                            )}
+                                            {alertMetricSel === 'snapshot_age' && (
+                                                <div data-event-fields="snapshot_age" className="space-y-3">
+                                                    <div>
+                                                        <label className="block text-sm text-gray-400 mb-1">{t('alertSnapDays')}</label>
+                                                        <input name="threshold" type="number" min="1" max="3650" required defaultValue={saved ? saved.threshold : 14} className={field} />
+                                                    </div>
+                                                    <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                                                        <input type="checkbox" name="snapshot_ignore_policy" defaultChecked={saved ? saved.snapshot_ignore_policy !== false : true} />
+                                                        {t('alertSnapIgnorePolicy')}
+                                                    </label>
+                                                </div>
+                                            )}
+                                            {/* LW Oct 2026 - a guest tagged like this is left out on purpose; the server splits the list */}
+                                            {alertMetricSel === 'backup_coverage' && (
+                                                <div data-event-fields="backup_coverage" className="space-y-3">
+                                                    <div className="grid grid-cols-2 gap-3">
+                                                        <div>
+                                                            <label className="block text-sm text-gray-400 mb-1">{t('backupCoverageGrace')}</label>
+                                                            <input name="threshold" type="number" min="0" max="720" required defaultValue={saved ? saved.threshold : 1} className={field} />
+                                                        </div>
+                                                        <div>
+                                                            <label className="block text-sm text-gray-400 mb-1">{t('backupCoverageExcludeTags')}</label>
+                                                            <input name="backup_exclude_tags" maxLength={500} placeholder="no-backup" defaultValue={saved ? (saved.backup_exclude_tags || []).join(', ') : 'no-backup'} className={`${field} font-mono text-sm`} />
+                                                        </div>
+                                                    </div>
+                                                    <p className="text-xs text-gray-500">{t('backupCoverageTagsHint')}</p>
+                                                </div>
+                                            )}
+                                            {alertMetricSel === 'zfs_health' && (
+                                                <div data-event-fields="zfs_health">
+                                                    <label className="block text-sm text-gray-400 mb-1">{t('zfsAlertLevel')}</label>
+                                                    <select name="threshold" defaultValue={saved ? String(saved.threshold) : '0'} className={field}>
+                                                        <option value="0">{t('zfsAlertAny')}</option>
+                                                        <option value="1">{t('zfsAlertStateOnly')}</option>
+                                                    </select>
+                                                </div>
+                                            )}
+                                            {alertMetricSel !== 'rolling_update' && (
+                                                <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                                                    <input key={isEvent ? 'nr-event' : 'nr-metric'} type="checkbox" name="notify_resolved"
+                                                        defaultChecked={editingAlert && EVENT_ALERT_METRICS.includes(editingAlert.metric) === isEvent
+                                                            ? (isEvent ? editingAlert.notify_resolved !== false : !!editingAlert.notify_resolved)
+                                                            : isEvent} />
+                                                    {t('alertNotifyResolved')}
+                                                </label>
+                                            )}
+                                        </>);
+                                    })()}
                                     <div>
                                         <label className="block text-sm text-gray-400 mb-1">{t('notifyVia') || 'Notify via'}</label>
                                         <div className="space-y-1.5 bg-proxmox-dark border border-proxmox-border rounded-lg p-2 max-h-40 overflow-y-auto">
@@ -24384,6 +27817,8 @@
                             clusterMetrics={clusterMetrics}
                             selectedCluster={selectedCluster}
                             onClose={() => setShowCommandPalette(false)}
+                            authFetch={authFetch}
+                            onPickHit={(hit) => { setShowCommandPalette(false); navigateToResult(hit); }}
                             onPickCluster={(c) => { setSelectedCluster(c); setActiveTab('overview'); setShowCommandPalette(false); }}
                             onPickVm={(vm) => {
                                 const c = clusters.find(cl => cl.id === vm._clusterId);
@@ -24414,6 +27849,7 @@
                         open={showShortcutsModal}
                         onClose={() => setShowShortcutsModal(false)}
                     />
+                    {showApiReference && <ApiReferenceModal onClose={() => setShowApiReference(false)} />}
 
                     {/* NS — connection-loss banner only after WS is dropped >4s */}
                     <div style={{ position: 'fixed', top: 0, left: 0, right: 0, zIndex: 95, pointerEvents: 'none' }}>
@@ -24682,6 +28118,11 @@
                     )}
                     
                     {/* Rename Cluster Modal — NS Mar 2026 */}
+                    {connCheckCluster && (
+                        <ConnectionCheckModal cluster={connCheckCluster} onClose={() => setConnCheckCluster(null)}
+                            authFetch={authFetch} apiUrl={API_URL} t={t} />
+                    )}
+
                     {renamingCluster && (
                         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setRenamingCluster(null)}>
                             <div className="bg-proxmox-card border-proxmox-border border rounded-xl w-full max-w-md p-6" onClick={e => e.stopPropagation()}>
@@ -25101,7 +28542,10 @@
             const pickLayout = async (layout) => {
                 setSaving(true);
                 try {
-                    await updatePreferences({ ui_layout: layout, layout_chosen: true });
+                    // Cloud brings its own theme, as when it is picked under My Profile
+                    await updatePreferences(layout === 'cloud'
+                        ? { ui_layout: 'cloud', theme: 'cloud', layout_chosen: true }
+                        : { ui_layout: layout, layout_chosen: true });
                 } catch(e) {
                     console.error('layout pick failed', e);
                 }
@@ -25110,7 +28554,7 @@
 
             return (
                 <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-[100] p-4">
-                    <div className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-lg shadow-2xl">
+                    <div className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-2xl shadow-2xl">
                         <div className="p-6">
                             <div className="flex items-center gap-3 mb-2">
                                 <div className="p-2 bg-proxmox-orange/20 rounded-lg">
@@ -25124,7 +28568,7 @@
                                 {t('layoutSelectionDesc') || 'Choose your preferred interface style. You can change this anytime under My Profile \u2192 Layout Style.'}
                             </p>
 
-                            <div className="grid grid-cols-2 gap-4 mb-4">
+                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
                                 {/* Modern */}
                                 <button
                                     onClick={() => pickLayout('modern')}
@@ -25184,6 +28628,32 @@
                                         <p className="text-xs text-gray-500 mt-0.5">{t('layoutCorporateDesc') || 'Enterprise style, dense'}</p>
                                     </div>
                                 </button>
+                                {/* LW Oct 2026 - Cloud, offered from the first login on as under My Profile */}
+                                <button
+                                    onClick={() => pickLayout('cloud')}
+                                    disabled={saving}
+                                    data-layout-pick="cloud"
+                                    className={`p-4 rounded-xl border-2 transition-all hover:scale-[1.03] text-left ${
+                                        user?.ui_layout === 'cloud'
+                                            ? 'border-proxmox-orange ring-2 ring-proxmox-orange/30'
+                                            : 'border-proxmox-border hover:border-gray-500'
+                                    } disabled:opacity-60`}
+                                >
+                                    <div className="h-20 rounded-lg mb-3 relative overflow-hidden border" style={{ background: '#0a1628', borderColor: '#1e3a52' }}>
+                                        <div className="absolute inset-1.5 grid grid-cols-2 gap-1">
+                                            <div className="rounded" style={{ background: '#16304a', border: '1px solid #1e3a52' }} />
+                                            <div className="rounded" style={{ background: '#16304a', border: '1px solid #1e3a52' }} />
+                                            <div className="rounded" style={{ background: '#16304a', border: '1px solid #1e3a52' }} />
+                                            <div className="rounded flex items-center justify-center" style={{ background: '#16304a', border: '1px solid #22d3ee' }}>
+                                                <div className="w-3 h-0.5 rounded-full" style={{ background: '#22d3ee' }} />
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div className="text-center">
+                                        <span className="text-sm font-medium text-white inline-flex items-center justify-center gap-1">Cloud <span className="text-[8px] px-1 rounded" style={{ background: 'rgba(34,211,238,0.15)', color: '#22d3ee' }}>PREVIEW</span></span>
+                                        <p className="text-xs text-gray-500 mt-0.5">{t('layoutCloudDesc') || 'Airy card grid, teal'}</p>
+                                    </div>
+                                </button>
                             </div>
 
                             <p className="text-xs text-gray-500 text-center">
@@ -25201,7 +28671,7 @@
         // host, which is one /api/clusters read — the parent window is not involved at all,
         // so the popup survives the opener being closed or navigated away.
         function StandaloneConsole({ consoleKey }) {
-            const { getAuthHeaders } = useAuth();
+            const { getAuthHeaders, haConsolesElsewhere } = useAuth();
             const { t } = useTranslation();
             const [state, setState] = useState({ status: 'loading', vm: null, info: null, clusterId: null });
 
@@ -25217,6 +28687,14 @@
                     (type !== 'qemu' && type !== 'lxc') || !/^\d+$/.test(vmid) ||
                     !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(node || '')) {
                     setState({ status: 'error', error: 'malformed' });
+                    return;
+                }
+                // consoles are the active's (#625); the server refuses one here anyway.
+                // Forwarding or not; the window offers the same console there instead. A
+                // member that serves users opens it itself
+                if (haConsolesElsewhere) {
+                    setState({ status: 'standby', clusterId, info: null,
+                               vm: { vmid: Number(vmid), node, type, _clusterId: clusterId } });
                     return;
                 }
 
@@ -25261,7 +28739,7 @@
                     }
                 })();
                 return () => { cancelled = true; };
-            }, [consoleKey]);  // eslint-disable-line react-hooks/exhaustive-deps
+            }, [consoleKey, haConsolesElsewhere]);  // eslint-disable-line react-hooks/exhaustive-deps
 
             // window.close() is only allowed for a window script opened. Someone who pasted
             // or bookmarked the link is in an ordinary tab, where it does nothing at all and
@@ -25275,6 +28753,13 @@
                 return (
                     <div className="min-h-screen bg-proxmox-darker flex items-center justify-center">
                         <p className="text-gray-400">{t('openingConsole')}</p>
+                    </div>
+                );
+            }
+            if (state.status === 'standby') {
+                return (
+                    <div className="min-h-screen bg-proxmox-darker flex items-center justify-center">
+                        <HaConsoleOnActive vm={state.vm} clusterId={state.clusterId} />
                     </div>
                 );
             }

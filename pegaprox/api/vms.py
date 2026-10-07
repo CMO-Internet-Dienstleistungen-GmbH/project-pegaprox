@@ -7,7 +7,7 @@ import json
 import time
 import logging
 from pegaprox.utils.sanitization import sanitize_log_message as _sl  # CWE-117 tainted-log sanitiser
-from pegaprox.utils.ssh_security import apply_host_key_policy, persist_host_keys  # TOFU SSH host-key verification
+from pegaprox.utils.ssh_security import apply_host_key_policy, persist_host_keys, secure_ssh_client  # TOFU SSH host-key verification
 import threading
 import uuid
 import hashlib
@@ -23,7 +23,8 @@ from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db
 
-from pegaprox.utils.auth import require_auth, load_users, validate_session, build_authz_user
+from pegaprox.utils.auth import (require_auth, load_users, validate_session, build_authz_user,
+                                 resolve_authz_user)
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.rbac import user_can_access_vm, get_user_permissions, get_user_clusters
 
@@ -38,11 +39,26 @@ def _require_vm_access(cluster_id, vmid, perm, vm_type=None):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, perm, vm_type):
         return jsonify({'error': f'Access denied to this VM ({perm})'}), 403
+    return _xapi_refusal(cluster_id, user, perm)
+
+
+def _xapi_refusal(cluster_id, user, perm):
+    """403 when an XCP-ng pool also wants an xapi.vm.* permission the caller lacks (#1110)"""
+    missing = xapi_permission_missing(cluster_id, user, perm)
+    if missing:
+        return jsonify({'error': f'Permission denied: {missing}'}), 403
     return None
-from pegaprox.utils.realtime import broadcast_sse, broadcast_action, push_immediate_update
+from pegaprox.utils.realtime import broadcast_sse, broadcast_action, push_immediate_update, hold_websocket
 from pegaprox.core.config import save_config
 from pegaprox.api.helpers import get_connected_manager, check_cluster_access, register_task_user, safe_error, parse_pve_error, scope_vm_rows, require_unconfined, caller_is_scoped
-from pegaprox.utils.ssh import get_paramiko
+from pegaprox.api.helpers import xapi_permission_missing
+from pegaprox.api.helpers import evacuation_options, evacuation_options_said
+from pegaprox.api.helpers import (sees_whole_maintenance, maintenance_without_guests,
+                                  node_maintenance_for_caller)
+from pegaprox.api.ha import standby_console_refusal, STANDBY_CONSOLE_ERROR
+from pegaprox.core import ha, ha_transport
+from pegaprox.background import guest_index
+from pegaprox.utils.ssh import get_paramiko, ssh_password_for, ssh_blocked_for
 from pegaprox.utils.sanitization import sanitize_int, validate_snapshot_name
 from urllib.parse import urlencode, quote as url_quote
 import signal
@@ -64,6 +80,7 @@ VNC_PVE_CONNECT_TIMEOUT = int(os.environ.get('PEGAPROX_VNC_CONNECT_TIMEOUT', '15
 # through gevent once, process-wide; no-op when gevent isn't patched in (e.g. under pytest).
 from pegaprox.utils.concurrent import install_gevent_to_thread, gevent_listen_socket
 from pegaprox.utils.ssh import read_capped as _read_capped
+from pegaprox.utils.vnc_polling import clear_tls_errors_before_io, write_with_deadline
 install_gevent_to_thread()
 
 
@@ -111,6 +128,10 @@ def _apply_vnc_socket_options(sock):
             sock.setsockopt(_s.IPPROTO_TCP, _s.TCP_KEEPCNT, 3)
     except Exception as _e:
         logging.debug(f"[VNC] socket options not fully applied: {_e}")
+    # MK Oct 2026 (#713) - every leg calls this on its PVE socket right after connecting,
+    # so it is also where that socket starts emptying OpenSSL's error queue before each read
+    # and write. See vnc_polling.clear_tls_errors_before_io.
+    clear_tls_errors_before_io(sock)
 
 
 # =====================================================
@@ -381,6 +402,43 @@ def get_cluster_info(cluster_id):
         return jsonify([])
 
 
+def _confirmed_api_fingerprint(manager, host, port, node_names):
+    """The fingerprint of the certificate host:port presents, but only when the cluster's
+    own API reports that certificate for one of `node_names`, else None.
+
+    NS Oct 2026 - join-info without a pve_fp fell back to reading the certificate off an
+    unverified handshake, and pvecm add then pinned whatever answered it. The API we are
+    signed in to vouches for the result now, as it does for pve_fp itself (#1087)."""
+    from pegaprox.core.manager import PegaProxManager
+    try:
+        wire = PegaProxManager.tls_fingerprint(host, port, timeout=5)
+    except Exception as e:
+        logging.debug(f"[Join] could not read the certificate of {host}: {e}")
+        return None
+    names = [n for n in node_names if n]
+    session = manager._create_session()
+    if not names:
+        try:
+            r = session.get(f"https://{host}:{port}/api2/json/nodes", timeout=5)
+            names = [n.get('node') for n in r.json().get('data', [])] if r.status_code == 200 else []
+        except Exception:
+            names = []
+    for name in names:
+        try:
+            r = session.get(f"https://{host}:{port}/api2/json/nodes/{url_quote(str(name), safe='')}"
+                            f"/certificates/info", timeout=5)
+            if r.status_code != 200:
+                continue
+            if any(str(c.get('fingerprint') or '').upper() == wire for c in r.json().get('data') or []
+                   if c.get('filename') in ('pve-ssl.pem', 'pveproxy-ssl.pem')):
+                return wire
+        except Exception:
+            continue
+    logging.warning(f"[Join] the certificate {host} presents is not one the cluster reports, "
+                    f"not using it as the join fingerprint")
+    return None
+
+
 @bp.route('/api/clusters/<cluster_id>/datacenter/join-info', methods=['GET'])
 @require_auth(perms=['cluster.view'])
 def get_join_info(cluster_id):
@@ -409,19 +467,17 @@ def get_join_info(cluster_id):
                     if isinstance(node_entry, dict) and node_entry.get('pve_fp'):
                         data['fingerprint'] = node_entry['pve_fp']
                         break
-            # Still no fingerprint? Get from SSL cert
+            # Still no fingerprint? Get from SSL cert.
+            # MK Sep 2026 (#956) - on the cluster's own API port. This read the cert from a
+            # literal 8006 two lines after unpacking manager.api_port for the request above,
+            # so a cluster reached on any other port silently produced no fingerprint and the
+            # join command could not be built.
             if not data.get('fingerprint'):
-                try:
-                    context = ssl.create_default_context()
-                    context.check_hostname = False
-                    context.verify_mode = ssl.CERT_NONE
-                    with socket.create_connection((host, 8006), timeout=5) as sock:
-                        with context.wrap_socket(sock, server_hostname=host) as ssock:
-                            cert_der = ssock.getpeercert(binary_form=True)
-                            fp_hex = hashlib.sha256(cert_der).hexdigest()
-                            data['fingerprint'] = ':'.join(fp_hex[i:i+2].upper() for i in range(0, len(fp_hex), 2))
-                except:
-                    pass
+                _fp = _confirmed_api_fingerprint(
+                    manager, host, port,
+                    [n.get('name') for n in data.get('nodelist', []) if isinstance(n, dict)])
+                if _fp:
+                    data['fingerprint'] = _fp
             return jsonify(data)
         
         # fallback
@@ -456,23 +512,11 @@ def get_join_info(cluster_id):
                         n['ring0_addr'] = node.get('ring0_addr')
                         n['pve_addr'] = node.get('pve_addr')
         
-        # Try to get fingerprint via SSL certificate
-        try:
-            import socket
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-            
-            with socket.create_connection((host, 8006), timeout=5) as sock:
-                with context.wrap_socket(sock, server_hostname=host) as ssock:
-                    cert_der = ssock.getpeercert(binary_form=True)
-                    fingerprint = hashlib.sha256(cert_der).hexdigest()
-                    # Format as colon-separated uppercase
-                    result['fingerprint'] = ':'.join(fingerprint[i:i+2].upper() for i in range(0, len(fingerprint), 2))
-        except Exception as e:
-            logging.debug(f"Could not get SSL fingerprint: {e}")
-            result['fingerprint'] = f'Run "pvecm status" on {host} to get fingerprint'
-        
+        # Try to get fingerprint via SSL certificate, one the cluster itself reports
+        result['fingerprint'] = (_confirmed_api_fingerprint(manager, host, port,
+                                                            [n.get('name') for n in result['nodelist']])
+                                 or f'Run "pvecm status" on {host} to get fingerprint')
+
         return jsonify(result)
 
     except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
@@ -1040,11 +1084,18 @@ def delete_datastore_content(cluster_id, storage_name, volid):
         # (local:100/vm-100-disk-0.qcow2). Under any other directory it is just a filename that
         # happens to look like one — local:snippets/vm-100-cloudinit.yml is a user snippet, not
         # guest 100's disk, and attributing it would deny a scoped caller their own file.
-        _disk_ok = len(_parts) == 1 or (len(_parts) == 2 and _parts[0].isdigit())
+        # NS Oct 2026 - PVE takes the owner from the number alone: vm-100-anything at the root,
+        # anything under 100/, and a linked clone 99/base-99-disk-0.qcow2/100/<name> belong to
+        # guest 100, whatever the rest of the name says (#1066). On ZFS, LVM-thin and RBD a
+        # linked clone is base-99-disk-0/vm-100-disk-1, the guest named last
         _m = (_re.search(r'/(?:vm|ct)/(\d+)/', volid)
               or _re.search(r'(?:^|/)vzdump-(?:qemu|lxc|openvz)-(\d+)-', _seg)
-              or (_re.match(r'(?:vm|base|subvol)-(\d+)-(?:disk|state|cloudinit)', _parts[-1])
-                  if _disk_ok else None))
+              or (_re.match(r'(?:vm|base|basevol|subvol)-(\d+)-', _parts[-1])
+                  if len(_parts) == 1 or (len(_parts) == 2 and _re.match(r'(?:base|basevol)-\d+-', _parts[0]))
+                  else None)
+              or (_re.fullmatch(r'(\d+)', _parts[0]) if len(_parts) == 2 else None)
+              or (_re.fullmatch(r'(\d+)', _parts[2])
+                  if len(_parts) == 4 and _parts[0].isdigit() else None))
         _src = int(_m.group(1)) if _m else None
         if _src is not None and not user_can_access_vm(_dc_user, cluster_id, _src, 'vm.view'):
             return jsonify({'error': 'Access denied to this volume'}), 403
@@ -1136,6 +1187,12 @@ def upload_to_datastore(cluster_id, storage_name):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    # NS Oct 2026 - an ISO, template or import image lands on a storage every guest of the
+    # cluster draws from, none of it belongs to one guest. A caller confined to some guests
+    # here does not write it (#1109), as with the ISO sync.
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -1307,6 +1364,9 @@ def download_iso_from_url(cluster_id, storage_name):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    _cerr = require_unconfined(cluster_id)   # same as the upload above (#1109)
+    if _cerr:
+        return _cerr
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
@@ -1675,7 +1735,8 @@ def restore_vm_backup(cluster_id, node, vm_type, vmid):
     # scoped to their own VM could restore ANOTHER VM's backup image into it (force=1 when
     # target==vmid) and read the contents. Mirrors pbs.py restore_backup's source check.
     _authz_user = build_authz_user(request.session.get('user', ''), request.session)
-    if _authz_user.get('effective_role', _authz_user.get('role')) != ROLE_ADMIN:
+    from pegaprox.utils.rbac import acts_as_admin
+    if not acts_as_admin(_authz_user):
         import re as _re
         _sm = _re.search(r'/(?:vm|ct)/(\d+)/', volid) or _re.search(r'vzdump-(?:qemu|lxc|openvz)-(\d+)-', volid)
         _src_vmid = int(_sm.group(1)) if _sm else None
@@ -1683,6 +1744,18 @@ def restore_vm_backup(cluster_id, node, vm_type, vmid):
         if _src_vmid is None or not user_can_access_vm(_authz_user, cluster_id, _src_vmid,
                                                        'vm.backup', 'lxc' if _src_is_lxc else 'qemu'):
             return jsonify({'error': 'Permission denied for source backup'}), 403
+        # another VMID makes this a new guest, which keeps to what the PBS twin asks of one
+        # (restore_backup, mode 'new'): the tenant's VMID range, and for a confined caller a
+        # node one of their guests lives on (#1081)
+        if str(target_vmid) != str(vmid):
+            from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID
+            from pegaprox.api.pbs import _authz_restore_node
+            _rok, _rmsg = check_tenant_vmid(_authz_user.get('tenant_id') or DEFAULT_TENANT_ID, target_vmid)
+            if not _rok:
+                return jsonify({'error': _rmsg}), 403
+            _nerr = _authz_restore_node(cluster_id, node, _authz_user)
+            if _nerr:
+                return _nerr
 
     try:
         host, port = manager.host, manager.api_port
@@ -1744,7 +1817,8 @@ def delete_vm_backup(cluster_id, node, vm_type, vmid, volid):
     # else a scoped backup.delete holder could delete ANOTHER VM's backup by naming its volid (the
     # source vmid is embedded in vzdump-<type>-<vmid>-...). Mirrors restore_vm_backup's source check.
     _authz_user = build_authz_user(request.session.get('user', ''), request.session)
-    if _authz_user.get('effective_role', _authz_user.get('role')) != ROLE_ADMIN:
+    from pegaprox.utils.rbac import acts_as_admin
+    if not acts_as_admin(_authz_user):
         import re as _re
         _sm = _re.search(r'/(?:vm|ct)/(\d+)/', volid) or _re.search(r'vzdump-(?:qemu|lxc|openvz)-(\d+)-', volid)
         _src_vmid = int(_sm.group(1)) if _sm else None
@@ -2491,6 +2565,277 @@ def get_usb_mappings(cluster_id):
         return jsonify({'error': safe_error(e, 'Failed to get USB mappings')}), 500
 
 
+# MK Oct 2026 - directory mappings (PVE 8.4+): a directory of the host per node, under the
+# id a VM's virtiofsN names. A mapping hands that directory to every guest given it, the
+# way the node's root sees it, so it is changed with cluster.config and by nobody confined
+# to some guests of the cluster; its host paths are not theirs to read either. PVE checks a
+# path only on the node that answers the request (assert_valid_map_list), so its rules for
+# the path are held here for every node, and a node the cluster does not have is refused
+# before PVE stores it.
+_PVE_NODE_NAME_RE = re.compile(r'[a-zA-Z0-9](?:[a-zA-Z0-9\-]*[a-zA-Z0-9])?')
+_DIR_MAPPING_FIELDS = ('id', 'description', 'map', 'digest')
+
+
+def _dir_path_problem(path):
+    """'' for a path PVE takes in a directory mapping (pve-storage-path-in-property-string),
+    else why not"""
+    if not isinstance(path, str) or not path:
+        return 'a path is required'
+    if not path.startswith('/'):
+        return f'{path[:80]!r} is not an absolute path'
+    if not path.strip('/'):
+        return 'the root directory would share the whole file system of the node'
+    if len(path) > 4096:
+        return 'the path is longer than 4096 characters'
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in path):
+        return 'a path cannot hold control characters'
+    bad = sorted({ch for ch in path if ch in ';,=()'})
+    if bad:
+        return 'a path cannot hold ' + ' '.join(bad)
+    if path != path.rstrip():
+        return 'a path cannot end with a space'
+    if '..' in path.split('/'):
+        return 'write the path without ".." in it'
+    return ''
+
+
+def _dir_mapping_fields(data, mapping_id=None):
+    """({id?, description?, map?, digest?}, None) from a request body, or (None, why not).
+    Creating (mapping_id None) wants an id and a map; a change wants a map, a description
+    or both."""
+    if not isinstance(data, dict):
+        return None, 'JSON object expected'
+    extra = [str(k)[:40] for k in data if k not in _DIR_MAPPING_FIELDS]
+    if extra:
+        return None, f'Unknown field: {extra[0]}'
+    out = {}
+    if mapping_id is None:
+        mid = data.get('id')
+        if not isinstance(mid, str) or not _MAPPING_ID_RE.fullmatch(mid):
+            return None, 'The id is 2 to 64 letters, digits, - and _, and starts with a letter'
+        out['id'] = mid
+    elif 'id' in data and data['id'] != mapping_id:
+        return None, 'The id of a mapping cannot change'
+    if data.get('description') is not None:
+        desc = data['description']
+        if not isinstance(desc, str) or len(desc) > 4096 or any(ord(ch) < 32 or ord(ch) == 127 for ch in desc):
+            return None, 'The description is one line of at most 4096 characters'
+        out['description'] = desc.strip()
+    if mapping_id is None or 'map' in data:
+        entries = data.get('map')
+        if not isinstance(entries, list) or not entries:
+            return None, 'map lists at least one node with its path'
+        pairs = []
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry) - {'node', 'path'}:
+                return None, 'Each map entry is {node, path}'
+            node, path = entry.get('node'), entry.get('path')
+            if not isinstance(node, str) or not _PVE_NODE_NAME_RE.fullmatch(node):
+                return None, f'{str(node)[:64]!r} is not a node name'
+            if any(node == n for n, _p in pairs):
+                return None, f'Node {node} is listed twice'
+            why = _dir_path_problem(path)
+            if why:
+                return None, f'{node}: {why}'
+            pairs.append((node, path))
+        out['map'] = pairs
+    elif 'description' not in out:
+        return None, 'Nothing to change: send map, description or both'
+    if data.get('digest') is not None:
+        if not isinstance(data['digest'], str) or not re.fullmatch(r'[0-9a-fA-F]{1,64}', data['digest']):
+            return None, 'Invalid digest'
+        out['digest'] = data['digest']
+    return out, None
+
+
+def _cluster_node_names(manager):
+    """The names of the cluster's nodes, online or not (GET /nodes), None when unreadable"""
+    try:
+        r = manager._create_session().get(f"https://{manager.host}:{manager.api_port}/api2/json/nodes", timeout=10)
+    except Exception:
+        return None
+    if r.status_code != 200:
+        return None
+    return sorted({str(n['node']) for n in (r.json().get('data') or []) if isinstance(n, dict) and n.get('node')})
+
+
+def _dir_mapping_manager(cluster_id):
+    """(manager, None), or (None, response) for a caller or a cluster the directory
+    mappings are not open to"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return None, err
+    denied = require_unconfined(cluster_id)
+    if denied:
+        return None, denied
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return None, error
+    if getattr(manager, 'cluster_type', 'proxmox') != 'proxmox':
+        return None, (jsonify({'error': 'Directory mappings are a Proxmox VE feature'}), 400)
+    return manager, None
+
+
+def _dir_mapping_nodes_refusal(manager, pairs):
+    """None when every node of `pairs` is one of the cluster's, else the response"""
+    nodes = _cluster_node_names(manager)
+    if nodes is None:
+        return jsonify({'error': 'Could not read the nodes of this cluster'}), 502
+    unknown = [n for n, _p in pairs if n not in nodes]
+    if unknown:
+        return jsonify({'error': f'{unknown[0]} is not a node of this cluster'}), 400
+    return None
+
+
+def _pve_dir_mapping_refusal(resp, what):
+    msg = parse_pve_error(resp.text, f'Proxmox refused to {what} the directory mapping')
+    low = msg.lower()
+    if 'already defined' in low or 'modified configuration' in low or 'digest' in low:
+        return jsonify({'error': msg}), 409
+    # the node that answered checks its own path, and dies (500) on one it does not have
+    if resp.status_code in (400, 403) or 'does not exist' in low or 'not a directory' in low:
+        return jsonify({'error': msg}), 403 if resp.status_code == 403 else 400
+    return jsonify({'error': msg}), 502
+
+
+def _dir_map_text(pairs):
+    return ', '.join(f'{n}={p}' for n, p in pairs)[:400]
+
+
+@bp.route('/api/clusters/<cluster_id>/datacenter/mapping/dir', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_dir_mappings(cluster_id):
+    """The directory mappings of a Proxmox VE cluster (8.4 or newer), each with its path per node, and the nodes of the cluster"""
+    manager, err = _dir_mapping_manager(cluster_id)
+    if err:
+        return err
+    try:
+        if _dir_mappings_missing(manager):
+            return jsonify({'supported': False, 'min_version': '8.4', 'mappings': [], 'nodes': [], 'digest': ''})
+        mappings, read_err = _read_mappings(manager, 'dir')
+        if mappings is None:
+            return jsonify({'error': read_err}), 502
+        rows = [{'id': m['id'], 'description': m['description'], 'nodes': m['nodes'],
+                 'entries': [{'node': e['node'], 'path': e['path']} for e in m['entries']]}
+                for m in mappings]
+        digest = next((m['digest'] for m in mappings if m['digest']), '')
+        return jsonify({'supported': True, 'mappings': rows, 'nodes': _cluster_node_names(manager) or [],
+                        'digest': digest})
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Failed to read the directory mappings')}), 500
+
+
+@bp.route('/api/clusters/<cluster_id>/datacenter/mapping/dir', methods=['POST'])
+@require_auth(perms=['cluster.config'])
+def create_dir_mapping(cluster_id):
+    """Create a directory mapping: {id, description, map: [{node, path}]}, an absolute path per node that VMs share through virtiofs"""
+    manager, err = _dir_mapping_manager(cluster_id)
+    if err:
+        return err
+    fields, why = _dir_mapping_fields(request.get_json(silent=True))
+    if why:
+        return jsonify({'error': why}), 400
+    try:
+        if _dir_mappings_missing(manager):
+            return jsonify({'error': 'Directory mappings need Proxmox VE 8.4 or newer'}), 400
+        refused = _dir_mapping_nodes_refusal(manager, fields['map'])
+        if refused:
+            return refused
+        body = {'id': fields['id'], 'map': [f'node={n},path={p}' for n, p in fields['map']]}
+        if fields.get('description'):
+            body['description'] = fields['description']
+        url = f"https://{manager.host}:{manager.api_port}/api2/json/cluster/mapping/dir"
+        resp = manager._create_session().post(url, data=body, timeout=15)
+        if resp.status_code != 200:
+            return _pve_dir_mapping_refusal(resp, 'create')
+        user = getattr(request, 'session', {}).get('user', 'system')
+        log_audit(user, 'mapping.dir_created', f"Directory mapping {fields['id']}: {_dir_map_text(fields['map'])}",
+                  cluster=manager.config.name)
+        return jsonify({'success': True, 'id': fields['id']})
+    except Exception as e:
+        logging.error(f"Error creating a directory mapping: {e}")
+        return jsonify({'error': safe_error(e, 'Failed to create the directory mapping')}), 500
+
+
+@bp.route('/api/clusters/<cluster_id>/datacenter/mapping/dir/<mapping_id>', methods=['PUT'])
+@require_auth(perms=['cluster.config'])
+def update_dir_mapping(cluster_id, mapping_id):
+    """Change a directory mapping: {map: [{node, path}], description, digest}, map and description each optional. The map replaces the one before."""
+    manager, err = _dir_mapping_manager(cluster_id)
+    if err:
+        return err
+    if not _MAPPING_ID_RE.fullmatch(mapping_id or ''):
+        return jsonify({'error': 'Invalid mapping id'}), 400
+    fields, why = _dir_mapping_fields(request.get_json(silent=True), mapping_id)
+    if why:
+        return jsonify({'error': why}), 400
+    try:
+        if _dir_mappings_missing(manager):
+            return jsonify({'error': 'Directory mappings need Proxmox VE 8.4 or newer'}), 400
+        known, read_err = _read_mappings(manager, 'dir')
+        if known is None:
+            return jsonify({'error': read_err}), 502
+        before = next((m for m in known if m['id'] == mapping_id), None)
+        if before is None:
+            return jsonify({'error': f'No directory mapping "{mapping_id}" in this cluster'}), 404
+        if 'map' in fields:
+            refused = _dir_mapping_nodes_refusal(manager, fields['map'])
+            if refused:
+                return refused
+        body = {}
+        if 'map' in fields:
+            body['map'] = [f'node={n},path={p}' for n, p in fields['map']]
+        if 'description' in fields:
+            if fields['description']:
+                body['description'] = fields['description']
+            else:
+                body['delete'] = 'description'
+        if fields.get('digest'):
+            body['digest'] = fields['digest']
+        url = f"https://{manager.host}:{manager.api_port}/api2/json/cluster/mapping/dir/{mapping_id}"
+        resp = manager._create_session().put(url, data=body, timeout=15)
+        if resp.status_code != 200:
+            return _pve_dir_mapping_refusal(resp, 'change')
+        user = getattr(request, 'session', {}).get('user', 'system')
+        old = _dir_map_text([(e['node'], e['path']) for e in before['entries']])
+        what = f"'{old}' -> '{_dir_map_text(fields['map'])}'" if 'map' in fields else 'description'
+        log_audit(user, 'mapping.dir_updated', f"Directory mapping {mapping_id}: {what}", cluster=manager.config.name)
+        return jsonify({'success': True, 'id': mapping_id})
+    except Exception as e:
+        logging.error(f"Error changing a directory mapping: {e}")
+        return jsonify({'error': safe_error(e, 'Failed to change the directory mapping')}), 500
+
+
+@bp.route('/api/clusters/<cluster_id>/datacenter/mapping/dir/<mapping_id>', methods=['DELETE'])
+@require_auth(perms=['cluster.config'])
+def delete_dir_mapping(cluster_id, mapping_id):
+    """Remove a directory mapping. A VM whose virtiofs device names it does not start until the device is removed or the mapping is back."""
+    manager, err = _dir_mapping_manager(cluster_id)
+    if err:
+        return err
+    if not _MAPPING_ID_RE.fullmatch(mapping_id or ''):
+        return jsonify({'error': 'Invalid mapping id'}), 400
+    try:
+        known, read_err = _read_mappings(manager, 'dir')
+        if known is None:
+            return jsonify({'error': read_err}), 502
+        before = next((m for m in known if m['id'] == mapping_id), None)
+        if before is None:
+            return jsonify({'error': f'No directory mapping "{mapping_id}" in this cluster'}), 404
+        url = f"https://{manager.host}:{manager.api_port}/api2/json/cluster/mapping/dir/{mapping_id}"
+        resp = manager._create_session().delete(url, timeout=15)
+        if resp.status_code != 200:
+            return _pve_dir_mapping_refusal(resp, 'remove')
+        user = getattr(request, 'session', {}).get('user', 'system')
+        old = _dir_map_text([(e['node'], e['path']) for e in before['entries']])
+        log_audit(user, 'mapping.dir_deleted', f"Directory mapping {mapping_id} removed (was {old})",
+                  cluster=manager.config.name)
+        return jsonify({'success': True})
+    except Exception as e:
+        logging.error(f"Error removing a directory mapping: {e}")
+        return jsonify({'error': safe_error(e, 'Failed to remove the directory mapping')}), 500
+
+
 # Maintenance Mode API Routes
 @bp.route('/api/clusters/<cluster_id>/nodes/<node_name>/maintenance-preview', methods=['GET'])
 @require_auth(perms=['node.maintenance'])
@@ -2512,6 +2857,36 @@ def maintenance_capacity_preview_api(cluster_id, node_name):
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to compute maintenance preview')}), 500
 
+
+@bp.route('/api/clusters/<cluster_id>/nodes/<node_name>/maintenance-plan', methods=['GET'])
+@require_auth(perms=['node.maintenance'])
+def maintenance_evacuation_plan(cluster_id, node_name):
+    """MK Oct 2026 (#763, #954) - what moving the templates and letting negative affinity
+    rules give way would change for this node's maintenance, for the dialog before it starts.
+    Reads only. Templates and HA rules span the cluster: confined callers get nothing, as for
+    the maintenance itself."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    mgr = cluster_managers[cluster_id]
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'supported': False})
+    try:
+        return jsonify(mgr.evacuation_plan(node=node_name))
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Failed to read the maintenance plan')}), 500
+
+
+def _maintenance_extras(mgr, **kw):
+    """#763, #954 - what only the Proxmox manager takes; the XCP-ng one has neither."""
+    return kw if getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox' else {}
+
+
 @bp.route('/api/clusters/<cluster_id>/nodes/<node_name>/maintenance', methods=['PUT'])
 @require_auth(perms=['node.maintenance'])
 def set_maintenance_mode(cluster_id, node_name):
@@ -2520,31 +2895,40 @@ def set_maintenance_mode(cluster_id, node_name):
     _cerr = require_unconfined(cluster_id)
     if _cerr:
         return _cerr
-    
+
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
-    
+
     mgr = cluster_managers[cluster_id]
     data = request.json or {}
     enable = data.get('enable', True)
     skip_evacuation = data.get('skip_evacuation', False)  # MK: for non-reboot updates
     usr = getattr(request, 'session', {}).get('user', 'system')
-    
+
     if enable:
+        # #763, #954 - the evacuation options of the rolling update, for this
+        # node: its templates move with it, and the negative affinity rules over its guests
+        # are off until it leaves maintenance. Both off unless asked for, Proxmox only.
+        migrate_templates, relax_anti_affinity = evacuation_options(mgr, data)
+        if skip_evacuation:
+            migrate_templates = relax_anti_affinity = False
         # MK Aug 2026 (#629): thread the cluster's local-disk-balance flag through so a
         # maintenance evacuation migrates local-disk VMs with --with-local-disks too,
         # like the balancer/anti-affinity path does (same config flag). Off by default,
         # so behaviour is unchanged unless "Balance VMs with Local Disks" is enabled.
         task = mgr.enter_maintenance_mode(node_name, skip_evacuation=skip_evacuation,
-                                          allow_local_disks=getattr(mgr.config, 'balance_local_disks', False))
-        
+                                          allow_local_disks=getattr(mgr.config, 'balance_local_disks', False),
+                                          **_maintenance_extras(mgr, migrate_templates=migrate_templates,
+                                                                relax_anti_affinity=relax_anti_affinity, who=usr))
+
         if skip_evacuation:
             log_audit(usr, 'node.maintenance_entered', f"Node {node_name} entered maintenance mode (skip_evacuation=True)", cluster=mgr.config.name)
             broadcast_action('maintenance_enter', 'node', node_name, {'status': 'completed', 'skip_evacuation': True}, cluster_id, usr)
         else:
-            log_audit(usr, 'node.maintenance_entered', f"Node {node_name} entered maintenance mode", cluster=mgr.config.name)
+            log_audit(usr, 'node.maintenance_entered', f"Node {node_name} entered maintenance mode"
+                      + evacuation_options_said(migrate_templates, relax_anti_affinity), cluster=mgr.config.name)
             broadcast_action('maintenance_enter', 'node', node_name, {'status': 'evacuating'}, cluster_id, usr)
-        
+
         return jsonify({
             'message': f'Entering maintenance mode for {node_name}',
             'skip_evacuation': skip_evacuation,
@@ -2552,7 +2936,7 @@ def set_maintenance_mode(cluster_id, node_name):
             'task': task.to_dict()
         })
     else:
-        success = mgr.exit_maintenance_mode(node_name)
+        success = mgr.exit_maintenance_mode(node_name, **_maintenance_extras(mgr, who=usr))
         if success:
             log_audit(usr, 'node.maintenance_exited', f"Node {node_name} exited maintenance mode", cluster=mgr.config.name)
             broadcast_action('maintenance_exit', 'node', node_name, {}, cluster_id, usr)
@@ -2573,8 +2957,13 @@ def get_maintenance_status(cluster_id, node_name):
     # NS: force-refresh from PVE so we don't return stale data (#141)
     mgr.refresh_maintenance_status()
     status = mgr.get_maintenance_status(node_name)
-
-    return jsonify(status if status else {'maintenance_mode': False})
+    if not status:
+        return jsonify({'maintenance_mode': False})
+    # node.view reaches a confined caller too: the progress, as from /node-progress
+    if not sees_whole_maintenance(build_authz_user(request.session.get('user', ''), request.session),
+                                  cluster_id):
+        status = maintenance_without_guests(status)
+    return jsonify(status)
 
 @bp.route('/api/clusters/<cluster_id>/nodes/<node_name>/maintenance', methods=['DELETE'])
 @require_auth(perms=['node.maintenance'])
@@ -2589,9 +2978,9 @@ def exit_maintenance_mode_api(cluster_id, node_name):
         return jsonify({'error': 'Cluster not found'}), 404
     
     mgr = cluster_managers[cluster_id]
-    success = mgr.exit_maintenance_mode(node_name)
     usr = getattr(request, 'session', {}).get('user', 'system')
-    
+    success = mgr.exit_maintenance_mode(node_name, **_maintenance_extras(mgr, who=usr))
+
     if success:
         log_audit(usr, 'node.maintenance_exited', f"Node {node_name} exited maintenance mode", cluster=mgr.config.name)
         broadcast_action('maintenance_exit', 'node', node_name, {}, cluster_id, usr)
@@ -2819,24 +3208,11 @@ def join_node_to_cluster(cluster_id):
             # Same method as get_join_info uses - this is the cert fingerprint
             # that pvecm add --fingerprint expects
             logging.warning(f"[Join] No pve_fp in API response, extracting from SSL certificate of {host}")
-            try:
-                import ssl
-                import socket
-                import hashlib
-                
-                context = ssl.create_default_context()
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
-                
-                with socket.create_connection((host, 8006), timeout=5) as sock:
-                    with context.wrap_socket(sock, server_hostname=host) as ssock:
-                        cert_der = ssock.getpeercert(binary_form=True)
-                        fp_hex = hashlib.sha256(cert_der).hexdigest()
-                        fingerprint = ':'.join(fp_hex[i:i+2].upper() for i in range(0, len(fp_hex), 2))
-                        logging.info(f"[Join] Got SSL fingerprint: {fingerprint[:20]}...")
-            except Exception as ssl_err:
-                logging.error(f"[Join] SSL fingerprint extraction failed: {ssl_err}")
-        
+            fingerprint = _confirmed_api_fingerprint(
+                mgr, host, port, [n.get('name') for n in nodelist if isinstance(n, dict)]) or ''
+            if fingerprint:
+                logging.info(f"[Join] Got SSL fingerprint: {fingerprint[:20]}...")
+
         if not fingerprint:
             logging.error(f"[Join] No fingerprint found! join_info type={type(join_info).__name__}, "
                          f"nodelist={len(nodelist)} entries, "
@@ -2844,8 +3220,7 @@ def join_node_to_cluster(cluster_id):
             return jsonify({'success': False, 'error': 'Could not get cluster fingerprint. Check server logs for details.'}), 500
         
         # Connect to new node via SSH
-        ssh = paramiko.SSHClient()
-        apply_host_key_policy(ssh, paramiko)
+        ssh = secure_ssh_client(paramiko)
         ssh.connect(node_ip, port=ssh_port, username=username, password=password, timeout=30)
         persist_host_keys(ssh)
         
@@ -2896,8 +3271,7 @@ def join_node_to_cluster(cluster_id):
             # Reconnect SSH after pve-cluster restart
             ssh.close()
             time.sleep(2)
-            ssh = paramiko.SSHClient()
-            apply_host_key_policy(ssh, paramiko)
+            ssh = secure_ssh_client(paramiko)
             ssh.connect(node_ip, port=ssh_port, username=username, password=password, timeout=30)
             persist_host_keys(ssh)
         
@@ -3119,6 +3493,14 @@ def remove_node_from_cluster(cluster_id, node_name):
     
     if not data.get('confirm'):
         return jsonify({'success': False, 'error': 'Confirmation required'}), 400
+
+    # #941 - pvecm delnode goes over SSH, and with SSH switched off the stored key used
+    # to log in here all the same
+    _blocked = ssh_blocked_for(mgr)
+    if _blocked:
+        return jsonify({'success': False, 'code': _blocked,
+                        'error': 'Removing a node runs pvecm delnode over SSH, which is not '
+                                 'available for this cluster'}), 409
     
     # LW: Feb 2026 - Maintenance is recommended but not strictly required
     # pvecm delnode runs on another node, not on the target
@@ -3133,7 +3515,7 @@ def remove_node_from_cluster(cluster_id, node_name):
         if not ssh_user:
             api_user = cluster_config.user
             ssh_user = (api_user or 'root').split('@')[0]  # PR #62 (ry-ops): null-safe
-        ssh_password = getattr(cluster_config, 'pass_', '') or ''
+        ssh_password = ssh_password_for(cluster_config)
         ssh_key_content = getattr(cluster_config, 'ssh_key', '') or ''
         
         # Find an online node to execute the removal from
@@ -3160,9 +3542,8 @@ def remove_node_from_cluster(cluster_id, node_name):
         removed_node_ip = mgr._get_node_ip(node_name) if hasattr(mgr, '_get_node_ip') else None
         logging.info(f"[RemoveNode] Pre-resolved IP for {node_name}: {removed_node_ip}")
         
-        # Connect to an online node via SSH
-        ssh = paramiko.SSHClient()
-        apply_host_key_policy(ssh, paramiko)
+        # Connect to an online node via SSH (its commands ask the transport guard, #625)
+        ssh = secure_ssh_client(paramiko)
         
         # Try SSH key first, then password
         connected = False
@@ -3220,8 +3601,7 @@ def remove_node_from_cluster(cluster_id, node_name):
         if removed_node_ip:
             try:
                 logging.info(f"[RemoveNode] Cleaning up cluster config on removed node {node_name} ({removed_node_ip})")
-                ssh_cleanup = paramiko.SSHClient()
-                apply_host_key_policy(ssh_cleanup, paramiko)
+                ssh_cleanup = secure_ssh_client(paramiko)
                 
                 # Try to connect to the removed node
                 cleanup_connected = False
@@ -3446,8 +3826,10 @@ def node_action_api(cluster_id, node_name, action):
             uid = _read_capped(stdout).strip()
             is_root = (uid == '0')
             
-            # Always use PTY for reliable execution
+            # Always use PTY for reliable execution. The channel of a transport is no
+            # exec of the guarded client: the shutdown asks the guard itself (#625)
             transport = ssh.get_transport()
+            ha_transport.guard_ssh(node_ip, 'shutdown')
             channel = transport.open_session()
             channel.get_pty()
             channel.settimeout(10)
@@ -3520,7 +3902,14 @@ def start_node_update(cluster_id, node_name):
     data = request.json or {}
     reboot = data.get('reboot', True)
     force = data.get('force', False)
-    
+    # NS Oct 2026 - rebooting after the update is node.reboot, as on the rolling-update and
+    # schedule routes; an update without one stays on node.update (#1072)
+    if reboot:
+        from pegaprox.utils.rbac import has_permission
+        if not has_permission(build_authz_user(request.session.get('user', ''), request.session),
+                              'node.reboot'):
+            return jsonify({'error': 'Rebooting the node needs the node.reboot permission'}), 403
+
     # check maintenance mode (unless force)
     if not force:
         if node_name not in mgr.nodes_in_maintenance:
@@ -3558,6 +3947,37 @@ def get_update_status(cluster_id, node_name):
     status = mgr.get_update_status(node_name)
     
     return jsonify(status if status else {'is_updating': False})
+
+
+@bp.route('/api/clusters/<cluster_id>/node-progress', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_node_progress(cluster_id):
+    """The maintenance and the update of every node that has one
+
+    {nodes: {name: {maintenance_mode, maintenance_task, maintenance_acknowledged,
+    is_updating, update_task}}}, the fields /metrics puts on a node. Both run in the
+    process of the instance that started them: a member that forwards reads this on
+    the leader and lays it over the /metrics it reads itself."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    mgr = cluster_managers[cluster_id]
+    # an ESXi cluster keeps a set here, and runs neither
+    in_maintenance = getattr(mgr, 'nodes_in_maintenance', None)
+    updating = getattr(mgr, 'nodes_updating', None)
+    nodes = {}
+    for name, task in (list(in_maintenance.items()) if isinstance(in_maintenance, dict) else []):
+        nodes[name] = {'maintenance_mode': True, 'maintenance_task': task.to_dict(),
+                       'maintenance_acknowledged': bool(task.acknowledged),
+                       'is_updating': False, 'update_task': None}
+    for name, task in (list(updating.items()) if isinstance(updating, dict) else []):
+        entry = nodes.setdefault(name, {'maintenance_mode': False, 'maintenance_task': None,
+                                        'maintenance_acknowledged': False})
+        entry.update(is_updating=True, update_task=task.to_dict())
+    # a confined caller gets the progress, not which guests are in it (helpers)
+    return jsonify({'nodes': node_maintenance_for_caller(cluster_id, nodes)})
 
 
 @bp.route('/api/clusters/<cluster_id>/nodes/<node_name>/update', methods=['DELETE'])
@@ -3674,6 +4094,190 @@ def vm_action_api(cluster_id, node, vm_type, vmid, action):
         return jsonify({'error': error_msg}), status_code
 
 
+# MK Oct 2026 - every guest of a node in one call: start them, shut them down or move
+# them away, through the node endpoints Proxmox has for that. Each guest is asked about
+# on its own as in vm_action_api above, and only those go into the list Proxmox gets, so
+# a caller confined to some guests of the node acts on those and on nothing else.
+_NODE_GUEST_ACTIONS = {
+    # action: (permission per guest, audit action, verb for the messages)
+    'startall': ('vm.start', 'node.guests_started', 'start'),
+    'stopall': ('vm.stop', 'node.guests_stopped', 'shut down'),
+    'migrateall': ('vm.migrate', 'node.guests_migrated', 'migrate'),
+}
+_NODE_GUESTS_MAX = 5000
+_VMID_TEXT_RE = re.compile(r'[0-9]{1,9}')
+
+
+def _vmid_list(value):
+    """The VMIDs of a body as ints, or None when one is no VMID"""
+    out = []
+    for v in value:
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            n = v
+        elif isinstance(v, str) and _VMID_TEXT_RE.fullmatch(v):
+            n = int(v)
+        else:
+            return None
+        if not 1 <= n <= 999999999:
+            return None
+        out.append(n)
+    return out
+
+
+def _affinity_held(cluster_id, vmids, target):
+    """{vmid: rule name} of the guests an enforced affinity rule keeps off `target`. Only
+    the guests a rule names are looked at: each look reads the cluster's guest list again"""
+    from pegaprox.api.history import check_affinity_violation, load_affinity_rules
+    ruled = set()
+    for rule in (load_affinity_rules() or {}).get('rules', []):
+        if rule.get('cluster_id') == cluster_id and rule.get('enabled', True):
+            ruled.update(str(v) for v in (rule.get('vm_ids') or rule.get('vms') or []))
+    held = {}
+    for vmid in [v for v in vmids if str(v) in ruled]:
+        aff = check_affinity_violation(cluster_id, vmid, target)
+        if aff.get('violation') and aff.get('enforce'):
+            held[vmid] = aff.get('rule')
+    return held
+
+
+def _node_guest_skip(action, guest):
+    """Why a guest the caller named stays out of the action, None when it takes part"""
+    if action == 'startall':
+        if str(guest.get('template', '')).lower() in ('1', 'true'):
+            return 'template'
+        if guest.get('status') == 'running':
+            return 'already running'
+    elif action == 'stopall' and guest.get('status') != 'running':
+        return 'not running'
+    return None
+
+
+@bp.route('/api/clusters/<cluster_id>/nodes/<node_name>/guests/<action>', methods=['POST'])
+@require_auth()
+def node_guests_action_api(cluster_id, node_name, action):
+    """Start, shut down or migrate the guests of one node in one go
+
+    action is startall, stopall or migrateall. Body:
+    - vms: the VMIDs to act on. Without it, every guest of the node the caller may act on
+      that fits the action (the stopped ones for startall, the running ones for stopall)
+    - target: (migrateall, required) the node they move to
+    - maxworkers: (migrateall) migrations at the same time, 1-16, default 1
+    - with_local_disks: (migrateall) move local disks along
+
+    Answers {success, task, vms, skipped: [{vmid, reason}]}: skipped are guests named in
+    vms that do not fit the action. 403 when the caller may act on none of the guests,
+    400 when a VMID named is not on the node or out of the caller's reach.
+    """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    if action not in _NODE_GUEST_ACTIONS:
+        return jsonify({'error': f"Invalid action. Valid actions: {', '.join(_NODE_GUEST_ACTIONS)}"}), 400
+    perm, audit_action, verb = _NODE_GUEST_ACTIONS[action]
+    mgr = cluster_managers[cluster_id]
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'error': 'Only Proxmox clusters act on all guests of a node'}), 400
+    from pegaprox.utils.sanitization import validate_hostname
+    if not validate_hostname(node_name):
+        return jsonify({'error': 'Invalid node name'}), 400
+
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'JSON object required'}), 400
+    wanted = data.get('vms')
+    if wanted is not None:
+        if not isinstance(wanted, list) or len(wanted) > _NODE_GUESTS_MAX:
+            return jsonify({'error': f'vms is a list of at most {_NODE_GUESTS_MAX} VMIDs'}), 400
+        wanted = _vmid_list(wanted)
+        if wanted is None:
+            return jsonify({'error': 'vms holds something that is no VMID'}), 400
+        wanted = set(wanted)
+
+    target, maxworkers, with_local_disks = None, 1, False
+    if action == 'migrateall':
+        target = data.get('target')
+        if not isinstance(target, str) or not validate_hostname(target):
+            return jsonify({'error': 'Target node is required'}), 400
+        if target == node_name:
+            return jsonify({'error': 'The target is the node itself'}), 400
+        maxworkers = data.get('maxworkers', 1)
+        if isinstance(maxworkers, bool) or not isinstance(maxworkers, int) or not 1 <= maxworkers <= 16:
+            return jsonify({'error': 'maxworkers is a number from 1 to 16'}), 400
+        with_local_disks = data.get('with_local_disks', False)
+        if not isinstance(with_local_disks, bool):
+            return jsonify({'error': 'with_local_disks is true or false'}), 400
+        nodes = mgr.get_node_status() or {}
+        if target not in nodes:
+            return jsonify({'error': f'{target} is no node of this cluster'}), 400
+        tinfo = nodes.get(target) or {}
+        if tinfo.get('offline') or tinfo.get('status', 'online') != 'online':
+            return jsonify({'error': f'{target} is not online'}), 400
+
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    on_node = {}
+    for g in (mgr.get_vm_resources(max_age=2) or []):
+        if g.get('node') != node_name or g.get('type') not in ('qemu', 'lxc'):
+            continue
+        try:
+            on_node[int(g.get('vmid'))] = g
+        except (TypeError, ValueError):
+            continue
+    allowed = {vmid: g for vmid, g in on_node.items()
+               if (wanted is None or vmid in wanted)
+               and user_can_access_vm(user, cluster_id, vmid, perm, g.get('type'))}
+    if not allowed:
+        return jsonify({'error': f'Permission denied: {perm}'}), 403
+    if wanted is not None:
+        # one answer for a guest elsewhere and one out of reach: which is which stays unsaid
+        refused = sorted(wanted - set(allowed))
+        if refused:
+            return jsonify({'error': f"Not on {node_name} or out of reach: "
+                                     f"{', '.join(str(v) for v in refused[:20])}"}), 400
+
+    act, skipped = [], []
+    for vmid in sorted(allowed):
+        why = _node_guest_skip(action, allowed[vmid])
+        if why is None:
+            act.append(vmid)
+        elif wanted is not None:
+            skipped.append({'vmid': vmid, 'reason': why})
+
+    if action == 'migrateall' and act:
+        # an enforced affinity rule holds a guest back, as in bulk_migrate_api
+        for vmid, rule in _affinity_held(cluster_id, act, target).items():
+            act.remove(vmid)
+            skipped.append({'vmid': vmid, 'reason': f"affinity rule '{rule}'"})
+
+    if not act:
+        return jsonify({'error': f'No guest on {node_name} to {verb}', 'skipped': skipped}), 400
+
+    try:
+        result = mgr.node_guests_action(node_name, action, act, target=target,
+                                        maxworkers=maxworkers, with_local_disks=with_local_disks)
+    except Exception as e:
+        logging.error(f"[NODE-GUESTS] {action} on {node_name}: {e}", exc_info=True)
+        return jsonify({'error': f'{verb} failed'}), 500
+    if not result.get('success'):
+        return jsonify({'error': parse_pve_error(result.get('error'), f'{verb} failed')}), 500
+
+    usr = request.session.get('user', 'system')
+    ids = ', '.join(str(v) for v in act[:50]) + (' ...' if len(act) > 50 else '')
+    log_audit(usr, audit_action, f"Node {node_name}: {verb} {len(act)} guest(s)"
+              + (f" to {target}" if target else '') + f" ({ids})", cluster=mgr.config.name)
+    task = result.get('task')
+    if task:
+        register_task_user(task, usr, cluster_id)
+    broadcast_action(action, 'node', node_name, {'vms': act, 'target': target}, cluster_id, usr)
+    push_immediate_update(cluster_id, delay=1.0)
+    return jsonify({'success': True, 'task': task, 'vms': act, 'skipped': skipped})
+
+
 @bp.route('/api/clusters/<cluster_id>/nextid', methods=['GET'])
 @require_auth(perms=['vm.view'])
 def get_next_vmid_api(cluster_id):
@@ -3732,11 +4336,28 @@ def clone_vm_api(cluster_id, node, vm_type, vmid):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.clone', vm_type):
         return jsonify({'error': 'Permission denied: vm.clone'}), 403
-    
+    denied = _xapi_refusal(cluster_id, user, 'vm.clone')
+    if denied: return denied
+
     manager = cluster_managers[cluster_id]
     data = request.json or {}
-    
+
+    # NS Oct 2026 - a clone is a new guest, so it keeps to what a restore into a new VMID
+    # asks: the tenant's VMID range for a VMID the caller names, and for a caller confined
+    # here a node one of their own guests lives on (#1081)
     newid = data.get('newid')
+    from pegaprox.utils.rbac import acts_as_admin
+    if not acts_as_admin(user):
+        from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID
+        from pegaprox.api.pbs import _authz_restore_node
+        if newid:
+            _rok, _rmsg = check_tenant_vmid(user.get('tenant_id') or DEFAULT_TENANT_ID, newid)
+            if not _rok:
+                return jsonify({'error': _rmsg}), 403
+        _nerr = _authz_restore_node(cluster_id, data.get('target_node') or node, user)
+        if _nerr:
+            return _nerr
+
     if not newid:
         # Get next available VMID
         next_result = manager.get_next_vmid()
@@ -3797,18 +4418,60 @@ def clone_vm_api(cluster_id, node, vm_type, vmid):
         return jsonify({'error': result['error']}), 500
 
 
+# MK Sep 2026 (#959) - the console answer carries the datacenter keymap so the
+# browser can stop emulating a US keyboard when the cluster is not running one. /cluster/options
+# is a value nobody touches twice in a year, and the console path has its own latency history
+# (#713/#777/#782), so it gets a short TTL instead of a round trip per console open.
+_DC_KEYMAP_TTL = 300
+_dc_keymap_cache = {}
+
+
+def _datacenter_keymap(cluster_id, manager):
+    """Configured VNC keymap of the datacenter, '' when none is set.
+
+    The per-VM `keyboard` option is deliberately not consulted: PVE deprecates it in favour
+    of this one, and reading it would cost another round trip on the console path. A VM that
+    overrides it just stays on the old US behaviour - no worse than before.
+    """
+    if getattr(manager, 'cluster_type', 'proxmox') != 'proxmox':
+        return ''
+    hit = _dc_keymap_cache.get(cluster_id)
+    if hit and (time.time() - hit[0]) < _DC_KEYMAP_TTL:
+        return hit[1]
+    try:
+        url = f"https://{manager.host}:{manager.api_port}/api2/json/cluster/options"
+        resp = manager._create_session().get(url, timeout=4)
+        if resp.status_code != 200:
+            return ''
+        keymap = (resp.json().get('data') or {}).get('keyboard') or ''
+    except Exception as exc:
+        # not worth failing a console over; the browser falls back to what it did before
+        logging.debug(f"[VNC] keymap lookup failed for {_sl(str(cluster_id))}: {_sl(str(exc))}")
+        return ''
+    _dc_keymap_cache[cluster_id] = (time.time(), keymap)
+    return keymap
+
+
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/console', methods=['GET'])
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/vnc', methods=['GET'])
 @require_auth()
 def get_console_ticket(cluster_id, node, vm_type, vmid):
     """Get VNC console ticket for VM - NS: Now uses VM ACLs"""
+    # #625 - the vncproxy call below starts a console on the node
+    refused = standby_console_refusal()
+    if refused:
+        return refused
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
 
-    user = build_authz_user(request.session.get('user', ''), request.session)
+    # NS Oct 2026 (#1101) - every console reads its caller by the account's own row:
+    # the whole-table read behind build_authz_user answers {} when it fails
+    user = resolve_authz_user(request.session)
+    if not user:
+        return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
 
     mgr = cluster_managers[cluster_id]
     console_perm = 'xapi.vm.view' if getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng' else 'vm.console'
@@ -3849,6 +4512,10 @@ def get_console_ticket(cluster_id, node, vm_type, vmid):
             except Exception as _enc_err:
                 logging.warning(f"[VNC] stable-mode key generation failed (falling back to plain): {_enc_err}")
 
+        # #959 - which keyboard the guest side thinks it has. The paste helper in the
+        # browser needs it to decide whether its US shift emulation still applies.
+        result['keymap'] = _datacenter_keymap(cluster_id, mgr)
+
         return jsonify(result)
     return jsonify({'error': result.get('error', 'Failed')}), 500
 
@@ -3860,6 +4527,11 @@ def get_spice_console(cluster_id, node, vm_type, vmid):
     own web UI): opens in remote-viewer, full SPICE (audio / USB / multi-monitor).
     Same authz as the VNC console (vm.console + per-VM ACL). remote-viewer tunnels the
     SPICE stream through the PVE host's pveproxy, so it works behind a single public IP."""
+    # #625 - once the .vv file is out, remote-viewer talks to the node and PegaProx is
+    # not in the path any more, so this route is the only place to say no
+    refused = standby_console_refusal()
+    if refused:
+        return refused
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
@@ -3868,7 +4540,9 @@ def get_spice_console(cluster_id, node, vm_type, vmid):
     if vm_type != 'qemu':
         return jsonify({'error': 'SPICE is only available for QEMU VMs'}), 400
 
-    user = build_authz_user(request.session.get('user', ''), request.session)
+    user = resolve_authz_user(request.session)
+    if not user:
+        return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
     mgr = cluster_managers[cluster_id]
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.console', vm_type):
         return jsonify({'error': 'Permission denied: vm.console'}), 403
@@ -3920,6 +4594,13 @@ _VM_SCREENSHOT_TTL = 60.0
 # guests that can't be grabbed will sit on all of them — which is what starves the
 # console and the SSE stream. Remember the failure too, just for less long.
 _VM_SCREENSHOT_FAIL_TTL = 120.0
+
+
+def _vnc_tunnel_wanted(mgr):
+    """vnc_tunnel is set and SSH to the nodes may go out. The tunnel is an SSH login like
+    any other - with SSH switched off (#941) it logged in with the stored key regardless,
+    from every tile poll. Without it the console goes direct, as when the tunnel fails."""
+    return bool(getattr(mgr.config, 'vnc_tunnel', False)) and not ssh_blocked_for(mgr)
 
 
 # NS Jun 2026 — RFB fallback for the console tile. screendump (qm monitor) is the
@@ -3978,11 +4659,14 @@ def _screenshot_via_rfb(mgr, node, vm_type, vmid, max_width=480, timeout=10):
     vnc_ticket = vnc_data['ticket']
     vnc_port = vnc_data['port']
 
-    # optional SSH tunnel for clusters where 8006 isn't directly reachable from us
+    # optional SSH tunnel for clusters where the API port isn't directly reachable
+    # MK Sep 2026 (#956) - was a literal 8006 and broke the screenshot tile for any
+    # cluster reachable on a forwarded port, the same way the console did.
+    _api_port = getattr(mgr, 'api_port', 8006) or 8006
     tunnel_endpoint = None
-    target_host, target_port = host, 8006
+    target_host, target_port = host, _api_port
     try:
-        if bool(getattr(mgr.config, 'vnc_tunnel', False)):
+        if _vnc_tunnel_wanted(mgr):
             from pegaprox.utils import vnc_tunnel as _vt
             _ssh_user = getattr(mgr.config, 'ssh_user', None) or (mgr.config.user or 'root').split('@')[0]
             _ssh_port = getattr(mgr.config, 'ssh_port', 22) or 22
@@ -3990,14 +4674,14 @@ def _screenshot_via_rfb(mgr, node, vm_type, vmid, max_width=480, timeout=10):
                 cluster_id=getattr(mgr, 'id', ''), pve_host=host,
                 ssh_user=_ssh_user, ssh_port=_ssh_port,
                 ssh_key_content=getattr(mgr.config, 'ssh_key', '') or '',
-                ssh_password=getattr(mgr.config, 'pass_', '') or '',
-                target_host='127.0.0.1', target_port=8006,
+                ssh_password=ssh_password_for(mgr.config),
+                target_host='127.0.0.1', target_port=_api_port,
             )
             target_host, target_port = '127.0.0.1', tunnel_endpoint.local_port
     except Exception as te:
         logging.warning(f"[Screenshot] RFB tunnel setup failed ({te}) — direct")
         tunnel_endpoint = None
-        target_host, target_port = host, 8006
+        target_host, target_port = host, _api_port
 
     encoded_ticket = url_quote(vnc_ticket, safe='')
     pve_ws_path = f"/api2/json/nodes/{node}/{vm_type}/{vmid}/vncwebsocket?port={vnc_port}&vncticket={encoded_ticket}"
@@ -4028,9 +4712,33 @@ def _screenshot_via_rfb(mgr, node, vm_type, vmid, max_width=480, timeout=10):
     return vnc_grab.to_png_thumbnail(img, max_width=max_width)
 
 
+def grab_vm_frame(mgr, node, vm_type, vmid, max_width=480):
+    """One PNG of a guest's display: screendump first, one RFB frame when that gives nothing.
+    Raises when neither does. The console tile and the boot screenshots of a DR test
+    failover (background/sr_boot_shots.py) both take theirs here. MK Oct 2026"""
+    from pegaprox.utils import vnc_grab
+    try:
+        return vnc_grab.screendump_to_png(mgr, node, vmid, max_width=max_width, timeout=20)
+    except Exception as e:
+        # screendump came back empty/blank, or can't run (API-token-only / no SSH).
+        # The common one is Windows on virtio-gpu/QXL - qm monitor screendump renders
+        # nothing there, so the tile only ever showed the icon. Fall back to a one-off
+        # RFB frame off the vncproxy (guest-GPU-independent) before giving up.
+        logging.info(f"[Screenshot] screendump failed {vm_type}/{vmid}@{node}: {e} - trying RFB")
+    try:
+        return _screenshot_via_rfb(mgr, node, vm_type, vmid, max_width=max_width, timeout=10)
+    except Exception as e2:
+        logging.info(f"[Screenshot] RFB fallback also failed {vm_type}/{vmid}@{node}: {e2}")
+        raise
+
+
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/screenshot', methods=['GET'])
 @require_auth()
 def get_vm_screenshot(cluster_id, node, vm_type, vmid):
+    # #625 - a screendump runs qm monitor on the node, the fallback opens a vncproxy
+    refused = standby_console_refusal()
+    if refused:
+        return refused
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
     if cluster_id not in cluster_managers:
@@ -4039,7 +4747,9 @@ def get_vm_screenshot(cluster_id, node, vm_type, vmid):
         # LXC consoles are a terminal, not a framebuffer — nothing to screenshot
         return jsonify({'error': 'screenshot only available for qemu'}), 400
 
-    user = build_authz_user(request.session.get('user', ''), request.session)
+    user = resolve_authz_user(request.session)
+    if not user:
+        return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
     mgr = cluster_managers[cluster_id]
     if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
         return jsonify({'error': 'screenshot only available on proxmox'}), 400
@@ -4062,21 +4772,11 @@ def get_vm_screenshot(cluster_id, node, vm_type, vmid):
 
     # screendump via qm monitor — no vncproxy, so no "console opened" PVE task
     try:
-        from pegaprox.utils import vnc_grab
-        png = vnc_grab.screendump_to_png(mgr, node, vmid, max_width=480, timeout=20)
-    except Exception as e:
-        # screendump came back empty/blank, or can't run (API-token-only / no SSH).
-        # The common one is Windows on virtio-gpu/QXL — qm monitor screendump renders
-        # nothing there, so the tile only ever showed the icon. Fall back to a one-off
-        # RFB frame off the vncproxy (guest-GPU-independent) before giving up.
-        logging.info(f"[Screenshot] screendump failed {vm_type}/{vmid}@{node}: {e} — trying RFB")
-        try:
-            png = _screenshot_via_rfb(mgr, node, vm_type, vmid, max_width=480, timeout=10)
-        except Exception as e2:
-            logging.info(f"[Screenshot] RFB fallback also failed {vm_type}/{vmid}@{node}: {e2}")
-            with _vm_screenshot_lock:
-                _vm_screenshot_cache[cache_key] = (time.monotonic(), None)
-            return jsonify({'error': f'screenshot unavailable: {e2}'}), 502
+        png = grab_vm_frame(mgr, node, vm_type, vmid, max_width=480)
+    except Exception as e2:
+        with _vm_screenshot_lock:
+            _vm_screenshot_cache[cache_key] = (time.monotonic(), None)
+        return jsonify({'error': f'screenshot unavailable: {e2}'}), 502
 
     with _vm_screenshot_lock:
         _vm_screenshot_cache[cache_key] = (time.monotonic(), png)
@@ -4119,7 +4819,9 @@ def vnc_poll(cluster_id, node, vm_type, vmid):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
 
-    user = build_authz_user(request.session.get('user', ''), request.session)
+    user = resolve_authz_user(request.session)
+    if not user:
+        return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
     mgr = cluster_managers[cluster_id]
     console_perm = 'xapi.vm.view' if getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng' else 'vm.console'
     if not user_can_access_vm(user, cluster_id, vmid, console_perm, vm_type):
@@ -4144,18 +4846,23 @@ def vnc_poll(cluster_id, node, vm_type, vmid):
             ssl_ctx.check_hostname = False
             ssl_ctx.verify_mode = _ssl.CERT_NONE
 
+        # #955 - a token cluster has no password to log in with, see _console_uses_token
+        _token_auth = _console_uses_token(mgr)
+        pve_ticket = csrf_token = None
+        _reuse_manager_auth = _token_auth
         try:
-            login_data = urllib.parse.urlencode({
-                'username': mgr.config.user,
-                'password': mgr.config.pass_,
-            }).encode('utf-8')
-            login_req = urllib.request.Request(
-                f"https://{mgr.auth_host}:{port}/api2/json/access/ticket", data=login_data, method='POST'
-            )
-            with urllib.request.urlopen(login_req, context=ssl_ctx, timeout=10) as r:
-                login_result = _json.loads(r.read().decode('utf-8'))
-            pve_ticket = login_result['data']['ticket']
-            csrf_token = login_result['data']['CSRFPreventionToken']
+            if not _token_auth:
+                login_data = urllib.parse.urlencode({
+                    'username': mgr.config.user,
+                    'password': mgr.config.pass_,
+                }).encode('utf-8')
+                login_req = urllib.request.Request(
+                    f"https://{mgr.auth_host}:{port}/api2/json/access/ticket", data=login_data, method='POST'
+                )
+                with urllib.request.urlopen(login_req, context=ssl_ctx, timeout=10) as r:
+                    login_result = _json.loads(r.read().decode('utf-8'))
+                pve_ticket = login_result['data']['ticket']
+                csrf_token = login_result['data']['CSRFPreventionToken']
 
             # MK Apr 2026 (#352 follow-up) — same single-vncproxy fix applies
             # to the polling endpoint. If JS provides pve_port + pve_ticket in
@@ -4166,6 +4873,9 @@ def vnc_poll(cluster_id, node, vm_type, vmid):
             if pve_port_q and pve_ticket_q and _ppt_ok:
                 vnc_ticket = pve_ticket_q
                 vnc_port = _ppt_port
+                _reuse_manager_auth = True
+            elif _token_auth:
+                vnc_ticket, vnc_port = _vncproxy_via_manager(mgr, node, vm_type, vmid)
             else:
                 vnc_url = f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{vmid}/vncproxy"
                 vnc_req = urllib.request.Request(vnc_url, data=urllib.parse.urlencode({'websocket': '1'}).encode('utf-8'), method='POST')
@@ -4184,9 +4894,9 @@ def vnc_poll(cluster_id, node, vm_type, vmid):
         # Optional SSH tunnel (same path as WS handler)
         tunnel_endpoint = None
         target_host = host
-        target_port = 8006
+        target_port = port          # MK Sep 2026 (#956): the cluster's API port
         try:
-            if bool(getattr(mgr.config, 'vnc_tunnel', False)):
+            if _vnc_tunnel_wanted(mgr):
                 from pegaprox.utils import vnc_tunnel as _vt
                 _ssh_user = getattr(mgr.config, 'ssh_user', None) or (mgr.config.user or 'root').split('@')[0]
                 _ssh_port = getattr(mgr.config, 'ssh_port', 22) or 22
@@ -4194,8 +4904,8 @@ def vnc_poll(cluster_id, node, vm_type, vmid):
                     cluster_id=cluster_id, pve_host=host,
                     ssh_user=_ssh_user, ssh_port=_ssh_port,
                     ssh_key_content=getattr(mgr.config, 'ssh_key', '') or '',
-                    ssh_password=getattr(mgr.config, 'pass_', '') or '',
-                    target_host='127.0.0.1', target_port=8006,
+                    ssh_password=ssh_password_for(mgr.config),
+                    target_host='127.0.0.1', target_port=port,
                 )
                 target_host = '127.0.0.1'
                 target_port = tunnel_endpoint.local_port
@@ -4204,14 +4914,15 @@ def vnc_poll(cluster_id, node, vm_type, vmid):
             logging.warning(f"[VncPoll] tunnel setup failed ({te}) — direct WSS to PVE")
             tunnel_endpoint = None
             target_host = host
-            target_port = 8006
+            target_port = port
 
         pve_ws_url = f"wss://{target_host}:{target_port}{pve_ws_path}"
         try:
             pve_ws = ws_client.create_connection(
                 pve_ws_url,
                 sslopt=({} if _verify_tls else {"cert_reqs": _ssl.CERT_NONE}),
-                header={"Cookie": f"PVEAuthCookie={pve_ticket}", "Host": f"{host}:{port}"},
+                header=_pve_console_ws_auth(mgr, f"{host}:{port}", pve_ticket,
+                                            reuse_manager_auth=_reuse_manager_auth),
                 timeout=VNC_PVE_CONNECT_TIMEOUT,
             )
             _apply_vnc_socket_options(pve_ws.sock)
@@ -4292,6 +5003,12 @@ def get_node_shell_ticket(cluster_id, node):
     """Get shell ticket for node - requires node.shell permission"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # a root shell on a node: not for a caller who reaches this cluster only through a VM
+    # ACL or a pool grant, the same rule as /api/internal/cluster-creds
+    from pegaprox.api.helpers import require_unconfined
+    denied = require_unconfined(cluster_id)
+    if denied:
+        return denied
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -4328,6 +5045,9 @@ def _get_vm_config_response(cluster_id, node, vm_type, vmid):
 
     if result['success']:
         config = result['config']
+        if isinstance(config, dict) and getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox':
+            # MK Oct 2026 - a config opened here is a fresh entry for the search index
+            guest_index.ingest(cluster_id, vm_type, vmid, config.get('raw'))
         if isinstance(config, dict) and not config.get('tags') and not config.get('tag'):
             raw = config.get('raw') if isinstance(config.get('raw'), dict) else {}
             general = config.get('general') if isinstance(config.get('general'), dict) else {}
@@ -4728,14 +5448,18 @@ def get_vm_guest_fsinfo_api(cluster_id, node, vm_type, vmid):
 # PVE 9.2 added optional `count`, `offset`, `decode` (base64) params so you
 # can stream large files in chunks without dragging the whole thing through
 # memory. We pass them through; older PVE silently ignores extras.
+# NS Oct 2026 (#1059) - the agent reads ANY file in the guest as root (/etc/shadow, keys),
+# so this is not a viewer's right. PVE 8 asks VM.Monitor (PVEVMAdmin), PVE 9
+# VM.GuestAgent.FileRead (PVEVMUser and up), no auditor role has either. vm.config is
+# the match here: user, tenant_admin and tenant_operator hold it, the viewer roles do not.
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/guest-file-read', methods=['POST'])
-@require_auth(perms=['vm.view'])
+@require_auth(perms=['vm.config'])
 def get_vm_guest_file_read_api(cluster_id, node, vm_type, vmid):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
-    denied = _require_vm_access(cluster_id, vmid, 'vm.view', vm_type)
+    denied = _require_vm_access(cluster_id, vmid, 'vm.config', vm_type)
     if denied: return denied
     if vm_type != 'qemu':
         return jsonify({'error': 'Guest-agent file-read is QEMU-only'}), 400
@@ -4801,6 +5525,44 @@ def get_vm_rrd_api(cluster_id, node, vm_type, vmid, timeframe):
         return jsonify({'error': result['error']}), 500
 
 
+# MK Oct 2026 - rng0 is a property string PVE parses as pve-qm-rng: the source is one of
+# three host files, max_bytes and period are any integer to PVE. QEMU then refuses to start
+# the VM on a negative limit or a period of 0, so both are held to what QEMU takes here.
+_RNG_SOURCES = ('/dev/urandom', '/dev/random', '/dev/hwrng')
+_RNG_LIMITS = {'max_bytes': (0, 2 ** 63 - 1), 'period': (1, 2 ** 32 - 1)}
+_RNG_NUMBER_RE = re.compile(r'[0-9]{1,20}')
+
+
+def _rng_value(value):
+    """'[source=]<file>[,max_bytes=N][,period=N]' -> (the value to send, None) or
+    (None, why not). Parsed the way PVE parses it (empty parts skipped, the bare value is
+    the source, each key once), sent back in one spelling."""
+    if not isinstance(value, str):
+        return None, 'rng0 must be a string'
+    found = {}
+    for part in value.split(','):
+        if not part.strip():
+            continue
+        key, sep, val = part.partition('=')
+        if not sep:
+            key, val = 'source', part
+        if key != 'source' and key not in _RNG_LIMITS:
+            return None, f'rng0 has no option {key!r}'
+        if key in found:
+            return None, f'rng0 sets {key} twice'
+        found[key] = val
+    if found.get('source') not in _RNG_SOURCES:
+        return None, 'rng0 needs a source: ' + ', '.join(_RNG_SOURCES)
+    out = ['source=' + found['source']]
+    for key, (low, high) in _RNG_LIMITS.items():
+        if key not in found:
+            continue
+        if not _RNG_NUMBER_RE.fullmatch(found[key]) or not low <= int(found[key]) <= high:
+            return None, f'rng0 {key} must be a whole number from {low} to {high}'
+        out.append(f'{key}={int(found[key])}')
+    return ','.join(out), None
+
+
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/config', methods=['PUT'])
 @require_auth(perms=['vm.config'])
 def update_vm_config_api(cluster_id, node, vm_type, vmid):
@@ -4816,15 +5578,43 @@ def update_vm_config_api(cluster_id, node, vm_type, vmid):
     # MK: Check pool permission for vm.config (+ xapi.vm.config for XCP-ng)
     user = build_authz_user(request.session.get('user', ''), request.session)
 
-    if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
-        from pegaprox.utils.rbac import has_permission
-        if not has_permission(user, 'xapi.vm.config'):
-            return jsonify({'error': 'Permission denied: xapi.vm.config'}), 403
-    else:
-        if not user_can_access_vm(user, cluster_id, vmid, 'vm.config', vm_type):
-            return jsonify({'error': 'Permission denied: vm.config'}), 403
+    # NS Oct 2026 - an XCP-ng guest is checked per VM as well, not only by the pool-wide
+    # xapi.vm.config, or a caller confined to some guests edited every one (#1110)
+    if not user_can_access_vm(user, cluster_id, vmid, 'vm.config', vm_type):
+        return jsonify({'error': 'Permission denied: vm.config'}), 403
+    denied = _xapi_refusal(cluster_id, user, 'vm.config')
+    if denied: return denied
 
     config_updates = request.json or {}
+    if not isinstance(config_updates, dict):
+        return jsonify({'error': 'Expected an object of config keys'}), 400
+
+    if getattr(manager, 'cluster_type', 'proxmox') != 'xcpng':
+        for key in [k for k in config_updates if re.fullmatch(r'rng[0-9]+', str(k))]:
+            if vm_type != 'qemu':
+                return jsonify({'error': 'A container has no VirtIO RNG'}), 400
+            if key != 'rng0':
+                return jsonify({'error': 'Proxmox has one VirtIO RNG per VM, rng0'}), 400
+            value, why = _rng_value(config_updates[key])
+            if why:
+                return jsonify({'error': f'Invalid VirtIO RNG: {why}'}), 400
+            config_updates[key] = value
+
+    refused = _virtiofs_refusal(manager, cluster_id, node, vmid, vm_type, config_updates)
+    if refused:
+        return refused
+
+    if getattr(manager, 'cluster_type', 'proxmox') != 'xcpng':
+        # NS Oct 2026 - a list goes out as the same key twice, and which one PVE keeps is not
+        # the one checked below. Every PVE config value is a string or a number (#1102)
+        if any(isinstance(v, (list, dict)) for v in config_updates.values()):
+            return jsonify({'error': 'Config values are strings or numbers'}), 400
+        # a cluster connected with root@pam's own password takes QEMU args, a hookscript or
+        # a host device from us where PVE refuses every token (#1102)
+        if caller_is_scoped(user, cluster_id):
+            root_key = _root_only_config_key(manager, node, vmid, vm_type, config_updates)
+            if root_key:
+                return _confined_root_refusal(f'setting {root_key}')
 
     result = manager.update_vm_config(node, vmid, vm_type, config_updates)
 
@@ -4867,7 +5657,9 @@ def sanitize_boot_order_api(cluster_id, node, vm_type, vmid):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.config', vm_type):
         return jsonify({'error': 'Permission denied: vm.config'}), 403
-    
+    denied = _xapi_refusal(cluster_id, user, 'vm.config')
+    if denied: return denied
+
     manager = cluster_managers[cluster_id]
     result = manager.sanitize_boot_order(node, vmid, vm_type)
     
@@ -5045,130 +5837,208 @@ def get_vm_passthrough_devices(cluster_id, node, vmid):
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/qemu/<int:vmid>/passthrough/pci', methods=['POST'])
 @require_auth(perms=['vm.config'])
 def add_pci_passthrough(cluster_id, node, vmid):
-    """Add a PCI device passthrough to a VM"""
+    """Add a PCI device passthrough to a VM: a cluster resource mapping (mapping) or a raw device (device_id)"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
     denied = _require_vm_access(cluster_id, vmid, 'vm.config', 'qemu')
     if denied: return denied
+    if not _PVE_NODE_RE.fullmatch(node or ''):
+        return jsonify({'error': 'Invalid node name'}), 400
 
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
-    
-    data = request.json or {}
+
+    data = request.get_json(silent=True) or {}
     device_id = data.get('device_id')
-    
-    if not device_id:
-        return jsonify({'error': 'device_id required'}), 400
-    
+    mapping = data.get('mapping')
+    # both go into a property string as they are, so a comma would add options of its
+    # own (romfile= is one PVE keeps for root@pam)
+    if mapping:
+        if not isinstance(mapping, str) or not _MAPPING_ID_RE.fullmatch(mapping):
+            return jsonify({'error': 'Invalid mapping id'}), 400
+    elif device_id:
+        if not isinstance(device_id, str) or not _PCI_ID_RE.fullmatch(device_id):
+            return jsonify({'error': 'Invalid PCI device id'}), 400
+    else:
+        return jsonify({'error': 'device_id or mapping required'}), 400
+
+    priv = None
     try:
         host, port = manager.host, manager.api_port
-        
+        session = manager._create_session()
+        covered = None
+        if mapping:
+            known, read_err = _read_mappings(manager, 'pci')
+            if known is None:
+                return jsonify({'error': read_err}), 502
+            entry = next((m for m in known if m['id'] == mapping), None)
+            if entry is None:
+                return jsonify({'error': f'No PCI mapping "{mapping}" in this cluster'}), 404
+            covered = entry['nodes']
+        else:
+            # a raw address is root@pam's only (check_hostpci_perm in qemu-server)
+            access = manager.pve_root_access()
+            if not access['root']:
+                return _root_refusal(access, 'attach a raw PCI device - use a resource mapping instead')
+            session, priv, refused = _session_as_root(manager, cluster_id, access, 'raw PCI passthrough')
+            if refused:
+                return refused
+
         # Find next available hostpci slot
         config_url = f"https://{host}:{port}/api2/json/nodes/{node}/qemu/{vmid}/config"
         config_response = manager._create_session().get(config_url, timeout=10)
         config = config_response.json().get('data', {}) if config_response.status_code == 200 else {}
-        
+
         # Find free slot (0-15)
-        used_slots = [int(k.replace('hostpci', '')) for k in config.keys() if k.startswith('hostpci')]
+        used_slots = [int(k[7:]) for k in config.keys() if re.fullmatch(r'hostpci\d+', k)]
         next_slot = 0
         while next_slot in used_slots and next_slot < 16:
             next_slot += 1
-        
+
         if next_slot >= 16:
             return jsonify({'error': 'No free PCI slots available'}), 400
-        
+
         # Build PCI passthrough config
-        pci_config = device_id
+        pci_config = f'mapping={mapping}' if mapping else device_id
         if data.get('pcie'):
             pci_config += ',pcie=1'
         if data.get('rombar') is False:
             pci_config += ',rombar=0'
         if data.get('x-vga'):
             pci_config += ',x-vga=1'
-        
+
         # Update VM config
         update_url = f"https://{host}:{port}/api2/json/nodes/{node}/qemu/{vmid}/config"
         update_data = {f'hostpci{next_slot}': pci_config}
-        response = manager._create_session().put(update_url, data=update_data, timeout=15)
-        
+        response = session.put(update_url, data=update_data, timeout=15)
+
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
-            log_audit(user, 'vm.pci_added', f"VM {vmid}: Added PCI device {device_id} at slot {next_slot}", cluster=manager.config.name)
-            return jsonify({'message': f'PCI device added at hostpci{next_slot}', 'slot': next_slot})
+            what = f'mapped PCI device {mapping}' if mapping else f'PCI device {device_id}'
+            log_audit(user, 'vm.pci_added', f"VM {vmid}: Added {what} at slot {next_slot}", cluster=manager.config.name)
+            out = {'message': f'PCI device added at hostpci{next_slot}', 'slot': next_slot}
+            if mapping:
+                out.update(mapping=mapping, nodes=covered, covers_node=node in covered)
+            return jsonify(out)
         else:
             return jsonify({'error': parse_pve_error(response.text)}), 500
-            
+
     except Exception as e:
         logging.error(f"Error adding PCI passthrough: {e}")
         return jsonify({'error': safe_error(e, 'Failed to add PCI passthrough')}), 500
+    finally:
+        if priv is not None:
+            try: priv.close()
+            except Exception: pass
 
 
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/qemu/<int:vmid>/passthrough/usb', methods=['POST'])
 @require_auth(perms=['vm.config'])
 def add_usb_passthrough(cluster_id, node, vmid):
-    """Add a USB device passthrough to a VM"""
+    """Add a USB device passthrough to a VM: a cluster resource mapping (mapping), vendorid+productid or hostbus+hostport"""
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
     denied = _require_vm_access(cluster_id, vmid, 'vm.config', 'qemu')
     if denied: return denied
+    if not _PVE_NODE_RE.fullmatch(node or ''):
+        return jsonify({'error': 'Invalid node name'}), 400
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
-    
-    data = request.json or {}
-    
-    # USB can be specified by vendor:product ID or by host bus/port
+
+    data = request.get_json(silent=True) or {}
+
+    # USB can be specified by a mapping, by vendor:product ID or by host bus/port
+    mapping = data.get('mapping')
     vendor_id = data.get('vendorid')
     product_id = data.get('productid')
     host_bus = data.get('hostbus')
     host_port = data.get('hostport')
-    
-    if not ((vendor_id and product_id) or (host_bus and host_port)):
-        return jsonify({'error': 'Either vendorid+productid or hostbus+hostport required'}), 400
-    
+
+    if mapping:
+        if not isinstance(mapping, str) or not _MAPPING_ID_RE.fullmatch(mapping):
+            return jsonify({'error': 'Invalid mapping id'}), 400
+    elif vendor_id and product_id:
+        if not all(isinstance(v, str) and re.fullmatch(r'[0-9a-fA-F]{4}', v) for v in (vendor_id, product_id)):
+            return jsonify({'error': 'vendorid and productid are four hex digits each'}), 400
+    elif host_bus and host_port:
+        if not (re.fullmatch(r'[0-9]{1,3}', str(host_bus)) and re.fullmatch(r'[0-9]{1,3}(\.[0-9]{1,3})*', str(host_port))):
+            return jsonify({'error': 'Invalid hostbus or hostport'}), 400
+    else:
+        return jsonify({'error': 'Either mapping, vendorid+productid or hostbus+hostport required'}), 400
+
+    priv = None
     try:
         host, port = manager.host, manager.api_port
-        
+        session = manager._create_session()
+        covered = None
+        if mapping:
+            known, read_err = _read_mappings(manager, 'usb')
+            if known is None:
+                return jsonify({'error': read_err}), 502
+            entry = next((m for m in known if m['id'] == mapping), None)
+            if entry is None:
+                return jsonify({'error': f'No USB mapping "{mapping}" in this cluster'}), 404
+            covered = entry['nodes']
+        else:
+            # host= is root@pam's only (check_usb_perm in qemu-server)
+            access = manager.pve_root_access()
+            if not access['root']:
+                return _root_refusal(access, 'attach a raw USB device - use a resource mapping instead')
+            session, priv, refused = _session_as_root(manager, cluster_id, access, 'raw USB passthrough')
+            if refused:
+                return refused
+
         # Find next available usb slot
         config_url = f"https://{host}:{port}/api2/json/nodes/{node}/qemu/{vmid}/config"
         config_response = manager._create_session().get(config_url, timeout=10)
         config = config_response.json().get('data', {}) if config_response.status_code == 200 else {}
-        
+
         # Find free slot (0-4)
         used_slots = [int(k.replace('usb', '')) for k in config.keys() if k.startswith('usb') and k[3:].isdigit()]
         next_slot = 0
         while next_slot in used_slots and next_slot < 5:
             next_slot += 1
-        
+
         if next_slot >= 5:
             return jsonify({'error': 'No free USB slots available (max 5)'}), 400
-        
+
         # Build USB config
-        if vendor_id and product_id:
+        if mapping:
+            usb_config = f"mapping={mapping}"
+        elif vendor_id and product_id:
             usb_config = f"host={vendor_id}:{product_id}"
         else:
             usb_config = f"host={host_bus}-{host_port}"
-        
+
         if data.get('usb3'):
             usb_config += ',usb3=1'
-        
+
         # Update VM config
         update_url = f"https://{host}:{port}/api2/json/nodes/{node}/qemu/{vmid}/config"
         update_data = {f'usb{next_slot}': usb_config}
-        response = manager._create_session().put(update_url, data=update_data, timeout=15)
-        
+        response = session.put(update_url, data=update_data, timeout=15)
+
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
-            log_audit(user, 'vm.usb_added', f"VM {vmid}: Added USB device at slot {next_slot}", cluster=manager.config.name)
-            return jsonify({'message': f'USB device added at usb{next_slot}', 'slot': next_slot})
+            what = f'mapped USB device {mapping}' if mapping else 'USB device'
+            log_audit(user, 'vm.usb_added', f"VM {vmid}: Added {what} at slot {next_slot}", cluster=manager.config.name)
+            out = {'message': f'USB device added at usb{next_slot}', 'slot': next_slot}
+            if mapping:
+                out.update(mapping=mapping, nodes=covered, covers_node=node in covered)
+            return jsonify(out)
         else:
             return jsonify({'error': parse_pve_error(response.text)}), 500
-            
+
     except Exception as e:
         logging.error(f"Error adding USB passthrough: {e}")
         return jsonify({'error': safe_error(e, 'Failed to add USB passthrough')}), 500
+    finally:
+        if priv is not None:
+            try: priv.close()
+            except Exception: pass
 
 
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/qemu/<int:vmid>/passthrough/serial', methods=['POST'])
@@ -5186,6 +6056,9 @@ def add_serial_port(cluster_id, node, vmid):
 
     data = request.json or {}
     serial_type = data.get('type', 'socket')  # socket, pty, or /dev/xxx
+    if serial_type != 'socket' and caller_is_scoped(
+            build_authz_user(request.session.get('user', ''), request.session), cluster_id):
+        return _confined_root_refusal('passing a serial device of the host')
     
     try:
         host, port = manager.host, manager.api_port
@@ -5238,65 +6111,733 @@ def remove_passthrough_device(cluster_id, node, vmid, device_type, key):
     valid_prefixes = {'pci': 'hostpci', 'usb': 'usb', 'serial': 'serial'}
     if device_type not in valid_prefixes:
         return jsonify({'error': 'Invalid device type'}), 400
-    
+
     # Key should be like hostpci0, usb1, serial0
     expected_prefix = valid_prefixes[device_type]
-    if not key.startswith(expected_prefix):
+    if not re.fullmatch(rf'{expected_prefix}\d+', key):
         return jsonify({'error': f'Invalid key for {device_type}'}), 400
-    
+    if not _PVE_NODE_RE.fullmatch(node or ''):
+        return jsonify({'error': 'Invalid node name'}), 400
+
+    priv = None
     try:
         host, port = manager.host, manager.api_port
-        
-        # Delete by setting to empty/delete
         update_url = f"https://{host}:{port}/api2/json/nodes/{node}/qemu/{vmid}/config"
+        session = manager._create_session()
+        # MK Oct 2026 - PVE checks the removed value like a new one: a raw PCI/USB device
+        # goes away as root@pam only. A mapped one or a serial port needs nothing more.
+        if device_type in ('pci', 'usb'):
+            current = session.get(update_url, timeout=10)
+            value = (current.json().get('data') or {}).get(key) if current.status_code == 200 else None
+            if value and _passthrough_is_raw(device_type, value):
+                access = manager.pve_root_access()
+                if not access['root']:
+                    return _root_refusal(access, f'remove a raw {device_type.upper()} device')
+                session, priv, refused = _session_as_root(manager, cluster_id, access,
+                                                          f'raw {device_type.upper()} passthrough')
+                if refused:
+                    return refused
+
+        # Delete by setting to empty/delete
         update_data = {'delete': key}
-        response = manager._create_session().put(update_url, data=update_data, timeout=15)
-        
+        response = session.put(update_url, data=update_data, timeout=15)
+
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, f'vm.{device_type}_removed', f"VM {vmid}: Removed {key}", cluster=manager.config.name)
             return jsonify({'message': f'Device {key} removed'})
         else:
             return jsonify({'error': parse_pve_error(response.text)}), 500
-            
+
     except Exception as e:
         logging.error(f"Error removing passthrough device: {e}")
         return jsonify({'error': safe_error(e, 'Failed to remove passthrough device')}), 500
+    finally:
+        if priv is not None:
+            try: priv.close()
+            except Exception: pass
 
 
 def _parse_pci_config(config_str):
     """Parse PCI passthrough config string"""
-    result = {'device': None, 'options': {}}
+    result = {'device': None, 'mapping': None, 'options': {}}
     if not config_str:
         return result
-    
+
     parts = config_str.split(',')
-    result['device'] = parts[0]
-    
-    for part in parts[1:]:
+    # the device is the default key, so it may come bare or as host=; a mapped one
+    # names its mapping instead
+    first = parts[0]
+    if '=' not in first:
+        result['device'] = first
+        parts = parts[1:]
+
+    for part in parts:
         if '=' in part:
             key, value = part.split('=', 1)
-            result['options'][key] = value
-    
+            if key == 'host':
+                result['device'] = value
+            elif key == 'mapping':
+                result['mapping'] = value
+            else:
+                result['options'][key] = value
+
     return result
 
 
 def _parse_usb_config(config_str):
     """Parse USB passthrough config string"""
-    result = {'host': None, 'options': {}}
+    result = {'host': None, 'mapping': None, 'options': {}}
     if not config_str:
         return result
-    
+
     parts = config_str.split(',')
-    for part in parts:
+    for i, part in enumerate(parts):
         if '=' in part:
             key, value = part.split('=', 1)
             if key == 'host':
                 result['host'] = value
+            elif key == 'mapping':
+                result['mapping'] = value
             else:
                 result['options'][key] = value
-    
+        elif i == 0 and part:
+            # host is the default key, as the device is for PCI
+            result['host'] = part
+
     return result
+
+
+# MK Oct 2026 - passthrough through cluster resource mappings, and the changes PVE keeps
+# for root@pam. A raw hostpci/usb address passes check_hostpci_perm / check_usb_perm as
+# root@pam only, which an API token never is (the clusters most often connected here:
+# a token, or the one we minted at the first password login, #110). A mapping needs
+# Mapping.Use on /mapping/<kind>/<id> and VM.Config.HWType, a token can hold both.
+_PVE_NODE_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9.\-]{0,62}$')
+# pve-configid
+_MAPPING_ID_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_\-]{1,63}$')
+# [domain:]bus:dev[.fn], several joined by ';' (pve-qm-hostpci)
+_PCI_ID_RE = re.compile(r'^(?:[0-9a-fA-F]{4,}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}(?:\.[0-7])?'
+                        r'(?:;(?:[0-9a-fA-F]{4,}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}(?:\.[0-7])?)*$')
+
+
+def _passthrough_is_raw(device_type, value):
+    """Whether a hostpci/usb value names a host device rather than a mapping. USB's
+    host=spice is no device of the host and open to everyone."""
+    # a host address next to a mapping is still a host address
+    if device_type == 'pci':
+        parsed = _parse_pci_config(value)
+        return bool(parsed['device']) or not parsed['mapping']
+    parsed = _parse_usb_config(value)
+    host = (parsed['host'] or '').lower()
+    if host:
+        return host != 'spice'
+    return not parsed['mapping']
+
+
+def _root_refusal(access, what):
+    """403 for a change only root@pam may make on Proxmox, with why this connection is
+    not root@pam. The UI words it from code and reason."""
+    why = {
+        'token': 'This cluster is connected with an API token, and Proxmox accepts none for this.',
+        'not_root': 'This cluster is connected as a user other than root@pam.',
+        'no_password': 'No root@pam password is stored for this cluster.',
+    }.get(access.get('reason'), '')
+    return jsonify({'error': f'Proxmox lets only root@pam {what}. {why}'.strip(),
+                    'code': 'PVE_ROOT_REQUIRED', 'reason': access.get('reason')}), 403
+
+
+def _confined_root_refusal(what):
+    return jsonify({'error': f'{what[:1].upper()}{what[1:]} is a change Proxmox keeps for root@pam. '
+                             'It reaches the host, so it needs access to the whole cluster.',
+                    'code': 'PVE_ROOT_CLUSTER_WIDE'}), 403
+
+
+def _session_as_root(manager, cluster_id, access, what):
+    """(session, owned, refusal) for a root@pam change: the cluster session when it is
+    root@pam's own password login, else a session on a fresh root@pam ticket, which the
+    caller closes (owned). refusal is the response to return instead.
+
+    NS Oct 2026 - on either session PVE checks nothing more about the change, so the
+    answer for a caller confined to some guests of the cluster comes from here (#1102)."""
+    if caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session), cluster_id):
+        return None, None, _confined_root_refusal(what)
+    if not access.get('fresh_ticket'):
+        return manager._create_session(), None, None
+    priv, err = manager.create_privileged_session(what)
+    if err:
+        return None, None, (jsonify({'error': err, 'code': 'PVE_ROOT_LOGIN_FAILED'}), 502)
+    return priv, priv, None
+
+
+# What else of a guest config Proxmox keeps for root@pam: every QEMU key without a privilege
+# of its own (check_vm_modify_config_perm), a raw device or a romfile, a serial port that is
+# no socket, a drive on a path of the host; for a container device passthrough, the
+# hookscript, bind and device mount points and the feature flags (check_ct_modify_config_perm).
+# A token is refused all of it, a cluster connected with root@pam's own password is not.
+_QEMU_ROOT_KEYS = ('args', 'hookscript', 'lock', 'affinity', 'hugepages', 'keephugepages',
+                   'ivshmem', 'arch', 'amd-sev', 'intel-tdx', 'vmgenid', 'spice_enhancements',
+                   'skiplock')
+_QEMU_DRIVE_KEY_RE = re.compile(r'(?:ide|sata|scsi|virtio|unused)[0-9]+|efidisk0|tpmstate0|cdrom')
+_LXC_VOLUME_KEY_RE = re.compile(r'rootfs|mp[0-9]+|unused[0-9]+')
+
+
+def _on_host_path(value, volume_key):
+    """Whether a drive or mount point names a path of the host rather than a volume"""
+    for i, part in enumerate(str(value or '').split(',')):
+        key, sep, val = part.partition('=')
+        if not sep:
+            key, val = (volume_key if i == 0 else ''), part
+        if key in (volume_key, 'import-from') and val.strip().startswith('/'):
+            return True
+    return False
+
+
+def _root_only_config_key(manager, node, vmid, vm_type, updates):
+    """The first key of a config change only root@pam may make on Proxmox, else None"""
+    # PVE splits these lists on commas, semicolons and spaces alike; revert drops a pending
+    # change the way delete drops a set one
+    deleted = [k for name in ('delete', 'revert')
+               for k in re.split(r'[,;\s]+', str(updates.get(name) or '')) if k]
+    if vm_type == 'qemu':
+        for key in list(updates) + deleted:
+            if key in _QEMU_ROOT_KEYS or re.fullmatch(r'parallel[0-9]+', str(key)):
+                return key
+        for key, value in updates.items():
+            key, value = str(key), str(value)
+            if re.fullmatch(r'hostpci[0-9]+', key):
+                if _passthrough_is_raw('pci', value) or 'romfile' in _parse_pci_config(value)['options']:
+                    return key
+            elif re.fullmatch(r'usb[0-9]+', key):
+                if _passthrough_is_raw('usb', value):
+                    return key
+            elif re.fullmatch(r'serial[0-9]+', key):
+                if value != 'socket':
+                    return key
+            elif _QEMU_DRIVE_KEY_RE.fullmatch(key) and _on_host_path(value, 'file'):
+                return key
+        return None
+    for key in list(updates) + deleted:
+        if key == 'hookscript' or re.fullmatch(r'dev[0-9]+', str(key)):
+            return key
+    for key, value in updates.items():
+        if _LXC_VOLUME_KEY_RE.fullmatch(str(key)) and _on_host_path(value, 'volume'):
+            return key
+    if 'features' in updates or 'features' in deleted:
+        rows, _resp = _lxc_pending(manager, node, vmid)
+        if rows is None:
+            return 'features'
+        current, _effective, unprivileged, _digest = _lxc_feature_state(rows)
+        old = _parse_lxc_features(current)
+        new = {} if 'features' in deleted else _parse_lxc_features(updates.get('features'))
+        if not unprivileged or any(k != 'nesting' for k in set(old) | set(new)
+                                   if old.get(k, '') != new.get(k, '')):
+            return 'features'
+    return None
+
+
+def _property_fields(text):
+    """'node=pve1,path=0000:01:00.0,description="a, b"' -> dict. Values PVE quoted may
+    hold commas."""
+    out, key, buf, quoted, i = {}, None, [], False, 0
+    text = str(text or '')
+    while i <= len(text):
+        ch = text[i] if i < len(text) else ','
+        if quoted:
+            if ch == '\\' and i + 1 < len(text):
+                buf.append(text[i + 1])
+                i += 1
+            elif ch == '"':
+                quoted = False
+            else:
+                buf.append(ch)
+        elif ch == '"':
+            quoted = True
+        elif ch == '=' and key is None:
+            key, buf = ''.join(buf).strip(), []
+        elif ch == ',':
+            if key is not None:
+                out[key] = ''.join(buf).strip()
+            key, buf = None, []
+        else:
+            buf.append(ch)
+        i += 1
+    return out
+
+
+def _read_mappings(manager, kind, check_node=None):
+    """The cluster's PCI, USB or directory resource mappings, as ([...], None) or (None, error).
+
+    Each with the nodes it has a device (a directory) on: a guest that uses it starts and
+    migrates there only. check_node asks PVE to check that node's devices against the mapping
+    (it answers from that node); a node that does not answer gets the plain list. One
+    request, two when the node is down - on opening the dialog, never in a loop."""
+    base = f"https://{manager.host}:{manager.api_port}/api2/json/cluster/mapping/{kind}"
+    session = manager._create_session()
+    resp = None
+    if check_node:
+        try:
+            resp = session.get(base, params={'check-node': check_node}, timeout=6)
+        except Exception:
+            resp = None
+        if resp is not None and resp.status_code != 200:
+            resp = None
+    if resp is None:
+        resp = session.get(base, timeout=10)
+    if resp.status_code != 200:
+        what = 'directory' if kind == 'dir' else kind.upper()
+        return None, f'Could not read the {what} resource mappings: {parse_pve_error(resp.text)}'
+    out = []
+    for row in resp.json().get('data') or []:
+        if not isinstance(row, dict) or not row.get('id'):
+            continue
+        entries = []
+        for item in row.get('map') or []:
+            f = _property_fields(item)
+            entries.append({'node': f.get('node', ''), 'path': f.get('path', ''),
+                            'id': f.get('id', ''), 'description': f.get('description', '')})
+        nodes = sorted({e['node'] for e in entries if e['node']})
+        checks = [{'severity': c.get('severity', ''), 'message': str(c.get('message', ''))[:300]}
+                  for c in (row.get('checks') or []) if isinstance(c, dict)]
+        out.append({'id': str(row['id']), 'description': str(row.get('description') or ''),
+                    'nodes': nodes, 'entries': entries,
+                    'on_node': (check_node in nodes) if check_node else None,
+                    'mdev': bool(row.get('mdev')),
+                    'live_migration': bool(row.get('live-migration-capable')),
+                    'checks': checks, 'digest': str(row.get('digest') or '')})
+    out.sort(key=lambda m: m['id'].lower())
+    return out, None
+
+
+@bp.route('/api/clusters/<cluster_id>/vms/<node>/qemu/<int:vmid>/passthrough/mappings', methods=['GET'])
+@require_auth(perms=['vm.config'])
+def get_vm_passthrough_mappings(cluster_id, node, vmid):
+    """The PCI, USB or directory mappings a VM can be given (?kind=pci|usb|dir), the nodes each covers, and whether this connection may attach raw devices (pci, usb) or share another directory (dir)"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    denied = _require_vm_access(cluster_id, vmid, 'vm.config', 'qemu')
+    if denied: return denied
+    kind = request.args.get('kind', 'pci')
+    if kind not in ('pci', 'usb', 'dir'):
+        return jsonify({'error': 'kind is pci, usb or dir'}), 400
+    if not _PVE_NODE_RE.fullmatch(node or ''):
+        return jsonify({'error': 'Invalid node name'}), 400
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    if getattr(manager, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'error': 'Resource mappings are a Proxmox VE feature'}), 400
+    try:
+        if kind == 'dir':
+            return _vm_dir_mappings(manager, cluster_id, node, vmid)
+        mappings, read_err = _read_mappings(manager, kind, check_node=node)
+        if mappings is None:
+            return jsonify({'error': read_err}), 502
+        access = manager.pve_root_access()
+        return jsonify({'kind': kind, 'node': node, 'mappings': mappings,
+                        'raw_allowed': access['root'], 'access': access})
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Failed to read resource mappings')}), 500
+
+
+# MK Oct 2026 - virtiofs, a directory of the host shared with a VM (PVE 8.4+). virtiofsN
+# names a cluster directory mapping and is a property string PVE parses as pve-qm-virtiofs
+# (qemu-server PVE/QemuServer/Virtiofs.pm):
+#     [dirid=]<mapping-id>[,cache=<auto|always|metadata|never>][,direct-io=<1|0>]
+#     [,expose-acl=<1|0>][,expose-xattr=<1|0>]
+# PVE checks the format and Mapping.Use, which the connection here holds for every id. A
+# mapping that does not exist and ACLs on a Windows guest are stored all the same, and the
+# VM then does not start; both stop here with the reason.
+_VIRTIOFS_KEY_RE = re.compile(r'virtiofs[0-9]')
+_VIRTIOFS_CACHE = ('auto', 'always', 'metadata', 'never')
+_VIRTIOFS_FLAGS = ('direct-io', 'expose-acl', 'expose-xattr')
+_DIR_MAPPING_MIN_PVE = (8, 4)
+
+
+def _pve_bool(text):
+    """'1' or '0' for what PVE::JSONSchema::parse_boolean reads, else None"""
+    if not text.isascii():
+        return None
+    low = text.lower()
+    if low in ('1', 'on', 'yes', 'true'):
+        return '1'
+    if low in ('0', 'off', 'no', 'false'):
+        return '0'
+    return None
+
+
+def _virtiofs_value(value):
+    """'[dirid=]<id>[,cache=..][,direct-io=..][,expose-acl=..][,expose-xattr=..]' -> (the
+    value to send, {dirid, options}, None) or (None, None, why not). Parsed the way PVE
+    parses it (empty parts skipped, the bare value is the mapping id, each key once) and
+    sent back in one spelling: the id first, the options as given, booleans as 1 or 0."""
+    if not isinstance(value, str):
+        return None, None, 'must be a string'
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return None, None, 'must be one line without control characters'
+    found = {}
+    for part in value.split(','):
+        if not part.strip():
+            continue
+        key, sep, val = part.partition('=')
+        if not sep:
+            key, val = 'dirid', part
+        elif not key or not val:
+            return None, None, f'has a part without a key or a value: {part[:40]!r}'
+        if key not in ('dirid', 'cache') + _VIRTIOFS_FLAGS:
+            return None, None, f'has no option {key[:40]!r}'
+        if key in found:
+            return None, None, f'sets {key} twice'
+        found[key] = val
+    dirid = found.get('dirid')
+    if not dirid:
+        return None, None, 'needs a directory mapping'
+    if not _MAPPING_ID_RE.fullmatch(dirid):
+        return None, None, f'names no valid mapping id: {dirid[:70]!r}'
+    out = [dirid]
+    if 'cache' in found:
+        if found['cache'] not in _VIRTIOFS_CACHE:
+            return None, None, 'cache is one of ' + ', '.join(_VIRTIOFS_CACHE)
+        out.append(f"cache={found['cache']}")
+    for flag in _VIRTIOFS_FLAGS:
+        if flag in found:
+            on = _pve_bool(found[flag])
+            if on is None:
+                return None, None, f'{flag} is 1 or 0'
+            found[flag] = on
+            out.append(f'{flag}={on}')
+    return ','.join(out), found, None
+
+
+def _virtiofs_dirid(value):
+    """The mapping id of a stored virtiofsN value, '' when it has none"""
+    for part in str(value or '').split(','):
+        key, sep, val = part.partition('=')
+        if not sep and part.strip():
+            return part
+        if sep and key == 'dirid':
+            return val
+    return ''
+
+
+def _pve_windows(ostype):
+    """qemu-server's windows_version(): whether PVE treats the guest as Windows"""
+    ostype = str(ostype or '')
+    return ostype in ('wxp', 'w2k', 'w2k3', 'w2k8', 'wvista') or bool(re.fullmatch(r'win[0-9]+', ostype))
+
+
+def _dir_mappings_missing(manager):
+    """True when the cluster runs a Proxmox VE older than 8.4, which has no directory
+    mappings and no virtiofs. An unknown version is tried."""
+    ver = manager.get_pve_version_tuple()
+    return isinstance(ver, tuple) and ver < _DIR_MAPPING_MIN_PVE
+
+
+def _vm_raw_config(manager, node, vmid):
+    res = manager.get_vm_config(node, vmid, 'qemu')
+    if isinstance(res, dict) and res.get('success'):
+        raw = (res.get('config') or {}).get('raw')
+        if isinstance(raw, dict):
+            return raw
+    return None
+
+
+def _vm_virtiofs_dirids(raw):
+    return {_virtiofs_dirid(v) for k, v in raw.items() if _VIRTIOFS_KEY_RE.fullmatch(str(k))} - {''}
+
+
+def _vm_dir_mappings(manager, cluster_id, node, vmid):
+    """The directory mappings for a virtiofs device of a VM, checked on its node. A caller
+    confined to some guests of the cluster gets only those the VM already has: a mapping
+    reaches a directory of the host, and which one a guest gets is a call for the whole
+    cluster (the config route holds the same line)."""
+    if _dir_mappings_missing(manager):
+        return jsonify({'kind': 'dir', 'node': node, 'supported': False, 'min_version': '8.4',
+                        'mappings': [], 'may_add': False})
+    mappings, read_err = _read_mappings(manager, 'dir', check_node=node)
+    if mappings is None:
+        return jsonify({'error': read_err}), 502
+    confined = caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session), cluster_id)
+    if confined:
+        raw = _vm_raw_config(manager, node, vmid)
+        if raw is None:
+            return jsonify({'error': 'Could not read the VM config'}), 502
+        mine = _vm_virtiofs_dirids(raw)
+        mappings = [m for m in mappings if m['id'] in mine]
+    for m in mappings:
+        m.pop('digest', None)
+    return jsonify({'kind': 'dir', 'node': node, 'supported': True, 'mappings': mappings,
+                    'may_add': not confined})
+
+
+def _virtiofs_refusal(manager, cluster_id, node, vmid, vm_type, config_updates):
+    """None when every virtiofsN of a config change may go to PVE (each is rewritten in
+    one spelling then), else the response that says why not."""
+    keys = [k for k in config_updates if str(k).startswith('virtiofs')]
+    if not keys:
+        return None
+    if getattr(manager, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'error': 'virtiofs is a Proxmox VE feature'}), 400
+    if vm_type != 'qemu':
+        return jsonify({'error': 'A container has no virtiofs - a mount point shares a host directory with it'}), 400
+    parsed = {}
+    for key in keys:
+        if not _VIRTIOFS_KEY_RE.fullmatch(str(key)):
+            return jsonify({'error': f'Proxmox has virtiofs0 to virtiofs9, not {str(key)[:40]}'}), 400
+        value, opts, why = _virtiofs_value(config_updates[key])
+        if why:
+            return jsonify({'error': f'Invalid virtiofs: {key} {why}'}), 400
+        parsed[key] = (value, opts)
+    if _dir_mappings_missing(manager):
+        return jsonify({'error': 'virtiofs needs Proxmox VE 8.4 or newer'}), 400
+
+    acl = any(opts.get('expose-acl') == '1' for _v, opts in parsed.values())
+    confined = caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session), cluster_id)
+    raw = None
+    if confined or (acl and 'ostype' not in config_updates):
+        raw = _vm_raw_config(manager, node, vmid)
+        if raw is None:
+            return jsonify({'error': 'Could not read the VM config to check the virtiofs device'}), 502
+    if confined:
+        mine = _vm_virtiofs_dirids(raw)
+        if any(opts['dirid'] not in mine for _v, opts in parsed.values()):
+            return jsonify({'error': 'Sharing another host directory with a VM is a change for the whole '
+                                     'cluster, which this account cannot make',
+                            'code': 'VIRTIOFS_CLUSTER_WIDE'}), 403
+
+    known, read_err = _read_mappings(manager, 'dir')
+    if known is None:
+        return jsonify({'error': read_err}), 502
+    ids = {m['id'] for m in known}
+    for key, (_v, opts) in parsed.items():
+        if opts['dirid'] not in ids:
+            return jsonify({'error': f"Invalid virtiofs: {key} names no directory mapping of this "
+                                     f"cluster ({opts['dirid']})"}), 400
+    if acl:
+        ostype = config_updates['ostype'] if 'ostype' in config_updates else raw.get('ostype')
+        if _pve_windows(ostype):
+            return jsonify({'error': 'Invalid virtiofs: a Windows VM cannot mount the share with '
+                                     'expose-acl, switch ACLs off'}), 400
+    for key, (value, _o) in parsed.items():
+        config_updates[key] = value
+    return None
+
+
+# MK Oct 2026 - LXC feature flags after creation. pve-container keeps every flag of a
+# privileged container, and every flag but nesting of an unprivileged one, for root@pam
+# (check_ct_modify_config_perm); nesting alone wants VM.Allocate. It compares the new
+# string with the current one value by value, so a flag nobody touched keeps its exact
+# text here. Flags this editor does not know (force_rw_sys, other mount types) stay.
+_LXC_FEATURE_FLAGS = ('nesting', 'keyctl', 'fuse', 'mknod')
+_LXC_FEATURE_MOUNTS = ('nfs', 'cifs')
+
+
+def _parse_lxc_features(value):
+    """'nesting=1,mount=nfs;cifs' -> {'nesting': '1', 'mount': 'nfs;cifs'}, in order"""
+    out = {}
+    for part in str(value or '').split(','):
+        k, sep, v = part.strip().partition('=')
+        if k.strip():
+            out[k.strip()] = v.strip() if sep else ''
+    return out
+
+
+def _feature_on(value):
+    return str(value or '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _mount_types(value):
+    return [m for m in re.split(r'[;\s]+', str(value or '')) if m]
+
+
+def _lxc_feature_view(parsed):
+    flags = {f: _feature_on(parsed.get(f)) for f in _LXC_FEATURE_FLAGS}
+    types = _mount_types(parsed.get('mount'))
+    flags['mount'] = {m: m in types for m in _LXC_FEATURE_MOUNTS}
+    kept = [f'{k}={v}' if v != '' else k for k, v in parsed.items()
+            if k not in _LXC_FEATURE_FLAGS and k != 'mount']
+    kept += [f'mount={m}' for m in types if m not in _LXC_FEATURE_MOUNTS]
+    return flags, kept
+
+
+def _lxc_features_after(base, wanted):
+    """The features dict after `wanted` ({flag: bool, 'mount': {fstype: bool}}) on top of
+    `base`. Only what changes is rewritten."""
+    new = dict(base)
+    for flag in _LXC_FEATURE_FLAGS:
+        if flag in wanted and _feature_on(base.get(flag)) != wanted[flag]:
+            if wanted[flag]:
+                new[flag] = '1'
+            else:
+                new.pop(flag, None)
+    if 'mount' in wanted:
+        types = _mount_types(base.get('mount'))
+        after = list(types)
+        for fstype in _LXC_FEATURE_MOUNTS:
+            if fstype in wanted['mount'] and (fstype in after) != wanted['mount'][fstype]:
+                after = after + [fstype] if wanted['mount'][fstype] else [t for t in after if t != fstype]
+        if after != types:
+            if after:
+                new['mount'] = ';'.join(after)
+            else:
+                new.pop('mount', None)
+    return new
+
+
+def _format_lxc_features(parsed):
+    return ','.join(f'{k}={v}' if v != '' else k for k, v in parsed.items())
+
+
+def _lxc_pending(manager, node, vmid):
+    """{key: {'value', 'pending', 'delete'}} of a container: the running config and what
+    waits for its next start, in one request."""
+    url = f"https://{manager.host}:{manager.api_port}/api2/json/nodes/{node}/lxc/{vmid}/pending"
+    resp = manager._create_session().get(url, timeout=10)
+    if resp.status_code != 200:
+        return None, resp
+    rows = {}
+    for item in resp.json().get('data') or []:
+        if isinstance(item, dict) and item.get('key'):
+            rows[item['key']] = item
+    return rows, resp
+
+
+def _lxc_feature_state(rows):
+    """current: what runs now. effective: what the container gets at its next start."""
+    item = rows.get('features') or {}
+    current = str(item.get('value') or '')
+    if 'pending' in item:
+        effective = str(item.get('pending') or '')
+    elif item.get('delete'):
+        effective = ''
+    else:
+        effective = current
+    # PVE asks the running value too; it cannot change after creation anyway
+    unprivileged = _feature_on((rows.get('unprivileged') or {}).get('value'))
+    digest = str((rows.get('digest') or {}).get('value') or '')
+    return current, effective, unprivileged, digest
+
+
+def _lxc_features_manager(cluster_id, node):
+    if not _PVE_NODE_RE.fullmatch(node or ''):
+        return None, (jsonify({'error': 'Invalid node name'}), 400)
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return None, error
+    if getattr(manager, 'cluster_type', 'proxmox') != 'proxmox':
+        return None, (jsonify({'error': 'Container features are a Proxmox VE setting'}), 400)
+    return manager, None
+
+
+@bp.route('/api/clusters/<cluster_id>/vms/<node>/lxc/<int:vmid>/features', methods=['GET'])
+@require_auth(perms=['vm.view'])
+def get_lxc_features(cluster_id, node, vmid):
+    """The feature flags of a container (nesting, keyctl, fuse, mknod, NFS/CIFS mounts), what waits for its next start, and whether this cluster connection may change them"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    denied = _require_vm_access(cluster_id, vmid, 'vm.view', 'lxc')
+    if denied:
+        return denied
+    manager, err = _lxc_features_manager(cluster_id, node)
+    if err:
+        return err
+    try:
+        rows, resp = _lxc_pending(manager, node, vmid)
+        if rows is None:
+            return jsonify({'error': parse_pve_error(resp.text, 'Could not read the container config')}), 502
+        current, effective, unprivileged, _digest = _lxc_feature_state(rows)
+        flags, kept = _lxc_feature_view(_parse_lxc_features(effective))
+        running_flags, _ = _lxc_feature_view(_parse_lxc_features(current))
+        return jsonify({'features': flags, 'current': running_flags, 'kept': kept,
+                        'raw': effective, 'pending': effective != current,
+                        'unprivileged': unprivileged, 'access': manager.pve_root_access()})
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Failed to read container features')}), 500
+
+
+@bp.route('/api/clusters/<cluster_id>/vms/<node>/lxc/<int:vmid>/features', methods=['PUT'])
+@require_auth(perms=['vm.config'])
+def set_lxc_features(cluster_id, node, vmid):
+    """Change the feature flags of a container: {nesting, keyctl, fuse, mknod: bool, mount: {nfs, cifs: bool}}, each optional. A running container gets them at its next start."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    denied = _require_vm_access(cluster_id, vmid, 'vm.config', 'lxc')
+    if denied:
+        return denied
+    manager, err = _lxc_features_manager(cluster_id, node)
+    if err:
+        return err
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'JSON object expected'}), 400
+    wanted = {}
+    for key, value in data.items():
+        if key in _LXC_FEATURE_FLAGS and isinstance(value, bool):
+            wanted[key] = value
+        elif key == 'mount' and isinstance(value, dict) and all(
+                k in _LXC_FEATURE_MOUNTS and isinstance(v, bool) for k, v in value.items()):
+            wanted['mount'] = dict(value)
+        else:
+            return jsonify({'error': f'Unknown or invalid feature: {str(key)[:40]}'}), 400
+
+    priv = None
+    try:
+        rows, resp = _lxc_pending(manager, node, vmid)
+        if rows is None:
+            return jsonify({'error': parse_pve_error(resp.text, 'Could not read the container config')}), 502
+        current, effective, unprivileged, digest = _lxc_feature_state(rows)
+        old = _parse_lxc_features(current)
+        base = _parse_lxc_features(effective)
+        new = _lxc_features_after(base, wanted)
+        new_text = _format_lxc_features(new)
+        if new == base:
+            return jsonify({'success': True, 'changed': False, 'features': effective,
+                            'pending': effective != current})
+        # what PVE will compare: the running value against the one sent
+        changed = sorted(k for k in set(old) | set(new) if old.get(k, '') != new.get(k, ''))
+        needs_root = bool(changed) and (not unprivileged or any(k != 'nesting' for k in changed))
+        access = manager.pve_root_access()
+        session = manager._create_session()
+        if needs_root:
+            if not access['root']:
+                what = ('change the feature flags of a privileged container' if not unprivileged
+                        else 'change feature flags other than nesting')
+                return _root_refusal(access, what)
+            session, priv, refused = _session_as_root(manager, cluster_id, access, 'LXC feature flags')
+            if refused:
+                return refused
+        body = {'features': new_text} if new_text else {'delete': 'features'}
+        if digest:
+            body['digest'] = digest
+        url = f"https://{manager.host}:{manager.api_port}/api2/json/nodes/{node}/lxc/{vmid}/config"
+        put = session.put(url, data=body, timeout=15)
+        if put.status_code != 200:
+            return jsonify({'error': parse_pve_error(put.text, 'Proxmox refused the change')}), 502
+        user = getattr(request, 'session', {}).get('user', 'system')
+        via = ' (through a root@pam login)' if needs_root and access.get('fresh_ticket') else ''
+        log_audit(user, 'vm.features_changed',
+                  f"CT {vmid}: features '{effective or '-'}' -> '{new_text or '-'}'{via}",
+                  cluster=manager.config.name)
+        # read back what PVE stored: a running container keeps it pending until it starts again
+        pending = None
+        try:
+            after, _r = _lxc_pending(manager, node, vmid)
+            if after is not None:
+                now_current, now_effective, _u, _d = _lxc_feature_state(after)
+                pending = now_effective != now_current
+        except Exception:
+            pending = None
+        return jsonify({'success': True, 'changed': True, 'features': new_text,
+                        'pending': pending, 'root_login': bool(needs_root and access.get('fresh_ticket'))})
+    except Exception as e:
+        logging.error(f"Error changing container features: {e}")
+        return jsonify({'error': safe_error(e, 'Failed to change container features')}), 500
+    finally:
+        if priv is not None:
+            try: priv.close()
+            except Exception: pass
 
 
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/resize', methods=['PUT'])
@@ -5377,6 +6918,35 @@ def get_iso_list_api(cluster_id, node):
     return jsonify(isos)
 
 
+# NS Oct 2026 - manager.add_disk and set_cdrom write these fields into the drive string and
+# its key as they come. A comma adds options, another key name changes another setting: both
+# are config changes the config route answers for (#1102), so here each field is one value.
+_STORAGE_ID_RE = re.compile(r'[A-Za-z][A-Za-z0-9._-]*')
+_DISK_SIZE_RE = re.compile(r'[0-9]+(?:\.[0-9]+)?[Gg]?')
+_DISK_WORD_RE = re.compile(r'[a-z0-9_]*')
+_QEMU_DISK_KEY_RE = re.compile(r'(?:ide|sata|scsi|virtio)[0-9]{1,2}')
+_CDROM_KEY_RE = re.compile(r'(?:ide|sata|scsi)[0-9]{1,2}')
+
+
+def _add_disk_problem(vm_type, cfg):
+    """Why an add-disk body cannot go into a drive string as it is, else None"""
+    if 'storage' in cfg and not (isinstance(cfg['storage'], str)
+                                 and _STORAGE_ID_RE.fullmatch(cfg['storage'])):
+        return 'Invalid storage id'
+    if 'size' in cfg and (isinstance(cfg['size'], bool)
+                          or not _DISK_SIZE_RE.fullmatch(str(cfg['size']))):
+        return 'Disk size is a number of GB'
+    if vm_type != 'qemu':
+        return None
+    if 'disk_id' in cfg and not (isinstance(cfg['disk_id'], str)
+                                 and _QEMU_DISK_KEY_RE.fullmatch(cfg['disk_id'])):
+        return 'disk_id names a drive: ide, sata, scsi or virtio and its number'
+    for key in ('cache', 'format'):
+        if cfg.get(key) and not (isinstance(cfg[key], str) and _DISK_WORD_RE.fullmatch(cfg[key])):
+            return f'Invalid {key}'
+    return None
+
+
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/disks', methods=['POST'])
 @require_auth(perms=['vm.config'])
 def add_disk_api(cluster_id, node, vm_type, vmid):
@@ -5391,7 +6961,13 @@ def add_disk_api(cluster_id, node, vm_type, vmid):
 
     manager = cluster_managers[cluster_id]
     disk_config = request.json or {}
-    
+    if not isinstance(disk_config, dict):
+        return jsonify({'error': 'Expected an object'}), 400
+    if getattr(manager, 'cluster_type', 'proxmox') != 'xcpng':
+        why = _add_disk_problem(vm_type, disk_config)
+        if why:
+            return jsonify({'error': why}), 400
+
     result = manager.add_disk(node, vmid, vm_type, disk_config)
     
     if result['success']:
@@ -5508,9 +7084,22 @@ def set_cdrom_api(cluster_id, node, vmid):
 
     manager = cluster_managers[cluster_id]
     data = request.json or {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Expected an object'}), 400
     iso_path = data.get('iso')  # None to eject
     drive = data.get('drive', 'ide2')
-    
+    if getattr(manager, 'cluster_type', 'proxmox') != 'xcpng':
+        if not (isinstance(drive, str) and _CDROM_KEY_RE.fullmatch(drive)):
+            return jsonify({'error': 'drive names a CD-ROM drive: ide, sata or scsi and its number'}), 400
+        if iso_path and not (isinstance(iso_path, str) and ',' not in iso_path):
+            return jsonify({'error': 'iso is one volume id'}), 400
+        if iso_path and caller_is_scoped(build_authz_user(request.session.get('user', ''),
+                                                          request.session), cluster_id):
+            root_key = _root_only_config_key(manager, node, vmid, 'qemu',
+                                             {drive: f'{iso_path},media=cdrom'})
+            if root_key:
+                return _confined_root_refusal('mounting a file of the host')
+
     result = manager.set_cdrom(node, vmid, iso_path, drive)
     
     if result['success']:
@@ -5694,10 +7283,12 @@ def create_snapshot_api(cluster_id, node, vm_type, vmid):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.snapshot', vm_type):
         return jsonify({'error': 'Permission denied: vm.snapshot'}), 403
-    
+    denied = _xapi_refusal(cluster_id, user, 'vm.snapshot')
+    if denied: return denied
+
     mgr = cluster_managers[cluster_id]
     data = request.json or {}
-    
+
     snapname = data.get('snapname', f'snap_{int(time.time())}')
     description = data.get('description', '')
     vmstate = data.get('vmstate', False)
@@ -5725,7 +7316,9 @@ def delete_snapshot_api(cluster_id, node, vm_type, vmid, snapname):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.snapshot', vm_type):
         return jsonify({'error': 'Permission denied: vm.snapshot'}), 403
-    
+    denied = _xapi_refusal(cluster_id, user, 'vm.snapshot')
+    if denied: return denied
+
     mgr = cluster_managers[cluster_id]
     result = mgr.delete_snapshot(node, vmid, vm_type, snapname)
     
@@ -5750,7 +7343,9 @@ def rollback_snapshot_api(cluster_id, node, vm_type, vmid, snapname):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.snapshot', vm_type):
         return jsonify({'error': 'Permission denied: vm.snapshot'}), 403
-    
+    denied = _xapi_refusal(cluster_id, user, 'vm.snapshot')
+    if denied: return denied
+
     mgr = cluster_managers[cluster_id]
     result = mgr.rollback_snapshot(node, vmid, vm_type, snapname)
     
@@ -5886,7 +7481,9 @@ def get_efficient_snapshots_api(cluster_id, node, vm_type, vmid):
         return jsonify({'error': 'Permission denied: vm.snapshot'}), 403
 
     mgr = cluster_managers[cluster_id]
-    refresh = request.args.get('refresh', 'false').lower() == 'true'
+    # #625 - a refresh measures the COW volumes over SSH, extends one that runs full and
+    # writes the result into a synced table. A standby shows what the active recorded.
+    refresh = request.args.get('refresh', 'false').lower() == 'true' and not ha.is_standby()
     snapshots = mgr.get_efficient_snapshots(cluster_id, vmid, refresh_usage=refresh)
     return jsonify(snapshots)
 
@@ -5903,6 +7500,8 @@ def create_efficient_snapshot_api(cluster_id, node, vm_type, vmid):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.snapshot', vm_type):
         return jsonify({'error': 'Permission denied: vm.snapshot'}), 403
+    denied = _xapi_refusal(cluster_id, user, 'vm.snapshot')
+    if denied: return denied
 
     mgr = cluster_managers[cluster_id]
     data = request.json or {}
@@ -5942,6 +7541,8 @@ def delete_efficient_snapshot_api(cluster_id, node, vm_type, vmid, snap_id):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.snapshot', vm_type):
         return jsonify({'error': 'Permission denied: vm.snapshot'}), 403
+    denied = _xapi_refusal(cluster_id, user, 'vm.snapshot')
+    if denied: return denied
 
     mgr = cluster_managers[cluster_id]
     result = mgr.delete_efficient_snapshot(node, vmid, snap_id)
@@ -5968,6 +7569,8 @@ def rollback_efficient_snapshot_api(cluster_id, node, vm_type, vmid, snap_id):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.snapshot', vm_type):
         return jsonify({'error': 'Permission denied: vm.snapshot'}), 403
+    denied = _xapi_refusal(cluster_id, user, 'vm.snapshot')
+    if denied: return denied
 
     mgr = cluster_managers[cluster_id]
     result = mgr.rollback_efficient_snapshot(node, vmid, vm_type, snap_id)
@@ -6055,6 +7658,13 @@ def snapshots_overview():
                 results.append({
                     "vmid": vmid, "vm_name": vm_name, "vm_type": vm_type, "node": node,
                     "snapshot_name": snap_name, "snapshot_date": snap_dt.strftime('%Y-%m-%d %H:%M'),
+                    # MK Sep 2026 (#939) — hand over the raw epoch as well. Formatting the
+                    # time server-side in UTC and printing that string meant this overview
+                    # disagreed with the per-VM snapshot list, which renders browser-local;
+                    # in CEST the same snapshot showed two different times depending on
+                    # which page you opened. snapshot_date stays for older frontends and
+                    # because the table sorts on it.
+                    "snapshot_ts": int(snap_ts),
                     "age": age, "cluster_id": cid
                 })
             return results
@@ -6091,7 +7701,8 @@ def snapshots_overview_delete():
     user_data = build_authz_user(user, request.session)
     data = request.get_json(silent=True) or {}
     snapshots = data.get('snapshots', [])
-    is_admin = user_data.get('effective_role', user_data.get('role')) == ROLE_ADMIN
+    from pegaprox.utils.rbac import acts_as_admin
+    is_admin = acts_as_admin(user_data)
     user_clusters = get_user_clusters(user_data)   # None => all clusters
     
     deleted_count = 0
@@ -6123,6 +7734,10 @@ def snapshots_overview_delete():
             # MK Feb 2026 - VM-level ACL check for snapshot delete
             if not user_can_access_vm(user_data, cluster_id, vmid, 'vm.snapshot', vm_type):
                 errors.append(f"Permission denied: vm.snapshot for VM {vmid}")
+                continue
+            _missing = xapi_permission_missing(cluster_id, user_data, 'vm.snapshot')
+            if _missing:
+                errors.append(f"Permission denied: {_missing} for VM {vmid}")
                 continue
 
             result = mgr.delete_snapshot(node, vmid, vm_type, snapname)
@@ -6299,6 +7914,94 @@ def _safe_vnc_passthrough(port_raw, ticket_raw):
     if not t or len(t) > 4096 or any(c in t for c in '\r\n\x00'):
         return (False, None)
     return (True, p)
+
+
+def _ws_subprocess_base_url(main_port, ssl_cert=None):
+    """Base URL the SSH-websocket subprocess should use to reach PegaProx.
+
+    It validates every session against this address, and it used to be pinned to
+    127.0.0.1. That only holds while we bind a wildcard: with "Proxy Bind Address"
+    set to one LAN IP the app listens there and nowhere else, loopback refuses the
+    connection, and every terminal ends with "Auth server unreachable" (#957).
+
+    A wildcard bind keeps loopback, which is the shortest path and does not depend
+    on an interface staying up. Read through the globals MODULE, never the
+    star-import: main() fills the value in long after this module is imported.
+    MK Sep 2026
+    """
+    from pegaprox import globals as _ppg
+    bind = (getattr(_ppg, 'SERVER_BIND_HOST', '') or '').strip()
+    target = '127.0.0.1' if bind in ('', '0.0.0.0', '::', '*') else bind
+    if ':' in target and not target.startswith('['):
+        target = f"[{target}]"          # IPv6 literal needs brackets in a URL
+    return f"https://{target}:{main_port}" if ssl_cert else f"http://{target}:{main_port}"
+
+
+def _pve_console_ws_path(node, vm_type, vmid, vnc_port, vnc_ticket):
+    """Path of PVE's vncwebsocket endpoint for one guest.
+
+    The API port and the VNC port are two different things, and only ONE of them
+    belongs in the URL authority. The VNC port goes in the query string; the
+    authority has to be the port pveproxy answers on. Getting that backwards is
+    what #945 and #956 both are: one handler reassigned its `port` variable to
+    the vncproxy port before building the URL and then dialled that, another
+    hardcoded 8006 and ignored a cluster reachable on a different API port.
+    Building the path here keeps the two apart for every caller. MK Sep 2026
+    """
+    kind = 'qemu' if vm_type == 'qemu' else 'lxc'
+    return (f"/api2/json/nodes/{node}/{kind}/{vmid}/vncwebsocket"
+            f"?port={vnc_port}&vncticket={url_quote(str(vnc_ticket), safe='')}")
+
+
+def _pve_console_ws_auth(manager, netloc, fresh_ticket=None, reuse_manager_auth=False):
+    """Headers for the upgrade to PVE's vncwebsocket.
+
+    PVE binds a vncproxy ticket to whoever asked for it. When we reuse the ticket
+    the browser already obtained through /console (#352 passthrough), the asker
+    was the manager's own auth context, so the upgrade has to present THAT: the
+    API token if the cluster authenticates with one, otherwise the manager's
+    stored access cookie. Presenting a freshly minted login cookie instead is
+    what produces "permission denied - invalid PVEVNC ticket" on PVE 9.1+ and is
+    the second half of #945; on a token-only cluster there is no fresh login to
+    mint in the first place, which is #955.
+
+    Without passthrough we issued the vncproxy call ourselves with fresh_ticket,
+    so that is the right cookie to send. MK Sep 2026
+    """
+    headers = {"Host": netloc}
+    if reuse_manager_auth:
+        if getattr(manager, '_using_api_token', False) and getattr(manager, '_api_token', None):
+            headers['Authorization'] = f"PVEAPIToken={manager._api_token}"
+            return headers
+        if getattr(manager, '_ticket', None):
+            headers['Cookie'] = f"PVEAuthCookie={manager._ticket}"
+            return headers
+    if fresh_ticket:
+        headers['Cookie'] = f"PVEAuthCookie={fresh_ticket}"
+    return headers
+
+
+def _console_uses_token(manager):
+    """True when the cluster talks to PVE with an API token.
+
+    config.user is then the token id and config.pass_ its secret, so the password
+    login the console handlers start with can only earn a 401 (#955). They skip it
+    and ask for the vncproxy through the manager's own session instead, which sends
+    the token, so the ticket is bound to the same identity the upgrade presents.
+    A token id in config.user counts even before the manager has connected.
+    MK Oct 2026
+    """
+    if getattr(manager, '_using_api_token', False) and getattr(manager, '_api_token', None):
+        return True
+    return '!' in str(getattr(getattr(manager, 'config', None), 'user', '') or '')
+
+
+def _vncproxy_via_manager(manager, node, vm_type, vmid):
+    """(ticket, port) of a vncproxy issued through the manager's own session."""
+    res = manager.get_vnc_ticket(node, vmid, 'qemu' if vm_type == 'qemu' else 'lxc') or {}
+    if not res.get('success'):
+        raise IOError(f"vncproxy refused: {res.get('error') or 'no answer'}")
+    return res['ticket'], res['port']
 
 
 def _resolve_vm_node(mgr, vmid, vm_type='qemu'):
@@ -6829,7 +8532,16 @@ def _untagged_replica_error(job_id, vmid, node, detail):
 # ============================================================================
 
 def _xcincr_node_ip(mgr, node):
-    """Resolve a cluster node name to an IP for SSH (cluster/status)."""
+    """Resolve a cluster node name to an IP for SSH (cluster/status), or None.
+
+    MK Sep 2026 — this used to hand the name straight back when cluster/status did not
+    list it. The name comes off the stored replication job, where it was supplied when
+    the job was created, so an unresolvable one became the SSH destination itself and
+    _ssh_connect offers THAT cluster's stored root credentials to it. Same contract as
+    manager.member_node_ip, and for the same reason: None means refuse, never "use the
+    name". A deployment that was relying on the node name resolving in DNS now fails
+    the job with a message saying so instead of dialling a host we never verified.
+    """
     try:
         r = mgr._api_get(f"https://{mgr.host}:{mgr.api_port}/api2/json/cluster/status")
         if r.status_code == 200:
@@ -6838,7 +8550,7 @@ def _xcincr_node_ip(mgr, node):
                     return it['ip']
     except Exception:
         pass
-    return node
+    return None
 
 
 def _xcincr_rbd_pool(ssh, storage):
@@ -6861,14 +8573,42 @@ def _xcincr_zfs_pool(ssh, storage):
     return p or storage
 
 
-def _xcincr_vm_exists(mgr, vmid):
+def _xcincr_vm_node(mgr, vmid):
+    """(node or None, readable): where the guest with this VMID lives. NS Oct 2026 - a list
+    that could not be read is not an empty one (#1051): read as "nobody there" it sent a
+    seed onto the VMID, and a seed replaces whatever disk carries that name."""
     try:
         r = mgr._api_get(f"https://{mgr.host}:{mgr.api_port}/api2/json/cluster/resources", params={'type': 'vm'})
-        if r.status_code == 200:
-            return any(int(x.get('vmid', 0)) == int(vmid) for x in r.json().get('data', []))
+        if r.status_code != 200:
+            return None, False
+        for x in r.json().get('data', []):
+            if int(x.get('vmid', 0)) == int(vmid):
+                return x.get('node') or None, True
+        return None, True
     except Exception:
-        pass
-    return False
+        return None, False
+
+
+def _xcincr_vm_exists(mgr, vmid):
+    """True / False, or None when the guest list cannot be read"""
+    node, readable = _xcincr_vm_node(mgr, vmid)
+    return bool(node) if readable else None
+
+
+def _xcincr_replica_node(target_mgr, tgt_vmid, vm_type, job_id):
+    """(node, None) of the guest at the target VMID when it is THIS job's replica, (None,
+    None) when there is none, (None, error) when it is somebody else's or cannot be told."""
+    node, readable = _xcincr_vm_node(target_mgr, tgt_vmid)
+    if not readable:
+        return None, (f"Cannot read the guests of the target cluster to check VMID {tgt_vmid} - "
+                      f"refusing to write to it this run")
+    if not node:
+        return None, None
+    if not _is_replica_of_job(target_mgr, node, tgt_vmid, vm_type, job_id):
+        return None, (f"Target VM {tgt_vmid} on {node} is not tagged as this job's replica "
+                      f"({_job_tag(job_id)} missing) - refusing to overwrite. Pick a free target VMID "
+                      f"or tag it if it really is a stranded replica.")
+    return node, None
 
 
 def _xcincr_remove_existing_replica(target_mgr, tgt_vmid, vm_type, job_id):
@@ -6876,21 +8616,11 @@ def _xcincr_remove_existing_replica(target_mgr, tgt_vmid, vm_type, job_id):
     freed and can be re-created. Same safety gate as the full path (#413): only
     remove a VM we can prove is THIS job's replica; refuse otherwise so a mis-set
     target VMID never nukes a bystander. Returns (ok, error)."""
-    node = None
-    try:
-        r = target_mgr._api_get(f"https://{target_mgr.host}:{target_mgr.api_port}/api2/json/cluster/resources", params={'type': 'vm'})
-        if r.status_code == 200:
-            for x in r.json().get('data', []):
-                if int(x.get('vmid', 0)) == int(tgt_vmid):
-                    node = x.get('node'); break
-    except Exception:
-        pass
+    node, foreign = _xcincr_replica_node(target_mgr, tgt_vmid, vm_type, job_id)
+    if foreign:
+        return False, foreign
     if not node:
         return True, None   # nothing there
-    if not _is_replica_of_job(target_mgr, node, tgt_vmid, vm_type, job_id):
-        return False, (f"Target VM {tgt_vmid} on {node} is not tagged as this job's replica "
-                       f"({_job_tag(job_id)} missing) — refusing to overwrite. Pick a free target VMID "
-                       f"or tag it if it really is a stranded replica.")
     try:
         base = f"https://{target_mgr.host}:{target_mgr.api_port}/api2/json/nodes/{node}/{vm_type}/{tgt_vmid}"
         sr = target_mgr._api_post(f"{base}/status/stop", data={})
@@ -6917,6 +8647,11 @@ _XCINCR_COPY_KEYS = (
     'rng0', 'tpmstate0', 'args', 'description',
 )
 
+# NS Oct 2026 - args is a QEMU command line the target node runs as root. The only args we
+# write ourselves are the V2P sector-size ones, so a replica carries those and no other (#1058)
+_SECTOR_ARG = r'-set device\.(?:scsi|sata|virtio|ide)[0-9]+\.(?:logical|physical)_block_size=512'
+_SECTOR_ARGS_RE = re.compile(f'{_SECTOR_ARG}(?: {_SECTOR_ARG})*')
+
 
 def _build_incremental_replica_vm(target_mgr, target_node, tgt_vmid, src_cfg, replicated,
                                   target_storage, job):
@@ -6926,6 +8661,16 @@ def _build_incremental_replica_vm(target_mgr, target_node, tgt_vmid, src_cfg, re
     payload = {'vmid': int(tgt_vmid)}
     for k in _XCINCR_COPY_KEYS:
         if k in src_cfg and src_cfg[k] not in (None, ''):
+            if k == 'args' and not (isinstance(src_cfg[k], str)
+                                    and _SECTOR_ARGS_RE.fullmatch(src_cfg[k].strip())):
+                logging.warning(f"[XCINCR] job {job.get('id')}: the source's QEMU args are not "
+                                f"carried to replica {tgt_vmid}")
+                continue
+            # NS Oct 2026 - root-only as well: TPM state on a device of the target host
+            if k == 'tpmstate0' and _on_host_path(src_cfg[k], 'file'):
+                logging.warning(f"[XCINCR] job {job.get('id')}: the source's TPM state is on a host "
+                                f"path, not carried to replica {tgt_vmid}")
+                continue
             payload[k] = src_cfg[k]
     # net: keep the source model + MAC, remap the bridge to the job's target bridge
     tgt_bridge = (job.get('target_bridge') or 'vmbr0').split(',')[0].split(':')[-1] or 'vmbr0'
@@ -7050,8 +8795,16 @@ def _execute_replication_incremental(job):
                  f"({len(disks)} disk(s), base={last_snap or 'none/seed'})")
     src_ssh = tgt_ssh = None
     try:
-        src_ssh = source_mgr._ssh_connect(_xcincr_node_ip(source_mgr, source_node))
-        tgt_ssh = target_mgr._ssh_connect(_xcincr_node_ip(target_mgr, target_node))
+        _src_ip = _xcincr_node_ip(source_mgr, source_node)
+        _tgt_ip = _xcincr_node_ip(target_mgr, target_node)
+        if not _src_ip or not _tgt_ip:
+            _missing = source_node if not _src_ip else target_node
+            _update_repl_status(db, job_id, 'error',
+                                f'Node {_missing!r} is not listed as a member of its cluster - '
+                                f'refusing to SSH to it')
+            return True
+        src_ssh = source_mgr._ssh_connect(_src_ip)
+        tgt_ssh = target_mgr._ssh_connect(_tgt_ip)
         if not src_ssh or not tgt_ssh:
             _update_repl_status(db, job_id, 'error', 'SSH to source/target node failed (incremental needs SSH creds on both clusters)')
             return True
@@ -7071,12 +8824,29 @@ def _execute_replication_incremental(job):
         # 2. decide (re)build + remove a stale replica FIRST so its RBD images
         #    are freed and a seed can recreate them (a seed can't `rbd rm` an
         #    image that an existing replica VM still has open).
-        rebuild = (not last_snap) or (not _xcincr_vm_exists(target_mgr, tgt_vmid))
-        if rebuild and _xcincr_vm_exists(target_mgr, tgt_vmid):
+        exists = _xcincr_vm_exists(target_mgr, tgt_vmid)
+        if exists is None:
+            _cleanup_snapshot(source_mgr, source_node, vmid, vm_type, new_snap)
+            _update_repl_status(db, job_id, 'error', f'Cannot read the guests of the target '
+                                f'cluster to check VMID {tgt_vmid} - nothing was written')
+            return True
+        rebuild = (not last_snap) or (not exists)
+        if rebuild and exists:
             ok_rm, rm_err = _xcincr_remove_existing_replica(target_mgr, tgt_vmid, vm_type, job_id)
             if not ok_rm:
                 _cleanup_snapshot(source_mgr, source_node, vmid, vm_type, new_snap)
                 _update_repl_status(db, job_id, 'error', rm_err); return True
+        elif not rebuild:
+            # NS Oct 2026 - a delta goes onto the disks of whatever guest holds the VMID now,
+            # and a target image without the base falls back to a seed, which removes it
+            # first. Once the replica is gone and the id taken again that is somebody
+            # else's guest, so it needs the same proof as the reseed above (#1051)
+            tgt_node, foreign = _xcincr_replica_node(target_mgr, tgt_vmid, vm_type, job_id)
+            if foreign or not tgt_node:
+                _cleanup_snapshot(source_mgr, source_node, vmid, vm_type, new_snap)
+                _update_repl_status(db, job_id, 'error',
+                                    foreign or f'Target VM {tgt_vmid} is gone - the next run seeds it again')
+                return True
 
         # 3. replicate each disk (seed when rebuilding, else the base..new delta)
         base_for_disk = None if rebuild else (last_snap or None)
@@ -7811,6 +9581,16 @@ def create_cross_cluster_replication():
             return jsonify({'error': 'target_vmid must be an integer'}), 400
         if not (100 <= target_vmid <= 999999999):
             return jsonify({'error': 'target_vmid out of range (100–999999999)'}), 400
+    # NS Oct 2026 - the replica takes a VMID on the target as the migration twin does: the one
+    # set here, else the source's (a local job takes the next free one), and for a non-admin
+    # inside the tenant's range (#1056)
+    from pegaprox.utils.rbac import acts_as_admin
+    if not acts_as_admin(_xu):
+        from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID
+        _land = target_vmid or (None if source_cluster == target_cluster else vmid)
+        _rok, _rmsg = check_tenant_vmid(_xu.get('tenant_id') or DEFAULT_TENANT_ID, _land)
+        if not _rok:
+            return jsonify({'error': _rmsg}), 403
     delete_target = 1 if data.get('delete_target') else 0
     # #174 aderumier — opt-in incremental mode. Validated here; the engine still
     # falls back to 'full' at run time if the VM's disks aren't rbd/zfspool on
@@ -7953,8 +9733,8 @@ def delete_cross_cluster_replication(job_id):
     # cluster is gone there are no ACLs or pool grants left to answer the question with, and the
     # guest went with it — gating there would only make the orphaned job undeletable again.
     _src = job.get('source_cluster') or ''
+    _xu = build_authz_user(request.session.get('user', ''), request.session)
     if _src in cluster_managers:
-        _xu = build_authz_user(request.session.get('user', ''), request.session)
         try:
             if not user_can_access_vm(_xu, _src, int(job.get('vmid')), 'vm.migrate'):
                 return jsonify({'error': 'Access denied to this replication job'}), 403
@@ -7962,6 +9742,12 @@ def delete_cross_cluster_replication(job_id):
             return jsonify({'error': 'Replication job has no valid guest'}), 403
 
     want_teardown = _wants_delete_target(job)
+    # NS Oct 2026 - removing the replica is a delete on the target cluster, which a caller
+    # confined there could not have created the job on either (#1068)
+    _tgt_cid = job.get('target_cluster') or ''
+    if want_teardown and _tgt_cid in cluster_managers and caller_is_scoped(_xu, _tgt_cid):
+        return jsonify({'error': 'Access denied to the target cluster: delete the job with '
+                                 'delete_target=0 to keep the replica'}), 403
 
     # Don't race an in-flight run: tearing the replica down mid-run just lets the run
     # re-create it (we hit exactly this during testing). Same _claim_job set the run
@@ -8028,6 +9814,9 @@ def run_cross_cluster_replication(job_id):
             return jsonify({'error': 'Access denied to this replication job'}), 403
     except (TypeError, ValueError):
         return jsonify({'error': 'Replication job has no valid guest'}), 403
+    # NS Oct 2026 - a run writes the replica on the target, as create would have (#1068)
+    if caller_is_scoped(_xu, _job.get('target_cluster') or ''):
+        return jsonify({'error': 'Access denied to the target cluster'}), 403
 
     # MK May 2026 (#455) — block duplicate triggers while a previous run is still
     # in-flight. The scheduler uses the same _claim_job() guard.
@@ -8044,7 +9833,9 @@ def run_cross_cluster_replication(job_id):
     is_local = job_dict.get('source_cluster') == job_dict.get('target_cluster')
     handler = _execute_local_replication if is_local else _execute_replication
     try:
-        threading.Thread(target=_tracked_run, args=(handler, job_dict), daemon=True).start()
+        # a user job: in an automatic group each step asks for the lease (#625)
+        threading.Thread(target=ha.as_job(_tracked_run, f"replication job {job_dict.get('id')}"),
+                         args=(handler, job_dict), daemon=True).start()
     except Exception as e:
         _release_job(job_id)
         return jsonify({'error': f'Failed to start replication: {e}'}), 500
@@ -8124,13 +9915,19 @@ def get_hardware_options():
 def _console_authz(user, cluster_id, vmid, vm_type=None):
     """Return (ok, reason) — user must have cluster access AND per-VM console access."""
     from pegaprox.utils.rbac import get_user_clusters, load_vm_acls, user_can_access_vm
-    if not user:
+    # NS Oct 2026 - load_users() answers {} when it cannot read the store, and the callers
+    # add the username: that bare dict read as a default-tenant viewer, every cluster and
+    # vm.console. A record without a role is no account.
+    if not user or not user.get('role'):
         return False, 'no user'
     # NS Aug 2026 (audit re-verify) — a disabled account keeps no console access, even via a
     # pre-minted ws_token (this path is reached without require_auth's account-state gate).
     if not user.get('enabled', True):
         return False, 'account disabled'
-    if user.get('role') == ROLE_ADMIN:
+    # NS Oct 2026 (#1116, #1028) - the role an API token acts under, and no tenant override
+    # lowering the account where it lives
+    from pegaprox.utils.rbac import acts_as_admin
+    if acts_as_admin(user):
         return True, None
     username = user.get('username', '') or ''
     # cluster gate (mirrors helpers.check_cluster_access, but no request.session)
@@ -8157,6 +9954,15 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
     print(f"VNC WEBSOCKET: {vm_type}/{vmid} on {node}")
     print(f"{'='*60}")
     
+    # #625 - keyboard and mouse on a guest: the active's to hand out, or a standby's
+    # that serves users
+    if not ha.consoles_here():
+        try:
+            ws.close(1008, STANDBY_CONSOLE_ERROR)
+        except Exception:
+            pass
+        return
+
     if cluster_id not in cluster_managers:
         print(f"ERROR: Cluster {cluster_id} not found")
         return
@@ -8186,24 +9992,27 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
         
-        # Step 1: Login
-        print(f"Step 1: Login...")
-        login_data = urlencode({
-            'username': manager.config.user,
-            'password': manager.config.pass_
-        }).encode('utf-8')
+        # Step 1: Login - not on a token cluster, there is no password (#955)
+        _token_auth = _console_uses_token(manager)
+        pve_ticket = csrf_token = None
+        if not _token_auth:
+            print(f"Step 1: Login...")
+            login_data = urlencode({
+                'username': manager.config.user,
+                'password': manager.config.pass_
+            }).encode('utf-8')
         
-        login_req = urllib.request.Request(
-            f"https://{manager.auth_host}:{port}/api2/json/access/ticket",
-            data=login_data, method='POST'
-        )
+            login_req = urllib.request.Request(
+                f"https://{manager.auth_host}:{port}/api2/json/access/ticket",
+                data=login_data, method='POST'
+            )
         
-        with urllib.request.urlopen(login_req, context=ssl_context, timeout=10) as response:
-            login_result = json.loads(response.read().decode('utf-8'))
+            with urllib.request.urlopen(login_req, context=ssl_context, timeout=10) as response:
+                login_result = json.loads(response.read().decode('utf-8'))
 
-        pve_ticket = login_result['data']['ticket']
-        csrf_token = login_result['data']['CSRFPreventionToken']
-        print(f"Got PVE ticket")
+            pve_ticket = login_result['data']['ticket']
+            csrf_token = login_result['data']['CSRFPreventionToken']
+            print(f"Got PVE ticket")
 
         # MK Apr 2026 (#352 follow-up) — single-vncproxy mode. If the JS
         # already got a vncproxy ticket+port via /console, reuse it so the VNC
@@ -8212,10 +10021,20 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
         pve_port_q = request.args.get('pve_port')
         pve_ticket_q = request.args.get('pve_ticket')
         _ppt_ok, _ppt_port = _safe_vnc_passthrough(pve_port_q, pve_ticket_q)
+        # MK Sep 2026 (#945, #956) - the vncproxy port goes in its OWN variable. It
+        # used to overwrite `port`, which still had to be the API port for the URL
+        # authority two steps down, so the upgrade was dialled against :5900 and got
+        # ECONNREFUSED. Reusing the browser's ticket also means the upgrade has to
+        # present the manager's auth, not a fresh login cookie (#945.2 / #955).
+        _reuse_manager_auth = False
         if pve_port_q and pve_ticket_q and _ppt_ok:
             vnc_ticket = pve_ticket_q
-            port = _ppt_port
-            print(f"Reusing JS-issued vncproxy ticket port={port}")
+            vnc_port = _ppt_port
+            _reuse_manager_auth = True
+            print(f"Reusing JS-issued vncproxy ticket port={vnc_port}")
+        elif _token_auth:
+            vnc_ticket, vnc_port = _vncproxy_via_manager(manager, node, vm_type, vmid)
+            _reuse_manager_auth = True
         else:
             print(f"Step 2: Get VNC ticket...")
             if vm_type == 'qemu':
@@ -8229,24 +10048,19 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
             with urllib.request.urlopen(vnc_req, context=ssl_context, timeout=10) as response:
                 vnc_result = json.loads(response.read().decode('utf-8'))
             vnc_ticket = vnc_result['data']['ticket']
-            port = vnc_result['data']['port']
-            print(f"Got VNC ticket, port={port} (no JS pass-through — PVE 9.1.x users may hit issue #352)")
+            vnc_port = vnc_result['data']['port']
+            print(f"Got VNC ticket, port={vnc_port} (no JS pass-through - PVE 9.1.x users may hit issue #352)")
         
         # Step 3: Connect to Proxmox WebSocket
         print(f"Step 3: Connect to Proxmox...")
-        encoded_vnc_ticket = url_quote(vnc_ticket, safe='')
-        
-        if vm_type == 'qemu':
-            pve_ws_path = f"/api2/json/nodes/{node}/qemu/{vmid}/vncwebsocket?port={port}&vncticket={encoded_vnc_ticket}"
-        else:
-            pve_ws_path = f"/api2/json/nodes/{node}/lxc/{vmid}/vncwebsocket?port={port}&vncticket={encoded_vnc_ticket}"
-        
+        pve_ws_path = _pve_console_ws_path(node, vm_type, vmid, vnc_port, vnc_ticket)
         pve_ws_url = f"wss://{host}:{port}{pve_ws_path}"
 
         pve_ws = websocket.create_connection(
             pve_ws_url,
             sslopt=({} if _verify_tls else {"cert_reqs": ssl.CERT_NONE}),
-            header={"Cookie": f"PVEAuthCookie={pve_ticket}"},
+            header=_pve_console_ws_auth(manager, f"{host}:{port}", pve_ticket,
+                                        reuse_manager_auth=_reuse_manager_auth),
             timeout=VNC_PVE_CONNECT_TIMEOUT
         )
         # MK Apr 2026 — TCP_NODELAY + keepalive: survives idle conntrack drops
@@ -8265,6 +10079,8 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
 
         bytes_sent = 0
         bytes_received = 0
+        # #713 - why it ended, first one wins; printed at WARNING when it was an error
+        ended = []
 
         # Greenlet to read from Proxmox and send to client
         def proxmox_to_client():
@@ -8280,16 +10096,16 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
                     except websocket.WebSocketTimeoutException:
                         gsleep(0.01)
                     except websocket.WebSocketConnectionClosedException:
-                        print("Proxmox closed")
+                        ended.append(('PVE closed', False))
                         running = False
                         break
                     except Exception as e:
                         if running:
-                            print(f"PVE->Client error: {e}")
+                            ended.append((f'PVE->Client: {e}', True))
                         running = False
                         break
             except Exception as e:
-                print(f"proxmox_to_client crashed: {e}")
+                ended.append((f'PVE->Client crashed: {e}', True))
                 running = False
         
         # Start the proxmox reader greenlet
@@ -8302,25 +10118,33 @@ def handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid):
             try:
                 data = ws.receive()
                 if data is None:
-                    print("Client disconnected")
+                    ended.append(('browser closed', False))
                     running = False
                     break
                 if data:
                     bytes_sent += len(data)
-                    with _pve_io_lock:
-                        pve_ws.send(data)
+                    try:
+                        with _pve_io_lock:
+                            write_with_deadline(pve_ws, pve_ws.send, data)
+                    except Exception as e:
+                        ended.append((f'Client->PVE: {e}', True))
+                        running = False
+                        break
             except Exception as e:
                 if running:
                     err_str = str(e)
-                    if 'closed' not in err_str.lower():
-                        print(f"Client->PVE error: {e}")
+                    ended.append(('browser closed', False) if 'closed' in err_str.lower()
+                                 else (f'browser: {e}', True))
                 running = False
                 break
         
         running = False
         pve_reader.kill()
         
-        print(f"Session ended: sent {bytes_sent}, received {bytes_received}")
+        _reason, _failed = ended[0] if ended else ('browser closed', False)
+        logging.log(logging.WARNING if _failed else logging.INFO,
+                    f"[VNC] session ended host={host} vm={vm_type}/{vmid} reason={_reason} "
+                    f"sent={bytes_sent}B recv={bytes_received}B")
         
     except Exception as e:
         logging.exception(f"VNC proxy error: {type(e).__name__}: {e}")
@@ -8352,31 +10176,25 @@ def vnc_websocket_route(cluster_id, node, vm_type, vmid):
     ws_token = request.args.get('token')
     session_id = request.args.get('session')
 
-    auth_user = None
-    auth_role = None
     if ws_token:
-        token_data = validate_ws_token(ws_token)
-        if not token_data:
+        auth = validate_ws_token(ws_token)
+        if not auth:
             return jsonify({'error': 'Invalid token', 'code': 'INVALID_TOKEN'}), 401
-        auth_user = token_data['user']
-        auth_role = token_data['role']
     elif session_id:
-        session = validate_session(session_id)
-        if not session:
+        auth = validate_session(session_id)
+        if not auth:
             return jsonify({'error': 'Invalid session', 'code': 'INVALID_SESSION'}), 401
-        auth_user = session['user']
-        auth_role = session['role']
     else:
         return jsonify({'error': 'Auth required', 'code': 'AUTH_REQUIRED'}), 401
 
-    # Check permissions
-    users = load_users()
-    user = users.get(auth_user, {})
-    user_perms = get_user_permissions(user)
     # MK 2026-06-10 (#537/RBAC): coarse "global vm.console perm OR admin" pre-check dropped —
     # the per-VM _console_authz gate below is authoritative and portal/custom-role aware.
+    # NS Oct 2026 (#1101, #1116) - the account by its own row, refused when unreadable,
+    # and held to the role of the API token that minted the ws token
+    user = resolve_authz_user(auth)
+    if not user:
+        return jsonify({'error': 'Auth required', 'code': 'AUTH_REQUIRED'}), 401
     # H-1/H-2: cluster + per-VM gate (vm.console alone isn't enough)
-    user['username'] = auth_user
     _ok, _why = _console_authz(user, cluster_id, vmid, vm_type)
     if not _ok:
         return jsonify({'error': 'Permission denied', 'code': 'INSUFFICIENT_PERMISSIONS'}), 403
@@ -8395,6 +10213,9 @@ def vnc_websocket_route(cluster_id, node, vm_type, vmid):
     ws = request.environ.get('wsgi.websocket')
     if ws is not None:
         print("Using geventwebsocket handler...")
+        # #988 - counted against the account until the request ends, and hung up with
+        # the session it was opened under (#1038)
+        hold_websocket(user['username'], ws, sid=auth.get('sid') if ws_token else session_id)
         handle_vnc_websocket(ws, cluster_id, node, vm_type, vmid)
         return ''
     
@@ -8451,6 +10272,12 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
         print(f"\n{'='*60}")
         print(f"VNC WebSocket connected: {path}")
         print(f"{'='*60}")
+
+        # #625 - the console port runs on a standby too; unless it serves users the
+        # answer there is no, before a token is spent or a stable-mode key is claimed
+        if not ha.consoles_here():
+            await websocket.close(1008, STANDBY_CONSOLE_ERROR)
+            return
         
         # NS: Mar 2026 - authenticate via single-use WS token (not session in URL)
         from urllib.parse import urlparse, parse_qs
@@ -8486,10 +10313,8 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                 print("ERROR: Invalid or expired WS token")
                 await websocket.close(1002, "Invalid token")
                 return
-            # check perms from token
-            users = load_users()
-            user = users.get(token_data['user'], {})
-            user['username'] = token_data['user']
+            # check perms from token - as the token's role, from the account's own row (#1116, #1101)
+            user = resolve_authz_user(token_data)
             # MK 2026-06-10 (#537 abyss1): the per-VM _console_authz gate below (H-1/H-2) is the
             # authoritative check (cluster + per-VM vm.console via user_can_access_vm). The old
             # coarse "global vm.console perm OR admin" pre-check here rejected Client-Portal users
@@ -8502,16 +10327,18 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                 print("ERROR: Invalid session")
                 await websocket.close(1002, "Invalid session")
                 return
-            users = load_users()
-            user = users.get(session['user'], {})
-            user['username'] = session['user']
+            user = resolve_authz_user(session)
             # #537: per-VM _console_authz below is the authoritative gate (see ws_token note).
             print(f"User {session['user']} authenticated for VNC (session)")
         else:
             print("ERROR: No token or session provided")
             await websocket.close(1002, "Authentication required")
             return
-        
+        if not user:
+            print("ERROR: account could not be read, no console")
+            await websocket.close(1002, "Authentication required")
+            return
+
         # Parse path: /api/clusters/{cluster_id}/vms/{node}/{vm_type}/{vmid}/vncwebsocket
         import re
         match = re.match(r'/api/clusters/([^/]+)/vms/([^/]+)/(qemu|lxc)/(\d+)/vncwebsocket', parsed.path)
@@ -8556,28 +10383,32 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = ssl.CERT_NONE
 
-            # Login to Proxmox to get auth ticket
-            login_data = urlencode({
-                'username': manager.config.user,
-                'password': manager.config.pass_
-            }).encode('utf-8')
-
-            login_req = urllib.request.Request(
-                f"https://{manager.auth_host}:{port}/api2/json/access/ticket",
-                data=login_data, method='POST'
-            )
-
             # MK Apr 2026 — wrap synchronous urllib.urlopen in asyncio.to_thread
             # so concurrent VNC handlers don't serialize on the TLS handshake.
             import asyncio as _aiowrap
             def _do_urlopen(req):
                 with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as r:
                     return r.read()
-            login_body = await _aiowrap.to_thread(_do_urlopen, login_req)
-            login_result = json.loads(login_body.decode('utf-8'))
 
-            pve_ticket = login_result['data']['ticket']
-            csrf_token = login_result['data']['CSRFPreventionToken']
+            # Login to Proxmox to get auth ticket. Not on a token cluster: config.user
+            # and pass_ are the token id and secret there, PVE answers 401 (#955).
+            _token_auth = _console_uses_token(manager)
+            pve_ticket = csrf_token = None
+            if not _token_auth:
+                login_data = urlencode({
+                    'username': manager.config.user,
+                    'password': manager.config.pass_
+                }).encode('utf-8')
+
+                login_req = urllib.request.Request(
+                    f"https://{manager.auth_host}:{port}/api2/json/access/ticket",
+                    data=login_data, method='POST'
+                )
+                login_body = await _aiowrap.to_thread(_do_urlopen, login_req)
+                login_result = json.loads(login_body.decode('utf-8'))
+
+                pve_ticket = login_result['data']['ticket']
+                csrf_token = login_result['data']['CSRFPreventionToken']
 
             # MK Apr 2026 — issue #352 follow-up. Single-vncproxy fast path.
             # If the JS already obtained a vncproxy ticket+port via /console
@@ -8599,8 +10430,11 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
             if pve_port_q and pve_ticket_q:
                 # Single-vncproxy mode: trust the caller-supplied port+ticket.
                 vnc_ticket = pve_ticket_q
-                port = _ppt_port
-                logging.info(f"[VNC] reusing JS-issued vncproxy ticket port={port} (single-call mode)")
+                vnc_port = _ppt_port
+                logging.info(f"[VNC] reusing JS-issued vncproxy ticket port={vnc_port} (single-call mode)")
+            elif _token_auth:
+                vnc_ticket, vnc_port = await _aiowrap.to_thread(
+                    _vncproxy_via_manager, manager, node, vm_type, vmid)
             else:
                 # Backwards-compat fallback: issue our own vncproxy. This still
                 # works on older PVE where two vncproxy calls produce matching
@@ -8616,15 +10450,10 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                 vnc_body = await _aiowrap.to_thread(_do_urlopen, vnc_req)
                 vnc_result = json.loads(vnc_body.decode('utf-8'))
                 vnc_ticket = vnc_result['data']['ticket']
-                port = vnc_result['data']['port']
-                logging.warning(f"[VNC] no pve_port/pve_ticket in URL — issued fresh vncproxy (port={port}). Update the frontend to pass JS-issued ticket through to avoid PVE 9.1.x password-mismatch (issue #352).")
+                vnc_port = vnc_result['data']['port']
+                logging.warning(f"[VNC] no pve_port/pve_ticket in URL - issued fresh vncproxy (port={vnc_port}). Update the frontend to pass JS-issued ticket through to avoid PVE 9.1.x password-mismatch (issue #352).")
 
-            encoded_vnc_ticket = url_quote(vnc_ticket, safe='')
-
-            if vm_type == 'qemu':
-                pve_ws_path = f"/api2/json/nodes/{node}/qemu/{vmid}/vncwebsocket?port={port}&vncticket={encoded_vnc_ticket}"
-            else:
-                pve_ws_path = f"/api2/json/nodes/{node}/lxc/{vmid}/vncwebsocket?port={port}&vncticket={encoded_vnc_ticket}"
+            pve_ws_path = _pve_console_ws_path(node, vm_type, vmid, vnc_port, vnc_ticket)
 
             # MK Apr 2026 — VNC SSH-Tunnel-Mode (D2 / second leg).
             # If the cluster is flagged with vnc_tunnel=True, we open a persistent
@@ -8635,9 +10464,11 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
             # Multi-user: each session gets its own ephemeral local port.
             tunnel_endpoint = None
             tunnel_target_host = host
-            tunnel_target_port = 8006
+            # MK Sep 2026 (#956) - the cluster's API port, not a literal 8006. A
+            # cluster reachable on a forwarded port worked everywhere except here.
+            tunnel_target_port = port
             try:
-                _use_tunnel = bool(getattr(manager.config, 'vnc_tunnel', False))
+                _use_tunnel = _vnc_tunnel_wanted(manager)
             except Exception:
                 _use_tunnel = False
 
@@ -8647,7 +10478,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                     _ssh_user = getattr(manager.config, 'ssh_user', None) or (manager.config.user or 'root').split('@')[0]
                     _ssh_port = getattr(manager.config, 'ssh_port', 22) or 22
                     _ssh_key = getattr(manager.config, 'ssh_key', '') or ''
-                    _ssh_pass = getattr(manager.config, 'pass_', '') or ''
+                    _ssh_pass = ssh_password_for(manager.config)
                     # MK Apr 2026 — _vt.acquire() is sync. On the *first* call for a
                     # cluster it builds the SSH transport (~1-2s on a fast LAN, more
                     # over WAN). If we ran it directly on the event loop, that 1-2s
@@ -8665,7 +10496,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                         ssh_key_content=_ssh_key,
                         ssh_password=_ssh_pass,
                         target_host='127.0.0.1',
-                        target_port=8006,
+                        target_port=port,
                     )
                     # Reroute the WSS through the local listener
                     tunnel_target_host = '127.0.0.1'
@@ -8682,7 +10513,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                     )
                     tunnel_endpoint = None
                     tunnel_target_host = host
-                    tunnel_target_port = 8006
+                    tunnel_target_port = port
 
             pve_ws_url = f"wss://{tunnel_target_host}:{tunnel_target_port}{pve_ws_path}"
 
@@ -8692,16 +10523,9 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
             # access cookie). Using a fresh login's cookie produces "permission
             # denied - invalid PVEVNC ticket" on PVE 9.1.x. Reuse the manager's
             # stored auth instead. Backwards-compat path keeps the fresh login.
-            ws_auth_header = {"Host": f"{host}:{port}"}
-            if pve_port_q and pve_ticket_q:
-                if getattr(manager, '_using_api_token', False) and getattr(manager, '_api_token', None):
-                    ws_auth_header['Authorization'] = f"PVEAPIToken={manager._api_token}"
-                elif getattr(manager, '_ticket', None):
-                    ws_auth_header['Cookie'] = f"PVEAuthCookie={manager._ticket}"
-                else:
-                    ws_auth_header['Cookie'] = f"PVEAuthCookie={pve_ticket}"
-            else:
-                ws_auth_header['Cookie'] = f"PVEAuthCookie={pve_ticket}"
+            ws_auth_header = _pve_console_ws_auth(
+                manager, f"{tunnel_target_host}:{tunnel_target_port}", pve_ticket,
+                reuse_manager_auth=bool(pve_port_q and pve_ticket_q) or _token_auth)
 
             # MK Apr 2026 — ws_client.create_connection is synchronous; offload to
             # a worker thread so concurrent VNC handlers don't serialize on the
@@ -8765,21 +10589,25 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
 
             # The only three call sites that touch the pve_ws SSL object — all funnelled through
             # the one lock. Blocking calls run in a worker thread via asyncio.to_thread.
+            # MK Oct 2026 (#713) - the writes with a deadline of their own, not the read slice
             def _pve_recv():
                 with _pve_io_lock:
                     return pve_ws.recv()
 
             def _pve_send(msg):
                 with _pve_io_lock:
-                    pve_ws.send(msg)
+                    write_with_deadline(pve_ws, pve_ws.send, msg)
 
             def _pve_send_binary(msg):
                 with _pve_io_lock:
-                    pve_ws.send_binary(msg)
+                    write_with_deadline(pve_ws, pve_ws.send_binary, msg)
 
             def _pve_ping():
                 with _pve_io_lock:
-                    pve_ws.ping()
+                    write_with_deadline(pve_ws, pve_ws.ping)
+
+            # why the session ended, first one wins - an error goes out at WARNING below
+            ended = []
 
             async def proxmox_to_client():
                 """Forward data from Proxmox to browser (blocking recv handled in thread).
@@ -8795,6 +10623,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                     try:
                         data = await asyncio.to_thread(_pve_recv)
                         if not data:
+                            ended.append(('PVE closed', False))
                             running = False
                             break
                         if _ttfb_ms is None:
@@ -8809,11 +10638,12 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                         # idle slice — no frame this tick; loop so the writers get the lock (#713)
                         continue
                     except ws_client.WebSocketConnectionClosedException:
+                        ended.append(('PVE closed', False))
                         running = False
                         break
                     except Exception as e:
                         if running:
-                            logging.debug(f"[VNC] PVE->Client: {e}")
+                            ended.append((f'PVE->Client: {e}', True))
                         running = False
                         break
                 stop_evt.set()
@@ -8845,16 +10675,24 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                                     f"(host={host} vm={vm_type}/{vmid}): {_crypto_err}. "
                                     "TLS-inspection / EDR is modifying packets mid-flight."
                                 )
+                                ended.append(('integrity check failed', True))
                                 running = False
                                 try:
                                     await websocket.close(4099, f"integrity_check_failed: {_crypto_err}")
                                 except Exception:
                                     pass
                                 break
-                        await asyncio.to_thread(_pve_send, message)
+                        try:
+                            await asyncio.to_thread(_pve_send, message)
+                        except Exception as e:
+                            ended.append((f'Client->PVE: {e}', True))
+                            break
+                    else:
+                        ended.append(('browser closed', False))
                 except Exception as e:
-                    if running and 'close' not in str(e).lower():
-                        logging.debug(f"[VNC] Client->PVE: {e}")
+                    if running:
+                        ended.append(('browser closed', False) if 'close' in str(e).lower()
+                                     else (f'browser: {e}', True))
                 finally:
                     running = False
                     stop_evt.set()
@@ -8896,7 +10734,9 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                     # WS-layer ping (cheap, keeps any websocket-aware intermediary happy)
                     try:
                         await asyncio.to_thread(_pve_ping)
-                    except Exception:
+                    except Exception as e:
+                        # this task ending ends the session too - it used to say nothing
+                        ended.append((f'keepalive ping to PVE: {e}', True))
                         break
                     # RFB-layer keepalive (keeps pveproxy/qemu from declaring the session idle)
                     now = _time.monotonic()
@@ -8905,7 +10745,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                             await asyncio.to_thread(_pve_send_binary, RFB_FB_UPDATE_REQUEST)
                             next_rfb_at = now + rfb_interval
                         except Exception as e:
-                            logging.debug(f"[VNC] RFB keepalive send failed: {e}")
+                            ended.append((f'RFB keepalive to PVE: {e}', True))
                             break
 
             task1 = asyncio.create_task(proxmox_to_client())
@@ -8932,10 +10772,12 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
             _duration_ms = int((_t_connect.monotonic() - _session_started) * 1000)
             _ttfb_str = f"{_ttfb_ms}ms" if _ttfb_ms is not None else "never"
             _short_session = _duration_ms < 5000 and bytes_received < 4096
-            _level = logging.WARNING if _short_session else logging.INFO
+            # #713 - the reason was a DEBUG line of its own, so a drop in the field said nothing
+            _reason, _failed = ended[0] if ended else ('unknown', False)
+            _level = logging.WARNING if (_short_session or _failed) else logging.INFO
             logging.log(
                 _level,
-                f"[VNC] session ended host={host} vm={vm_type}/{vmid} "
+                f"[VNC] session ended host={host} vm={vm_type}/{vmid} reason={_reason} "
                 f"connect={_connect_ms}ms ttfb={_ttfb_str} duration={_duration_ms}ms "
                 f"sent={bytes_sent}B recv={bytes_received}B "
                 f"{'SHORT_OR_EMPTY — middlebox/EDR may be interfering' if _short_session else ''}"
@@ -9104,43 +10946,47 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
     print(f"VNC WEBSOCKET: {vm_type}/{vmid} on {node}")
     print(f"{'='*60}")
     
+    # #625 - see handle_vnc_websocket
+    if not ha.consoles_here():
+        try:
+            ws.send(STANDBY_CONSOLE_ERROR)
+            ws.close(reason=1008, message=STANDBY_CONSOLE_ERROR)
+        except Exception:
+            pass
+        return
+
     # NS: Mar 2026 - prefer WS token, session as legacy fallback
     from pegaprox.utils.realtime import validate_ws_token
     ws_token = request.args.get('token')
     session_id = request.args.get('session')
 
-    auth_user = None
     if ws_token:
-        token_data = validate_ws_token(ws_token)
-        if not token_data:
+        auth = validate_ws_token(ws_token)
+        if not auth:
             try: ws.send('Invalid or expired token')
             except: pass
             return
-        users = load_users()
-        user = users.get(token_data['user'], {})
-        user_perms = get_user_permissions(user)
         # #537/RBAC: coarse "global vm.console OR admin" pre-check dropped — _console_authz below is authoritative.
-        auth_user = token_data['user']
     elif session_id:
-        session = validate_session(session_id)
-        if not session:
+        auth = validate_session(session_id)
+        if not auth:
             try: ws.send('Invalid session')
             except: pass
             return
-        users = load_users()
-        user = users.get(session['user'], {})
-        user_perms = get_user_permissions(user)
-        # #537/RBAC: coarse pre-check dropped — _console_authz below is authoritative.
-        auth_user = session['user']
     else:
         try: ws.send('Authentication required')
         except: pass
         return
 
-    print(f"User {auth_user} authenticated for VNC")
+    # #1101, #1116 - see vnc_websocket_route
+    user = resolve_authz_user(auth)
+    if not user:
+        try: ws.send('Authentication required')
+        except: pass
+        return
+    print(f"User {user['username']} authenticated for VNC")
 
     # H-1/H-2: cluster + per-VM gate before this proxy self-mints a PVE ticket
-    user['username'] = auth_user
     _ok, _why = _console_authz(user, cluster_id, vmid, vm_type)
     if not _ok:
         try: ws.send('Permission denied')
@@ -9159,6 +11005,11 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
         try: ws.send('Invalid node or vm_type')
         except: pass
         return
+
+    # NS Oct 2026 (#988) - this socket holds a request slot for as long as the console is
+    # open: counted against the account until the request ends, and hung up with the
+    # session it was opened under (#1038)
+    hold_websocket(user['username'], ws, sid=auth.get('sid') if ws_token else session_id)
 
     if cluster_id not in cluster_managers:
         print(f"ERROR: Cluster {cluster_id} not found")
@@ -9187,24 +11038,27 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
         
-        # Step 1: Login
-        print(f"Step 1: Login...")
-        login_data = urlencode({
-            'username': manager.config.user,
-            'password': manager.config.pass_
-        }).encode('utf-8')
+        # Step 1: Login - not on a token cluster, there is no password (#955)
+        _token_auth = _console_uses_token(manager)
+        pve_ticket = csrf_token = None
+        if not _token_auth:
+            print(f"Step 1: Login...")
+            login_data = urlencode({
+                'username': manager.config.user,
+                'password': manager.config.pass_
+            }).encode('utf-8')
         
-        login_req = urllib.request.Request(
-            f"https://{manager.auth_host}:{port}/api2/json/access/ticket",
-            data=login_data, method='POST'
-        )
+            login_req = urllib.request.Request(
+                f"https://{manager.auth_host}:{port}/api2/json/access/ticket",
+                data=login_data, method='POST'
+            )
         
-        with urllib.request.urlopen(login_req, context=ssl_context, timeout=10) as response:
-            login_result = json.loads(response.read().decode('utf-8'))
+            with urllib.request.urlopen(login_req, context=ssl_context, timeout=10) as response:
+                login_result = json.loads(response.read().decode('utf-8'))
 
-        pve_ticket = login_result['data']['ticket']
-        csrf_token = login_result['data']['CSRFPreventionToken']
-        print(f"Got PVE ticket")
+            pve_ticket = login_result['data']['ticket']
+            csrf_token = login_result['data']['CSRFPreventionToken']
+            print(f"Got PVE ticket")
 
         # MK Apr 2026 (#352 follow-up) — single-vncproxy mode. If the JS
         # already got a vncproxy ticket+port via /console, reuse it so the VNC
@@ -9213,10 +11067,20 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
         pve_port_q = request.args.get('pve_port')
         pve_ticket_q = request.args.get('pve_ticket')
         _ppt_ok, _ppt_port = _safe_vnc_passthrough(pve_port_q, pve_ticket_q)
+        # MK Sep 2026 (#945, #956) - the vncproxy port goes in its OWN variable. It
+        # used to overwrite `port`, which still had to be the API port for the URL
+        # authority two steps down, so the upgrade was dialled against :5900 and got
+        # ECONNREFUSED. Reusing the browser's ticket also means the upgrade has to
+        # present the manager's auth, not a fresh login cookie (#945.2 / #955).
+        _reuse_manager_auth = False
         if pve_port_q and pve_ticket_q and _ppt_ok:
             vnc_ticket = pve_ticket_q
-            port = _ppt_port
-            print(f"Reusing JS-issued vncproxy ticket port={port}")
+            vnc_port = _ppt_port
+            _reuse_manager_auth = True
+            print(f"Reusing JS-issued vncproxy ticket port={vnc_port}")
+        elif _token_auth:
+            vnc_ticket, vnc_port = _vncproxy_via_manager(manager, node, vm_type, vmid)
+            _reuse_manager_auth = True
         else:
             print(f"Step 2: Get VNC ticket...")
             if vm_type == 'qemu':
@@ -9230,24 +11094,19 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
             with urllib.request.urlopen(vnc_req, context=ssl_context, timeout=10) as response:
                 vnc_result = json.loads(response.read().decode('utf-8'))
             vnc_ticket = vnc_result['data']['ticket']
-            port = vnc_result['data']['port']
-            print(f"Got VNC ticket, port={port} (no JS pass-through — PVE 9.1.x users may hit issue #352)")
+            vnc_port = vnc_result['data']['port']
+            print(f"Got VNC ticket, port={vnc_port} (no JS pass-through - PVE 9.1.x users may hit issue #352)")
         
         # Step 3: Connect to Proxmox WebSocket
         print(f"Step 3: Connect to Proxmox...")
-        encoded_vnc_ticket = url_quote(vnc_ticket, safe='')
-        
-        if vm_type == 'qemu':
-            pve_ws_path = f"/api2/json/nodes/{node}/qemu/{vmid}/vncwebsocket?port={port}&vncticket={encoded_vnc_ticket}"
-        else:
-            pve_ws_path = f"/api2/json/nodes/{node}/lxc/{vmid}/vncwebsocket?port={port}&vncticket={encoded_vnc_ticket}"
-        
+        pve_ws_path = _pve_console_ws_path(node, vm_type, vmid, vnc_port, vnc_ticket)
         pve_ws_url = f"wss://{host}:{port}{pve_ws_path}"
 
         pve_ws = websocket.create_connection(
             pve_ws_url,
             sslopt=({} if _verify_tls else {"cert_reqs": ssl.CERT_NONE}),
-            header={"Cookie": f"PVEAuthCookie={pve_ticket}"},
+            header=_pve_console_ws_auth(manager, f"{host}:{port}", pve_ticket,
+                                        reuse_manager_auth=_reuse_manager_auth),
             timeout=VNC_PVE_CONNECT_TIMEOUT
         )
         # MK Apr 2026 — TCP_NODELAY + keepalive (consolidated helper)
@@ -9266,6 +11125,8 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
 
         bytes_sent = 0
         bytes_received = 0
+        # #713 - why it ended, first one wins; printed at WARNING when it was an error
+        ended = []
 
         # Greenlet to read from Proxmox and send to client
         def proxmox_to_client():
@@ -9281,16 +11142,16 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
                     except websocket.WebSocketTimeoutException:
                         gsleep(0.01)
                     except websocket.WebSocketConnectionClosedException:
-                        print("Proxmox closed")
+                        ended.append(('PVE closed', False))
                         running = False
                         break
                     except Exception as e:
                         if running:
-                            print(f"PVE->Client error: {e}")
+                            ended.append((f'PVE->Client: {e}', True))
                         running = False
                         break
             except Exception as e:
-                print(f"proxmox_to_client crashed: {e}")
+                ended.append((f'PVE->Client crashed: {e}', True))
                 running = False
         
         # Start the proxmox reader greenlet
@@ -9303,18 +11164,36 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
             try:
                 data = ws.receive(timeout=0.1)
                 if data is None:
-                    print("Client disconnected")
+                    # MK Sep 2026 (#945.4) - simple-websocket returns None for BOTH
+                    # "timed out with nothing to read" and "the peer is gone", and
+                    # this read times out ten times a second by design. Treating it
+                    # as a disconnect ended the session ~0.1s after it opened unless
+                    # the browser happened to send something first. Ask the socket
+                    # whether it is actually still connected.
+                    if getattr(ws, 'connected', False):
+                        gsleep(0.01)
+                        continue
+                    ended.append(('browser closed', False))
                     running = False
                     break
                 if data:
                     bytes_sent += len(data)
-                    with _pve_io_lock:
-                        pve_ws.send(data)
+                    # #713 - outside the timeout handling below: that one is for the
+                    # browser's read. A write to PVE that times out was swallowed by it,
+                    # and the next frame went out behind a partial one.
+                    try:
+                        with _pve_io_lock:
+                            write_with_deadline(pve_ws, pve_ws.send, data)
+                    except Exception as e:
+                        ended.append((f'Client->PVE: {e}', True))
+                        running = False
+                        break
             except TimeoutError:
                 gsleep(0.01)
             except Exception as e:
                 if "timed out" not in str(e).lower() and "timeout" not in str(e).lower():
-                    print(f"Client->PVE error: {e}")
+                    ended.append(('browser closed', False) if 'closed' in str(e).lower()
+                                 else (f'browser: {e}', True))
                     running = False
                     break
                 gsleep(0.01)
@@ -9322,7 +11201,10 @@ def vnc_websocket_proxy(ws, cluster_id, node, vm_type, vmid):
         running = False
         pve_reader.kill()
         
-        print(f"Session ended: sent {bytes_sent}, received {bytes_received}")
+        _reason, _failed = ended[0] if ended else ('browser closed', False)
+        logging.log(logging.WARNING if _failed else logging.INFO,
+                    f"[VNC] session ended host={host} vm={vm_type}/{vmid} reason={_reason} "
+                    f"sent={bytes_sent}B recv={bytes_received}B")
         
     except Exception as e:
         logging.exception(f"SSH proxy error: {type(e).__name__}: {e}")
@@ -9370,12 +11252,12 @@ def get_termproxy_ticket_api(cluster_id, node, vm_type, vmid):
     if vm_type not in ('qemu', 'lxc'):
         return jsonify({'error': 'Unsupported vm_type'}), 400
 
-    # H-1/H-2: per-VM gate (cluster access alone isn't enough for a console)
-    from flask import g as _g
-    _u = getattr(_g, 'current_user', None)
-    if _u is None:
-        _u = get_db().get_user(request.session.get('user', '')) or {}
-    _u = dict(_u); _u['username'] = request.session.get('user', '')
+    # H-1/H-2: per-VM gate (cluster access alone isn't enough for a console). Not on
+    # g.current_user: that is the token OWNER's record, an admin's for an admin-owned
+    # viewer token (#1116)
+    _u = resolve_authz_user(request.session)
+    if not _u:
+        return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
     _ok2, _why2 = _console_authz(_u, cluster_id, vmid, vm_type)
     if not _ok2:
         return jsonify({'error': 'Permission denied: no access to this VM'}), 403
@@ -9383,7 +11265,8 @@ def get_termproxy_ticket_api(cluster_id, node, vm_type, vmid):
     mgr = cluster_managers[cluster_id]
     pve_pwd = getattr(mgr.config, 'pass_', None) or getattr(mgr.config, 'password', None)
     pve_usr = getattr(mgr.config, 'user', None) or 'root@pam'
-    if not pve_pwd:
+    # #955 - a token id with its secret is no password either; PVE would only answer 401
+    if not pve_pwd or '!' in pve_usr:
         return jsonify({'error': 'Cluster has no stored password — termproxy needs user/pass auth (API tokens cannot mint termproxy tickets).'}), 400
 
     import ssl as _ssl
@@ -9482,6 +11365,9 @@ BIND_HOST = os.environ.get('SSH_WS_HOST', '0.0.0.0')
 SSL_CERT = os.environ.get('SSH_WS_SSL_CERT', '')
 SSL_KEY = os.environ.get('SSH_WS_SSL_KEY', '')
 PEGAPROX_URL = os.environ.get('PEGAPROX_URL', 'http://127.0.0.1:5000')
+# shows the main app it is talking to the console server it started (api/realtime.py
+# CONSOLE_SERVER_HEADER); only then does /validate hand back the cluster context
+CONSOLE_HEADERS = {'X-PegaProx-Console-Server': os.environ.get('PEGAPROX_CONSOLE_SECRET', '')}
 
 try:
     import websockets
@@ -9498,6 +11384,24 @@ import threading
 # subprocess: a TOFU host-key save must not race another and corrupt the file
 # (mirrors the main app's _persist_lock, which this standalone can't import).
 _KH_WRITE_LOCK = threading.Lock()
+
+
+async def _refused_as_standby(ws, resp):
+    """#625 - on a standby the main app answers 409 HA_STANDBY to the validate and
+    cluster-creds calls. Hand its sentence to the browser instead of calling it a bad
+    session. True when it did and the socket is closed."""
+    if resp is None or resp.status_code != 409:
+        return False
+    try:
+        body = resp.json() or {}
+    except Exception:
+        return False
+    if body.get('code') != 'HA_STANDBY':
+        return False
+    await ws.send(json.dumps({'status': 'error', 'message': body.get('error') or 'Consoles are only available on the active instance.'}))
+    await ws.close(1008, "standby")
+    return True
+
 
 async def ssh_handler(websocket):
     """SSH WebSocket handler with user credential prompt and SSH key support
@@ -9555,6 +11459,7 @@ async def ssh_handler(websocket):
     node_ip = None
     cluster_host = None
     node_ips = {}
+    known_only = False
     try:
         if ws_token:
             # NS Aug 2026 (Aikido pentest) — shell=node makes /validate enforce the node.shell
@@ -9568,13 +11473,15 @@ async def ssh_handler(websocket):
             validate_url = f"{PEGAPROX_URL}/api/auth/validate"
             print("Validating session (legacy)...")
 
-        headers = {'X-Session-ID': session_id} if session_id else {}
+        headers = dict(CONSOLE_HEADERS, **({'X-Session-ID': session_id} if session_id else {}))
         cookies = {'session': session_id} if session_id else {}
         # nosec B501 — localhost-to-PegaProx (PEGAPROX_URL = 127.0.0.1:port) with our
         # own self-signed cert. Same-host trust boundary; attacker with local
         # cert-read access already has more direct attack paths. MK 2026-06-04.
         r = requests.get(validate_url, cookies=cookies, headers=headers, timeout=8, verify=False)
 
+        if await _refused_as_standby(websocket, r):
+            return
         if r.status_code == 403:
             print(f"Auth failed: 403 (no access to cluster {cluster_id})")
             await websocket.send(json.dumps({'status': 'error', 'message': f'No access to cluster {cluster_id}'}))
@@ -9585,6 +11492,13 @@ async def ssh_handler(websocket):
             await websocket.send('{"status":"error","message":"Session ungültig - bitte neu einloggen"}')
             await websocket.close(1008, "Invalid auth")
             return
+
+        # #625 - a standby holds the leader's known_hosts and the next sync replaces it:
+        # the main app says so, and a host key it does not know yet is refused below
+        try:
+            known_only = bool((r.json() or {}).get('known_hosts_only'))
+        except Exception:
+            known_only = False
 
         # Pull the cluster context out of the validate response (ws-token path only)
         if ws_token:
@@ -9605,6 +11519,8 @@ async def ssh_handler(websocket):
                 # nosec B501 — same-host PegaProx self-signed cert, see MK 2026-06-04 audit
                 rc = requests.get(f"{PEGAPROX_URL}/api/internal/cluster-creds/{cluster_id}",
                                   cookies={'session': session_id}, timeout=10, verify=False)
+                if await _refused_as_standby(websocket, rc):
+                    return
                 if rc.status_code == 200:
                     creds = rc.json()
                     cluster_host = creds.get('host')
@@ -9727,13 +11643,30 @@ async def ssh_handler(websocket):
         _ssh_kh = os.path.abspath(os.path.join('config', '.ssh_known_hosts'))
         print("[SSH-WS] WARNING: PEGAPROX_SSH_KNOWN_HOSTS not set; falling back to "
               + _ssh_kh + " — host-key pinning may not match the main app")
+    kh_unreadable = False
     try:
         if os.path.exists(_ssh_kh):
             ssh.load_host_keys(_ssh_kh)
-    except Exception:
-        pass
+    except Exception as _kh_err:
+        # NS Oct 2026 - as in utils/ssh_security.py: the pins behind a damaged line read as
+        # unknown hosts, so no first use while the file cannot be read, and no save over it
+        print("[SSH-WS] known_hosts unreadable (" + str(_kh_err) + ") - refusing new host keys")
+        kh_unreadable = True
     class _TofuPolicy(paramiko.MissingHostKeyPolicy):
         def missing_host_key(self, _c, _h, _k):
+            if known_only:
+                # the address tried, not the node name: the leader pins a key under the
+                # address it reaches the node at (as utils/ssh_security.py says it)
+                raise paramiko.SSHException(
+                    f"host key of {_h} is not known here yet - open a shell to it on the "
+                    "leader once. This standby only has the keys the leader pinned; if the "
+                    f"leader reaches this node at another address than {_h}, its key is "
+                    "pinned under that one")
+            if kh_unreadable:
+                raise paramiko.SSHException(
+                    f"config/.ssh_known_hosts could not be read, so the host key of {_h} "
+                    "cannot be checked against its pin - refusing to trust it on first use. "
+                    "Repair or remove the damaged line (see the log) and connect again")
             if os.environ.get('PEGAPROX_SSH_STRICT_HOST_KEYS', '').strip().lower() in ('1', 'true', 'yes', 'on'):
                 raise paramiko.SSHException("strict host-key checking: unknown SSH host key for " + str(_h))
             try:
@@ -9742,9 +11675,25 @@ async def ssh_handler(websocket):
                 pass
     ssh.set_missing_host_key_policy(_TofuPolicy())
     def _persist_ssh_hostkeys():
+        if known_only or kh_unreadable:
+            return
+        # NS Oct 2026 - save_host_keys() wrote the set loaded before connect over the file,
+        # erasing any pin the main app or another shell recorded meanwhile (#1025). Merge
+        # into what is on disk now and let the disk win, as persist_host_keys() does.
         try:
             with _KH_WRITE_LOCK:
-                ssh.save_host_keys(_ssh_kh)
+                merged = paramiko.hostkeys.HostKeys()
+                if os.path.exists(_ssh_kh):
+                    merged.load(_ssh_kh)
+                added = 0
+                for _hn, _keys in ssh.get_host_keys().items():
+                    _on_disk = merged.lookup(_hn)
+                    for _kt, _key in _keys.items():
+                        if _on_disk is None or _kt not in _on_disk:
+                            merged.add(_hn, _kt, _key)
+                            added += 1
+                if added:
+                    merged.save(_ssh_kh)
         except Exception:
             pass
 
@@ -9879,12 +11828,14 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
             )
         else:
             validate_url = f"{PEGAPROX_URL}/api/auth/validate"
-        headers = {'X-Session-ID': session_id} if session_id else {}
+        headers = dict(CONSOLE_HEADERS, **({'X-Session-ID': session_id} if session_id else {}))
         cookies = {'session': session_id} if session_id else {}
         # nosec B501 — localhost-to-PegaProx (PEGAPROX_URL = 127.0.0.1:port) with our
         # own self-signed cert. Same-host trust boundary; attacker with local
         # cert-read access already has more direct attack paths. MK 2026-06-04.
         r = requests.get(validate_url, cookies=cookies, headers=headers, timeout=8, verify=False)
+        if await _refused_as_standby(client_ws, r):
+            return
         if r.status_code == 403:
             await client_ws.send(json.dumps({'status': 'error', 'message': f'No access to cluster {cluster_id}'}))
             await client_ws.close(1008, "Forbidden")
@@ -9939,10 +11890,18 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
     # certs and most labs run them. Admins toggle on once they've installed
     # a real cert + the cluster's `ssl_verify` config field is true.
     verify_pve_tls = bool(ctx.get('verify_pve_tls', False))
+    # MK Sep 2026 (#956) - the API port of this cluster. 8006 stays the default for a
+    # context built before this field existed.
+    try:
+        pve_api_port = int(ctx.get('api_port') or 8006)
+    except (TypeError, ValueError):
+        pve_api_port = 8006
     if not allowed_hosts and session_id:
         try:
             cr = requests.get(f"{PEGAPROX_URL}/api/internal/cluster-creds/{cluster_id}",
                               cookies={'session': session_id}, timeout=10, verify=False)  # nosec B501 — localhost-to-PegaProx self-signed cert; same-host trust boundary, see MK 2026-06-04 audit
+            if await _refused_as_standby(client_ws, cr):
+                return
             if cr.status_code == 200:
                 cr_data = cr.json() or {}
                 if cr_data.get('host'):
@@ -9951,6 +11910,11 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
                 # Honour the cluster-side ssl_verify flag from the creds payload.
                 if 'verify_pve_tls' in cr_data:
                     verify_pve_tls = bool(cr_data['verify_pve_tls'])
+                if cr_data.get('api_port'):
+                    try:
+                        pve_api_port = int(cr_data['api_port'])
+                    except (TypeError, ValueError):
+                        pass
                 # C-1: server-side PVE session cookie (session-cookie flow)
                 if cr_data.get('pve_auth_ticket'):
                     pve_auth = cr_data['pve_auth_ticket']
@@ -9979,7 +11943,7 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
 
     # Connect to PVE WS — Cookie uses session auth ticket; URL uses termproxy ticket.
     pve_path = f"/api2/json/nodes/{node}/{vm_type}/{vmid_str}/vncwebsocket?port={pve_port}&vncticket={quote_plus(pve_ticket)}"
-    pve_url = f"wss://{pve_host}:8006{pve_path}"
+    pve_url = f"wss://{pve_host}:{pve_api_port}{pve_path}"
     # NS Jul 2026 (CodeAnt sensitive-data-in-url) — never log the vncticket (a live PVE console
     # credential in the query string); redact it (self-contained: runs in the WS subprocess).
     print("[TERMPROXY] connecting to PVE: " + pve_url.split('vncticket=')[0] + "vncticket=[REDACTED]")
@@ -10108,7 +12072,23 @@ async def main():
         else:
             raise
 
+def _watch_parent():
+    # the server goes with the PegaProx that started it, also after a kill -9 of that one,
+    # which left it holding its port for the next start (start_new_session: no signal
+    # reaches it from the parent's group)
+    import time as _time
+    parent = os.getppid()
+
+    def watch():
+        while True:
+            _time.sleep(5)
+            if os.getppid() != parent:
+                os._exit(0)
+    threading.Thread(target=watch, daemon=True).start()
+
+
 if __name__ == '__main__':
+    _watch_parent()
     asyncio.run(main())
 '''
     
@@ -10123,7 +12103,15 @@ if __name__ == '__main__':
     pkg_base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if not os.access(script_dir, os.W_OK):
-        script_dir = tempfile.gettempdir()
+        # MK Sep 2026 (#958) - CONFIG_DIR before the shared temp dir. On a package
+        # install the fallback above put an executable under a predictable name in
+        # a world-writable directory; CONFIG_DIR is the service's own (created 0700
+        # next to the database), so nobody else can pre-create or swap the file.
+        # gettempdir() stays as the last resort for installs where even that fails.
+        for _cand in (CONFIG_DIR, tempfile.gettempdir()):
+            if _cand and os.path.isdir(_cand) and os.access(_cand, os.W_OK):
+                script_dir = _cand
+                break
     script_path = os.path.join(script_dir, '.ssh_ws_server.py')
     
     try:
@@ -10158,8 +12146,31 @@ if __name__ == '__main__':
             except:
                 pass  # Neither fuser nor lsof available, hope for the best
         
-        with open(script_path, 'w') as f:
-            f.write(server_script)
+        # MK Sep 2026 (#958) - O_NOFOLLOW so a symlink planted at script_path is an
+        # error rather than a write through it, O_EXCL so a plain file somebody else
+        # got there first is refused instead of written into (O_NOFOLLOW alone only
+        # covers the symlink half, and O_TRUNC would have handed us their inode to
+        # rewrite between our write and the exec), and 0600 so the file we are about
+        # to execute is not readable or writable by anyone else. Our own leftover from
+        # the last start has to go first or O_EXCL would refuse every restart; if the
+        # unlink fails because the file is not ours, the open fails too, and the
+        # terminal not starting is the right outcome there.
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
+        _fd = os.open(script_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(_fd, 'w') as f:
+                _fd = None
+                f.write(server_script)
+        finally:
+            if _fd is not None:
+                os.close(_fd)
+        try:
+            os.chmod(script_path, 0o600)   # pre-existing file keeps its old mode otherwise
+        except OSError:
+            pass
         
         # Set environment variables for the subprocess
         env = os.environ.copy()
@@ -10174,7 +12185,9 @@ if __name__ == '__main__':
         env['SSH_WS_PORT'] = str(port)
         env['SSH_WS_HOST'] = host  # Issue #71: IPv6 support
         main_port = port - 2
-        env['PEGAPROX_URL'] = f"https://127.0.0.1:{main_port}" if ssl_cert else f"http://127.0.0.1:{main_port}"
+        env['PEGAPROX_URL'] = _ws_subprocess_base_url(main_port, ssl_cert)   # #957
+        from pegaprox.api.realtime import console_server_secret
+        env['PEGAPROX_CONSOLE_SECRET'] = console_server_secret()
         if ssl_cert:
             env['SSH_WS_SSL_CERT'] = ssl_cert
         if ssl_key:
@@ -10215,6 +12228,14 @@ if __name__ == '__main__':
 def node_shell_websocket_proxy(ws, cluster_id, node):
     """WebSocket proxy for node shell via SSH"""
 
+    # #625 - a root shell on a hypervisor node: not from a standby unless it serves users
+    if not ha.consoles_here():
+        try:
+            ws.send(json.dumps({'status': 'error', 'message': STANDBY_CONSOLE_ERROR}))
+        except Exception:
+            pass
+        return
+
     # NS Feb 2026: Authentication + authorization (was missing entirely - critical security fix)
     session_id = request.args.get('session')
     if not session_id:
@@ -10235,8 +12256,15 @@ def node_shell_websocket_proxy(ws, cluster_id, node):
         return
 
     # Check permissions - require node.shell or admin role
-    users = load_users()
-    user = users.get(session['user'], {})
+    # NS Oct 2026 (#1101) - by the account's own row; one we cannot read opens nothing
+    user = resolve_authz_user(session)
+    if not user or not user.get('enabled', True):
+        logging.error(f"SHELL WS: account {session['user']} could not be read or is disabled")
+        try:
+            ws.send('{"status":"error","message":"Invalid session"}')
+        except:
+            pass
+        return
     user_perms = get_user_permissions(user)
     # MK 2026-06-10 (RBAC): gate on the node.shell perm only — admin holds it via
     # all-perms so the explicit admin bypass was redundant; a custom role with node.shell now works.
@@ -10258,8 +12286,21 @@ def node_shell_websocket_proxy(ws, cluster_id, node):
         except:
             pass
         return
+    # confined to single VMs or a pool here (a portal user, say): no node shell, the same
+    # rule as /api/internal/cluster-creds
+    from pegaprox.api.helpers import caller_is_scoped
+    if caller_is_scoped(user, cluster_id):
+        logging.error(f"SHELL WS: User {session['user']} is confined on cluster {cluster_id}")
+        try:
+            ws.send('{"status":"error","message":"Access denied: this action affects the whole cluster"}')
+        except:
+            pass
+        return
 
     logging.info(f"SHELL WS: User {session['user']} authenticated for shell on {cluster_id}/{node}")
+    # #988 - counted against the account until the request ends, the credential wait included,
+    # and hung up with its session (#1038)
+    hold_websocket(session['user'], ws, sid=session_id)
 
     logging.info(f"")
     logging.info(f"========================================")
@@ -10564,7 +12605,9 @@ def delete_vm_api(cluster_id, node, vm_type, vmid):
     user = build_authz_user(request.session.get('user', ''), request.session)
     if not user_can_access_vm(user, cluster_id, vmid, 'vm.delete', vm_type):
         return jsonify({'error': 'Permission denied: vm.delete'}), 403
-    
+    denied = _xapi_refusal(cluster_id, user, 'vm.delete')
+    if denied: return denied
+
     manager = cluster_managers[cluster_id]
     data = request.json or {}
     purge = data.get('purge', False)
@@ -10574,6 +12617,29 @@ def delete_vm_api(cluster_id, node, vm_type, vmid):
     
     if result.get('success'):
         usr = getattr(request, 'session', {}).get('user', 'system')
+        # MK Sep 2026 - drop the per-VM ACL with the VM. The row is keyed by the NUMERIC
+        # vmid, and Proxmox hands out the lowest free one, so a recycled id is the normal
+        # case rather than a corner: leave the grant behind and the next guest to land on
+        # this number is reachable by the previous one's users, across tenants. The portal's
+        # own teardown route has done this since #556 for exactly this reason; the main
+        # delete path, which is where almost every VM actually goes, never did.
+        # Only on success, so a refused delete does not strip a live VM's grants.
+        try:
+            if get_db().delete_vm_acl(cluster_id, vmid):
+                # the ACL snapshot is cached behind a 30s TTL and every write path is
+                # expected to invalidate it - without this the grant outlives the row
+                from pegaprox.utils.rbac import invalidate_vm_acls_cache
+                invalidate_vm_acls_cache()
+        except Exception as e:
+            logging.error(f"{vm_type.upper()} {vmid} deleted but its VM ACL was NOT removed: {e} "
+                          f"- remove the stale vm_acls row by hand, a recycled VMID would "
+                          f"inherit the grant")
+            # NS Oct 2026 - and in the audit trail, where an admin looks, as the portal's
+            # teardown does: delete_vm_acl raises now instead of answering "no grant"
+            log_audit(usr, 'vm.acl_cleanup_failed',
+                      f"{vm_type.upper()} {vmid} deleted but its VM ACL is still there - remove it "
+                      f"by hand, the next guest on this VMID would inherit it",
+                      cluster=manager.config.name)
         log_audit(usr, 'vm.deleted', f"{vm_type.upper()} {vmid} deleted from {node}" + (" (purged)" if purge else ""), cluster=manager.config.name)
         broadcast_action('delete', vm_type, str(vmid), {'node': node, 'purge': purge}, cluster_id, usr)
         
@@ -10593,7 +12659,23 @@ def delete_vm_api(cluster_id, node, vm_type, vmid):
 @bp.route('/api/clusters/<cluster_id>/vms/bulk-migrate', methods=['POST'])
 @require_auth(perms=['vm.migrate'])
 def bulk_migrate_api(cluster_id):
-    """Migrate multiple VMs at once"""
+    """Migrate several guests to one node
+
+    Body: vms (a list of {vmid, node, type}), target, online (default true).
+
+    With mode the migrations run on the server as a bulk run (#952) and the answer is the
+    run (202, {run}), to follow with GET /api/bulk-migrations/<run_id>:
+    - mode: sequential (one guest after another: the next starts when the migration
+      task before it has ended), parallel (`parallel` at a time, 2-5) or all (every
+      migration starts at once and nobody waits for them)
+    - with_local_disks: (VMs) move local disks along
+    A guest that is not on the cluster or out of the caller's reach refuses the request
+    (400); one an enforced affinity rule keeps off the target, one already there and one
+    another running run still moves are listed as skipped.
+
+    Without mode every migration starts at once, and the answer lists what Proxmox said
+    to each start.
+    """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
     
@@ -10601,7 +12683,11 @@ def bulk_migrate_api(cluster_id):
         return jsonify({'error': 'Cluster not found'}), 404
     
     mgr = cluster_managers[cluster_id]
-    data = request.json or {}
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'JSON object required'}), 400
     vms = data.get('vms', [])  # List of {node, vmid, type}
     # NS Jul 2026 (pentest DoS) — cap the batch so one request can't fan out unbounded
     # per-VM cluster-walk + SQLCipher work (a 10 MB body could carry tens of thousands
@@ -10617,6 +12703,15 @@ def bulk_migrate_api(cluster_id):
     if not vms:
         return jsonify({'error': 'No VMs specified'}), 400
     
+    # the single-guest route asks this of an XCP-ng pool, the bulk one never did
+    if getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng':
+        from pegaprox.utils.rbac import has_permission
+        if not has_permission(build_authz_user(request.session.get('user', ''), request.session), 'xapi.vm.migrate'):
+            return jsonify({'error': 'Permission denied: xapi.vm.migrate'}), 403
+
+    if data.get('mode') is not None:
+        return _start_bulk_run(cluster_id, mgr, data)
+
     user = getattr(request, 'session', {}).get('user', 'system')
     log_audit(user, 'vm.bulk_migrated', f"Bulk migration of {len(vms)} VMs to {target_node}", cluster=mgr.config.name)
 
@@ -10624,9 +12719,9 @@ def bulk_migrate_api(cluster_id):
     # bulk twin only had the cluster gate, so a VM-ACL/pool-scoped user could relocate foreign VMs
     # by listing their vmids. Build the authz user once and skip (don't abort on) each VM the caller
     # isn't scoped to.
-    _authz_user = load_users().get(request.session['user'], {})
-    _authz_user['username'] = request.session['user']
-    
+    # NS Oct 2026 - as the API token acts, not as its owner's stored record (#1047)
+    _authz_user = build_authz_user(request.session['user'], request.session)
+
     # LW: Feb 2026 - enforced violations skip that VM but don't abort the whole batch
     from pegaprox.api.history import check_affinity_violation
 
@@ -10671,6 +12766,178 @@ def bulk_migrate_api(cluster_id):
         'total': len(vms),
         'successful': sum(1 for r in results if r['success'])
     })
+
+
+# MK Oct 2026 (#952) - a bulk migration as a run on the server: one guest after another,
+# a few at a time or all at once, followed per guest (core/bulk_migrate.py). The checks are
+# those of the call above and of the node route, made before anything starts; the run
+# asks again before each guest whether its starter may still move it.
+_BULK_HOW = {'sequential': 'one at a time', 'parallel': '{n} at a time', 'all': 'all at once'}
+
+
+def _start_bulk_run(cluster_id, mgr, data):
+    from pegaprox.core import bulk_migrate as bulk
+    from pegaprox.utils.sanitization import validate_hostname
+    mode = data.get('mode')
+    if mode not in bulk.MODES:
+        return jsonify({'error': 'mode is sequential, parallel or all'}), 400
+    parallel = 1
+    if mode == 'parallel':
+        parallel = data.get('parallel', 2)
+        if isinstance(parallel, bool) or not isinstance(parallel, int) or not 2 <= parallel <= bulk.PARALLEL_MAX:
+            return jsonify({'error': f'parallel is a number from 2 to {bulk.PARALLEL_MAX}'}), 400
+    online, local = data.get('online', True), data.get('with_local_disks', False)
+    if not isinstance(online, bool) or not isinstance(local, bool):
+        return jsonify({'error': 'online and with_local_disks are true or false'}), 400
+    target = data.get('target')
+    if not isinstance(target, str) or not validate_hostname(target):
+        return jsonify({'error': 'Target node is required'}), 400
+    if getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox':
+        nodes = mgr.get_node_status() or {}
+        if target not in nodes:
+            return jsonify({'error': f'{target} is no node of this cluster'}), 400
+        tinfo = nodes.get(target) or {}
+        if tinfo.get('offline') or tinfo.get('status', 'online') != 'online':
+            return jsonify({'error': f'{target} is not online'}), 400
+
+    wanted = _vmid_list([v.get('vmid') if isinstance(v, dict) else v for v in data.get('vms')]) \
+        if isinstance(data.get('vms'), list) else None
+    if wanted is None:
+        return jsonify({'error': 'vms holds something that is no VMID'}), 400
+    wanted = list(dict.fromkeys(wanted))
+
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    guests = {}
+    for g in (mgr.get_vm_resources(max_age=2) or []):
+        if g.get('type') in ('qemu', 'lxc'):
+            try:
+                guests[int(g.get('vmid'))] = g
+            except (TypeError, ValueError):
+                continue
+    # one answer for a guest elsewhere and one out of reach: which is which stays unsaid
+    refused = [v for v in wanted if v not in guests
+               or not user_can_access_vm(user, cluster_id, v, 'vm.migrate', guests[v].get('type'))]
+    if refused:
+        return jsonify({'error': f"Not on this cluster or out of reach: "
+                                 f"{', '.join(str(v) for v in refused[:20])}"}), 400
+
+    held = _affinity_held(cluster_id, wanted, target)
+    busy = bulk.busy_vmids(cluster_id)
+    rows = []
+    for vmid in wanted:
+        g = guests[vmid]
+        if vmid in held:
+            rows.append(bulk.new_row(g, 'skipped', f"Affinity rule '{held[vmid]}' keeps it off {target}"))
+        elif g.get('node') == target:
+            rows.append(bulk.new_row(g, 'skipped', f'Already on {target}'))
+        elif vmid in busy:
+            rows.append(bulk.new_row(g, 'skipped', 'Another bulk migration moves it already'))
+        else:
+            rows.append(bulk.new_row(g))
+    if not any(r['state'] == bulk.WAITING for r in rows):
+        return jsonify({'error': 'None of these guests is left to migrate',
+                        'skipped': [{'vmid': r['vmid'], 'reason': r['note']} for r in rows]}), 400
+
+    usr = request.session.get('user', 'system')
+    from pegaprox.utils.audit import get_client_ip
+    run = bulk.BulkRun(cluster_id, mgr.config.name, usr, request.session, get_client_ip(), target, mode,
+                       parallel, online, local, rows)
+    try:
+        bulk.register(run)
+    except bulk.TooMany as e:
+        return jsonify({'error': str(e)}), 409
+    moving = [str(r['vmid']) for r in rows if r['state'] == bulk.WAITING]
+    log_audit(usr, 'vm.bulk_migrated',
+              f"Bulk migration {run.id} of {len(moving)} guest(s) to {target}, "
+              f"{_BULK_HOW[mode].format(n=parallel)} ({', '.join(moving[:50])}{' ...' if len(moving) > 50 else ''})",
+              cluster=mgr.config.name)
+    bulk.launch(run)
+    return jsonify({'run': run.view(run.rows_copy(), me=usr)}), 202
+
+
+def _bulk_view(run, with_rows=True):
+    """The run as the caller may see it, None when they may see none of it: the cluster out
+    of their reach, or not one of its guests theirs to see"""
+    if run is None:
+        return None
+    ok, _err = check_cluster_access(run.cluster_id)
+    if not ok:
+        return None
+    rows = scope_vm_rows(run.cluster_id, run.rows_copy())
+    if not rows:
+        return None
+    return run.view(rows, with_rows=with_rows, me=request.session.get('user', ''))
+
+
+def _may_cancel(run):
+    """Who started it, or a caller with vm.migrate on the whole cluster (an admin, an
+    operator of the tenant that owns it): not one confined to some of its guests"""
+    if request.session.get('user') == run.user:
+        return True
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    from pegaprox.utils.rbac import has_permission
+    return has_permission(user, 'vm.migrate') and not caller_is_scoped(user, run.cluster_id)
+
+
+@bp.route('/api/bulk-migrations', methods=['GET'])
+@require_auth(perms=['vm.view'])
+def list_bulk_migrations():
+    """Bulk migrations of the last hour
+
+    The runs on the clusters the caller reaches, newest first, with their counts and
+    without the guests. A run counts only the guests the caller may see. They run in the
+    process of the active instance: a restart ends them."""
+    from pegaprox.core import bulk_migrate as bulk
+    out = []
+    for run in bulk.runs():
+        view = _bulk_view(run, with_rows=False)
+        if view:
+            out.append(view)
+    return jsonify({'runs': out})
+
+
+@bp.route('/api/bulk-migrations/<run_id>', methods=['GET'])
+@require_auth(perms=['vm.view'])
+def get_bulk_migration(run_id):
+    """One bulk migration, a line per guest
+
+    Each guest with its state (wait, migrating, done, started, failed, skipped, cancelled,
+    unknown), a note, its task and the node it went to; may_cancel says whether the
+    caller may cancel the rest."""
+    from pegaprox.core import bulk_migrate as bulk
+    run = bulk.get(run_id)
+    view = _bulk_view(run)
+    if not view:
+        return jsonify({'error': 'Bulk migration not found'}), 404
+    view['may_cancel'] = view['state'] == 'running' and not view['cancelled_by'] and _may_cancel(run)
+    return jsonify({'run': view})
+
+
+@bp.route('/api/bulk-migrations/<run_id>/cancel', methods=['POST'])
+@require_auth(perms=['vm.migrate'])
+def cancel_bulk_migration(run_id):
+    """Cancel the rest of a bulk migration
+
+    No further guest starts. What is migrating finishes in Proxmox; the guests not
+    started stay where they are."""
+    from pegaprox.core import bulk_migrate as bulk
+    run = bulk.get(run_id)
+    if not _bulk_view(run, with_rows=False):
+        return jsonify({'error': 'Bulk migration not found'}), 404
+    if not _may_cancel(run):
+        return jsonify({'error': 'Only who started it, or someone who migrates on the whole '
+                                 'cluster, cancels a bulk migration'}), 403
+    usr = request.session.get('user', 'system')
+    if not bulk.cancel(run, usr):
+        return jsonify({'error': 'This bulk migration is over'}), 409
+    waiting = sum(1 for r in run.rows_copy() if r['state'] == bulk.WAITING)
+    log_audit(usr, 'vm.bulk_migrate_cancelled',
+              f"Bulk migration {run.id} to {run.target} (started by {run.user}): {waiting} guest(s) "
+              f"not started", cluster=run.cluster_name)
+    # the answer of the detail route: the rest is cancelled, there is nothing left to cancel
+    view = _bulk_view(run) or {}
+    view['may_cancel'] = False
+    return jsonify({'run': view})
 
 
 @bp.route('/api/clusters/<cluster_id>/fingerprint', methods=['GET'])
@@ -10718,14 +12985,41 @@ def remote_migrate_vm_api(cluster_id, node, vm_type, vmid):
     delete_source = data.get('delete_source', True)
     bwlimit = data.get('bwlimit')
     
-    if not all([target_endpoint, target_storage, target_bridge]):
-        return jsonify({'error': 'target_endpoint, target_storage, and target_bridge are required'}), 400
-    
-    result = manager.remote_migrate_vm(
-        node, vmid, vm_type, 
-        target_endpoint, target_storage, target_bridge,
-        target_vmid, online, delete_source, bwlimit
-    )
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
+        # NS Oct 2026 (#1088, #1048) - an XCP-ng pool logs into the target with stored
+        # credentials, so the target is a registered pool, never a URL from the request
+        from pegaprox.utils.rbac import has_permission
+        if not has_permission(user, 'xapi.vm.migrate'):
+            return jsonify({'error': 'Permission denied: xapi.vm.migrate'}), 403
+        target_cluster = data.get('target_cluster')
+        if not isinstance(target_cluster, str) or not all([target_cluster, target_storage, target_bridge]):
+            return jsonify({'error': 'target_cluster (a registered XCP-ng pool), target_storage '
+                                     'and target_bridge are required'}), 400
+        target_mgr = cluster_managers.get(target_cluster)
+        if (target_cluster == cluster_id or target_mgr is None
+                or getattr(target_mgr, 'cluster_type', 'proxmox') != 'xcpng'):
+            return jsonify({'error': 'Target must be another XCP-ng pool registered in PegaProx'}), 400
+        ok, err = check_cluster_access(target_cluster)
+        if not ok:
+            return err
+        if caller_is_scoped(user, target_cluster):
+            return jsonify({'error': 'Access denied to target cluster'}), 403
+        result = manager.remote_migrate_vm(
+            node, vmid, vm_type, None, target_storage, target_bridge,
+            target_vmid, online, delete_source, bwlimit, target_pool=target_mgr)
+    else:
+        if not all([target_endpoint, target_storage, target_bridge]):
+            return jsonify({'error': 'target_endpoint, target_storage, and target_bridge are required'}), 400
+        # same rule as XHM: removing the source guest is vm.delete, not vm.migrate
+        if delete_source and not user_can_access_vm(user, cluster_id, vmid, 'vm.delete', vm_type):
+            return jsonify({'error': 'Access denied: removing the source guest needs '
+                                     'vm.delete on it'}), 403
+        result = manager.remote_migrate_vm(
+            node, vmid, vm_type,
+            target_endpoint, target_storage, target_bridge,
+            target_vmid, online, delete_source, bwlimit
+        )
     
     if result.get('success'):
         # NS: Register PegaProx user for this task
@@ -10786,7 +13080,13 @@ def cross_cluster_migrate_api():
     
     if not target_node:
         return jsonify({'error': 'Target node is required for cross-cluster migration'}), 400
-    
+    # NS Oct 2026 (#1048) - the gates and the migration have to mean the same guest. '0100'
+    # or ' 100' missed the ACL row of VM 100 and got decided by the role instead.
+    try:
+        vmid = int(vmid)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'vmid must be a number'}), 400
+
     if source_cluster_id not in cluster_managers:
         return jsonify({'error': 'Source cluster not found'}), 404
     if target_cluster_id not in cluster_managers:
@@ -10806,6 +13106,25 @@ def cross_cluster_migrate_api():
     err = _require_vm_access(source_cluster_id, vmid, 'vm.migrate', vm_type)
     if err:
         return err
+    # NS Oct 2026 - the target side runs on a token we mint for the target cluster's own
+    # account, on any node, storage and bridge the body names. Reaching that cluster through
+    # one guest or pool is no standing to place one there, the replication twin refuses it
+    # too; and the guest takes a VMID there as a create would, inside the tenant's range (#1056)
+    _xu = build_authz_user(request.session.get('user', ''), request.session)
+    if caller_is_scoped(_xu, target_cluster_id):
+        return jsonify({'error': 'Access denied to the target cluster'}), 403
+    from pegaprox.utils.rbac import acts_as_admin
+    if not acts_as_admin(_xu):
+        from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID
+        _rok, _rmsg = check_tenant_vmid(_xu.get('tenant_id') or DEFAULT_TENANT_ID, target_vmid or vmid)
+        if not _rok:
+            return jsonify({'error': _rmsg}), 403
+    # NS Oct 2026 (#1048) - delete_source destroys the source guest: vm.delete, like XHM
+    if delete_source:
+        err = _require_vm_access(source_cluster_id, vmid, 'vm.delete', vm_type)
+        if err:
+            return jsonify({'error': 'Access denied: removing the source guest needs '
+                                     'vm.delete on it'}), 403
 
     source_manager = cluster_managers[source_cluster_id]
     target_manager = cluster_managers[target_cluster_id]
@@ -10997,7 +13316,8 @@ def cross_cluster_migrate_api():
                 target_manager.delete_api_token(token_name)
                 logging.info(f"[TOKEN-CLEANUP] Deleted migration token: {token_name}")
             
-            cleanup_thread = threading.Thread(target=cleanup_token_when_done, daemon=True)
+            cleanup_thread = threading.Thread(target=ha.as_job(cleanup_token_when_done, 'token cleanup'),
+                                              daemon=True)
             cleanup_thread.start()
             
             response = {
@@ -11094,9 +13414,15 @@ def get_templates_api(cluster_id, node):
         if not has_permission(u, 'xapi.template.view'):
             return jsonify({'error': 'Permission denied: xapi.template.view'}), 403
 
-    templates = manager.get_templates(node)
-    # sec (audit): template rows carry a vmid — twin of the scoped templates/existing route
-    return jsonify(scope_vm_rows(cluster_id, templates or []))
+    templates = manager.get_templates(node) or []
+    # sec (audit): VM template rows carry a vmid and are scoped per guest, twin of the scoped
+    # templates/existing route. Container templates are storage content (a volid, no vmid) and
+    # XCP-ng templates carry a uuid: scope_vm_rows drops a row without a vmid, which took every
+    # container template away from everyone - they stay, as ISO and vztmpl rows of the storage
+    # routes do (MK Oct 2026)
+    guests = [t for t in templates if t.get('vmid') is not None]
+    content = [t for t in templates if t.get('vmid') is None]
+    return jsonify(scope_vm_rows(cluster_id, guests) + content)
 
 
 @bp.route('/api/clusters/<cluster_id>/xcp/os-types', methods=['GET'])
@@ -11119,6 +13445,11 @@ def create_vm_api(cluster_id, node):
     """Create a new VM on a node"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # NS Oct 2026 - a new guest has no grant to ask about yet: which node, storage and bridge
+    # it takes is a call for the whole cluster, as on template and OCI deploy (#1081, #1086)
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -11190,6 +13521,9 @@ def create_container_api(cluster_id, node):
     """Create a new container on a node"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)   # same as the VM twin above (#1081)
+    if _cerr:
+        return _cerr
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404

@@ -16,11 +16,12 @@ METRICS_HISTORY_FILE = os.path.join(CONFIG_DIR, 'metrics_history.json')
 
 from pegaprox.globals import cluster_managers
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 from pegaprox.utils.concurrent import run_per_node  # #601: SSH-aware bounded fan-out for per-node temp reads
 
 
 def _node_hottest_temp(mgr, node):
-    """#601 — SSH lm-sensors → hottest temperature reading (°C) for one node, or None.
+    """#601 - SSH lm-sensors (or the kernel's hwmon) → hottest temperature (°C) for one node, or None.
 
     Honours a per-node backoff so installs WITHOUT lm-sensors/SSH (or non-PVE hosts)
     aren't re-probed every 5-min cycle — an error parks the node for ~1h. Nodes that
@@ -28,6 +29,12 @@ def _node_hottest_temp(mgr, node):
     up on the next successful probe.
     """
     import time as _t
+    # MK Oct 2026 - SSH off for this cluster (switched off, or only an API token): nothing
+    # to read, so no address lookup for it either. No backoff, so switching SSH back on
+    # shows temperatures from the next cycle.
+    _blocked = getattr(mgr, 'ssh_blocked_reason', None)
+    if callable(_blocked) and isinstance(_blocked(), str):
+        return None
     backoff = getattr(mgr, '_node_temp_probe_backoff', None)
     if backoff is None:
         backoff = mgr._node_temp_probe_backoff = {}
@@ -128,7 +135,28 @@ def _node_hw_summary_redfish(mgr, cluster_id, node):
     return _compact_hw(res)
 
 
-def load_metrics_history():
+# Upper bound on a windowed history read. A week at the 5-min cadence and
+# stride 3 is ~670 rows, so this only bites where snapshots land far more often
+# than they should, and there it stops one report from dragging tens of
+# thousands of encrypted blobs through the parser.
+_WINDOW_ROW_CAP = 4000
+
+
+# MK Oct 2026 - a windowed read is cached per window and stays in memory until the
+# next read of that window replaces it. At 10k guests one parsed snapshot is ~5 MB,
+# nearly all of it the per-guest map, so a cached week held a few GB for figures the
+# reports never look at. Trimmed row by row, so the parse never holds them all either.
+def _cluster_totals_only(snap):
+    """Keep each cluster's name and totals, drop the guest, node and storage maps."""
+    clusters = snap.get('clusters')
+    if isinstance(clusters, dict):
+        # only keys that are there, so a reader's .get(key, default) still sees a gap as one
+        snap['clusters'] = {cid: {k: c[k] for k in ('name', 'totals') if k in c}
+                            for cid, c in clusters.items() if isinstance(c, dict)}
+    return snap
+
+
+def load_metrics_history(days=None, totals_only=False):
     """Load historical metrics from SQLite database.
 
     NS 2026-06-05 (#528 scaling): this SELECTed up to 1000 snapshot rows and
@@ -136,8 +164,20 @@ def load_metrics_history():
     freeze per report (reports.py calls this up to 3× per report). Now the fetch
     + parse run off-hub via run_heavy_read, with a short TTL cache so the repeated
     calls within a report (and back-to-back reports) coalesce onto one query.
+
+    `days` bounds the read by TIME. The flat LIMIT 1000 covers ~3.5 days at the
+    5-min cadence and a good deal less when snapshots land more often, so a
+    caller asking for a week got "the newest 1000 rows" and no way to tell the
+    difference. That is why the reports page showed the same window for
+    "Last 24h" and "Last Week". Callers that know their window pass it, and the
+    windowed read comes back oldest-first, which is the order a timeline wants.
+    days=None keeps the old row-capped (newest-first) behaviour.
+
+    totals_only=True hands back each cluster's name and totals and nothing else,
+    which is all the report endpoints read (see _cluster_totals_only).
     """
     try:
+        from datetime import timedelta
         from pegaprox.core.dbcrypto import run_heavy_read
 
         def _parse(rows):
@@ -146,14 +186,48 @@ def load_metrics_history():
                 try:
                     data = json.loads(row['data'])
                     data['timestamp'] = row['timestamp']
-                    out.append(data)
+                    out.append(_cluster_totals_only(data) if totals_only else data)
                 except Exception:
                     pass
             return out
 
-        snapshots = run_heavy_read(
-            'SELECT timestamp, data FROM metrics_history ORDER BY timestamp DESC LIMIT 1000',
-            cache_key='mh_reports_1000', transform=_parse)
+        key_tail = '_totals' if totals_only else ''
+        if days:
+            # One decimation policy for every history consumer rather than a
+            # second copy of it here. A week of 5-min rows is ~2000 blobs to
+            # decrypt + parse, and every consumer either averages or feeds a
+            # chart that decimates to 200 points anyway, so the skipped rows are
+            # never decrypted: the modulo is answered from the timestamp index.
+            from pegaprox.api.helpers import _history_stride
+            cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+            stride = _history_stride(days)
+            if stride > 1:
+                # Anchored on the newest row instead of a bare `id % stride = 0`.
+                # A plain modulo keeps the last snapshot only when its id happens
+                # to divide, so two times out of three the newest sample is
+                # dropped and a report's `current` is silently a stride older
+                # than the data it was read from.
+                where = ('WHERE timestamp >= ? AND '
+                         '((SELECT MAX(id) FROM metrics_history) - id) % ? = 0')
+                params = (cutoff, stride)
+            else:
+                where = 'WHERE timestamp >= ?'
+                params = (cutoff,)
+            # The old flat LIMIT was also the only thing bounding the work. A
+            # window is a time span, so on an install writing far more often than
+            # the 5-min cadence a week is unbounded decrypt + parse. Keep a
+            # backstop, and trim it from the OLD end so the recent resolution the
+            # charts are about survives.
+            sql = ('SELECT timestamp, data FROM ('
+                   'SELECT id, timestamp, data FROM metrics_history '
+                   f'{where} ORDER BY timestamp DESC LIMIT {_WINDOW_ROW_CAP}'
+                   ') ORDER BY timestamp ASC')
+            snapshots = run_heavy_read(
+                sql, params, cache_key=f'mh_reports_d{days}{key_tail}', transform=_parse)
+        else:
+            snapshots = run_heavy_read(
+                'SELECT timestamp, data FROM metrics_history ORDER BY timestamp DESC LIMIT 1000',
+                cache_key=f'mh_reports_1000{key_tail}', transform=_parse)
         return {'snapshots': snapshots, 'last_cleanup': None}
     except Exception as e:
         logging.error(f"Error loading metrics history from database: {e}")
@@ -299,9 +373,13 @@ def collect_metrics_snapshot():
             # the 5-min collector greenlet, off the broadcast hot-path. Writes both the
             # snapshot (→ persisted history) and the manager temp-cache (→ read by the
             # 60s alert loop, which must not SSH).
+            # MK Sep 2026 (#625) - not from a PegaProx standby, and neither is the BMC and
+            # Redfish fan-out below: the active reads the same nodes already, and a TOFU pin
+            # made here would land in the known_hosts file the sync replaces. The API figures
+            # above and below are what a standby's live view shows.
             try:
                 online_node_names = list(cluster_data['nodes'].keys())
-                if online_node_names:
+                if online_node_names and ha.is_active():
                     node_calls = {name: (lambda nm: _node_hottest_temp(mgr, nm))
                                   for name in online_node_names}
                     temp_by_node = run_per_node(node_calls, max_concurrent=8, timeout=90)
@@ -345,7 +423,8 @@ def collect_metrics_snapshot():
                 _rf_enabled = _redfish_consent_state()[0]
             except Exception:
                 _hw_enabled = _rf_enabled = False
-            if (_hw_enabled or _rf_enabled) and getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox':
+            if ((_hw_enabled or _rf_enabled) and getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox'
+                    and ha.is_active()):
                 try:
                     online_node_names = list(cluster_data['nodes'].keys())
                     if online_node_names:

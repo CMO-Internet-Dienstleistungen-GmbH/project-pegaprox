@@ -197,7 +197,8 @@ def test_an_account_this_login_does_not_own_is_never_adopted(monkeypatch, source
 def test_the_guard_uses_the_shared_constant():
     """So a future auth_source ('saml', ...) is refused by default rather than adopted."""
     import inspect
-    src = inspect.getsource(O.oidc_provision_user)
+    # the guard sits in the builder since the split (#625); provisioning only saves
+    src = inspect.getsource(O.oidc_build_user_row)
     assert 'not in OIDC_AUTH_SOURCES' in src
     assert "== 'local'" not in src
 

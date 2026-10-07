@@ -72,15 +72,23 @@ def check_auth_action_rate_limit(key: str, max_attempts: int = 5, window: int = 
         if win is None:
             if len(_auth_action_windows) >= _AUTH_ACTION_MAX_BUCKETS:
                 # More distinct budgets than the code has call sites means somebody is
-                # passing them in from a request. Drop the least recently created one;
-                # the budgets themselves are not secret and a re-created window simply
-                # starts counting again.
-                oldest = next(iter(_auth_action_windows))
-                _auth_action_windows.pop(oldest, None)
+                # passing them in from a request.
+                #
+                # MK Sep 2026 (follow-up) - this used to evict `next(iter(...))`, which on
+                # an insertion-ordered dict is the FIRST bucket ever created, i.e. one of
+                # the literal ones the real login paths have been counting in since boot.
+                # Evicting a window resets it, so the defence against a caller-chosen
+                # budget would have cleared the rate limit protecting password change or
+                # TOTP verification - it fed the attack it was meant to stop. Refuse the
+                # unknown budget instead: nothing is evicted, the map cannot grow, and a
+                # caller doing this gets a 429 rather than a reset. Unreachable today (four
+                # call sites, three distinct literal pairs) and it should stay that way.
                 logging.warning(
-                    '[RATELIMIT] auth-action budgets exceeded %d distinct pairs - '
-                    'evicted %s. A caller is choosing the budget; it should be a literal.',
-                    _AUTH_ACTION_MAX_BUCKETS, oldest)
+                    '[RATELIMIT] auth-action budgets exceeded %d distinct pairs - refusing '
+                    '%s rather than evicting an established window. A caller is choosing '
+                    'the budget; it should be a literal.',
+                    _AUTH_ACTION_MAX_BUCKETS, bucket)
+                return False
             win = SlidingWindow(limit=max_attempts, window=window, max_keys=4096,
                                 name=f'auth-action-{max_attempts}/{window}')
             _auth_action_windows[bucket] = win
@@ -139,6 +147,17 @@ def read_capped(fh, limit=None):
     return out
 
 
+def ssh_login_args(user, host):
+    """The end of an OpenSSH argv: ['-l', user, '--', host]. The login name is checked
+    and travels as the value of -l, and '--' ends option parsing before the host, so
+    neither can be read as an option (the command after it neither). Raises ValueError
+    for a user that is not a login name."""
+    from pegaprox.utils.sanitization import validate_ssh_user
+    if not validate_ssh_user(user):
+        raise ValueError(f'refusing SSH login name {str(user)[:40]!r}: not a valid user name')
+    return ['-l', user, '--', str(host)]
+
+
 def _ssh_exec(host, user, password, cmd, timeout=30, use_controlmaster=False,
               connect_timeout=8):
     """Execute command on remote host via SSH.
@@ -169,6 +188,15 @@ def _ssh_exec(host, user, password, cmd, timeout=30, use_controlmaster=False,
     import socket as _socket
     last_err = ''
     errors = []
+    try:
+        login_args = ssh_login_args(user, host)
+    except ValueError as e:
+        return 1, '', str(e)
+    # one exit, both ways out below (#625): asked before anything connects, and again
+    # right before the command goes out either way
+    from pegaprox.core import ha_transport
+    from pegaprox.core.ha import GuardRefused
+    ha_transport.guard_ssh(host, cmd)
 
     def _make_sock():
         """Pre-create socket with explicit connect_timeout — paramiko.Transport
@@ -323,8 +351,9 @@ def _ssh_exec(host, user, password, cmd, timeout=30, use_controlmaster=False,
         # MK: Mar 2026 - persist host keys (TOFU model) — reject-on-change next time
         persist_host_keys(client)
 
-        # Execute command
+        # Execute command (the connects above may have taken a while: checked again, #625)
         try:
+            ha_transport.guard_ssh(host, cmd, again=True)
             stdin, stdout, stderr = client.exec_command(cmd, timeout=timeout)
             out = read_capped(stdout)
             err = read_capped(stderr)
@@ -334,21 +363,24 @@ def _ssh_exec(host, user, password, cmd, timeout=30, use_controlmaster=False,
         except Exception as e:
             try: client.close()
             except: pass
+            if isinstance(e, GuardRefused):
+                raise
             raise Exception(f'Paramiko exec failed: {e}')
-    
+
+    except GuardRefused:
+        raise
     except Exception as paramiko_err:
         last_err = str(paramiko_err)
     
     # Fallback: sshpass + ssh subprocess (handles keyboard-interactive via PreferredAuthentications)
     try:
-        import subprocess
-        from pegaprox.utils.ssh_security import strict_host_keys_enabled
+        from pegaprox.utils.ssh_security import cli_hostkey_opts
         env = os.environ.copy()
         env['SSHPASS'] = password
-        # accept-new = TOFU (accept unknown, REJECT a changed key). strict mode
-        # upgrades to `yes` (reject unknown too). Keeps the system-ssh fallback's
+        # accept-new = TOFU (accept unknown, REJECT a changed key). strict mode and a
+        # standby upgrade to `yes` (reject unknown too). Keeps the system-ssh fallback's
         # host-key behaviour in lock-step with the paramiko paths.
-        _hkc = 'yes' if strict_host_keys_enabled() else 'accept-new'
+        _hkc = cli_hostkey_opts()[0]
         ssh_args = ['sshpass', '-e', 'ssh',
              '-o', f'StrictHostKeyChecking={_hkc}',
              '-o', f'UserKnownHostsFile={_known_hosts}',
@@ -366,17 +398,58 @@ def _ssh_exec(host, user, password, cmd, timeout=30, use_controlmaster=False,
             except Exception as _cm_err:
                 # any import / setup error → fall through, ssh just runs without sharing
                 pass
-        ssh_args.extend([f'{user}@{host}', cmd])
-        result = subprocess.run(
-            ssh_args,
-            capture_output=True, text=True, timeout=timeout, env=env
+        ssh_args.extend(login_args + [cmd])
+        # long after the guard was asked at the top: checked again, bounded and in a
+        # process group of its own in an automatic group (#625)
+        result = ha_transport.node_cmd(
+            ssh_args, capture_output=True, text=True, timeout=timeout, env=env,
+            host=host, again=True
         )
         if result.returncode == 0:
             return result.returncode, result.stdout, result.stderr
         # sshpass also failed
         return result.returncode, result.stdout, result.stderr or last_err
+    except GuardRefused:
+        raise
     except Exception as sub_err:
         return 1, '', f'All SSH methods failed: {last_err}; subprocess: {sub_err}'
+
+
+def ssh_password_for(config):
+    """The password an SSH login to this PVE cluster's nodes may offer - '' for none.
+
+    MK Oct 2026 - pass_ is only an SSH password when config.user is an account. With a
+    token id typed as the username ('user@realm!tokenid') it is the token SECRET, and
+    every ladder that went key -> BatchMode -> sshpass handed it to sshd whenever the
+    key was refused (#717 class). ssh_blocked_reason did not catch that: a stored key
+    is enough for it to say go. The marker is '!' in user, not _using_api_token - a
+    token we minted ourselves (#110) leaves pass_ the account password. The marker holds
+    only while user and pass_ change together, which is why the cluster edit routes do
+    not take 'user' on its own.
+    Use this (or PegaProxManager.ssh_password_to_offer) for every password step,
+    never config.pass_ directly.
+    """
+    if bool(getattr(config, 'ssh_disabled', False)):
+        return ''
+    if '!' in (getattr(config, 'user', '') or ''):
+        return ''
+    return getattr(config, 'pass_', '') or ''
+
+
+def ssh_blocked_for(mgr):
+    """Why SSH to this manager's nodes must not happen - a code, or None.
+
+    For the routes that build their own paramiko client from config.ssh_key: blanking the
+    password was not enough there, the key still logged in with SSH switched off (#941).
+    Managers without ssh_blocked_reason (XCP-ng) answer by the switch alone.
+    """
+    probe = getattr(mgr, 'ssh_blocked_reason', None)
+    if callable(probe):
+        reason = probe()
+        return reason if isinstance(reason, str) else None
+    if bool(getattr(getattr(mgr, 'config', None), 'ssh_disabled', False)):
+        return 'SSH_DISABLED'
+    return None
 
 
 _node_ip_cache = {}  # (cluster_id, node) -> (ip, timestamp)
@@ -484,7 +557,10 @@ def _pve_node_exec(pve_mgr, node, cmd, timeout=600, use_controlmaster=True,
             _diag = pve_mgr.ssh_diagnose(node)
         except Exception:
             pass   # older managers without the classifier — behave as before
-        if _diag and _diag[0] == 'SSH_NO_CREDENTIALS':
+        # MK Sep 2026 (#941) — SSH_DISABLED belongs here too. There are two ways out of
+        # this process to a node: paramiko via manager._ssh_connect, and this shell-out.
+        # An off switch that only closed one of them would be worth nothing.
+        if _diag and _diag[0] in ('SSH_NO_CREDENTIALS', 'SSH_DISABLED'):
             return 1, '', _diag[1]
 
         _ssh_user = getattr(pve_mgr.config, 'ssh_user', '') or 'root'
@@ -501,7 +577,7 @@ def _pve_node_exec(pve_mgr, node, cmd, timeout=600, use_controlmaster=True,
         # token WE minted (#110) keeps its password, and blanking it here took node
         # commands away from the most common configuration we have.
         _token_auth = '!' in (getattr(pve_mgr.config, 'user', '') or '')
-        _ssh_pass = '' if _token_auth else (getattr(pve_mgr.config, 'pass_', '') or '')
+        _ssh_pass = ssh_password_for(pve_mgr.config)
         if not _ssh_pass:
             # Say which of the three it actually is. The first version of this asserted a
             # stored key in every case, but the branch is also reached on a cluster with no

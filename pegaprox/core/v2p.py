@@ -160,7 +160,19 @@ class V2PMigrationTask:
         # '' by default (no behaviour change; PVE default aio=io_uring).
         return f',aio={self.aio_mode}' if getattr(self, 'aio_mode', '') else ''
 
+    def _redact(self, text):
+        # NS Oct 2026 (#1098) - tool output (qemu-img, ssh) can echo the ESXi password,
+        # plain or URL-encoded; the log is served to the UI and broadcast over SSE
+        text = str(text)
+        pw = getattr(self, 'esxi_password', '') or ''
+        if pw:
+            import urllib.parse
+            for form in {pw, urllib.parse.quote(pw, safe=''), shlex.quote(pw)}:
+                text = text.replace(form, '********')
+        return text
+
     def log(self, msg):
+        msg = self._redact(msg)
         ts = datetime.now().strftime('%H:%M:%S')
         self.log_lines.append(f"[{ts}] {msg}")
         logging.info(f"[V2P:{self.id}] {msg}")
@@ -185,6 +197,15 @@ class V2PMigrationTask:
                 self.config.pop('esxi_password', None)
         except Exception:
             pass
+        # and the secret file the HTTPS boot handed to QEMU (#1098)
+        node_secret = getattr(self, '_node_secret', None)
+        if node_secret:
+            self._node_secret = None
+            try:
+                pve_mgr, node, path = node_secret
+                _pve_node_exec(pve_mgr, node, f"rm -f {shlex.quote(path)}", timeout=10)
+            except Exception:
+                pass
 
     def set_phase(self, phase, error=None):
         if self.phase in self.phase_times:
@@ -199,6 +220,7 @@ class V2PMigrationTask:
             self.downtime_end = datetime.now()
             self.total_downtime_seconds = round((self.downtime_end - self.downtime_start).total_seconds(), 1)
         if error:
+            error = self._redact(error)
             self.error = error; self.status = 'failed'
             self.log(f"FAILED: {error}")
         if phase == 'completed':
@@ -285,8 +307,9 @@ class V2PMigrationTask:
         self._cutover_cancelled = False
         self.set_phase('awaiting_confirmation')
         self.log("=== HOLD FOR CONFIRMATION: disks are staged and the source VM is STILL "
-                 "RUNNING on VMware. The switchover (suspend source → start target) will "
-                 "happen only when you confirm. Drain traffic / flip DNS now, then commit. ===")
+                 "RUNNING on ESXi. The switchover (stop the source, carry over what changed, "
+                 "start the target) happens only when you confirm. Drain traffic / flip DNS "
+                 "now, then commit. ===")
         try:
             broadcast_sse('vmware_migration', {
                 'id': self.id, 'phase': self.phase, 'status': self.status,
@@ -341,6 +364,42 @@ class V2PMigrationTask:
                 'esxi_datastore': self.esxi_datastore,
             },
         }
+
+
+def _node_hkc():
+    """StrictHostKeyChecking for the ssh/sshfs the PVE node runs against the ESXi host.
+
+    NS Oct 2026 (#1112) - same rule as the XHM path: strict host keys travel with these
+    commands. They check against the node's own known_hosts, which a strict setup seeds
+    the way it seeds ours."""
+    from pegaprox.utils.ssh_security import strict_host_keys_enabled
+    return 'yes' if strict_host_keys_enabled() else 'accept-new'
+
+
+# what mktemp in _write_node_script prints, and nothing else
+_NODE_SCRIPT_RE = re.compile(r'/tmp/v2p-[a-z0-9-]+-[A-Za-z0-9]{10}')
+
+
+def _write_node_script(pve_mgr, node, body, tag, timeout=15):
+    """Write `body` to a new root-only file on the node and return its path, or None.
+
+    NS Oct 2026 (#1123) - the helper scripts went to fixed names in /tmp (the VMID, or the
+    task id the mount next to them gives away) and ran in a later call. A local account
+    that created the name first got its own file run as root; with protected_regular the
+    root write fails and the run still went ahead. mktemp makes a new 0600 file nobody else
+    can swap in sticky /tmp, and nothing runs when the write did not happen. Writing and
+    running stay two calls: some bodies carry the ESXi password, and a command line is
+    readable by every local account for as long as it runs.
+    """
+    tag = re.sub(r'[^a-z0-9-]', '', str(tag).lower()) or 'script'
+    if not body.endswith('\n'):
+        body += '\n'
+    rc, out, _ = _pve_node_exec(pve_mgr, node,
+        f"umask 077; f=$(mktemp /tmp/v2p-{tag}-XXXXXXXXXX) && "
+        f"cat > \"$f\" << 'V2P_NODE_SCRIPT' && echo \"$f\"\n{body}V2P_NODE_SCRIPT\n",
+        timeout=timeout)
+    path = (str(out or '').strip().splitlines() or [''])[-1].strip()
+    return path if rc == 0 and _NODE_SCRIPT_RE.fullmatch(path) else None
 
 
 def _run_v2p_migration(task):
@@ -822,11 +881,11 @@ def _run_v2p_migration(task):
         v2p_tmpdir = str(tmpdir_out or '').strip() or '/var/tmp'
         task.log(f"TMPDIR for subprocesses: {v2p_tmpdir}")
 
-        _pve_node_exec(pve_mgr, task.target_node,
-            "grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null || "
-            "sed -i 's/^#user_allow_other/user_allow_other/' /etc/fuse.conf 2>/dev/null || "
-            "echo 'user_allow_other' >> /etc/fuse.conf",
-            timeout=10)
+        # NS Oct 2026 (#1117) - the datastore mount below is root's alone now: no allow_other,
+        # and no user_allow_other switched on in /etc/fuse.conf for every account on the
+        # node. allow_other let any local account read the whole datastore with the ESXi
+        # login's rights for the length of the run. Whatever reads the mount is root
+        # (qemu-img, dd, qemu-nbd, kvm), and root owns the mount.
 
         # NS: resolve datastore symlink — /vmfs/volumes/<name> -> /vmfs/volumes/<uuid>
         # SSHFS can't mount symlinks, need the real path
@@ -858,9 +917,10 @@ def _run_v2p_migration(task):
         #     (avoids thousands of stat() calls -- HUGE reduction in FUSE overhead)
         #   negative_timeout=3600: cache "file not found" for 1h
         #   no_check_root: skip root dir check (faster mount)
+        _hk = _node_hkc()
         sshfs_ssh_opts = (
-            "StrictHostKeyChecking=accept-new,"
-            "allow_other,reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,"
+            f"StrictHostKeyChecking={_hk},"
+            "reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,"
             "cache=yes,kernel_cache,"
             "max_read=1048576,max_write=1048576,big_writes,large_read,"
             "entry_timeout=3600,negative_timeout=3600,attr_timeout=3600,"
@@ -888,8 +948,8 @@ def _run_v2p_migration(task):
             mount_cmd2 = (
                 f"mkdir -p {mnt_path} && "
                 f"printf '%s' {safe_pass} | sshfs -o password_stdin,"
-                f"StrictHostKeyChecking=accept-new,"
-                f"allow_other,reconnect,ServerAliveInterval=15,"
+                f"StrictHostKeyChecking={_hk},"
+                f"reconnect,ServerAliveInterval=15,"
                 f"cache=yes,kernel_cache,"
                 f"max_read=1048576,big_writes,large_read,"
                 f"entry_timeout=3600,attr_timeout=3600 "
@@ -900,8 +960,8 @@ def _run_v2p_migration(task):
             mount_cmd3 = (
                 f"mkdir -p {mnt_path} && "
                 f"printf '%s' {safe_pass} | sshfs -o password_stdin,"
-                f"StrictHostKeyChecking=accept-new,"
-                f"allow_other,reconnect,ServerAliveInterval=15,"
+                f"StrictHostKeyChecking={_hk},"
+                f"reconnect,ServerAliveInterval=15,"
                 f"cache=yes "
                 f"{esxi_user}@{esxi_host}:{shlex.quote(ds_mount_path)} {mnt_path}")
             rc, out, err = _pve_node_exec(pve_mgr, task.target_node, mount_cmd3, timeout=30)
@@ -1140,13 +1200,15 @@ def _run_v2p_migration(task):
             return
         
         if task.transfer_mode in ('vmkfstools_clone', 'auto'):
-            # NS Jun 2026 — VDDK-free near-zero-downtime. We snapshot the running VM (freezes the
+            # NS Jun 2026 - VDDK-free live clone. We snapshot the running VM (freezes the
             # base, writes go to the delta), then vmkfstools-clone the *frozen base* ON the ESXi
             # host. vmkfstools is vmkernel-aware, so it reads the active-chain base extent that a
             # raw dd/HTTP/SSHFS open cannot ("Device or resource busy"). The static clone then
             # rides PegaProx's existing transfer + per-storage import path (CEPH/RBD krbd, LVM,
             # LVM-thin, dir/qcow2) verbatim — so this branch is just the clone front-end + cutover.
-            # v1 = single snapshot + short cutover (no iterative CBT delta yet).
+            # MK Oct 2026 (#1124) - v1 dropped every write made after the snapshot, the hold
+            # included. The switchover now stops the source, folds the snapshot back and copies
+            # the blocks that differ, like the pre-sync flow below. Downtime grows with disk size.
             # NS Jun 2026 — this is now ALSO the implicit path for transfer_mode='auto' (Nico:
             # auto should prefer the clone). For 'auto' we fall back to the legacy pre-sync flow
             # below if the source can't be snapshotted/cloned — raised as _VmkFallback BEFORE any
@@ -1154,15 +1216,63 @@ def _run_v2p_migration(task):
             _vmk_auto = (task.transfer_mode == 'auto')
             class _VmkFallback(Exception):
                 pass
-            task.log(f"=== TRANSFER MODE: {'Auto -> vmkfstools_clone' if _vmk_auto else 'vmkfstools_clone'} (VDDK-free near-zero downtime) ===")
+            class _VmkSwitchoverFailed(Exception):
+                pass
+            task.log(f"=== TRANSFER MODE: {'Auto -> vmkfstools_clone' if _vmk_auto else 'vmkfstools_clone'} (VDDK-free live clone) ===")
             clone_bases = []  # (datastore, vm_dir, basename) to rm on every exit path (#561: per-disk)
+            src_stopped = False        # we powered off a running source at the switchover
+            target_start_sent = False  # from here on a rollback would leave two VMs running
+            restart_cap = 3600         # how long a rollback keeps asking ESXi to start the source
 
             def _vc_cleanup_clones():
                 for _cb_ds, _cb_dir, b in clone_bases:
                     try: _esxi_rm_clone(esxi_host, esxi_user, esxi_pass, _cb_ds, _cb_dir, b)
                     except Exception: pass
 
+            def _vc_drop_clone_snap():
+                try:
+                    snaps = vmware_mgr.get_snapshots(task.vm_id)
+                    if 'error' in snaps:
+                        return {'error': f"snapshot listing failed: {snaps['error']}"}
+                    for s in (snaps.get('data') or []):
+                        if s.get('name') == '_pegaprox_clone_snap':
+                            return vmware_mgr.delete_snapshot(task.vm_id, str(s.get('snapshot') or s.get('id') or ''))
+                except Exception as _de:
+                    return {'error': str(_de)}
+                return None
+
+            def _vc_replay_source(i, ds_i, vmdir_i, desc_file):
+                """(flat on ESXi, descriptor name for a full copy) holding disk i as it is now."""
+                base = f"/vmfs/volumes/{ds_i}/{vmdir_i}"
+                rc_d, out_d, _ = _ssh_esxi_exec(esxi_host, esxi_user, esxi_pass,
+                    f"cat {shlex.quote(base + '/' + desc_file)} 2>/dev/null", timeout=15)
+                text = str(out_d or '') if rc_d == 0 else ''
+                extents = re.findall(r'^\s*(?:RW|RDONLY)\s+\d+\s+\S+\s+"([^"]*)"', text, re.M | re.I)
+                if text.strip() and 'parentFileNameHint' not in text and len(extents) <= 1:
+                    flat = extents[0] if extents and validate_esxi_path_component(extents[0]) \
+                        else desc_file.replace('.vmdk', '-flat.vmdk')
+                    rc_s, out_s, _ = _ssh_esxi_exec(esxi_host, esxi_user, esxi_pass,
+                        f"stat -c '%s' {shlex.quote(base + '/' + flat)} 2>/dev/null", timeout=15)
+                    if rc_s == 0 and str(out_s or '').strip().isdigit():
+                        # the full copy derives "<name>-flat.vmdk" from the name it gets
+                        full = flat[:-len('-flat.vmdk')] + '.vmdk' if flat.endswith('-flat.vmdk') else desc_file
+                        return f"{base}/{flat}", full
+                # a delta of the VM's own snapshots (its flat is not the whole disk), a split disk
+                # or a descriptor we could not read: vmkfstools reads all of them, the source is off
+                cb_r = f"_pegaprox_replay_{task.proxmox_vmid}_{i}"
+                clone_bases.append((ds_i, vmdir_i, cb_r))
+                task.log(f"  Disk {i}: {desc_file} is not a single flat file - cloning it to read the whole disk")
+                cdesc_r, cflat_r = _esxi_vmkfstools_clone(
+                    esxi_host, esxi_user, esxi_pass, ds_i, vmdir_i, desc_file, cb_r, task=task)
+                if not cdesc_r:
+                    raise _VmkSwitchoverFailed(f'Disk {i}: could not clone {desc_file} to read what changed')
+                return cflat_r, f"{cb_r}.vmdk"
+
             try:
+                # `disks` was read at planning, so it names the file every disk used before
+                # the snapshot; the consolidation check waits for exactly those again
+                backing_before = _disk_backing_files(disks)
+
                 # --- freeze the base (VM keeps running) ---
                 task.log("Creating clone snapshot (freezes base VMDKs; VM stays up)...")
                 # quiesce=False on purpose — see the snapshot_zero note above (Tools can stall).
@@ -1263,6 +1373,7 @@ def _run_v2p_migration(task):
                 task.disk_progress = {f'disk{_i}': {'copied': 0, 'total': _c or 1, 'pct': 0, 'file': _d}
                                       for _i, (_a, _b, _d, _c) in enumerate(disk_specs)}
 
+                clone_vols = []  # (vol_id, vol_path, size) per disk, what the replay writes to
                 for i, (ds_i, vmdir_i, desc_file, disk_size) in enumerate(disk_specs):
                     dk = f'disk{i}'
                     cb = f"_pegaprox_clone_{task.proxmox_vmid}_{i}"
@@ -1339,8 +1450,104 @@ def _run_v2p_migration(task):
                         return
                     task.log(f"  Disk {i}: cloned → transferred → attached as {disk_bus}{i}")
                     task.update_progress(dk, disk_size, disk_size)
+                    clone_vols.append((vol_id, vol_path, disk_size or csz))
+
+                # checksums of the untouched copies ahead of the switchover, so it only has to
+                # read the ESXi side. Nothing writes to the target disks before the replay, the
+                # post-copy steps come after it.
+                pristine = {}
+                task.log("Checksumming the copied disks for the switchover...")
+                for i, (_vid, vol_path, size) in enumerate(clone_vols):
+                    sums = _pve_block_checksums(pve_mgr, task.target_node, vol_path, size)
+                    if sums:
+                        pristine[i] = sums
+                        task.log(f"  Disk {i}: {len(sums)} block checksums")
+                    else:
+                        task.log(f"  Disk {i}: checksums failed, the switchover computes them instead")
+
+                # #562 - optional operator-scheduled cutover. The copy finished and the source
+                # VM is still running on ESXi, so this is the clean seam to hold. A source that
+                # is off serves nothing, holding it would only add time.
+                task.await_cutover_confirmation(
+                    source_running=_vm_power_state(vmware_mgr, task.vm_id) != 'POWERED_OFF')
+
+                # --- switchover: stop the source, fold the snapshot back, copy what changed ---
+                task.set_phase('delta_sync')
+                cut_t0 = time.time()
+                src_state = _vm_power_state(vmware_mgr, task.vm_id)
+                if src_state != 'POWERED_OFF':
+                    task.log(f"=== SWITCHOVER: stopping the source VM on ESXi ({src_state or 'state unknown'}), downtime starts ===")
+                    vmware_mgr.vm_power_action(task.vm_id, 'stop')
+                    src_stopped = src_state != 'SUSPENDED'
+                    if not _wait_power_state(vmware_mgr, task.vm_id, 'POWERED_OFF', 120):
+                        raise _VmkSwitchoverFailed('The source VM did not power off within 120s')
+                    task.log("  Source VM is powered off")
+                else:
+                    task.log("=== SWITCHOVER: the source VM is already powered off ===")
+
+                # MK Oct 2026 (#1124) - an off source is folded back and compared as well. It may
+                # have been powered on and off during the copy or the hold, and what it wrote then
+                # sits in the clone snapshot's delta. Two power readings cannot tell.
+                delta_bytes = _clone_snap_delta_bytes(vmware_mgr, task.vm_id, backing_before,
+                                                      esxi_host, esxi_user, esxi_pass)
+                if delta_bytes is None:
+                    fold_limit = _consolidation_timeout(sum(s[3] for s in disk_specs))
+                    task.log(f"  The clone snapshot's delta files could not be measured, "
+                             f"allowing {fold_limit}s for the merge (from the disk size)")
+                else:
+                    fold_limit = _consolidation_timeout(delta_bytes)
+                    task.log(f"  The clone snapshot holds {delta_bytes / 1024 ** 3:.1f} GiB of changes, "
+                             f"allowing {fold_limit}s for the merge")
+                # a merge that runs out of time is still running on ESXi, a rollback has to outlast it
+                restart_cap = max(restart_cap, fold_limit)
+                task.log("Removing the clone snapshot, ESXi folds what changed since then back into the source disks...")
+                for _try in range(2):
+                    _res = _vc_drop_clone_snap()
+                    _err = str(_res.get('error') or '') if isinstance(_res, dict) else ''
+                    if _err:
+                        task.log(f"  Snapshot removal reported: {_err}")
+                    if not _err or 'timed out' in _err.lower():
+                        break
+                    if _try == 0:
+                        time.sleep(10)
+                # a timed-out remove keeps consolidating on ESXi, any other error gets a short look
+                _limit = 120 if _err and 'timed out' not in _err.lower() else fold_limit
+                if not _wait_clone_snap_consolidated(vmware_mgr, task.vm_id, backing_before, _limit):
+                    raise _VmkSwitchoverFailed(
+                        f'The clone snapshot was not consolidated within {_limit}s (still listed, or a '
+                        f'disk is not back on its own file), nothing was read from the source')
+                task.log("  Snapshot consolidated, every disk is back on its own file")
+
+                task.log("=== Carrying over what changed on the source since the snapshot ===")
+                for i, (ds_i, vmdir_i, desc_file, _cap) in enumerate(disk_specs):
+                    dk = f'disk{i}'
+                    vol_id, vol_path, size = clone_vols[i]
+                    src_flat, full_desc = _vc_replay_source(i, ds_i, vmdir_i, desc_file)
+                    task.log(f"Disk {i}: comparing [{ds_i}] {vmdir_i}/{os.path.basename(src_flat)} with {vol_id}")
+                    if not _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
+                                              src_flat, vol_path, size, i, pve_checksums=pristine.get(i)):
+                        task.log(f"  Disk {i}: block replay failed, copying the whole disk again")
+                        _pve_node_exec(pve_mgr, task.target_node,
+                            f"qm set {task.proxmox_vmid} --delete {disk_bus}{i} 2>/dev/null", timeout=15)
+                        _pve_node_exec(pve_mgr, task.target_node,
+                            f"pvesm free {shlex.quote(vol_id)} 2>/dev/null", timeout=30)
+                        vol_id, vol_path = _ssh_pipe_transfer(
+                            pve_mgr, task, esxi_host, esxi_user, esxi_pass,
+                            ds_i, vmdir_i, full_desc, i)
+                        if not vol_id:
+                            raise _VmkSwitchoverFailed(f'Disk {i}: the block replay and the full copy both failed')
+                        rc_a, out_a, _ = _pve_node_exec(pve_mgr, task.target_node,
+                            f"qm set {task.proxmox_vmid} --{disk_bus}{i} {vol_id}{task._disk_attach_opts()} 2>&1", timeout=30)
+                        if rc_a != 0:
+                            raise _VmkSwitchoverFailed(
+                                f'qm set --{disk_bus}{i} {vol_id} -> {str(out_a or "").strip()[-300:]}')
+                        clone_vols[i] = (vol_id, vol_path, size)
+                        task.log(f"  Disk {i}: copied again as {vol_id}")
+                    task.update_progress(dk, task.disk_progress[dk]['total'], task.disk_progress[dk]['total'])
 
                 # --- post-copy fix chain (mirror offline/snapshot_zero) ---
+                # MK Oct 2026 (#1124) - after the replay: the UEFI loader, the VirtIO drivers and
+                # the qcow2 move write to the target disks, a replay after them would undo that
                 _pve_node_exec(pve_mgr, task.target_node,
                     f"qm set {task.proxmox_vmid} --boot order={disk_bus}0 2>&1", timeout=15)
                 if bios == 'ovmf':
@@ -1358,40 +1565,30 @@ def _run_v2p_migration(task):
                 try: _maybe_convert_disks_to_qcow2(pve_mgr, task)
                 except Exception as _qe: task.log(f"  qcow2 convert skipped: {_qe}")
 
-                # #562 — optional operator-scheduled cutover. The clone finished and the
-                # source VM is still running on ESXi, so this is the clean seam to hold.
-                task.await_cutover_confirmation()
-                # --- cutover (short downtime: stop source, start target) ---
-                # v1 has no delta replay; the delta_sync→cutover transitions just bracket the
-                # cutover so the downtime metric (downtime_start/end) is recorded.
-                task.set_phase('delta_sync')
                 task.set_phase('cutover')
-                cut_t0 = time.time()
-                task.log("=== CUTOVER: suspending source, starting target ===")
-                pwr = vmware_mgr.vm_power_action(task.vm_id, 'suspend')
-                if 'error' in pwr:
-                    task.log(f"  Suspend failed ({pwr.get('error')}), powering off instead")
-                    vmware_mgr.vm_power_action(task.vm_id, 'stop')
-                else:
-                    task._source_suspended = True
-                time.sleep(3)
+                target_running = False
                 if task.start_after:
-                    pve_mgr._api_post(
-                        f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
-                        f"/qemu/{task.proxmox_vmid}/status/start")
+                    target_start_sent = True
+                    task.log("Starting the target VM on Proxmox...")
+                    # MK Oct 2026 (#1124) - _api_post hands back an error answer instead of raising,
+                    # and the start task can still fail after it. Only a VM that runs counts.
+                    outcome, why = _start_target_vm(pve_mgr, task)
+                    if outcome == 'failed':
+                        target_start_sent = False  # Proxmox said no and nothing runs: the source may come back
+                        raise _VmkSwitchoverFailed(f'The target VM did not start: {why}')
+                    if outcome != 'running':
+                        raise _VmkSwitchoverFailed(f'The target VM start did not settle: {why}')
+                    target_running = True
+                    task.log("  Target VM is running on Proxmox")
                 actual_downtime = time.time() - cut_t0
                 task.total_downtime_seconds = actual_downtime
-                task.log(f"=== CUTOVER DONE (downtime ~{actual_downtime:.1f}s) ===")
+                task.log(f"=== SWITCHOVER DONE (downtime {actual_downtime:.1f}s) ===")
 
                 # --- cleanup (clone artifacts + snapshot + source) ---
+                # the source is off by now: stopped above, or it was never running
                 task.set_phase('verify')
                 time.sleep(3)
                 task.set_phase('cleanup')
-                try:
-                    vmware_mgr.vm_power_action(task.vm_id, 'stop')
-                    time.sleep(2)
-                except Exception:
-                    pass
                 _vc_cleanup_clones()
                 try:
                     sl = vmware_mgr.get_snapshots(task.vm_id).get('data', []) or []
@@ -1403,22 +1600,45 @@ def _run_v2p_migration(task):
                 try: vmware_mgr.delete_migration_snapshot(task.vm_id)
                 except: pass
                 _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
-                if task.remove_source:
+                if task.remove_source and target_running:
                     task.log("Deleting source VM on ESXi (remove_source=true)")
                     try: vmware_mgr.delete_vm(task.vm_id)
                     except Exception as _e: task.log(f"  delete_vm failed: {_e}")
+                elif task.remove_source:
+                    task.log("remove_source is set, but the target VM was not started here - the source VM "
+                             "stays on ESXi, delete it there once the target runs")
 
                 task.set_phase('completed')
                 task.log(f"COMPLETED (vmkfstools_clone, downtime ~{actual_downtime:.1f}s): "
                          f"{task.vm_name} -> VMID {task.proxmox_vmid}")
                 return
+            except V2PCutoverCancelled:
+                # the hold comes before the source is touched. The outer handler marks the run
+                # cancelled and drops the clone snapshot, the clones go here
+                _vc_cleanup_clones()
+                raise
             except _VmkFallback:
                 # auto-mode: clone path bailed before any irreversible work — drop through to
                 # the legacy auto pre-sync/live-mirror flow below (do NOT return).
                 pass
             except Exception as _vce:
-                task.set_phase('failed', f'vmkfstools_clone exception: {_vce}')
+                msg = str(_vce) if isinstance(_vce, _VmkSwitchoverFailed) else f'vmkfstools_clone exception: {_vce}'
+                # MK Oct 2026 (#1124) - we stopped the source and the target does not run: bring
+                # the source back, the target stays off. A start that may have gone through leaves
+                # both alone, two running copies would be worse than two stopped ones.
+                if target_start_sent:
+                    msg += (f' - the target VM {task.proxmox_vmid} may be running on Proxmox, the source VM '
+                            f'stays off; check which one runs before starting the other')
+                elif src_stopped:
+                    if _restart_source(vmware_mgr, task.vm_id, task, restart_cap, backing_before):
+                        msg += ' - the source VM was powered back on, the target VM stays stopped'
+                    else:
+                        msg += ' - the source VM did not come back up, start it on ESXi; the target VM stays stopped'
+                task.set_phase('failed', msg)
                 _vc_cleanup_clones()
+                _res = _vc_drop_clone_snap()
+                if isinstance(_res, dict) and _res.get('error'):
+                    task.log(f"  Clone snapshot not removed ({_res['error']}), check _pegaprox_clone_snap on ESXi")
                 try: vmware_mgr.delete_migration_snapshot(task.vm_id)
                 except: pass
                 _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
@@ -1752,18 +1972,12 @@ def _run_v2p_migration(task):
             # Normal path: VM still running, do checksums + delta sync
             task.log("Pre-computing Proxmox checksums (VM still running)...")
             presync_checksums = {}
-            DELTA_BS = 256 * 1024 * 1024  # Must match _delta_sync_blocks
             for i, (vol_id, vol_path, esxi_flat, flat_size) in enumerate(presync_volumes):
-                num_blocks = (flat_size + DELTA_BS - 1) // DELTA_BS
+                num_blocks = (flat_size + DELTA_BLOCK_SIZE - 1) // DELTA_BLOCK_SIZE
                 task.log(f"  Checksumming disk {i}: {num_blocks} blocks...")
-                pve_script = (
-                    f"i=0; while [ $i -lt {num_blocks} ]; do "
-                    f"dd if={shlex.quote(vol_path)} bs={DELTA_BS} skip=$i count=1 2>/dev/null | md5sum | cut -d' ' -f1; "
-                    f"i=$((i+1)); done"
-                )
-                rc_p, out_p, _ = _pve_node_exec(pve_mgr, task.target_node, pve_script, timeout=600)
-                if rc_p == 0 and out_p:
-                    presync_checksums[i] = [s.strip() for s in out_p.strip().split('\n') if s.strip()]
+                sums = _pve_block_checksums(pve_mgr, task.target_node, vol_path, flat_size)
+                if sums:
+                    presync_checksums[i] = sums
                     task.log(f"  Disk {i}: {len(presync_checksums[i])} checksums computed")
                 else:
                     task.log(f"  Disk {i}: checksum failed, will do full comparison during downtime")
@@ -2051,10 +2265,11 @@ def _register_uefi_fallback_loader(pve_mgr, task):
             "mkdir -p \"$MNT/EFI/BOOT\"\n"
             "cp -f \"$MGR\" \"$DST\" && sync && echo 'fallback loader installed'\n"
         )
-        sf = f"/tmp/v2p-efi-fallback-{task.proxmox_vmid}.sh"
-        _pve_node_exec(pve_mgr, task.target_node,
-            f"cat > {sf} << 'EOFSCRIPT'\n{script}EOFSCRIPT\nchmod +x {sf}",
-            timeout=15)
+        sf = _write_node_script(pve_mgr, task.target_node, script,
+                                f"efi-fallback-{task.proxmox_vmid}")
+        if not sf:
+            task.log("EFI fallback loader skipped (non-fatal): the script could not be written")
+            return
         rc, out, err = _pve_node_exec(pve_mgr, task.target_node,
             f"bash {sf} 2>&1; rm -f {sf}", timeout=120)
         out_str = str(out or '').strip()
@@ -2201,6 +2416,10 @@ def _inject_virtio_drivers(pve_mgr, task):
     # 2) Locate ISO. User-set path wins.
     iso_candidates = []
     if getattr(task, 'virtio_iso_path', ''):
+        from pegaprox.utils.sanitization import validate_node_iso_path
+        if not validate_node_iso_path(task.virtio_iso_path):
+            task.log("[VirtIO] ✗ virtio_iso_path must be an absolute path to an .iso file - skipping")
+            return False
         iso_candidates.append(task.virtio_iso_path)
     iso_candidates += [
         "/var/lib/vz/template/iso/virtio-win.iso",
@@ -2261,7 +2480,9 @@ def _inject_virtio_drivers(pve_mgr, task):
         "  rm -rf \"$TMP\"; "
         "}\n"
         "trap cleanup EXIT\n"
-        "mount -o ro,loop \"$ISO\" \"$ISO_MNT\" || { echo 'ISO_MOUNT_FAILED'; exit 3; }\n"
+        # NS Oct 2026 (#1090) - CD filesystems only: a disk image under an .iso name is
+        # refused instead of handed to the kernel's other filesystem parsers as root
+        "mount -t iso9660,udf -o ro,loop \"$ISO\" \"$ISO_MNT\" || { echo 'ISO_MOUNT_FAILED'; exit 3; }\n"
         # ── Expose target disk as a partitioned block device (BLK) ──
         "BLK=\"\"\n"
         "case \"$STYPE\" in\n"
@@ -2411,7 +2632,10 @@ def _inject_virtio_drivers(pve_mgr, task):
         "done\n"
         "[ \"$COPIED\" -gt 0 ] || { echo 'NO_DRIVERS_COPIED'; exit 8; }\n"
         # Inject SYSTEM-hive registry: CriticalDeviceDatabase + Services for storage drivers.
-        # We always target ControlSet001 (the most common; Windows fixes Select on next boot).
+        # MK Oct 2026 (#823) - into the control set(s) Select names, not a fixed
+        # ControlSet001. Default is what the next boot loads, Current what the last boot
+        # used (and what virt-v2v writes to); normally the same set. A set that is not
+        # there is never created - Windows would not boot from it anyway.
         # NS Apr 2026 — using python3-hivex (well-supported on Debian/Proxmox) instead of
         # hivexregedit which Debian's libhivex-bin doesn't ship.
         "SYSTEM_HIVE=\"$WIN_MNT/$WDIR/System32/config/SYSTEM\"\n"
@@ -2446,38 +2670,77 @@ def _inject_virtio_drivers(pve_mgr, task):
         "have_vioscsi = os.path.exists(drv_root + '/vioscsi.sys')\n"
         "print(f'HIVEX have_viostor={have_viostor} have_vioscsi={have_vioscsi}')\n"
         "root = h.root()\n"
-        "cs = navigate(root, ['ControlSet001'])\n"
-        "services = navigate(cs, ['Services'])\n"
-        "control = navigate(cs, ['Control'])\n"
-        "cdb = navigate(control, ['CriticalDeviceDatabase'])\n"
+        "def control_sets():\n"
+        "    sel = h.node_get_child(root, 'Select')\n"
+        "    picks = {}\n"
+        "    if sel is not None:\n"
+        "        for v in h.node_values(sel):\n"
+        "            k = h.value_key(v).lower()\n"
+        "            if k in ('default', 'current'):\n"
+        "                try: picks[k] = h.value_dword(v)\n"
+        "                except Exception: pass\n"
+        "    names = []\n"
+        "    for n in (picks.get('default'), picks.get('current')):\n"
+        "        if not n or not 0 < n < 1000: continue\n"
+        "        name = f'ControlSet{n:03d}'\n"
+        "        if name not in names and h.node_get_child(root, name) is not None:\n"
+        "            names.append(name)\n"
+        "    if not names and h.node_get_child(root, 'ControlSet001') is not None:\n"
+        "        names = ['ControlSet001']\n"
+        "    return names\n"
+        "cs_names = control_sets()\n"
+        "print(f'HIVEX control sets: {cs_names}')\n"
+        "if not cs_names:\n"
+        "    print('HIVEX no ControlSet in this SYSTEM hive - nothing written')\n"
+        "    sys.exit(3)\n"
+        # MK Oct 2026 (#823) - BusType and DmaRemappingCompatible as each driver's own INF
+        # writes them (viostor 1, vioscsi 0x0A); vioscsi with 1 stops at
+        # INACCESSIBLE_BOOT_DEVICE. This alone does not make Win8+ bind vioscsi at early
+        # boot (it ignores the CriticalDeviceDatabase, and no DriverDatabase entries are
+        # written), so the scsihw auto-switch further down stays off.
         "_svcs = []\n"
-        "if have_viostor: _svcs.append(('viostor', 0x58, 'system32\\\\drivers\\\\viostor.sys'))\n"
-        "if have_vioscsi: _svcs.append(('vioscsi', 0x59, 'system32\\\\drivers\\\\vioscsi.sys'))\n"
-        "for svc, tag, img in _svcs:\n"
-        "    svc_node = navigate(services, [svc])\n"
-        "    set_expand_sz(svc_node, 'ImagePath', img)\n"
-        "    set_dword(svc_node, 'Type', 1)\n"
-        "    set_dword(svc_node, 'Start', 0)\n"
-        "    set_sz(svc_node, 'Group', 'SCSI miniport')\n"
-        "    set_dword(svc_node, 'ErrorControl', 1)\n"
-        "    set_dword(svc_node, 'Tag', tag)\n"
-        "    params = navigate(svc_node, ['Parameters'])\n"
-        "    set_dword(params, 'BusType', 1)\n"
-        "    pnp = navigate(params, ['PnpInterface'])\n"
-        "    set_dword(pnp, '5', 1)\n"
+        "if have_viostor: _svcs.append(('viostor', 0x58, 'system32\\\\drivers\\\\viostor.sys', 0x01))\n"
+        "if have_vioscsi: _svcs.append(('vioscsi', 0x59, 'system32\\\\drivers\\\\vioscsi.sys', 0x0A))\n"
         "GUID = '{4D36E97B-E325-11CE-BFC1-08002BE10318}'\n"
+        # The ids the INFs name, transitional (1001/1004) and modern (1042/1048), since
+        # the machine type decides which one the guest sees. 1041 is virtio-net (netkvm)
+        # and was mapped to vioscsi here by mistake.
         "_pci = []\n"
         "if have_viostor:\n"
         "    _pci += [('pci#ven_1af4&dev_1001', 'viostor'),\n"
-        "             ('pci#ven_1af4&dev_1001&subsys_00021af4&rev_00', 'viostor')]\n"
+        "             ('pci#ven_1af4&dev_1001&subsys_00021af4', 'viostor'),\n"
+        "             ('pci#ven_1af4&dev_1001&subsys_00021af4&rev_00', 'viostor'),\n"
+        "             ('pci#ven_1af4&dev_1042', 'viostor'),\n"
+        "             ('pci#ven_1af4&dev_1042&subsys_11001af4', 'viostor'),\n"
+        "             ('pci#ven_1af4&dev_1042&subsys_11001af4&rev_01', 'viostor')]\n"
         "if have_vioscsi:\n"
         "    _pci += [('pci#ven_1af4&dev_1004', 'vioscsi'),\n"
         "             ('pci#ven_1af4&dev_1004&subsys_00081af4', 'vioscsi'),\n"
-        "             ('pci#ven_1af4&dev_1041', 'vioscsi')]\n"
-        "for pci_id, svc in _pci:\n"
-        "    cd = navigate(cdb, [pci_id])\n"
-        "    set_sz(cd, 'ClassGUID', GUID)\n"
-        "    set_sz(cd, 'Service', svc)\n"
+        "             ('pci#ven_1af4&dev_1004&subsys_00081af4&rev_00', 'vioscsi'),\n"
+        "             ('pci#ven_1af4&dev_1048', 'vioscsi'),\n"
+        "             ('pci#ven_1af4&dev_1048&subsys_11001af4', 'vioscsi'),\n"
+        "             ('pci#ven_1af4&dev_1048&subsys_11001af4&rev_01', 'vioscsi')]\n"
+        "for cs_name in cs_names:\n"
+        "    cs = h.node_get_child(root, cs_name)\n"
+        "    services = navigate(cs, ['Services'])\n"
+        "    cdb = navigate(cs, ['Control', 'CriticalDeviceDatabase'])\n"
+        "    for svc, tag, img, bus_type in _svcs:\n"
+        "        svc_node = navigate(services, [svc])\n"
+        "        set_expand_sz(svc_node, 'ImagePath', img)\n"
+        "        set_dword(svc_node, 'Type', 1)\n"
+        "        set_dword(svc_node, 'Start', 0)\n"
+        "        set_sz(svc_node, 'Group', 'SCSI miniport')\n"
+        "        set_dword(svc_node, 'ErrorControl', 1)\n"
+        "        set_dword(svc_node, 'Tag', tag)\n"
+        "        params = navigate(svc_node, ['Parameters'])\n"
+        "        set_dword(params, 'BusType', bus_type)\n"
+        "        set_dword(params, 'DmaRemappingCompatible', 0)\n"
+        "        pnp = navigate(params, ['PnpInterface'])\n"
+        "        set_dword(pnp, '5', 1)\n"
+        "    for pci_id, svc in _pci:\n"
+        "        cd = navigate(cdb, [pci_id])\n"
+        "        set_sz(cd, 'ClassGUID', GUID)\n"
+        "        set_sz(cd, 'Service', svc)\n"
         "h.commit(None)\n"
         "print('hivex commit OK')\n"
         "PYEOF\n"
@@ -2563,10 +2826,10 @@ def _inject_virtio_drivers(pve_mgr, task):
         "echo 'INJECTION_OK'\n"
     )
 
-    sf = f"/tmp/v2p-virtio-inject-{task.proxmox_vmid}.sh"
-    _pve_node_exec(pve_mgr, node,
-        f"cat > {sf} << 'EOFSCRIPT'\n{script}EOFSCRIPT\nchmod +x {sf}",
-        timeout=15)
+    sf = _write_node_script(pve_mgr, node, script, f"virtio-inject-{task.proxmox_vmid}")
+    if not sf:
+        task.log("[VirtIO] ✗ the injection script could not be written on the node")
+        return False
 
     # Detect version first via a separate quick run (so we can pass VIRTIO_SUBDIR cleanly)
     # Simpler path: do a probe-only run then a real run. But to keep cost down we just
@@ -2660,6 +2923,11 @@ def _ssh_esxi_exec(esxi_host, esxi_user, esxi_pass, cmd, timeout=30):
     """
     import os, subprocess, shlex as _sh
     from pegaprox.utils.ssh_security import cli_hostkey_opts
+    from pegaprox.utils.ssh import ssh_login_args
+    try:
+        login = ssh_login_args(esxi_user, esxi_host)
+    except ValueError as e:
+        return 1, '', str(e)
     _hkc, _kh = cli_hostkey_opts()
     # MK Jul 2026 — feed the ESXi password via SSHPASS env (`sshpass -e`), never
     # `-p <pw>` on argv: the argv of a running process is world-readable in
@@ -2673,10 +2941,12 @@ def _ssh_esxi_exec(esxi_host, esxi_user, esxi_pass, cmd, timeout=30):
         full.extend(controlmaster_args(esxi_host, esxi_user))
     except Exception:
         pass  # graceful fallback
-    full.extend([f'{esxi_user}@{esxi_host}', cmd])
+    full.extend(login + [cmd])
     try:
-        r = subprocess.run(full, capture_output=True, timeout=timeout, text=True,
-                           env={**os.environ, 'SSHPASS': esxi_pass or ''})
+        # the transport guard of an automatic group, and the bound of a node command (#625)
+        from pegaprox.core.ha_transport import node_cmd
+        r = node_cmd(full, capture_output=True, timeout=timeout, text=True,
+                     env={**os.environ, 'SSHPASS': esxi_pass or ''}, host=esxi_host)
         return r.returncode, r.stdout, r.stderr
     except Exception as e:
         return 1, '', str(e)
@@ -2740,6 +3010,200 @@ def _esxi_rm_clone(esxi_host, esxi_user, esxi_pass, datastore, vm_dir, clone_bas
         timeout=30)
 
 
+def _vm_power_state(vmware_mgr, vm_id):
+    """'POWERED_ON', 'POWERED_OFF', 'SUSPENDED', or '' when ESXi did not say."""
+    try:
+        return str((vmware_mgr.get_vm(vm_id).get('data') or {}).get('power_state') or '')
+    except Exception:
+        return ''
+
+
+def _wait_power_state(vmware_mgr, vm_id, want, timeout, poll=2):
+    deadline = time.monotonic() + timeout
+    while _vm_power_state(vmware_mgr, vm_id) != want:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll)
+    return True
+
+
+def _disk_backing_files(disks):
+    """{disk key: '[ds] dir/file.vmdk'} from get_vm_disks_for_export's disk list."""
+    return {(d.get('key') or f'#{i}'): (d.get('vmdk_file') or '').strip()
+            for i, d in enumerate(disks or [])}
+
+
+def _clone_snap_consolidated(vmware_mgr, vm_id, backing_before):
+    """True once _pegaprox_clone_snap is gone and every disk runs on the file it used before
+    the snapshot again. A listing that fails reads as not yet."""
+    try:
+        snaps = vmware_mgr.get_snapshots(vm_id)
+        if 'error' in snaps or any(s.get('name') == '_pegaprox_clone_snap'
+                                   for s in (snaps.get('data') or [])):
+            return False
+        now = vmware_mgr.get_vm_disks_for_export(vm_id)
+        if 'error' in now:
+            return False
+        files = _disk_backing_files((now.get('data') or {}).get('disks'))
+    except Exception:
+        return False
+    return bool(backing_before) and all(files.get(k) == f for k, f in backing_before.items())
+
+
+def _consolidation_timeout(merge_bytes):
+    # the remove call gives up after 120s while ESXi keeps folding the delta back. Sized from
+    # what there is to merge at a slow 10 MiB/s (busy NFS or iSCSI), 10 min to 24 h; a 1 h
+    # cap ran out on a large delta while ESXi was still at it.
+    return min(86400, max(600, int(merge_bytes or 0) // (10 * 1024 ** 2)))
+
+
+def _wait_clone_snap_consolidated(vmware_mgr, vm_id, backing_before, timeout, poll=10):
+    deadline = time.monotonic() + timeout
+    while not _clone_snap_consolidated(vmware_mgr, vm_id, backing_before):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll)
+    return True
+
+
+def _clone_snap_delta_bytes(vmware_mgr, vm_id, backing_before, esxi_host, esxi_user, esxi_pass):
+    """Size of the delta files the disks run on now, i.e. what removing the clone snapshot
+    has to fold back. None when a disk could not be measured."""
+    from pegaprox.utils.sanitization import validate_esxi_path_component
+    try:
+        now = vmware_mgr.get_vm_disks_for_export(vm_id)
+        files = {} if 'error' in now else _disk_backing_files((now.get('data') or {}).get('disks'))
+    except Exception:
+        files = {}
+    if not files:
+        return None
+    total = 0
+    for key, f in files.items():
+        if f == backing_before.get(key):
+            continue
+        m = re.match(r'^\[([^\]]+)\]\s+(.+)\.vmdk$', f)
+        if not m:
+            return None
+        ds, stem = m.group(1).strip(), m.group(2).strip()
+        if not validate_esxi_path_component(ds) or \
+           not all(validate_esxi_path_component(p) for p in stem.split('/') if p):
+            return None
+        # app01-000001.vmdk keeps its data in app01-000001-sesparse.vmdk (or -delta.vmdk)
+        _rc, out, _ = _ssh_esxi_exec(esxi_host, esxi_user, esxi_pass,
+            f"stat -c '%s' {shlex.quote(f'/vmfs/volumes/{ds}/{stem}')}-*.vmdk 2>/dev/null", timeout=15)
+        sizes = [int(x) for x in str(out or '').split() if x.isdigit()]
+        if not sizes:
+            return None
+        total += sum(sizes)
+    return total
+
+
+_ESXI_BUSY_RE = re.compile(r'in progress|current state|TaskInProgress|InvalidState', re.I)
+
+
+def _restart_source(vmware_mgr, vm_id, task, cap, backing_before):
+    """Power the source back on after a switchover that failed. True once it runs.
+
+    ESXi runs one task per VM and refuses PowerOn while it still folds the clone snapshot
+    back, so a single start right after a merge that ran out of time fails. Ask again with
+    growing pauses while ESXi is busy, give up after three refusals from an idle ESXi or
+    when `cap` runs out."""
+    deadline = time.monotonic() + cap
+    pause, refused = 15, 0
+    while True:
+        if _vm_power_state(vmware_mgr, vm_id) == 'POWERED_ON':
+            return True
+        try:
+            res = vmware_mgr.vm_power_action(vm_id, 'start')
+            err = str(res.get('error') or '') if isinstance(res, dict) else ''
+        except Exception as e:
+            err = str(e)
+        # a refused start is final for this round; the next round looks at the state first
+        if not err and _wait_power_state(vmware_mgr, vm_id, 'POWERED_ON', 60):
+            return True
+        busy = bool(_ESXI_BUSY_RE.search(err)) or \
+            not _clone_snap_consolidated(vmware_mgr, vm_id, backing_before)
+        refused = 0 if busy else refused + 1
+        if refused >= 3 or time.monotonic() + pause > deadline:
+            task.log(f"  Powering the source back on failed: {err or 'it stayed powered off'}")
+            return False
+        task.log(f"  Source VM is not back on yet ({err or 'still powered off'})"
+                 f"{', ESXi is still merging the clone snapshot' if busy else ''} - asking again in {pause}s")
+        time.sleep(pause)
+        pause = min(pause * 2, 300)
+
+
+def _pve_vm_status(pve_mgr, node, vmid):
+    """'running', 'stopped', ... from status/current, or '' when Proxmox did not answer."""
+    try:
+        r = pve_mgr._api_get(f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{node}"
+                             f"/qemu/{vmid}/status/current")
+        if r.status_code == 200:
+            return str((r.json().get('data') or {}).get('status') or '')
+    except Exception:
+        pass
+    return ''
+
+
+def _start_target_vm(pve_mgr, task, task_wait=300, run_wait=30, poll=2):
+    """Start the target VM and find out whether it runs: ('running' | 'failed' | 'unknown', why).
+
+    'failed' means Proxmox refused or its start task failed and the VM is not running, so the
+    source may come back. 'unknown' is a start that may still be under way: no answer to the
+    request, or a task that did not end in time."""
+    base = f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{task.target_node}"
+    upid, refused, why = '', False, ''
+    try:
+        r = pve_mgr._api_post(f"{base}/qemu/{task.proxmox_vmid}/status/start", timeout=60)
+        if r.status_code in (200, 201):
+            upid = str((r.json() or {}).get('data') or '')
+            if not upid:
+                why = 'Proxmox answered the start without a task id'
+        else:
+            refused = True
+            why = f"Proxmox refused the start: HTTP {r.status_code} {str(getattr(r, 'text', '') or '').strip()[:300]}"
+    except Exception as e:
+        why = f"no answer to the start request ({e})"
+
+    task_failed = False
+    if upid:
+        deadline = time.monotonic() + task_wait
+        while True:
+            st = {}
+            try:
+                sr = pve_mgr._api_get(f"{base}/tasks/{upid}/status")
+                if sr.status_code == 200:
+                    st = sr.json().get('data') or {}
+            except Exception:
+                pass
+            if st.get('status') == 'stopped':
+                if str(st.get('exitstatus') or '') != 'OK':
+                    task_failed = True
+                    why = f"the start task ended with: {st.get('exitstatus') or 'no exit status'}"
+                break
+            if time.monotonic() >= deadline:
+                why = f"the start task did not end within {task_wait}s"
+                break
+            time.sleep(poll)
+
+    # whatever the answers said, the VM's own status decides
+    deadline = time.monotonic() + run_wait
+    while True:
+        state = _pve_vm_status(pve_mgr, task.target_node, task.proxmox_vmid)
+        if state == 'running':
+            return 'running', ''
+        if state == 'stopped' and (refused or task_failed):
+            return 'failed', why
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(poll)
+    if state == 'stopped' and upid and not why:
+        return 'failed', 'the start task ended but the VM is not running'
+    if task_failed:
+        return 'failed', why
+    return 'unknown', why or f"status {state or 'unreadable'}"
+
+
 def _list_delta_files_on_esxi(esxi_host, esxi_user, esxi_pass, datastore, vm_dir, descriptor_files):
     """For each disk in descriptor_files, return list of -delta.vmdk paths
     (on ESXi-side path /vmfs/volumes/<ds>/<vm_dir>/<basename>-NNNNNN-delta.vmdk),
@@ -2755,6 +3219,35 @@ def _list_delta_files_on_esxi(esxi_host, esxi_user, esxi_pass, datastore, vm_dir
         items = [l.strip() for l in (out or '').splitlines() if l.strip()]
         per_disk.append(items)
     return per_disk
+
+
+def _descriptor_extents_are_local(pve_mgr, node, sshfs_descriptor_path):
+    """True only if every extent a VMDK descriptor names is a plain file in its own directory.
+
+    NS Oct 2026 (#1106) - qemu-img/qm read the descriptor as root on the PVE node and honour
+    whatever extent paths it carries: an absolute path, a '../' escape, or a protocol prefix
+    (file:/, http:, nbd:, ssh:) lets a crafted descriptor on an attacker-served datastore copy
+    any node file or block device into the new VM's disk. A genuine ESXi descriptor names its
+    extents as bare filenames sitting next to it, so anything else is refused.
+    """
+    rc, out, _ = _pve_node_exec(pve_mgr, node,
+        f"cat {shlex.quote(sshfs_descriptor_path)} 2>/dev/null", timeout=15)
+    if rc != 0 or not str(out or '').strip():
+        return False
+    # extent line: <access> <size> <type> "<filename>" [offset]
+    extent_re = re.compile(r'^\s*(?:RW|RDONLY|NOACCESS)\s+\d+\s+\S+\s+"([^"]*)"', re.IGNORECASE)
+    saw_extent = False
+    for line in str(out).splitlines():
+        m = extent_re.match(line)
+        if not m:
+            continue
+        saw_extent = True
+        name = m.group(1)
+        # a legitimate extent is one filename in the same directory: no path, no scheme
+        if (not name or '/' in name or '\\' in name or '://' in name
+                or name.startswith('.') or ':' in name):
+            return False
+    return saw_extent
 
 
 def _qemu_map_extents_via_sshfs(pve_mgr, task, sshfs_descriptor_path):
@@ -3541,14 +4034,17 @@ def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errb
     
     # MK: Apr 2026 — always try raw first, only fall back to qcow2 if raw fails on all attempts (#222)
     # Mixed formats (raw+qcow2) cause confusion and the dd/importdisk path always uses --format raw
+    # MK Oct 2026 (#816) - and say so on every attempt. PVE 9 can put qcow2 on LVM, so an alloc
+    # without --format may hand back a .qcow2 volume that the raw dd then writes over.
     alloc_attempts = [
-        f"pvesm alloc {storage} {vmid} {fn_raw} {size_gb}G 2>&1",
-        f"pvesm alloc {storage} {vmid} {fn_raw} {size_kb} 2>&1",
         f"pvesm alloc {storage} {vmid} {fn_raw} {size_gb}G --format raw 2>&1",
-        f"pvesm alloc {storage} {vmid} {fn_raw} {size_mb}M 2>&1",
-        # last resort: qcow2 for dir/nfs storage that requires a file extension
-        f"pvesm alloc {storage} {vmid} {fn_qcow} {size_gb}G --format qcow2 2>&1",
+        f"pvesm alloc {storage} {vmid} {fn_raw} {size_kb} --format raw 2>&1",
+        f"pvesm alloc {storage} {vmid} {fn_raw} {size_mb}M --format raw 2>&1",
     ]
+    if fn_qcow != fn_raw:
+        # last resort: qcow2 for dir/nfs storage that requires a file extension.
+        # Never on block storage, that is the same qcow2-on-LVM volume again.
+        alloc_attempts.append(f"pvesm alloc {storage} {vmid} {fn_qcow} {size_gb}G --format qcow2 2>&1")
     
     last_error = ''
     for attempt_cmd in alloc_attempts:
@@ -3747,7 +4243,7 @@ def _setup_temp_ssh_key(pve_mgr, node, esxi_host, esxi_user, esxi_pass):
     
     # SSH options for key-based verification (after deployment)
     ESXI_SSH_OPTS = (
-        "-o StrictHostKeyChecking=accept-new "
+        f"-o StrictHostKeyChecking={_node_hkc()} "
         "-o LogLevel=ERROR "
         "-o HostKeyAlgorithms=+ssh-rsa,ssh-ed25519,ecdsa-sha2-nistp256 "
         "-o PubkeyAcceptedAlgorithms=+ssh-rsa,ssh-ed25519 "
@@ -3860,7 +4356,7 @@ def _setup_temp_ssh_key(pve_mgr, node, esxi_host, esxi_user, esxi_pass):
         f"  HostName {esxi_host}\n"
         f"  User {esxi_user}\n"
         f"  IdentityFile {key_path}\n"
-        f"  StrictHostKeyChecking accept-new\n"
+        f"  StrictHostKeyChecking {_node_hkc()}\n"
         f"  HostKeyAlgorithms +ssh-rsa,ssh-ed25519,ecdsa-sha2-nistp256\n"
         f"  PubkeyAcceptedAlgorithms +ssh-rsa,ssh-ed25519\n"
         f"  KexAlgorithms +diffie-hellman-group14-sha1,diffie-hellman-group14-sha256\n"
@@ -3884,7 +4380,7 @@ def _cleanup_temp_ssh_key(pve_mgr, node, key_path, esxi_host, esxi_user):
     ssh_config_path = f"/tmp/v2p-sshcfg-{key_id}"
     
     ESXI_SSH_OPTS = (
-        "-o StrictHostKeyChecking=accept-new "
+        f"-o StrictHostKeyChecking={_node_hkc()} "
         "-o LogLevel=ERROR "
         "-o HostKeyAlgorithms=+ssh-rsa,ssh-ed25519 "
         "-o PubkeyAcceptedAlgorithms=+ssh-rsa,ssh-ed25519 "
@@ -4024,7 +4520,6 @@ def _qemu_img_ssh_copy(pve_mgr, task, esxi_host, esxi_user, key_path,
     
     Speed stack:
     - Compression (lz4/gzip): 32GB disk with 8GB data → ~3-5GB over wire
-    - Netcat: no encryption overhead = full line-rate
     - conv=sparse + oflag=direct: skip zeros, bypass page cache (no VM RAM pressure)
     - nice -n19 ionice -c3: idle priority (VM I/O always has priority)
     - Parallel streams: saturate link
@@ -4035,14 +4530,13 @@ def _qemu_img_ssh_copy(pve_mgr, task, esxi_host, esxi_user, key_path,
     - xxhash verify: fast integrity check after copy
     
     Methods tried in order:
-    1. netcat + compression (fastest: no crypto + compressed)
-    2. SSH + compression + parallel streams  
-    3. SSH single stream (always works)
+    1. SSH + compression + parallel streams
+    2. SSH single stream (always works)
     
     Returns True on success, False on failure.
     """
-    import time, re, math, random
-    
+    import time, re, math
+
     BS_MB = 4
     esxi_pass = task.esxi_password
     safe_pass = shlex.quote(esxi_pass)
@@ -4057,14 +4551,14 @@ def _qemu_img_ssh_copy(pve_mgr, task, esxi_host, esxi_user, key_path,
     )
     if key_path:
         ssh_base = (
-            f"-i {key_path} -o StrictHostKeyChecking=accept-new "
+            f"-i {key_path} -o StrictHostKeyChecking={_node_hkc()} "
             f"-o ServerAliveInterval=30 -o ServerAliveCountMax=5 "
             f"{ESXI_ALGO_OPTS}"
         )
         SSH_PREFIX = "ssh"
     else:
         ssh_base = (
-            f"-o StrictHostKeyChecking=accept-new "
+            f"-o StrictHostKeyChecking={_node_hkc()} "
             f"-o ServerAliveInterval=30 -o ServerAliveCountMax=5 "
             f"{ESXI_ALGO_OPTS}"
         )
@@ -4083,27 +4577,20 @@ def _qemu_img_ssh_copy(pve_mgr, task, esxi_host, esxi_user, key_path,
     # ================================================================
     esxi_pass = task.esxi_password
     
-    # Proxmox IP
-    rc_ip, out_ip, _ = _pve_node_exec(pve_mgr, task.target_node,
-        f"ip route get {esxi_host} 2>/dev/null | grep -oP 'src \\K[0-9.]+'", timeout=5)
-    pve_ip = str(out_ip or '').strip()
-    
     # ESXi capabilities
     rc_tools, tools_out, _ = _ssh_exec(esxi_host, esxi_user, esxi_pass,
-        "echo NC=$(which nc 2>/dev/null || echo NO);"
         "echo LZ4=$(which lz4 2>/dev/null || echo NO);"
         "echo GZIP=$(which gzip 2>/dev/null || echo NO);"
         "echo PIGZ=$(which pigz 2>/dev/null || echo NO);"
         "echo XXHASH=$(which xxhsum 2>/dev/null || which xxh128sum 2>/dev/null || echo NO)",
         timeout=10)
     tools_str = str(tools_out or '')
-    esxi_nc = 'NC=/' in tools_str
     esxi_lz4 = 'LZ4=/' in tools_str
     esxi_gzip = 'GZIP=/' in tools_str
     esxi_pigz = 'PIGZ=/' in tools_str
     esxi_xxhash = 'XXHASH=/' in tools_str
     
-    task.log(f"ESXi tools: nc={esxi_nc}, lz4={esxi_lz4}, gzip={esxi_gzip}, pigz={esxi_pigz}")
+    task.log(f"ESXi tools: lz4={esxi_lz4}, gzip={esxi_gzip}, pigz={esxi_pigz}")
     
     # Proxmox: ensure tools installed
     _pve_node_exec(pve_mgr, task.target_node,
@@ -4188,67 +4675,19 @@ def _qemu_img_ssh_copy(pve_mgr, task, esxi_host, esxi_user, key_path,
         
         copied = False
         
+        # NS Oct 2026 (#1097) - the netcat method that ran first here streamed the disk
+        # unauthenticated and in clear over a listener on every interface of the node.
+        # The SSH stream below carries the same compressed pipe.
         # ==============================================================
-        # METHOD 1: Netcat + Compression -- fastest possible
-        # ==============================================================
-        if pve_ip and esxi_nc:
-            port = random.randint(49152, 65000)
-            task.log(f"  Method 1: nc+{compress_name} ({esxi_host}→{pve_ip}:{port})")
-            
-            script = f"/tmp/v2p-nc-{task.id[:8]}-d{di}.sh"
-            nc_script = f"""#!/bin/bash
-# Resource isolation: low I/O priority + high OOM score + cgroup
-{CG_EXEC}
-echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true
-ulimit -p 1048576 2>/dev/null || true
-
-# Receiver: listen → decompress → mbuffer → sparse direct-write
-# nice/ionice: idle priority so VM I/O is never impacted
-{NICE} nc -l -p {port} -w 300 \\
-  | mbuffer -q -s {BS_MB}M -m 128M 2>/dev/null \\
-  | {pve_decompress} \\
-  | {NICE} {DD_WRITE_SPARSE} of={dev_path} 2>/dev/null &
-RECV=$!
-sleep 1
-
-# Sender: read → compress → nc
-{SSH_PREFIX} {ssh_base} {esxi_user}@{esxi_host} \\
-  "{NICE} {DD_READ} if={esxi_path} 2>/dev/null | {esxi_compress} | nc -w 120 {pve_ip} {port}" &
-SEND=$!
-
-wait $SEND 2>/dev/null; S=$?
-wait $RECV 2>/dev/null; R=$?
-exit $((S + R))
-"""
-            _pve_node_exec(pve_mgr, task.target_node,
-                f"( umask 077; cat > {script} << 'NCEOF'\n{nc_script}\nNCEOF\n ); chmod 700 {script}", timeout=10)
-            
-            start_time = time.time()
-            rc_nc_r, _, _ = _pve_node_exec(pve_mgr, task.target_node,
-                f"bash {script} 2>&1", timeout=86400)
-            _pve_node_exec(pve_mgr, task.target_node, f"rm -f {script}", timeout=5)
-            elapsed = time.time() - start_time
-            
-            if rc_nc_r == 0 and elapsed > 2:
-                speed = disk_gb * 1024 / max(elapsed, 1)
-                task.log(f"  ✓ nc+{compress_name}: {elapsed:.0f}s, {speed:.0f} MB/s effective")
-                copied = True
-            else:
-                task.log(f"  nc+{compress_name} failed (rc={rc_nc_r}, {elapsed:.0f}s)")
-                _pve_node_exec(pve_mgr, task.target_node,
-                    f"kill $(lsof -ti :{port}) 2>/dev/null; true", timeout=5)
-        
-        # ==============================================================
-        # METHOD 2: SSH + compression + parallel streams
+        # METHOD 1: SSH + compression + parallel streams
         # ==============================================================
         if not copied:
             total_blocks = math.ceil(disk_total / (BS_MB * 1024 * 1024))
             NUM_STREAMS = min(4, max(1, total_blocks // 4))
             bps = math.ceil(total_blocks / NUM_STREAMS)
             
-            task.log(f"  Method 2: SSH+{compress_name} × {NUM_STREAMS} streams")
+            task.log(f"  Method 1: SSH+{compress_name} × {NUM_STREAMS} streams")
             
-            script = f"/tmp/v2p-ssh-{task.id[:8]}-d{di}.sh"
             lines = [
                 "#!/bin/bash",
                 # sec/correctness (audit): each stream below is a PIPELINE (ssh | dd), so
@@ -4285,14 +4724,15 @@ exit $((S + R))
             lines.append('for p in $pids; do wait "$p" || rc=1; done')
             lines.append('exit $rc')
             
-            _pve_node_exec(pve_mgr, task.target_node,
-                f"( umask 077; cat > {script} << 'SSHEOF'\n" + "\n".join(lines) + "\nSSHEOF\n"
-                f" ); chmod 700 {script}", timeout=10)
-            
+            script = _write_node_script(pve_mgr, task.target_node, "\n".join(lines),
+                                        f"ssh-{task.id[:8]}-d{di}", timeout=10)
+
             start_time = time.time()
-            rc_ssh, _, _ = _pve_node_exec(pve_mgr, task.target_node,
-                f"bash {script} 2>&1", timeout=86400)
-            _pve_node_exec(pve_mgr, task.target_node, f"rm -f {script}", timeout=5)
+            rc_ssh = 1
+            if script:
+                rc_ssh, _, _ = _pve_node_exec(pve_mgr, task.target_node,
+                    f"bash {script} 2>&1", timeout=86400)
+                _pve_node_exec(pve_mgr, task.target_node, f"rm -f {script}", timeout=5)
             elapsed = time.time() - start_time
             
             if rc_ssh == 0:
@@ -4303,11 +4743,10 @@ exit $((S + R))
                 task.log(f"  SSH parallel failed (rc={rc_ssh})")
         
         # ==============================================================
-        # METHOD 3: Single SSH + compression (always works)
+        # METHOD 2: Single SSH + compression (always works)
         # ==============================================================
         if not copied:
-            task.log(f"  Method 3: SSH single + {compress_name}")
-            script = f"/tmp/v2p-s-{task.id[:8]}-d{di}.sh"
+            task.log(f"  Method 2: SSH single + {compress_name}")
             if compress_name != 'none':
                 pipe = (
                     f'{NICE} {SSH_PREFIX} {ssh_fast} {esxi_user}@{esxi_host} '
@@ -4320,16 +4759,17 @@ exit $((S + R))
                     f'"{NICE} {DD_READ} if={esxi_path} 2>/dev/null" '
                     f'| {NICE} {DD_WRITE_SPARSE} of={dev_path} 2>/dev/null'
                 )
-            _pve_node_exec(pve_mgr, task.target_node,
-                f"( umask 077; cat > {script} << 'SEOF'\n#!/bin/bash\n{CG_EXEC}\n"
+            script = _write_node_script(pve_mgr, task.target_node,
+                f"#!/bin/bash\n{CG_EXEC}\n"
                 f"echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true\n"
-                f"{pipe}\nSEOF\n ); chmod 700 {script}",
-                timeout=10)
-            
+                f"{pipe}\n", f"s-{task.id[:8]}-d{di}", timeout=10)
+
             start_time = time.time()
-            rc_s, _, _ = _pve_node_exec(pve_mgr, task.target_node,
-                f"bash {script} 2>&1", timeout=86400)
-            _pve_node_exec(pve_mgr, task.target_node, f"rm -f {script}", timeout=5)
+            rc_s = 1
+            if script:
+                rc_s, _, _ = _pve_node_exec(pve_mgr, task.target_node,
+                    f"bash {script} 2>&1", timeout=86400)
+                _pve_node_exec(pve_mgr, task.target_node, f"rm -f {script}", timeout=5)
             elapsed = time.time() - start_time
             
             if rc_s == 0:
@@ -4351,7 +4791,6 @@ exit $((S + R))
         if rc_xxh == 0 and esxi_xxhash and disk_gb < 100:  # Only for disks < 100GB
             task.log(f"  Verifying integrity (xxhash)...")
             # Hash first 64MB + last 64MB (spot check, not full hash)
-            verify_script = f"/tmp/v2p-verify-{task.id[:8]}-d{di}.sh"
             verify_body = f"""#!/bin/bash
 # Hash first 64MB + last 64MB on both sides
 ESX_HASH=$({SSH_PREFIX} {ssh_base} {esxi_user}@{esxi_host} "{{
@@ -4370,12 +4809,13 @@ else
   echo "MISMATCH:ESX=$ESX_HASH PVE=$PVE_HASH"
 fi
 """
-            _pve_node_exec(pve_mgr, task.target_node,
-                f"cat > {verify_script} << 'VEOF'\n{verify_body}\nVEOF\nchmod +x {verify_script}",
-                timeout=10)
-            rc_v, out_v, _ = _pve_node_exec(pve_mgr, task.target_node,
-                f"bash {verify_script} 2>&1", timeout=120)
-            _pve_node_exec(pve_mgr, task.target_node, f"rm -f {verify_script}", timeout=5)
+            verify_script = _write_node_script(pve_mgr, task.target_node, verify_body,
+                                               f"verify-{task.id[:8]}-d{di}", timeout=10)
+            out_v = ''
+            if verify_script:
+                rc_v, out_v, _ = _pve_node_exec(pve_mgr, task.target_node,
+                    f"bash {verify_script} 2>&1", timeout=120)
+                _pve_node_exec(pve_mgr, task.target_node, f"rm -f {verify_script}", timeout=5)
             v_out = str(out_v or '').strip()
             if 'MATCH:' in v_out:
                 task.log(f"  ✓ Verified: {v_out.split(':',1)[1][:16]}")
@@ -4507,13 +4947,17 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
         drive_id = f"ssh-disk{di}"
         
         # QEMU drive spec with SSH backend + write-back cache
+        # NS Oct 2026 (#1112) - known_hosts, not none: the node's root known_hosts holds
+        # the ESXi key since the key check in _setup_temp_ssh_key, so a changed key is
+        # refused here as everywhere else. The pre-flight below asks the same way, and a
+        # host libssh will not accept falls through to the next boot method.
         drive_spec = (
             f"file.driver=ssh,"
             f"file.host={esxi_host},"
             f"file.port=22,"
             f"file.path={esxi_path},"
             f"file.user={esxi_user},"
-            f"file.host-key-check.mode=none"
+            f"file.host-key-check.mode=known_hosts"
             f"{ssh_key_opt},"
             f"format=raw,"
             f"if=none,"
@@ -4589,7 +5033,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
         f"\"file.port\":22,"
         f"\"file.path\":\"{esxi_test_path}\","
         f"\"file.user\":\"{esxi_user}\","
-        f"\"file.host-key-check.mode\":\"none\","
+        f"\"file.host-key-check.mode\":\"known_hosts\","
         f"\"file.identity-file\":\"{key_path}\"}}' 2>&1",
         timeout=20, ignore_node_backoff=True)
     qtest_out = (str(out_qtest or '') + str(err_qtest or '')).strip()
@@ -4618,29 +5062,37 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
     
     if not qemu_ssh_works:
         task.log("libssh cannot connect - trying HTTPS-backed boot (ESXi datastore)...")
-        
-        # URL-encode password for basic auth
+
         import urllib.parse
-        url_pass = urllib.parse.quote(esxi_pass, safe='')
-        url_user = urllib.parse.quote(esxi_user, safe='')
-        
+        # NS Oct 2026 (#1098) - the password sat in the URL as basic auth, so it landed in
+        # the args: line of the VM config (served by the config API) and in qemu-img error
+        # text. QEMU reads it from a root-only secret file now, gone when the task ends.
+        secret_id = 'v2pesxipw'
+        secret_path = f"/run/pegaprox-v2p-{task.id}.secret"
+        _pve_node_exec(pve_mgr, task.target_node,
+            f"umask 077; printf '%s' {shlex.quote(esxi_pass)} > {secret_path}", timeout=5)
+        task._node_secret = (pve_mgr, task.target_node, secret_path)
+        secret_obj = f"secret,id={secret_id},file={secret_path}"
+        ssl_opt = 'on' if getattr(vmware_mgr, 'ssl_verify', False) else 'off'
+
         # ESXi datastore browser URL format
         # https://host/folder/VM-dir/VM-flat.vmdk?dcPath=ha-datacenter&dsName=datastore
         ds_name = urllib.parse.quote(datastore, safe='')
-        
+
         # Test: can QEMU open the HTTPS URL?
         test_flat = descriptor_files[0].replace('.vmdk', '-flat.vmdk')
         test_url = (
-            f"https://{url_user}:{url_pass}@{esxi_host}"
+            f"https://{esxi_host}"
             f"/folder/{urllib.parse.quote(vm_dir, safe='')}"
             f"/{urllib.parse.quote(test_flat, safe='')}"
             f"?dcPath=ha-datacenter&dsName={ds_name}"
         )
-        
+
         rc_ht, out_ht, err_ht = _pve_node_exec(pve_mgr, task.target_node,
-            f"timeout 10 qemu-img info --force-share "
+            f"timeout 10 qemu-img info --force-share --object {secret_obj} "
             f"'json:{{\"file.driver\":\"https\",\"file.url\":\"{test_url}\","
-            f"\"file.sslverify\":\"off\"}}' 2>&1",
+            f"\"file.username\":\"{esxi_user}\",\"file.password-secret\":\"{secret_id}\","
+            f"\"file.sslverify\":\"{ssl_opt}\"}}' 2>&1",
             timeout=15, ignore_node_backoff=True)
         ht_out = (str(out_ht or '') + str(err_ht or '')).strip()
         
@@ -4652,7 +5104,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             for di, desc_file in enumerate(descriptor_files):
                 flat_file = desc_file.replace('.vmdk', '-flat.vmdk')
                 flat_url = (
-                    f"https://{url_user}:{url_pass}@{esxi_host}"
+                    f"https://{esxi_host}"
                     f"/folder/{urllib.parse.quote(vm_dir, safe='')}"
                     f"/{urllib.parse.quote(flat_file, safe='')}"
                     f"?dcPath=ha-datacenter&dsName={ds_name}"
@@ -4665,14 +5117,16 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             _pve_node_exec(pve_mgr, task.target_node, f"sed -i '/^args:/d' {conf_path}", timeout=5)
             _pve_node_exec(pve_mgr, task.target_node, f"sed -i '/^boot:/d' {conf_path}", timeout=5)
             
-            args_parts = []
+            args_parts = [f"-object {secret_obj}"]
             for di, flat_url in enumerate(https_flat_paths):
                 drive_id = f"sshfs-disk{di}"  # Keep same ID for drive-mirror compat
                 # QEMU HTTPS driver -- kernel-level TCP, no FUSE
                 drive_spec = (
                     f"file.driver=https,"
                     f"file.url={flat_url},"
-                    f"file.sslverify=off,"
+                    f"file.username={esxi_user},"
+                    f"file.password-secret={secret_id},"
+                    f"file.sslverify={ssl_opt},"
                     f"file.readahead=1048576,"
                     f"format=raw,"
                     f"if=none,"
@@ -4886,8 +5340,8 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             f"fusermount -u {mnt_path} 2>/dev/null; "
             f"mkdir -p {mnt_path} && "
             f"printf '%s' {safe_pass_r} | sshfs -o password_stdin,"
-            f"StrictHostKeyChecking=accept-new,"
-            f"allow_other,reconnect,ServerAliveInterval=15,"
+            f"StrictHostKeyChecking={_node_hkc()},"
+            f"reconnect,ServerAliveInterval=15,"
             f"cache=yes,{sshfs_algo} "
             f"{esxi_user}@{esxi_host}:{shlex.quote(ds_remount)} {mnt_path} 2>&1",
             timeout=20)
@@ -4930,14 +5384,11 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             boot_method = "nbd"
             # NBD bridge uses Unix sockets -- no AppArmor issues
         
-        # Ensure key file is readable by QEMU process
-        # NOTE (audit 2026-09): this leaves a passphrase-less private key world-readable on the
-        # Proxmox node for the life of the migration. The right fix is to chown it to the user
-        # QEMU actually runs as and keep 0600, but that is on the VM-start path and cannot be
-        # verified without a real migration, so it is deliberately left alone rather than
-        # changed blind. Raised with the maintainer.
-        _pve_node_exec(pve_mgr, task.target_node, f"chmod 644 {key_path} 2>/dev/null", timeout=5)
-        
+        # NS Oct 2026 (#1029) - the key stays 0600 as ssh-keygen made it. A chmod 644 here
+        # left a passphrase-less ESXi root key readable to every local account on the node
+        # for the whole run. Everything that reads it on a PVE node is root: the node
+        # commands, qemu-img, and kvm, which qemu-server starts as root.
+
         task.log(f"Starting Proxmox VM ({boot_method} backend + cache=writeback)...")
         try:
             pve_mgr._api_post(
@@ -5082,12 +5533,12 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
         task.log(f"=== DISK COPY: SSH → {task.target_storage} ===")
         task.log("(Copying disks, VM will start after copy completes)")
     
-    import math, random
+    import math
     BS_MB = 64  # 64MB blocks -- less syscall overhead than 4MB
     BS = BS_MB * 1024 * 1024
     
     bg_ssh_base = (
-        f"-i {key_path} -o StrictHostKeyChecking=accept-new "
+        f"-i {key_path} -o StrictHostKeyChecking={_node_hkc()} "
         f"-o ServerAliveInterval=30 -o ServerAliveCountMax=5 "
         f"-o HostKeyAlgorithms=+ssh-rsa,ssh-ed25519 "
         f"-o PubkeyAcceptedAlgorithms=+ssh-rsa,ssh-ed25519 "
@@ -5101,19 +5552,13 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
     )
     
     # Detect tools on ESXi
-    rc_ip2, out_ip2, _ = _pve_node_exec(pve_mgr, task.target_node,
-        f"ip route get {esxi_host} 2>/dev/null | grep -oP 'src \\K[0-9.]+'", timeout=5)
-    bg_pve_ip = str(out_ip2 or '').strip()
-    
     bg_pass = task.esxi_password
     rc_t, t_out, _ = _ssh_exec(esxi_host, esxi_user, bg_pass,
-        "echo NC=$(which nc 2>/dev/null || echo NO);"
         "echo GZIP=$(which gzip 2>/dev/null || echo NO);"
         "echo LZ4=$(which lz4 2>/dev/null || echo NO);"
         "echo PIGZ=$(which pigz 2>/dev/null || echo NO);"
         "echo ZSTD=$(which zstd 2>/dev/null || echo NO)", timeout=10)
     t_str = str(t_out or '')
-    bg_nc = 'NC=/' in t_str
     bg_has_lz4_esxi = 'LZ4=/' in t_str
     bg_has_pigz_esxi = 'PIGZ=/' in t_str
     bg_has_zstd_esxi = 'ZSTD=/' in t_str
@@ -5155,7 +5600,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
         bg_decompress = "cat"
         compress_name = "none"
     
-    task.log(f"Transfer: bs={BS_MB}MB, compress={compress_name}, nc={'yes' if bg_nc else 'no'}")
+    task.log(f"Transfer: bs={BS_MB}MB, compress={compress_name}, over SSH")
     
     # Resource isolation for background copy (critical: VM is running!)
     bg_iso = _setup_copy_isolation(pve_mgr, task.target_node, esxi_host, task.proxmox_vmid)
@@ -5260,6 +5705,13 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
                     f"test -f {qdesc} && head -5 {qdesc} 2>/dev/null", timeout=10)
                 d_head = str(out_d or '').strip().lower()
                 if rc_d == 0 and any(kw in d_head for kw in ['descriptor', 'vmdk', 'extent', 'version=']):
+                    # #1106 - qemu-img follows the descriptor's extent paths as root; only use it
+                    # when every extent is a plain file in the same directory
+                    if not _descriptor_extents_are_local(pve_mgr, task.target_node, desc_path):
+                        task.set_phase('failed',
+                            f'Disk {di}: descriptor {desc_file} names a non-local extent - refusing')
+                        import_ok = False
+                        continue
                     sshfs_src = desc_path
                     task.log(f"  Disk {di}: using descriptor VMDK ({desc_file})")
                 else:
@@ -5311,7 +5763,6 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             if sshfs_src.endswith('.vmdk') and not sshfs_src.endswith('-flat.vmdk'):
                 src_format = "vmdk"
 
-            copy_script = f"/tmp/v2p-copy-{task.proxmox_vmid}-{di}.sh"
             if src_format == "raw":
                 # dd path — preferred for raw flat-vmdk sources, works on any sector size
                 script_body = (
@@ -5333,13 +5784,13 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
                     f"&> '{progress_log}'\n"
                     f"echo \"EXIT_CODE=$?\" >> '{progress_log}'\n"
                 )
-            _pve_node_exec(pve_mgr, task.target_node,
-                f"cat > {copy_script} << 'EOFSCRIPT'\n{script_body}EOFSCRIPT\n"
-                f"chmod +x {copy_script}", timeout=10)
-            
-            _pve_node_exec(pve_mgr, task.target_node,
-                f"nohup {copy_script} > /dev/null 2>&1 &", timeout=10)
-            
+            # the name keeps v2p-copy-<vmid>-<di>, which the pgrep fallbacks below look for
+            copy_script = _write_node_script(pve_mgr, task.target_node, script_body,
+                                             f"copy-{task.proxmox_vmid}-{di}", timeout=10)
+            if copy_script:
+                _pve_node_exec(pve_mgr, task.target_node,
+                    f"nohup bash {copy_script} > /dev/null 2>&1 &", timeout=10)
+
             # Verify process actually started (look for either dd or qemu-img depending on src_format)
             time.sleep(2)
             proc_pattern = "dd if=" if src_format == "raw" else "qemu-img convert"
@@ -5362,10 +5813,13 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
                     f"&> '{progress_log}'\n"
                     f"echo \"EXIT_CODE=$?\" >> '{progress_log}'\n"
                 )
-                _pve_node_exec(pve_mgr, task.target_node,
-                    f"cat > {copy_script} << 'EOFSCRIPT'\n{script_body_min}EOFSCRIPT", timeout=10)
-                _pve_node_exec(pve_mgr, task.target_node,
-                    f"nohup {copy_script} > /dev/null 2>&1 &", timeout=10)
+                if copy_script:
+                    _pve_node_exec(pve_mgr, task.target_node, f"rm -f {copy_script}", timeout=5)
+                copy_script = _write_node_script(pve_mgr, task.target_node, script_body_min,
+                                                 f"copy-{task.proxmox_vmid}-{di}", timeout=10)
+                if copy_script:
+                    _pve_node_exec(pve_mgr, task.target_node,
+                        f"nohup bash {copy_script} > /dev/null 2>&1 &", timeout=10)
                 time.sleep(2)
 
             task.log(f"  Background copy started ({'dd' if src_format == 'raw' else 'qemu-img'}: {src_format} → raw)")
@@ -5480,7 +5934,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             
             # Cleanup temp files
             _pve_node_exec(pve_mgr, task.target_node,
-                f"rm -f {progress_log} {copy_script}", timeout=5)
+                f"rm -f {progress_log} {copy_script or ''}", timeout=5)
         
         if import_ok:
             task.log("=== ALL DISKS COPIED - switching to local storage (brief restart) ===")
@@ -5604,9 +6058,10 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
                     rc_d, out_d, _ = _pve_node_exec(pve_mgr, task.target_node,
                         f"test -f {qdesc} && head -5 {qdesc} 2>/dev/null", timeout=10)
                     d_head = str(out_d or '').strip().lower()
-                    if rc_d == 0 and any(kw in d_head for kw in ['descriptor', 'vmdk', 'extent', 'version=']):
+                    if (rc_d == 0 and any(kw in d_head for kw in ['descriptor', 'vmdk', 'extent', 'version='])
+                            and _descriptor_extents_are_local(pve_mgr, task.target_node, desc_path)):  # #1106
                         import_path = desc_path
-                
+
                 if not import_path:
                     raw_link = sshfs_path.replace('.vmdk', '.raw')
                     _pve_node_exec(pve_mgr, task.target_node,
@@ -5675,58 +6130,13 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
         task.log(f"Copying disk {di} ({disk_gb:.1f} GB) → {vol_id}")
         bg_copied = False
         
-        # Netcat + compression (fastest method: raw TCP, no SSH overhead)
-        if bg_pve_ip and bg_nc:
-            port = random.randint(49152, 65000)
-            task.log(f"  nc+{compress_name} {esxi_host}→{bg_pve_ip}:{port}")
-            nc_s = f"/tmp/v2p-bgnc-{task.id[:8]}-d{di}.sh"
-            nc_body = f"""#!/bin/bash
-{BG_CG_EXEC}
-echo 1000 > /proc/self/oom_score_adj 2>/dev/null || true
-# Tune TCP buffers for bulk transfer (16MB window)
-sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216 2>/dev/null || true
-sysctl -w net.ipv4.tcp_rmem='4096 1048576 16777216' net.ipv4.tcp_wmem='4096 1048576 16777216' 2>/dev/null || true
-{BG_NICE} nc -l -p {port} -w 300 | {bg_decompress} | {BG_NICE} {BG_DD_WRITE} of={dev_path} 2>/dev/null &
-RECV=$!
-sleep 1
-ssh {bg_ssh_base} {esxi_user}@{esxi_host} "{BG_NICE} {BG_DD_READ} if={esxi_path} 2>/dev/null | {bg_compress} | nc -w 120 {bg_pve_ip} {port}" &
-SEND=$!
-wait $SEND 2>/dev/null; S=$?
-wait $RECV 2>/dev/null; R=$?
-exit $((S + R))
-"""
-            _pve_node_exec(pve_mgr, task.target_node,
-                f"cat > {nc_s} << 'NCEOF'\n{nc_body}\nNCEOF\nchmod +x {nc_s}", timeout=10)
-            start_time = time.time()
-            # MK May 2026 (#411): capture output so a fast-failing nc path
-            # (auth, port conflict, missing nc, etc.) surfaces in the task log.
-            rc_bg, bg_out, bg_err = _pve_node_exec(pve_mgr, task.target_node,
-                f"bash {nc_s} 2>&1", timeout=86400)
-            _pve_node_exec(pve_mgr, task.target_node, f"rm -f {nc_s}", timeout=5)
-            elapsed = time.time() - start_time
-            if rc_bg == 0 and elapsed > 2:
-                speed = disk_gb * 1024 / max(elapsed, 1)
-                task.log(f"  ✓ {elapsed:.0f}s, {speed:.0f} MB/s effective")
-                bg_copied = True
-            else:
-                # nc didn't take. Log the tail before we fall through to
-                # the SSH+compress path so the user knows why nc bailed.
-                tail = ((bg_err or bg_out) or '').strip()
-                if tail and rc_bg != 0:
-                    excerpt = '\n'.join(tail.splitlines()[-6:])[:400]
-                    task.log(f"  nc rc={rc_bg} after {elapsed:.0f}s — falling through to SSH+compress")
-                    for line in excerpt.splitlines():
-                        task.log(f"    {line}")
-                _pve_node_exec(pve_mgr, task.target_node,
-                    f"kill $(lsof -ti :{port}) 2>/dev/null; true", timeout=5)
-        
+        # no netcat leg here either: unauthenticated and in clear (#1097)
         # SSH + compression parallel
         if not bg_copied:
             total_blocks = math.ceil(disk_total / BS)
             streams = min(8, max(1, total_blocks // 4))
             bps = math.ceil(total_blocks / streams)
             task.log(f"  SSH+compress × {streams}")
-            ss = f"/tmp/v2p-bgssh-{task.id[:8]}-d{di}.sh"
             lines = [
                 "#!/bin/bash",
                 f"{BG_CG_EXEC}",
@@ -5754,12 +6164,14 @@ exit $((S + R))
             #     with no clue what failed. Capture and surface the tail
             #     of the output on rc!=0 so the next ticket on this has
             #     something actionable.
-            _pve_node_exec(pve_mgr, task.target_node,
-                f"cat > {ss} << 'SEOF'\n" + "\n".join(lines) + f"\nSEOF\nchmod +x {ss}", timeout=10)
+            ss = _write_node_script(pve_mgr, task.target_node, "\n".join(lines),
+                                    f"bgssh-{task.id[:8]}-d{di}", timeout=10)
             start_time = time.time()
-            rc_bg, bg_out, bg_err = _pve_node_exec(pve_mgr, task.target_node,
-                f"bash {ss} 2>&1", timeout=86400)
-            _pve_node_exec(pve_mgr, task.target_node, f"rm -f {ss}", timeout=5)
+            rc_bg, bg_out, bg_err = 1, '', 'the copy script could not be written on the node'
+            if ss:
+                rc_bg, bg_out, bg_err = _pve_node_exec(pve_mgr, task.target_node,
+                    f"bash {ss} 2>&1", timeout=86400)
+                _pve_node_exec(pve_mgr, task.target_node, f"rm -f {ss}", timeout=5)
             elapsed = time.time() - start_time
             if rc_bg == 0:
                 speed = disk_gb * 1024 / max(elapsed, 1)
@@ -6299,6 +6711,14 @@ def _monitor_disk_write(pve_mgr, node, vol_path, disk_size, task, disk_key, stop
       monitor itself is still alive.
     """
     import time as _time
+    from pegaprox.core import ha
+
+    def probe(cmd):
+        # stat, lvs and a cat of the dd log only read. This thread carries neither the
+        # import job's mark nor a token, so in an automatic group they say so (#625)
+        with ha.reading():
+            return _pve_node_exec(pve_mgr, node, cmd, timeout=8)
+
     # Detect block-device target once
     is_block_dev = bool(vol_path) and vol_path.startswith('/dev/')
 
@@ -6321,8 +6741,7 @@ def _monitor_disk_write(pve_mgr, node, vol_path, disk_size, task, disk_key, stop
                 # /dev/pve/vm-100-disk-0 → ['', 'dev', 'pve', 'vm-100-disk-0']
                 if len(parts) >= 4 and parts[1] == 'dev':
                     vg, lv = parts[2], parts[3]
-                    rc, out, _ = _pve_node_exec(pve_mgr, node,
-                        f"lvs --noheadings -o data_percent {vg}/{lv} 2>/dev/null", timeout=8)
+                    rc, out, _ = probe(f"lvs --noheadings -o data_percent {vg}/{lv} 2>/dev/null")
                     s = str(out or '').strip()
                     if rc == 0 and s and s != '':
                         try:
@@ -6338,16 +6757,15 @@ def _monitor_disk_write(pve_mgr, node, vol_path, disk_size, task, disk_key, stop
                 # into one of these three logs on the node.
                 if written < 0:
                     _idx = disk_key.replace('disk', '') or '0'
-                    rc2, out2, _ = _pve_node_exec(pve_mgr, node,
+                    rc2, out2, _ = probe(
                         f"cat /tmp/v2p-{task.id}-sshdd-{_idx}.log /tmp/v2p-{task.id}-dl-{_idx}.log "
                         f"/tmp/v2p-{task.id}-dd3-{_idx}.log 2>/dev/null | tr '\\r' '\\n' "
-                        f"| grep -oE '[0-9]+ bytes' | tail -1", timeout=8)
+                        f"| grep -oE '[0-9]+ bytes' | tail -1")
                     m = re.search(r'(\d+)', str(out2 or ''))
                     if m:
                         written = int(m.group(1))
             else:
-                rc, out, _ = _pve_node_exec(pve_mgr, node,
-                    f"stat -c '%s' '{vol_path}' 2>/dev/null || echo 0", timeout=8)
+                rc, out, _ = probe(f"stat -c '%s' '{vol_path}' 2>/dev/null || echo 0")
                 if rc == 0 and str(out or '').strip().isdigit():
                     written = int(out.strip())
         except Exception:
@@ -6473,12 +6891,14 @@ def _ssh_pipe_transfer(pve_mgr, task, esxi_host, esxi_user, esxi_pass, datastore
     task.log(f"  URL: .../{vm_dir}/{flat_file}?dsName={ds_name}")
     
     # 6. Store credentials on Proxmox node
-    auth_file = f"/tmp/v2p-{task.id}-auth-{disk_index}"
-    cookie_jar = f"/tmp/v2p-{task.id}-cookies-{disk_index}"
+    # NS Oct 2026 (#1029) - both in /run, 0600 from creation: curl writes the jar (an ESXi
+    # session) with the default umask, and a /tmp name could be taken first
+    auth_file = f"/run/pegaprox-v2p-{task.id}-auth-{disk_index}"
+    cookie_jar = f"/run/pegaprox-v2p-{task.id}-cookies-{disk_index}"
     b64auth = base64.b64encode(f"{esxi_user}:{esxi_pass}".encode()).decode()
     _pve_node_exec(pve_mgr, task.target_node,
-        f"echo '{b64auth}' | base64 -d > {auth_file} && chmod 600 {auth_file}", timeout=10)
-    
+        f"umask 077; echo '{b64auth}' | base64 -d > {auth_file} && : > {cookie_jar}", timeout=10)
+
     # 7. Establish cookie session
     task.log(f"  Establishing ESXi session...")
     _pve_node_exec(pve_mgr, task.target_node,
@@ -6616,7 +7036,7 @@ def _ssh_pipe_transfer(pve_mgr, task, esxi_host, esxi_user, esxi_pass, datastore
             dd_log2 = f"/tmp/v2p-{task.id}-sshdd-{disk_index}.log"
 
             ssh_cmd = (
-                f"SSHPASS={safe_p} sshpass -e ssh -o StrictHostKeyChecking=accept-new "  # NS Feb 2026 - env var instead of -p
+                f"SSHPASS={safe_p} sshpass -e ssh -o StrictHostKeyChecking={_node_hkc()} "  # NS Feb 2026 - env var instead of -p
                 f"-o ConnectTimeout=15 "
                 f"-o HostKeyAlgorithms=+ssh-rsa,ssh-ed25519 "
                 f"-o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group14-sha256 "
@@ -6693,6 +7113,64 @@ def _ssh_pipe_transfer(pve_mgr, task, esxi_host, esxi_user, esxi_pass, datastore
     return vol_id, vol_path
 
 
+# the replay compares block by block, so the ESXi side, the node side and checksums taken
+# ahead of the switchover all have to use the same block size and loop
+DELTA_BLOCK_SIZE = 256 * 1024 * 1024
+
+
+def _block_md5_script(path, num_blocks):
+    """Shell loop printing the md5 of every DELTA_BLOCK_SIZE block of `path`, one per line.
+    Plain dd + md5sum, so the same loop runs on the ESXi BusyBox and on the node."""
+    return (
+        f"i=0; while [ $i -lt {num_blocks} ]; do "
+        f"dd if={shlex.quote(path)} bs={DELTA_BLOCK_SIZE} skip=$i count=1 2>/dev/null | md5sum | cut -d' ' -f1; "
+        f"i=$((i+1)); done"
+    )
+
+
+def _checksum_timeout(size_bytes):
+    # a fixed 600s ran out above ~100 GB and every replay fell back to a full copy.
+    # Assume 50 MiB/s, never less than the old 600s
+    return min(86400, max(600, int(size_bytes or 0) // (50 * 1024 * 1024)))
+
+
+def _pve_block_checksums(pve_mgr, node, vol_path, size_bytes):
+    """Block md5s of a target volume in the form _delta_sync_blocks takes, or None."""
+    num_blocks = (size_bytes + DELTA_BLOCK_SIZE - 1) // DELTA_BLOCK_SIZE
+    rc, out, _ = _pve_node_exec(pve_mgr, node, _block_md5_script(vol_path, num_blocks),
+                                timeout=_checksum_timeout(size_bytes))
+    if rc != 0 or not out:
+        return None
+    return [s.strip() for s in str(out).strip().split('\n') if s.strip()]
+
+
+def _pve_block_checksums_at(pve_mgr, node, vol_path, blocks, size_bytes):
+    """md5 of the listed blocks of a target volume, in the order given, or None.
+
+    A partial last block is hashed over the bytes ESXi hashed and no further: the volume
+    can be larger than the disk (LVM rounds up to its extent size)."""
+    bs = DELTA_BLOCK_SIZE
+    q = shlex.quote(vol_path)
+    full = [i for i in blocks if (i + 1) * bs <= size_bytes]
+    tail = [i for i in blocks if (i + 1) * bs > size_bytes]
+    parts = []
+    if full:
+        parts.append(f"for i in {' '.join(str(i) for i in full)}; do "
+                     f"dd if={q} bs={bs} skip=$i count=1 iflag=fullblock 2>/dev/null "
+                     f"| md5sum | cut -d' ' -f1; done")
+    for i in tail:
+        parts.append(f"dd if={q} bs={bs} skip={i} count=1 iflag=fullblock 2>/dev/null "
+                     f"| head -c {max(0, size_bytes - i * bs)} | md5sum | cut -d' ' -f1")
+    if not parts:
+        return []
+    rc, out, _ = _pve_node_exec(pve_mgr, node, '; '.join(parts),
+                                timeout=_checksum_timeout(len(blocks) * bs))
+    sums = [s.strip() for s in str(out or '').strip().split('\n') if s.strip()]
+    if rc != 0 or len(sums) != len(full) + len(tail):
+        return None
+    by_block = dict(zip(full + tail, sums))
+    return [by_block[i] for i in blocks]
+
 
 def _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
                         esxi_flat_path, vol_path, flat_size, disk_index,
@@ -6707,7 +7185,7 @@ def _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
     """
     import base64
     
-    BLOCK_SIZE = 256 * 1024 * 1024  # 256 MB blocks (fewer checksums = faster downtime)
+    BLOCK_SIZE = DELTA_BLOCK_SIZE  # 256 MB blocks (fewer checksums = faster downtime)
     num_blocks = (flat_size + BLOCK_SIZE - 1) // BLOCK_SIZE
     bs_mb = BLOCK_SIZE // (1024 * 1024)
     
@@ -6715,13 +7193,8 @@ def _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
     
     # 1. Generate checksums on ESXi (one SSH call, BusyBox-compatible)
     task.log(f"  Computing checksums on ESXi ({num_blocks} blocks)...")
-    checksum_script = (
-        f"i=0; while [ $i -lt {num_blocks} ]; do "
-        f"dd if={shlex.quote(esxi_flat_path)} bs={BLOCK_SIZE} skip=$i count=1 2>/dev/null | md5sum | cut -d' ' -f1; "
-        f"i=$((i+1)); done"
-    )
     rc_e, out_e, _ = _ssh_exec(esxi_host, esxi_user, esxi_pass,
-        checksum_script, timeout=600)
+        _block_md5_script(esxi_flat_path, num_blocks), timeout=_checksum_timeout(flat_size))
     
     if rc_e != 0 or not out_e:
         task.log(f"  ESXi checksum failed: rc={rc_e}")
@@ -6742,12 +7215,8 @@ def _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
         task.log(f"  Proxmox: using {len(pve_sums)} pre-computed checksums (no downtime cost)")
     else:
         task.log(f"  Computing checksums on Proxmox...")
-        pve_script = (
-            f"i=0; while [ $i -lt {num_blocks} ]; do "
-            f"dd if={shlex.quote(vol_path)} bs={BLOCK_SIZE} skip=$i count=1 2>/dev/null | md5sum | cut -d' ' -f1; "
-            f"i=$((i+1)); done"
-        )
-        rc_p, out_p, _ = _pve_node_exec(pve_mgr, task.target_node, pve_script, timeout=600)
+        rc_p, out_p, _ = _pve_node_exec(pve_mgr, task.target_node,
+            _block_md5_script(vol_path, num_blocks), timeout=_checksum_timeout(flat_size))
         
         if rc_p != 0 or not out_p:
             task.log(f"  Proxmox checksum failed: rc={rc_p}")
@@ -6776,21 +7245,26 @@ def _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
     # 4. Transfer only changed blocks via SSH dd
     # Write password file on Proxmox node
     b64pass = base64.b64encode(esxi_pass.encode()).decode()
-    pass_file = f"/tmp/v2p-{task.id}-delta-pass"
+    # in /run and 0600 from the first byte, like the auth file of the HTTPS fallback
+    pass_file = f"/run/pegaprox-v2p-{task.id}-delta-pass"
     _pve_node_exec(pve_mgr, task.target_node,
-        f"echo '{b64pass}' | base64 -d > {pass_file} && chmod 600 {pass_file}",
+        f"umask 077; echo '{b64pass}' | base64 -d > {pass_file}",
         timeout=10)
     
     # Build a script that transfers all differing blocks
-    xfer_lines = ['#!/bin/bash', 'ERRORS=0']
+    # MK Oct 2026 (#1124) - a pipe read returns at most 64 KiB and count=1 took that as the
+    # whole block, so only the head of each block landed. fullblock reads until the block is
+    # complete, pipefail makes a failed ssh count instead of an empty write that exits 0.
+    xfer_lines = ['#!/bin/bash', 'set -o pipefail', 'ERRORS=0']
+    _hk = _node_hkc()
     for i in diff_blocks:
         xfer_lines.append(
-            f"sshpass -f {pass_file} ssh -o StrictHostKeyChecking=accept-new "
+            f"sshpass -f {pass_file} ssh -o StrictHostKeyChecking={_hk} "
             f"-o HostKeyAlgorithms=+ssh-rsa,ssh-ed25519 "
             f"-o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group14-sha256 "
             f"{esxi_user}@{esxi_host} "
             f"\"dd if={shlex.quote(esxi_flat_path)} bs={BLOCK_SIZE} skip={i} count=1 2>/dev/null\" "
-            f"| dd of={shlex.quote(vol_path)} bs={BLOCK_SIZE} seek={i} count=1 conv=notrunc 2>/dev/null "
+            f"| dd of={shlex.quote(vol_path)} bs={BLOCK_SIZE} seek={i} count=1 conv=notrunc iflag=fullblock 2>/dev/null "
             f"|| ERRORS=$((ERRORS+1))"
         )
     xfer_lines.append(f'rm -f {pass_file}')
@@ -6798,24 +7272,37 @@ def _delta_sync_blocks(pve_mgr, task, esxi_host, esxi_user, esxi_pass,
     xfer_lines.append('exit $ERRORS')
     
     xfer_script = '\n'.join(xfer_lines) + '\n'
-    script_file = f"/tmp/v2p-{task.id}-delta-{disk_index}.sh"
-    b64script = base64.b64encode(xfer_script.encode()).decode()
-    _pve_node_exec(pve_mgr, task.target_node,
-        f"echo '{b64script}' | base64 -d > {script_file} && chmod +x {script_file}",
-        timeout=10)
-    
+    script_file = _write_node_script(pve_mgr, task.target_node, xfer_script,
+                                     f"delta-{task.id}-{disk_index}", timeout=10)
+
     task.log(f"  Transferring {len(diff_blocks)} changed blocks ({diff_size_mb} MB)...")
-    rc_x, out_x, _ = _pve_node_exec(pve_mgr, task.target_node,
-        f"bash {script_file} 2>&1", timeout=86400)
-    
+    rc_x, out_x = 1, 'the delta script could not be written on the node'
+    if script_file:
+        rc_x, out_x, _ = _pve_node_exec(pve_mgr, task.target_node,
+            f"bash {script_file} 2>&1", timeout=86400)
+
     result = str(out_x or '').strip()
     task.log(f"  Delta result: rc={rc_x}, {result[-200:]}")
-    
+
     # Cleanup
     _pve_node_exec(pve_mgr, task.target_node,
-        f"rm -f {script_file} {pass_file}", timeout=5)
-    
-    return rc_x == 0 or 'DELTA_DONE errors=0' in result
+        f"rm -f {script_file or ''} {pass_file}", timeout=5)
+
+    if not (rc_x == 0 or 'DELTA_DONE errors=0' in result):
+        return False
+    # every command in the pipe can exit 0 and a block still arrive short. Read the changed
+    # blocks back and hold them against ESXi; a mismatch sends the caller to the full copy.
+    got = _pve_block_checksums_at(pve_mgr, task.target_node, vol_path, diff_blocks, flat_size)
+    if got is None:
+        task.log("  Read-back check failed: the copied blocks could not be checksummed on the node")
+        return False
+    bad = [i for i, s in zip(diff_blocks, got) if s != esxi_sums[i]]
+    if bad:
+        task.log(f"  Read-back check: {len(bad)} of {len(diff_blocks)} copied blocks do not match ESXi "
+                 f"(first: block {bad[0]})")
+        return False
+    task.log(f"  Read-back check: all {len(diff_blocks)} copied blocks match ESXi")
+    return True
 
 
 def _cleanup_sshfs(pve_mgr, node, mnt_path):

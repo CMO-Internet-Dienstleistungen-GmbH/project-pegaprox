@@ -456,8 +456,10 @@ def start_drill(plan_id):
 
     log_audit(user, 'dr.drill_started', f"plan_id={plan_id} drill_id={drill_id}")
 
-    t = threading.Thread(target=_execute_drill, args=(drill_id,), daemon=True,
-                         name=f'dr-drill-{drill_id}')
+    # a user job: in an automatic group each call it sends asks for the lease (#625)
+    from pegaprox.core import ha
+    t = threading.Thread(target=ha.as_job(_execute_drill, f'DR drill {drill_id}'), args=(drill_id,),
+                         daemon=True, name=f'dr-drill-{drill_id}')
     t.start()
     return jsonify({'drill_id': drill_id, 'status': 'running'})
 

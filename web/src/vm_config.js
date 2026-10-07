@@ -117,9 +117,686 @@
             );
         }
 
+        // LW Oct 2026 - the feature flags of a container after creation. It saves on its own
+        // (not through the modal's Save): Proxmox keeps every flag but nesting for root@pam,
+        // every flag of a privileged container too, and the server knows whether this
+        // cluster connection is root@pam (an API token never is).
+        const LXC_FEATURE_ROWS = [
+            { key: 'nesting', label: 'ctFeatNesting', hint: 'ctFeatNestingHint' },
+            { key: 'keyctl', label: 'ctFeatKeyctl', hint: 'ctFeatKeyctlHint' },
+            { key: 'fuse', label: 'ctFeatFuse', hint: 'ctFeatFuseHint' },
+            { key: 'mknod', label: 'ctFeatMknod', hint: 'ctFeatMknodHint' },
+            { key: 'nfs', label: 'ctFeatNfs', hint: 'ctFeatNfsHint' },
+            { key: 'cifs', label: 'ctFeatCifs', hint: 'ctFeatCifsHint' },
+        ];
+
+        function lxcFeatureFlags(f) {
+            const m = (f && f.mount) || {};
+            return { nesting: !!f?.nesting, keyctl: !!f?.keyctl, fuse: !!f?.fuse, mknod: !!f?.mknod, nfs: !!m.nfs, cifs: !!m.cifs };
+        }
+
+        // why this connection cannot make a root@pam change, from the server's access.reason
+        function pveRootReasonText(t, reason) {
+            if (reason === 'token') return t('pveRootToken');
+            if (reason === 'no_password') return t('pveRootNoPassword');
+            return t('pveRootOtherUser');
+        }
+
+        function LxcFeaturesCard({ vm, clusterId, authFetch, addToast, t, haReadOnly }) {
+            const [state, setState] = useState(null);
+            const [edit, setEdit] = useState(null);
+            const [loadError, setLoadError] = useState('');
+            const [saving, setSaving] = useState(false);
+            const base = `${API_URL}/clusters/${clusterId}/vms/${vm.node}/lxc/${vm.vmid}/features`;
+
+            const load = async () => {
+                setLoadError('');
+                try {
+                    const r = await authFetch(base);
+                    if (r && r.ok) {
+                        const d = await r.json();
+                        setState(d);
+                        setEdit(lxcFeatureFlags(d.features));
+                        return;
+                    }
+                    const e = r ? await r.json().catch(() => ({})) : {};
+                    setLoadError(e.error || t('ctFeaturesLoadFailed'));
+                } catch (e) {
+                    setLoadError(t('ctFeaturesLoadFailed'));
+                }
+            };
+            useEffect(() => { load(); }, [vm.vmid, vm.node, clusterId]);
+
+            const header = (
+                <div className="flex items-center justify-between mb-1">
+                    <label className="text-sm font-medium text-gray-300 flex items-center gap-2">
+                        <Icons.Layers className="w-4 h-4" />
+                        {t('ctFeatures')}
+                    </label>
+                    {vm.status === 'running' && (
+                        <span className="text-[10px] px-1.5 py-0.5 bg-red-500/20 text-red-400 rounded font-medium">{t('needsRestart')}</span>
+                    )}
+                </div>
+            );
+
+            if (loadError || !state || !edit) {
+                return (
+                    <div className="p-4 bg-proxmox-dark rounded-lg border border-proxmox-border" data-ct-features="">
+                        {header}
+                        {loadError ? (
+                            <div className="flex items-center justify-between gap-3 text-xs text-red-400">
+                                <span>{loadError}</span>
+                                <button type="button" onClick={load} className="px-2 py-1 rounded bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white">{t('retry')}</button>
+                            </div>
+                        ) : (
+                            <div className="flex justify-center py-3">
+                                <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-proxmox-orange"></div>
+                            </div>
+                        )}
+                    </div>
+                );
+            }
+
+            const shown = lxcFeatureFlags(state.features);
+            const running = lxcFeatureFlags(state.current);
+            const unprivileged = !!state.unprivileged;
+            const access = state.access || {};
+            const changed = Object.keys(edit).filter(k => edit[k] !== shown[k]);
+            // Proxmox compares what runs now with what is sent, value by value
+            const vsRunning = Object.keys(edit).filter(k => edit[k] !== running[k]);
+            const needsRoot = changed.length > 0 && vsRunning.length > 0 && (!unprivileged || vsRunning.some(k => k !== 'nesting'));
+            const blocked = needsRoot && !access.root;
+            const rowLocked = (key) => !access.root && (!unprivileged || key !== 'nesting');
+
+            const apply = async () => {
+                const body = {};
+                changed.forEach(k => {
+                    if (k === 'nfs' || k === 'cifs') body.mount = { ...(body.mount || {}), [k]: edit[k] };
+                    else body[k] = edit[k];
+                });
+                setSaving(true);
+                try {
+                    const r = await authFetch(base, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    const d = r ? await r.json().catch(() => ({})) : {};
+                    if (r && r.ok) {
+                        addToast(d.pending ? t('ctFeaturesSavedRestart') : t('ctFeaturesSaved'), 'success');
+                        await load();
+                    } else if (d.code === 'PVE_ROOT_REQUIRED') {
+                        addToast(pveRootReasonText(t, d.reason), 'error');
+                    } else {
+                        addToast(d.error || t('saveFailed'), 'error');
+                    }
+                } catch (e) {
+                    addToast(t('connectionError'), 'error');
+                }
+                setSaving(false);
+            };
+
+            return (
+                <div className="p-4 bg-proxmox-dark rounded-lg border border-proxmox-border" data-ct-features="">
+                    {header}
+                    <p className="text-xs text-gray-500 mb-3">{t('ctFeaturesHint')}</p>
+                    <div className="grid grid-cols-2 gap-3">
+                        {LXC_FEATURE_ROWS.map(row => {
+                            const locked = rowLocked(row.key);
+                            // keyctl is for unprivileged containers, as in the Proxmox UI
+                            const privOnly = row.key === 'keyctl' && !unprivileged && !edit.keyctl;
+                            return (
+                                <label key={row.key} className={`flex items-start gap-2 ${locked || privOnly ? 'opacity-60' : 'cursor-pointer'}`} data-ct-feature={row.key}>
+                                    <input
+                                        type="checkbox"
+                                        checked={edit[row.key]}
+                                        disabled={locked || privOnly || saving}
+                                        onChange={e => setEdit(prev => ({ ...prev, [row.key]: e.target.checked }))}
+                                        className="w-4 h-4 mt-0.5 rounded border-proxmox-border bg-proxmox-card text-proxmox-orange focus:ring-proxmox-orange"
+                                    />
+                                    <span className="min-w-0">
+                                        <span className="text-sm text-gray-300 flex items-center gap-1.5">
+                                            {t(row.label)}
+                                            {locked && <span className="text-[10px] px-1.5 py-0.5 bg-yellow-500/20 text-yellow-400 rounded font-medium" title={t('ctFeaturesRootOnly')}>root@pam</span>}
+                                        </span>
+                                        <span className="block text-xs text-gray-500">{privOnly ? t('ctFeatUnprivilegedOnly') : t(row.hint)}</span>
+                                    </span>
+                                </label>
+                            );
+                        })}
+                    </div>
+                    {state.kept?.length > 0 && (
+                        <p className="mt-3 text-xs text-gray-500">{t('ctFeaturesKept')} <code className="font-mono text-gray-400">{state.kept.join(', ')}</code></p>
+                    )}
+                    {state.pending && (
+                        <div className="mt-3 text-xs text-yellow-400 flex items-center gap-2" data-ct-features-pending="">
+                            <Icons.Clock className="w-3.5 h-3.5" />
+                            {t('ctFeaturesPending')}
+                        </div>
+                    )}
+                    {!access.root && (
+                        <div className="mt-3 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg text-xs text-yellow-300 flex items-start gap-2" data-ct-features-root={access.reason || ''}>
+                            <Icons.Lock className="w-4 h-4 shrink-0 mt-0.5" />
+                            <span>
+                                {unprivileged ? t('ctFeaturesRootRule') : t('ctFeaturesRootPrivileged')}{' '}
+                                {pveRootReasonText(t, access.reason)}
+                            </span>
+                        </div>
+                    )}
+                    {needsRoot && access.fresh_ticket && (
+                        <p className="mt-3 text-xs text-gray-500 flex items-center gap-2"><Icons.Info className="w-3.5 h-3.5" />{t('pveRootViaLogin')}</p>
+                    )}
+                    {!haReadOnly && (
+                        <div className="mt-4 flex items-center justify-end gap-2">
+                            {changed.length > 0 && (
+                                <button type="button" onClick={() => setEdit(shown)} disabled={saving}
+                                    className="px-3 py-1.5 rounded-lg text-sm bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white disabled:opacity-50">
+                                    {t('revert')}
+                                </button>
+                            )}
+                            <button type="button" onClick={apply} disabled={!changed.length || saving || blocked}
+                                className="px-3 py-1.5 rounded-lg text-sm bg-proxmox-orange text-white hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                                data-ct-features-apply="">
+                                {saving ? t('saving') : t('ctFeaturesApply')}
+                            </button>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // one cluster resource mapping to pick in the passthrough dialog: what
+        // it is, the nodes it has a device on (a VM with it starts and migrates only there),
+        // and what Proxmox found wrong with it on this VM's node
+        function PassthroughMappingPicker({ kind, info, value, onChange, node, t }) {
+            if (!info || info.loading) {
+                return (
+                    <div className="flex justify-center py-3">
+                        <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-proxmox-orange"></div>
+                    </div>
+                );
+            }
+            if (info.error) return <div className="text-xs text-red-400">{info.error}</div>;
+            const list = info.mappings || [];
+            if (!list.length) {
+                return <div className="text-xs text-gray-500" data-pt-no-mappings="">{t(kind === 'pci' ? 'ptNoPciMappings' : 'ptNoUsbMappings')}</div>;
+            }
+            const picked = list.find(m => m.id === value);
+            return (
+                <div className="space-y-2">
+                    <select
+                        value={value}
+                        onChange={e => onChange(e.target.value)}
+                        className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white"
+                        data-pt-mapping-select={kind}
+                    >
+                        <option value="">-- {t('ptSelectMapping')} --</option>
+                        {list.map(m => (
+                            <option key={m.id} value={m.id}>
+                                {m.id}{m.description ? ` - ${m.description}` : ''}{m.on_node === false ? ` (${t('ptNotOnThisNode')})` : ''}
+                            </option>
+                        ))}
+                    </select>
+                    {picked && (
+                        <div className="p-3 bg-proxmox-dark rounded text-sm space-y-1" data-pt-mapping-detail={picked.id}>
+                            <div className="text-gray-400">{t('ptMappingNodes')}: <span className="text-white">{picked.nodes.length ? picked.nodes.join(', ') : '-'}</span></div>
+                            {picked.entries.filter(e => e.node === node).map((e, i) => (
+                                <div key={i} className="text-gray-400">{node}: <span className="font-mono text-white">{e.path || e.id}</span></div>
+                            ))}
+                            {picked.on_node === false && (
+                                <div className="text-xs text-yellow-400" data-pt-mapping-off-node="">{t('ptMappingNotHere').replace(/\{node\}/g, () => node)}</div>
+                            )}
+                            {(picked.checks || []).map((c, i) => (
+                                <div key={i} className={`text-xs ${c.severity === 'error' ? 'text-red-400' : 'text-yellow-400'}`}>{c.message}</div>
+                            ))}
+                        </div>
+                    )}
+                    <p className="text-xs text-gray-500">{t('ptMappingNodesHint')}</p>
+                </div>
+            );
+        }
+
+        // the choice between a mapped device (first) and a raw one, and why raw is shut
+        function PassthroughModeSwitch({ mode, setMode, t }) {
+            const modes = [['mapping', 'ptModeMapped'], ['raw', 'ptModeRaw']];
+            return (
+                <div className="flex gap-1 p-1 bg-proxmox-dark rounded-lg border border-proxmox-border">
+                    {modes.map(([id, label]) => (
+                        <button key={id} type="button" onClick={() => setMode(id)} data-pt-mode={id}
+                            className={`flex-1 px-3 py-1.5 rounded text-sm transition-colors ${mode === id ? 'bg-proxmox-orange text-white' : 'text-gray-400 hover:text-white'}`}>
+                            {t(label)}
+                        </button>
+                    ))}
+                </div>
+            );
+        }
+
+        function PassthroughRawNote({ info, t }) {
+            const access = info?.access;
+            if (!access) return null;
+            if (!access.root) {
+                return (
+                    <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg text-xs text-yellow-300 flex items-start gap-2" data-pt-raw-refused={access.reason || ''}>
+                        <Icons.Lock className="w-4 h-4 shrink-0 mt-0.5" />
+                        <span>{t('ptRawRootOnly')} {pveRootReasonText(t, access.reason)}</span>
+                    </div>
+                );
+            }
+            if (access.fresh_ticket) {
+                return <p className="text-xs text-gray-500 flex items-center gap-2"><Icons.Info className="w-3.5 h-3.5" />{t('pveRootViaLogin')}</p>;
+            }
+            return null;
+        }
+
+        // LW Oct 2026 - the VirtIO RNG of a VM. PVE keeps it as rng0 =
+        // "[source=]<file>[,max_bytes=N][,period=N]" and fills in 1024 bytes per 1000 ms when
+        // the numbers are left out. The server checks the same rules before PVE sees the value.
+        const RNG_SOURCES = ['/dev/urandom', '/dev/random', '/dev/hwrng'];
+        const RNG_MAX_BYTES_TOP = '9223372036854775807';
+
+        function parseRng(value) {
+            const out = { source: '', max_bytes: '', period: '' };
+            String(value || '').split(',').forEach(part => {
+                if (!part.trim()) return;
+                const eq = part.indexOf('=');
+                if (eq < 0) out.source = part;
+                else if (Object.prototype.hasOwnProperty.call(out, part.slice(0, eq))) out[part.slice(0, eq)] = part.slice(eq + 1);
+            });
+            return out;
+        }
+
+        const rngDigits = (v) => String(v ?? '').replace(/^0+(?=[0-9])/, '');
+
+        // '' when the form is fine, else the key of what is wrong with it
+        function rngProblem(form) {
+            if (!RNG_SOURCES.includes(form.source)) return 'rngBadSource';
+            const bytes = rngDigits(form.max_bytes);
+            if (!/^[0-9]{1,19}$/.test(bytes) || (bytes.length === 19 && bytes > RNG_MAX_BYTES_TOP)) return 'rngBadMaxBytes';
+            if (bytes === '0') return '';
+            const period = rngDigits(form.period);
+            if (!/^[0-9]{1,10}$/.test(period) || Number(period) < 1 || Number(period) > 4294967295) return 'rngBadPeriod';
+            return '';
+        }
+
+        // without a limit QEMU never gets the period, so it is left out
+        function rngValue(form) {
+            const bytes = rngDigits(form.max_bytes);
+            const parts = [`source=${form.source}`, `max_bytes=${bytes}`];
+            if (bytes !== '0') parts.push(`period=${rngDigits(form.period)}`);
+            return parts.join(',');
+        }
+
+        function VirtioRngCard({ value, running, onAdd, onEdit, onRemove, t }) {
+            const cur = value ? parseRng(value) : null;
+            const limit = cur && (rngDigits(cur.max_bytes) === '0'
+                ? t('rngNoLimit')
+                : t('rngLimitText').replace('{bytes}', () => rngDigits(cur.max_bytes) || '1024').replace('{ms}', () => rngDigits(cur.period) || '1000'));
+            return (
+                <div className="mt-6 pt-6 border-t border-proxmox-border" data-rng-card>
+                    <h3 className="text-white font-medium mb-4 flex items-center gap-2">
+                        <span className="text-purple-400"><Icons.Dice /></span>
+                        {t('rngTitle')}
+                        {running && (
+                            <span className="text-xs text-yellow-400 bg-yellow-500/10 px-2 py-0.5 rounded">{t('changesAfterRestart')}</span>
+                        )}
+                    </h3>
+                    {cur ? (
+                        <div className="p-3 bg-proxmox-dark rounded-lg" data-rng-device>
+                            <div className="flex items-center justify-between gap-4">
+                                <div className="flex items-center gap-2 min-w-0">
+                                    <span className="text-xs text-gray-500 font-mono">rng0</span>
+                                    <span className="text-sm font-mono text-gray-300 truncate" data-rng-shown-source>{cur.source || value}</span>
+                                    <span className="text-xs text-gray-500 truncate" data-rng-shown-limit>{limit}</span>
+                                </div>
+                                <div className="flex items-center gap-1 shrink-0">
+                                    <button onClick={onEdit} data-rng-edit title={t('edit')}
+                                        className="text-xs px-2 py-1 text-gray-400 hover:text-white hover:bg-proxmox-hover rounded">
+                                        <Icons.Edit />
+                                    </button>
+                                    <button onClick={onRemove} data-rng-remove title={t('remove')}
+                                        className="text-xs px-2 py-1 text-red-400 hover:bg-red-500/20 rounded">
+                                        <Icons.Trash className="w-3.5 h-3.5" />
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="p-3 bg-proxmox-dark rounded-lg border border-dashed border-proxmox-border">
+                            <div className="flex items-center justify-between gap-4">
+                                <span className="text-sm text-gray-500">{t('rngNone')}</span>
+                                <button onClick={onAdd} data-rng-add
+                                    className="shrink-0 text-xs px-3 py-1.5 bg-purple-500/20 text-purple-400 rounded hover:bg-purple-500/30 flex items-center gap-1">
+                                    <Icons.Plus className="w-3 h-3" />
+                                    {t('rngAdd')}
+                                </button>
+                            </div>
+                            <p className="text-xs text-gray-600 mt-2">{t('rngHint')}</p>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        function VirtioRngDialog({ value, onSave, onClose, t }) {
+            const [form, setForm] = useState(() => {
+                const cur = parseRng(value);
+                return {
+                    source: value ? cur.source : '/dev/urandom',
+                    max_bytes: cur.max_bytes !== '' ? cur.max_bytes : '1024',
+                    period: cur.period !== '' ? cur.period : '1000',
+                };
+            });
+            const [busy, setBusy] = useState(false);
+            const problem = rngProblem(form);
+            const unlimited = rngDigits(form.max_bytes) === '0';
+            const set = (key) => (e) => setForm(prev => ({ ...prev, [key]: e.target.value }));
+            const save = async () => {
+                if (problem || busy) return;
+                setBusy(true);
+                if (!(await onSave(rngValue(form)))) setBusy(false);
+            };
+            const warning = form.source === '/dev/random' ? 'rngWarnRandom' : form.source === '/dev/hwrng' ? 'rngWarnHwrng' : '';
+            return (
+                <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60" data-rng-dialog={value ? 'edit' : 'add'}>
+                    <div className="w-full max-w-md bg-proxmox-card border border-proxmox-border rounded-xl p-6">
+                        <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+                            <span className="text-purple-400"><Icons.Dice /></span>
+                            {value ? t('rngEdit') : t('rngAdd')}
+                        </h3>
+                        <div className="space-y-4">
+                            <div>
+                                <label className="block text-xs text-gray-400 mb-1">{t('rngSource')}</label>
+                                <select value={form.source} onChange={set('source')} data-rng-source
+                                    className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white">
+                                    {!RNG_SOURCES.includes(form.source) && <option value={form.source}>{form.source || '-'}</option>}
+                                    {RNG_SOURCES.map(s => <option key={s} value={s}>{s}</option>)}
+                                </select>
+                                {warning && (
+                                    <p className="text-xs text-yellow-400 mt-2 flex items-start gap-1" data-rng-warning={form.source.slice(5)}>
+                                        <span className="shrink-0 mt-0.5"><Icons.AlertTriangle /></span>
+                                        <span>{t(warning)}</span>
+                                    </p>
+                                )}
+                            </div>
+                            <div className="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1">{t('rngMaxBytes')}</label>
+                                    <input type="number" min="0" step="1" value={form.max_bytes} onChange={set('max_bytes')} data-rng-max-bytes
+                                        className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white" />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1">{t('rngPeriod')}</label>
+                                    <input type="number" min="1" step="1" value={unlimited ? '' : form.period} onChange={set('period')} data-rng-period
+                                        disabled={unlimited} placeholder={unlimited ? t('rngNoLimit') : ''}
+                                        className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white disabled:opacity-50" />
+                                </div>
+                            </div>
+                            <p className="text-xs text-gray-500">{t('rngLimitHint')}</p>
+                            {unlimited && (
+                                <p className="text-xs text-yellow-400 flex items-start gap-1" data-rng-warning="unlimited">
+                                    <span className="shrink-0 mt-0.5"><Icons.AlertTriangle /></span>
+                                    <span>{t('rngWarnUnlimited')}</span>
+                                </p>
+                            )}
+                            {problem && <p className="text-xs text-red-400" data-rng-problem={problem}>{t(problem)}</p>}
+                            <div className="flex gap-2 justify-end pt-4">
+                                <button onClick={onClose} className="px-4 py-2 bg-proxmox-dark hover:bg-proxmox-hover rounded">{t('cancel')}</button>
+                                <button onClick={save} disabled={!!problem || busy} data-rng-save
+                                    className="px-4 py-2 bg-purple-600 hover:bg-purple-700 rounded disabled:opacity-50">
+                                    {busy ? t('saving') : (value ? t('save') : t('add'))}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // LW Oct 2026 - virtiofs, a directory of the host shared with the VM (PVE 8.4+). PVE keeps
+        // it as virtiofs0..9 = "[dirid=]<mapping>[,cache=..][,direct-io=1][,expose-acl=1][,expose-xattr=1]",
+        // the directory itself is a directory mapping of the cluster (Datacenter, Resource Mappings).
+        // The server checks the same rules before PVE sees the value.
+        const VFS_SLOTS = 10;
+        const VFS_CACHE = ['auto', 'always', 'metadata', 'never'];
+        const VFS_FLAGS = ['direct-io', 'expose-xattr', 'expose-acl'];
+        const VFS_FLAG_LABELS = { 'direct-io': 'vfsDirectIo', 'expose-xattr': 'vfsXattr', 'expose-acl': 'vfsAcl' };
+        const vfsOn = (v) => /^(1|on|yes|true)$/i.test(String(v ?? ''));
+        const vfsWindows = (ostype) => /^(wxp|w2k|w2k3|w2k8|wvista|win[0-9]+)$/.test(String(ostype || ''));
+
+        function parseVirtiofs(value) {
+            const out = { dirid: '', cache: '', 'direct-io': false, 'expose-xattr': false, 'expose-acl': false };
+            String(value || '').split(',').forEach(part => {
+                if (!part.trim()) return;
+                const eq = part.indexOf('=');
+                if (eq < 0) { out.dirid = part; return; }
+                const key = part.slice(0, eq), val = part.slice(eq + 1);
+                if (key === 'dirid') out.dirid = val;
+                else if (key === 'cache') out.cache = val;
+                else if (VFS_FLAGS.includes(key)) out[key] = vfsOn(val);
+            });
+            return out;
+        }
+
+        // the virtiofs keys a raw config holds, in slot order
+        const vfsKeys = (raw) => Array.from({ length: VFS_SLOTS }, (_, i) => `virtiofs${i}`).filter(k => raw && raw[k]);
+
+        // auto is PVE's default and the flags default to off, so neither is written out; the
+        // order is the one the server sends on
+        function virtiofsValue(form) {
+            const parts = [form.dirid];
+            if (form.cache && form.cache !== 'auto') parts.push(`cache=${form.cache}`);
+            ['direct-io', 'expose-acl', 'expose-xattr'].forEach(f => { if (form[f]) parts.push(`${f}=1`); });
+            return parts.join(',');
+        }
+
+        // '' when the form is fine, else the key of what is wrong with it
+        function vfsProblem(form, ostype) {
+            if (!/^[A-Za-z][A-Za-z0-9_-]{1,63}$/.test(form.dirid || '')) return 'vfsPickMapping';
+            if (form.cache && !VFS_CACHE.includes(form.cache)) return 'vfsBadCache';
+            if (form['expose-acl'] && vfsWindows(ostype)) return 'vfsAclWindows';
+            return '';
+        }
+
+        function vfsOptionsText(p) {
+            return [`cache=${p.cache || 'auto'}`, ...VFS_FLAGS.filter(f => p[f])].join(', ');
+        }
+
+        function VirtiofsCard({ raw, running, info, node, onAdd, onEdit, onRemove, t }) {
+            const keys = vfsKeys(raw);
+            const loaded = info && !info.loading && !info.error && info.supported !== false;
+            const mappings = (info && info.mappings) || [];
+            return (
+                <div className="mt-6 pt-6 border-t border-proxmox-border" data-vfs-card>
+                    <h3 className="text-white font-medium mb-4 flex items-center gap-2">
+                        <span className="text-emerald-400"><Icons.FolderOpen /></span>
+                        {t('vfsTitle')}
+                        {running && (
+                            <span className="text-xs text-yellow-400 bg-yellow-500/10 px-2 py-0.5 rounded">{t('changesAfterRestart')}</span>
+                        )}
+                        <button onClick={onAdd} data-vfs-add disabled={keys.length >= VFS_SLOTS}
+                            title={keys.length >= VFS_SLOTS ? t('vfsAllSlots') : undefined}
+                            className="ml-auto shrink-0 text-xs px-3 py-1.5 bg-emerald-500/20 text-emerald-400 rounded hover:bg-emerald-500/30 flex items-center gap-1 disabled:opacity-50">
+                            <Icons.Plus className="w-3 h-3" />
+                            {t('vfsAdd')}
+                        </button>
+                    </h3>
+                    {keys.length ? (
+                        <div className="space-y-2">
+                            {keys.map(key => {
+                                const p = parseVirtiofs(raw[key]);
+                                const m = mappings.find(x => x.id === p.dirid);
+                                const here = m ? m.entries.filter(e => e.node === node) : [];
+                                return (
+                                    <div key={key} className="p-3 bg-proxmox-dark rounded-lg" data-vfs-device={key}>
+                                        <div className="flex items-center justify-between gap-4">
+                                            <div className="flex items-center gap-2 min-w-0">
+                                                <span className="text-xs text-gray-500 font-mono">{key}</span>
+                                                <span className="text-sm font-mono text-gray-300 truncate" data-vfs-shown-dirid>{p.dirid || raw[key]}</span>
+                                                <span className="text-xs text-gray-500 truncate" data-vfs-shown-options>{vfsOptionsText(p)}</span>
+                                            </div>
+                                            <div className="flex items-center gap-1 shrink-0">
+                                                <button onClick={() => onEdit(key)} data-vfs-edit={key} title={t('edit')}
+                                                    className="text-xs px-2 py-1 text-gray-400 hover:text-white hover:bg-proxmox-hover rounded">
+                                                    <Icons.Edit />
+                                                </button>
+                                                <button onClick={() => onRemove(key, p.dirid)} data-vfs-remove={key} title={t('remove')}
+                                                    className="text-xs px-2 py-1 text-red-400 hover:bg-red-500/20 rounded">
+                                                    <Icons.Trash className="w-3.5 h-3.5" />
+                                                </button>
+                                            </div>
+                                        </div>
+                                        {here.map((e, i) => (
+                                            <div key={i} className="text-xs text-gray-500 mt-1" data-vfs-shown-path>{e.node}: <span className="font-mono text-gray-300">{e.path}</span></div>
+                                        ))}
+                                        {loaded && !m && (
+                                            <div className="text-xs text-yellow-400 mt-1" data-vfs-gone>{t('vfsGone').replace(/\{id\}/g, () => p.dirid)}</div>
+                                        )}
+                                        {m && !here.length && (
+                                            <div className="text-xs text-yellow-400 mt-1" data-vfs-off-node>{t('vfsNotHere').replace(/\{node\}/g, () => node)}</div>
+                                        )}
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    ) : (
+                        <div className="p-3 bg-proxmox-dark rounded-lg border border-dashed border-proxmox-border">
+                            <span className="text-sm text-gray-500">{t('vfsNone')}</span>
+                        </div>
+                    )}
+                    <ul className="text-xs text-gray-500 mt-2 space-y-1" data-vfs-hints>
+                        <li>{t('vfsHintDriver')}</li>
+                        <li>{t('vfsHintMigration')}</li>
+                    </ul>
+                </div>
+            );
+        }
+
+        function VirtiofsDialog({ slot, value, info, node, ostype, others, onSave, onClose, t }) {
+            const [form, setForm] = useState(() => {
+                const p = parseVirtiofs(value);
+                return { ...p, cache: p.cache || 'auto' };
+            });
+            const [busy, setBusy] = useState(false);
+            const loading = !info || info.loading;
+            const unsupported = info && info.supported === false;
+            const list = (info && info.mappings) || [];
+            const picked = list.find(m => m.id === form.dirid);
+            const here = picked ? picked.entries.filter(e => e.node === node) : [];
+            const problem = unsupported ? 'vfsUnsupported' : vfsProblem(form, ostype);
+            const twice = Object.entries(others || {}).find(([k, v]) => k !== slot && parseVirtiofs(v).dirid === form.dirid);
+            const flip = (flag) => (e) => {
+                const on = e.target.checked;
+                // ACLs need the extended attributes, virtiofsd turns them on with them
+                setForm(prev => ({ ...prev, [flag]: on, ...(flag === 'expose-acl' && on ? { 'expose-xattr': true } : {}) }));
+            };
+            const save = async () => {
+                if (problem || busy || loading) return;
+                setBusy(true);
+                if (!(await onSave(slot, virtiofsValue(form)))) setBusy(false);
+            };
+            return (
+                <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60" data-vfs-dialog={value ? 'edit' : 'add'}>
+                    <div className="w-full max-w-lg bg-proxmox-card border border-proxmox-border rounded-xl p-6 max-h-[90vh] overflow-y-auto">
+                        <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+                            <span className="text-emerald-400"><Icons.FolderOpen /></span>
+                            {value ? t('vfsEdit') : t('vfsAdd')}
+                            <span className="text-xs text-gray-500 font-mono">{slot}</span>
+                        </h3>
+                        <div className="space-y-4">
+                            <div>
+                                <label className="block text-xs text-gray-400 mb-1">{t('vfsMapping')}</label>
+                                {loading ? (
+                                    <div className="flex justify-center py-3">
+                                        <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-proxmox-orange"></div>
+                                    </div>
+                                ) : info.error ? (
+                                    <div className="text-xs text-red-400">{info.error}</div>
+                                ) : unsupported ? (
+                                    <div className="text-xs text-yellow-400" data-vfs-unsupported>{t('vfsUnsupported')}</div>
+                                ) : (
+                                    <>
+                                        {list.length || form.dirid ? (
+                                            <select value={form.dirid} onChange={e => setForm(prev => ({ ...prev, dirid: e.target.value }))} data-vfs-mapping
+                                                className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white">
+                                                <option value="">-- {t('vfsPickMapping')} --</option>
+                                                {form.dirid && !picked && <option value={form.dirid}>{form.dirid}</option>}
+                                                {list.map(m => (
+                                                    <option key={m.id} value={m.id}>
+                                                        {m.id}{m.description ? ` - ${m.description}` : ''}{m.on_node === false ? ` (${t('ptNotOnThisNode')})` : ''}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                        ) : null}
+                                        {!list.length && info.may_add !== false && (
+                                            <div className="text-xs text-gray-500 mt-2" data-vfs-no-mappings>{t('vfsNoMappings')}</div>
+                                        )}
+                                        {info.may_add === false && (
+                                            <div className="text-xs text-yellow-400 mt-2 flex items-start gap-1" data-vfs-confined>
+                                                <span className="shrink-0 mt-0.5"><Icons.Lock className="w-3.5 h-3.5" /></span>
+                                                <span>{t('vfsConfined')}</span>
+                                            </div>
+                                        )}
+                                        {picked && (
+                                            <div className="mt-2 p-3 bg-proxmox-dark rounded text-sm space-y-1" data-vfs-mapping-detail={picked.id}>
+                                                <div className="text-gray-400">{t('ptMappingNodes')}: <span className="text-white">{picked.nodes.length ? picked.nodes.join(', ') : '-'}</span></div>
+                                                {here.map((e, i) => (
+                                                    <div key={i} className="text-gray-400">{node}: <span className="font-mono text-white break-all">{e.path}</span></div>
+                                                ))}
+                                                {!here.length && (
+                                                    <div className="text-xs text-yellow-400" data-vfs-off-node>{t('vfsNotHere').replace(/\{node\}/g, () => node)}</div>
+                                                )}
+                                                {(picked.checks || []).filter(c => here.length || c.severity === 'error').map((c, i) => (
+                                                    <div key={i} className={`text-xs ${c.severity === 'error' ? 'text-red-400' : 'text-yellow-400'}`} data-vfs-check={c.severity}>{c.message}</div>
+                                                ))}
+                                            </div>
+                                        )}
+                                        {twice && (
+                                            <p className="text-xs text-yellow-400 mt-2" data-vfs-warning="twice">{t('vfsSameTwice').replace(/\{key\}/g, () => twice[0])}</p>
+                                        )}
+                                    </>
+                                )}
+                            </div>
+                            <div>
+                                <label className="block text-xs text-gray-400 mb-1">{t('vfsCache')}</label>
+                                <select value={form.cache} onChange={e => setForm(prev => ({ ...prev, cache: e.target.value }))} data-vfs-cache
+                                    className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white">
+                                    {!VFS_CACHE.includes(form.cache) && <option value={form.cache}>{form.cache}</option>}
+                                    {VFS_CACHE.map(c => <option key={c} value={c}>{c === 'auto' ? t('vfsCacheAuto') : c}</option>)}
+                                </select>
+                                <p className="text-xs text-gray-500 mt-1">{t('vfsCacheHint')}</p>
+                            </div>
+                            <div className="space-y-2">
+                                {VFS_FLAGS.map(flag => {
+                                    const implied = flag === 'expose-xattr' && form['expose-acl'];
+                                    return (
+                                        <label key={flag} className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer" data-vfs-flag={flag}>
+                                            <input type="checkbox" className="mt-1" checked={!!form[flag] || implied} disabled={implied} onChange={flip(flag)} />
+                                            <span>
+                                                <span className="font-mono text-white">{flag}</span> <span className="text-gray-400">{t(VFS_FLAG_LABELS[flag])}</span>
+                                                {flag === 'direct-io' && <span className="block text-xs text-gray-500">{t('vfsDirectIoHint')}</span>}
+                                                {implied && <span className="block text-xs text-gray-500" data-vfs-implied>{t('vfsAclHint')}</span>}
+                                            </span>
+                                        </label>
+                                    );
+                                })}
+                            </div>
+                            {problem && !loading && <p className="text-xs text-red-400" data-vfs-problem={problem}>{t(problem)}</p>}
+                            <div className="flex gap-2 justify-end pt-4">
+                                <button onClick={onClose} className="px-4 py-2 bg-proxmox-dark hover:bg-proxmox-hover rounded">{t('cancel')}</button>
+                                <button onClick={save} disabled={!!problem || busy || loading} data-vfs-save
+                                    className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 rounded disabled:opacity-50">
+                                    {busy ? t('saving') : (value ? t('save') : t('add'))}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
         function ConfigModal({ vm, clusterId, allClusters = [], dashboardAuthFetch, onClose, addToast, isCorporate = false }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();
+            const { getAuthHeaders, haReadOnly, haStandby } = useAuth();
             const [config, setConfig] = useState(null);
             const [configError, setConfigError] = useState(null);  // MK: Track config load errors
             const [loading, setLoading] = useState(true);
@@ -231,12 +908,22 @@
             const [cloudInitFormat, setCloudInitFormat] = useState('raw');
             const [cloudInitBus, setCloudInitBus] = useState('ide');
             const [cloudInitDevice, setCloudInitDevice] = useState('2');
+            const [showRngDialog, setShowRngDialog] = useState(false);
+            const [vfsDialog, setVfsDialog] = useState(null);   // { slot, value } of the virtiofs dialog
             const [selectedPciDevice, setSelectedPciDevice] = useState(null);
             const [selectedUsbDevice, setSelectedUsbDevice] = useState(null);
             const [pciOptions, setPciOptions] = useState({ pcie: true, rombar: true });
             const [usbOptions, setUsbOptions] = useState({ usb3: false });
             const [serialType, setSerialType] = useState('socket');
             const [passthroughLoading, setPassthroughLoading] = useState(false);
+            // LW Oct 2026 - cluster resource mappings for the passthrough dialogs, per kind:
+            // { loading, error, mappings, access }. A mapped device is the first choice, a
+            // raw one only where this cluster connection is root@pam
+            const [ptMappings, setPtMappings] = useState({});
+            const [pciMode, setPciMode] = useState('mapping');
+            const [usbMode, setUsbMode] = useState('mapping');
+            const [selectedPciMapping, setSelectedPciMapping] = useState('');
+            const [selectedUsbMapping, setSelectedUsbMapping] = useState('');
 
             // Firewall states
             const [fwOptions, setFwOptions] = useState({});
@@ -362,7 +1049,12 @@
                     // Fetch current passthrough config
                     const ptRes = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/qemu/${vm.vmid}/passthrough`);
                     if (ptRes && ptRes.ok) {
-                        setPassthrough(await ptRes.json());
+                        const pt = await ptRes.json();
+                        setPassthrough(pt);
+                        // the nodes a mapped device covers, only when the VM has one
+                        ['pci', 'usb'].forEach(kind => {
+                            if ((pt[kind] || []).some(d => d.parsed?.mapping)) loadPtMappings(kind);
+                        });
                     }
                     
                     // Fetch available PCI devices
@@ -381,15 +1073,130 @@
                 }
             };
 
+            // one hardware key set ({rng0: value}) or removed ({delete: 'rng0'}); true when it went through
+            const putHwConfig = async (body, okKey, failKey) => {
+                try {
+                    const res = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/qemu/${vm.vmid}/config`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body)
+                    });
+                    if (res?.ok) {
+                        addToast(t(okKey), 'success');
+                        fetchConfig();
+                        return true;
+                    }
+                    const err = res ? await res.json().catch(() => ({})) : {};
+                    addToast(err.error || t(failKey), 'error');
+                } catch (e) {
+                    addToast(t('connectionError'), 'error');
+                }
+                return false;
+            };
+
+            const saveRng = async (value) => {
+                const ok = await putHwConfig({ rng0: value }, 'rngSaved', 'rngSaveFailed');
+                if (ok) setShowRngDialog(false);
+                return ok;
+            };
+
+            const removeRng = () => {
+                if (!confirm(t('rngRemoveConfirm'))) return;
+                putHwConfig({ delete: 'rng0' }, 'rngRemoved', 'rngRemoveFailed');
+            };
+
+            // virtiofsN of the dialog: slot is the key, a new share takes the first free one
+            const openVirtiofs = (slot) => {
+                const raw = config?.raw || {};
+                const key = slot || Array.from({ length: VFS_SLOTS }, (_, i) => `virtiofs${i}`).find(k => !raw[k]);
+                if (!key) return;
+                setVfsDialog({ slot: key, value: slot ? raw[slot] : '' });
+                if (!ptMappings.dir || ptMappings.dir.error) loadPtMappings('dir');
+            };
+
+            const saveVirtiofs = async (slot, value) => {
+                const ok = await putHwConfig({ [slot]: value }, 'vfsSaved', 'vfsSaveFailed');
+                if (ok) setVfsDialog(null);
+                return ok;
+            };
+
+            const removeVirtiofs = (slot, dirid) => {
+                if (!confirm(t('vfsRemoveConfirm').replace(/\{id\}/g, () => dirid || slot).replace(/\{key\}/g, () => slot))) return;
+                putHwConfig({ delete: slot }, 'vfsRemoved', 'vfsRemoveFailed');
+            };
+
+            // the card names the path of each share on this node: one read when the VM has any
+            useEffect(() => {
+                if (vm.type === 'qemu' && (activeTab === 'hardware' || activeTab === 'resources')
+                    && vfsKeys(config?.raw).length && !ptMappings.dir) loadPtMappings('dir');
+            }, [activeTab, config]);
+
+            const loadPtMappings = async (kind) => {
+                setPtMappings(prev => ({ ...prev, [kind]: { ...(prev[kind] || {}), loading: true, error: '' } }));
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/qemu/${vm.vmid}/passthrough/mappings?kind=${kind}`);
+                    const d = r ? await r.json().catch(() => ({})) : {};
+                    if (r && r.ok) {
+                        setPtMappings(prev => ({ ...prev, [kind]: { loading: false, error: '', mappings: d.mappings || [], access: d.access || null,
+                                                                    supported: d.supported, may_add: d.may_add } }));
+                        return d;
+                    }
+                    setPtMappings(prev => ({ ...prev, [kind]: { loading: false, error: d.error || t('operationFailed'), mappings: [], access: null } }));
+                } catch (e) {
+                    setPtMappings(prev => ({ ...prev, [kind]: { loading: false, error: t('connectionError'), mappings: [], access: null } }));
+                }
+                return null;
+            };
+
+            // opens the add dialog on a mapped device, or on a raw one when the cluster has no
+            // mapping of that kind and this connection may attach raw devices
+            const openAddPassthrough = async (kind) => {
+                const setMode = kind === 'pci' ? setPciMode : setUsbMode;
+                (kind === 'pci' ? setSelectedPciMapping : setSelectedUsbMapping)('');
+                setMode('mapping');
+                (kind === 'pci' ? setShowAddPci : setShowAddUsb)(true);
+                const d = await loadPtMappings(kind);
+                if (d && !(d.mappings || []).length && d.access?.root) setMode('raw');
+            };
+
+            // under an attached mapped device: the nodes it can start and migrate to
+            const ptMappedLine = (kind, dev) => {
+                const id = dev.parsed?.mapping;
+                if (!id) return null;
+                const m = (ptMappings[kind]?.mappings || []).find(x => x.id === id);
+                return (
+                    <span className="block text-xs text-gray-500" data-pt-mapped={id}>
+                        {t('ptMappingNodes')}: {m ? (m.nodes.length ? m.nodes.join(', ') : '-') : '...'}
+                        {m && !m.nodes.includes(vm.node) && <span className="ml-2 text-yellow-400">{t('ptNotOnThisNode')}</span>}
+                    </span>
+                );
+            };
+
+            const ptRefused = async (response) => {
+                const err = response ? await response.json().catch(() => ({})) : {};
+                if (err.code === 'PVE_ROOT_REQUIRED') addToast(`${t('ptRawRootOnly')} ${pveRootReasonText(t, err.reason)}`, 'error');
+                else addToast(err.error || t('operationFailed'), 'error');
+            };
+
+            const ptAdded = (response) => response.json().catch(() => ({})).then(d => {
+                // a mapping without a device on this node: the VM does not start here
+                if (d.mapping && d.covers_node === false) {
+                    addToast(t('ptMappingNotHere').replace(/\{node\}/g, () => vm.node), 'warning');
+                } else {
+                    addToast(t('deviceAdded'));
+                }
+            });
+
             const handleAddPciDevice = async () => {
-                if (!selectedPciDevice) return;
+                const mapped = pciMode === 'mapping';
+                if (mapped ? !selectedPciMapping : !selectedPciDevice) return;
                 setPassthroughLoading(true);
                 try {
                     const response = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/qemu/${vm.vmid}/passthrough/pci`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            device_id: selectedPciDevice.id,
+                            ...(mapped ? { mapping: selectedPciMapping } : { device_id: selectedPciDevice.id }),
                             pcie: pciOptions.pcie,
                             rombar: pciOptions.rombar
                         })
@@ -397,11 +1204,11 @@
                     if (response && response.ok) {
                         setShowAddPci(false);
                         setSelectedPciDevice(null);
+                        setSelectedPciMapping('');
                         fetchPassthrough();
-                        addToast(t('deviceAdded'));
+                        await ptAdded(response);
                     }else{
-                        const err = await response.json();
-                        addToast(err.error || t('operationFailed'), 'error');
+                        await ptRefused(response);
                     }
                 } catch (error) {
                     addToast(t('connectionError'), 'error');
@@ -410,26 +1217,26 @@
             };
 
             const handleAddUsbDevice = async () => {
-                if (!selectedUsbDevice) return;
+                const mapped = usbMode === 'mapping';
+                if (mapped ? !selectedUsbMapping : !selectedUsbDevice) return;
                 setPassthroughLoading(true);
                 try {
                     const response = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/qemu/${vm.vmid}/passthrough/usb`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            vendorid: selectedUsbDevice.vendid,
-                            productid: selectedUsbDevice.prodid,
+                            ...(mapped ? { mapping: selectedUsbMapping } : { vendorid: selectedUsbDevice.vendid, productid: selectedUsbDevice.prodid }),
                             usb3: usbOptions.usb3
                         })
                     });
                     if (response && response.ok) {
                         setShowAddUsb(false);
                         setSelectedUsbDevice(null);
+                        setSelectedUsbMapping('');
                         fetchPassthrough();
-                        addToast(t('deviceAdded'));
+                        await ptAdded(response);
                     }else{
-                        const err = await response.json();
-                        addToast(err.error || t('operationFailed'), 'error');
+                        await ptRefused(response);
                     }
                 } catch (error) {
                     addToast(t('connectionError'), 'error');
@@ -471,7 +1278,7 @@
                         fetchPassthrough();
                         addToast(t('deviceRemoved'));
                     }else{
-                        addToast(t('operationFailed'), 'error');
+                        await ptRefused(response);
                     }
                 } catch (error) {
                     addToast(t('connectionError'), 'error');
@@ -565,7 +1372,9 @@
             // NS: Feb 2026 - Fetch efficient snapshots + capability
             const fetchEfficientSnapshots = async () => {
                 try {
-                    const response = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/efficient-snapshots?refresh=true`);
+                    // ?refresh=true runs lvs, maybe lvextend, on the node; a standby reads what is stored (#625).
+                    // A GET is not forwarded, so a forwarding standby leaves it out too
+                    const response = await authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/efficient-snapshots${haStandby ? '' : '?refresh=true'}`);
                     if (response && response.ok) {
                         setEfficientSnapshots(await response.json());
                     }
@@ -1564,6 +2373,8 @@
                     { id: 'options', labelKey: 'optionsTab', icon: Icons.Settings },
                 ];
 
+            const lockedTab = haReadOnly && activeTab !== 'history';
+
             // NS May 2026: in Corporate layout we render a corporate flat
             // chrome (flat, light-weighted typography, underlined tabs, clean
             // header with explicit Apply / Cancel actions). The Modern dark
@@ -1604,7 +2415,7 @@
                                     {hasChanges && (
                                         <span className="corp-unsaved-pill">{t('unsavedChanges') || 'Unsaved Changes'}</span>
                                     )}
-                                    {hasChanges && (
+                                    {hasChanges && !haReadOnly && (
                                         <button
                                             onClick={handleSave}
                                             disabled={saving}
@@ -1728,7 +2539,9 @@
                                     </div>
                                 )
                             ) : config ? (
-                                <>
+                                // #625 v2 - a standby shows the configuration and changes none of
+                                // it: every tab but History renders its controls disabled
+                                <fieldset disabled={lockedTab} className="contents" data-ha-locked={lockedTab ? '' : undefined}>
                                     {/* General Tab */}
                                     {activeTab === 'general' && (
                                         <div className="space-y-6">
@@ -2432,6 +3245,30 @@
                                                         })()}
                                                     </div>
                                                     
+                                                    {allClusters.find(c => c.id === clusterId)?.cluster_type !== 'xcpng' && (
+                                                        <VirtioRngCard
+                                                            value={config?.raw?.rng0}
+                                                            running={vm.status === 'running'}
+                                                            onAdd={() => setShowRngDialog(true)}
+                                                            onEdit={() => setShowRngDialog(true)}
+                                                            onRemove={removeRng}
+                                                            t={t}
+                                                        />
+                                                    )}
+
+                                                    {!['xcpng', 'esxi'].includes(allClusters.find(c => c.id === clusterId)?.cluster_type) && (
+                                                        <VirtiofsCard
+                                                            raw={config?.raw}
+                                                            running={vm.status === 'running'}
+                                                            info={ptMappings.dir}
+                                                            node={vm.node}
+                                                            onAdd={() => openVirtiofs(null)}
+                                                            onEdit={openVirtiofs}
+                                                            onRemove={removeVirtiofs}
+                                                            t={t}
+                                                        />
+                                                    )}
+
                                                     {/* PCI/USB/Serial Passthrough Section */}
                                                     <div className="mt-6 pt-6 border-t border-proxmox-border">
                                                         <h3 className="text-white font-medium mb-4 flex items-center gap-2">
@@ -2448,7 +3285,7 @@
                                                             <div className="flex justify-between items-center mb-2">
                                                                 <span className="text-sm text-gray-400">{t('pciDevices')}</span>
                                                                 <button
-                                                                    onClick={() => setShowAddPci(true)}
+                                                                    onClick={() => openAddPassthrough('pci')}
                                                                     className="text-xs px-2 py-1 bg-proxmox-orange/20 text-proxmox-orange rounded hover:bg-proxmox-orange/30"
                                                                 >
                                                                     + {t('addPci')}
@@ -2458,7 +3295,10 @@
                                                                 <div className="space-y-1">
                                                                     {passthrough.pci.map((dev, idx) => (
                                                                         <div key={idx} className="flex items-center justify-between p-2 bg-proxmox-dark rounded text-sm">
-                                                                            <span className="font-mono text-gray-300">{dev.key}: {dev.value}</span>
+                                                                            <span className="min-w-0">
+                                                                                <span className="font-mono text-gray-300">{dev.key}: {dev.value}</span>
+                                                                                {ptMappedLine('pci', dev)}
+                                                                            </span>
                                                                             <button
                                                                                 onClick={() => handleRemovePassthrough('pci', dev.key)}
                                                                                 className="text-red-400 hover:text-red-300 p-1"
@@ -2478,7 +3318,7 @@
                                                             <div className="flex justify-between items-center mb-2">
                                                                 <span className="text-sm text-gray-400">{t('usbDevices')}</span>
                                                                 <button
-                                                                    onClick={() => setShowAddUsb(true)}
+                                                                    onClick={() => openAddPassthrough('usb')}
                                                                     className="text-xs px-2 py-1 bg-proxmox-orange/20 text-proxmox-orange rounded hover:bg-proxmox-orange/30"
                                                                 >
                                                                     + {t('addUsb')}
@@ -2488,7 +3328,10 @@
                                                                 <div className="space-y-1">
                                                                     {passthrough.usb.map((dev, idx) => (
                                                                         <div key={idx} className="flex items-center justify-between p-2 bg-proxmox-dark rounded text-sm">
-                                                                            <span className="font-mono text-gray-300">{dev.key}: {dev.value}</span>
+                                                                            <span className="min-w-0">
+                                                                                <span className="font-mono text-gray-300">{dev.key}: {dev.value}</span>
+                                                                                {ptMappedLine('usb', dev)}
+                                                                            </span>
                                                                             <button
                                                                                 onClick={() => handleRemovePassthrough('usb', dev.key)}
                                                                                 className="text-red-400 hover:text-red-300 p-1"
@@ -2922,7 +3765,7 @@
                                                                     <div>
                                                                         <div className="font-medium text-white">{snap.name}</div>
                                                                         <div className="text-xs text-gray-400">
-                                                                            {snap.snaptime ? new Date(snap.snaptime * 1000).toLocaleString() : t('unknown')}
+                                                                            {snap.snaptime ? fmtDate(snap.snaptime) : t('unknown')}
                                                                             {snap.vmstate && <span className="ml-2 text-blue-400">+ RAM</span>}
                                                                         </div>
                                                                         {snap.description && (
@@ -4786,6 +5629,7 @@
                                                             needsRestart={true}
                                                             t={t}
                                                         />
+                                                        <LxcFeaturesCard vm={vm} clusterId={clusterId} authFetch={authFetch} addToast={addToast} t={t} haReadOnly={haReadOnly} />
                                                     </>
                                                 )}
                                             </div>
@@ -5288,7 +6132,7 @@
                                             )}
                                         </div>
                                     )}
-                                </>
+                                </fieldset>
                             ) : (
                                 <div className="text-center py-8 text-red-400">
                                     Konfiguration konnte nicht geladen werden
@@ -5312,7 +6156,7 @@
                                 >
                                     {t('cancel')}
                                 </button>
-                                <button
+                                {!haReadOnly && <button
                                     onClick={handleSave}
                                     disabled={!hasChanges || saving}
                                     className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange rounded-lg text-white font-medium hover:bg-orange-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -5323,7 +6167,7 @@
                                         <Icons.Save />
                                     )}
                                     {t('save')}
-                                </button>
+                                </button>}
                             </div>
                         </div>
                     </div>
@@ -5755,27 +6599,39 @@
                             <div className="w-full max-w-lg bg-proxmox-card border border-proxmox-border rounded-xl p-6">
                                 <h3 className="text-lg font-semibold text-white mb-4">{t('addPci')}</h3>
                                 <div className="space-y-4">
-                                    <div>
-                                        <label className="block text-xs text-gray-400 mb-1">{t('availableDevices')}</label>
-                                        <select
-                                            value={selectedPciDevice?.id || ''}
-                                            onChange={(e) => setSelectedPciDevice(availablePci.find(d => d.id === e.target.value))}
-                                            className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white"
-                                        >
-                                            <option value="">-- {t('selectDevice')} --</option>
-                                            {availablePci.filter(d => d.iommugroup >= 0).map(dev => (
-                                                <option key={dev.id} value={dev.id}>
-                                                    {dev.id} - {dev.vendor_name} {dev.device_name} (IOMMU: {dev.iommugroup})
-                                                </option>
-                                            ))}
-                                        </select>
-                                    </div>
-                                    {selectedPciDevice && (
-                                        <div className="p-3 bg-proxmox-dark rounded text-sm">
-                                            <div className="text-gray-400">{t('vendor')}: <span className="text-white">{selectedPciDevice.vendor_name}</span></div>
-                                            <div className="text-gray-400">Device: <span className="text-white">{selectedPciDevice.device_name}</span></div>
-                                            <div className="text-gray-400">{t('iommuGroup')}: <span className="text-white">{selectedPciDevice.iommugroup}</span></div>
-                                        </div>
+                                    <PassthroughModeSwitch mode={pciMode} setMode={setPciMode} t={t} />
+                                    {pciMode === 'mapping' ? (
+                                        <PassthroughMappingPicker kind="pci" info={ptMappings.pci} value={selectedPciMapping} onChange={setSelectedPciMapping} node={vm.node} t={t} />
+                                    ) : (
+                                        <>
+                                            <PassthroughRawNote info={ptMappings.pci} t={t} />
+                                            {ptMappings.pci?.access?.root !== false && (
+                                                <>
+                                                    <div>
+                                                        <label className="block text-xs text-gray-400 mb-1">{t('availableDevices')}</label>
+                                                        <select
+                                                            value={selectedPciDevice?.id || ''}
+                                                            onChange={(e) => setSelectedPciDevice(availablePci.find(d => d.id === e.target.value))}
+                                                            className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white"
+                                                        >
+                                                            <option value="">-- {t('selectDevice')} --</option>
+                                                            {availablePci.filter(d => d.iommugroup >= 0).map(dev => (
+                                                                <option key={dev.id} value={dev.id}>
+                                                                    {dev.id} - {dev.vendor_name} {dev.device_name} (IOMMU: {dev.iommugroup})
+                                                                </option>
+                                                            ))}
+                                                        </select>
+                                                    </div>
+                                                    {selectedPciDevice && (
+                                                        <div className="p-3 bg-proxmox-dark rounded text-sm">
+                                                            <div className="text-gray-400">{t('vendor')}: <span className="text-white">{selectedPciDevice.vendor_name}</span></div>
+                                                            <div className="text-gray-400">Device: <span className="text-white">{selectedPciDevice.device_name}</span></div>
+                                                            <div className="text-gray-400">{t('iommuGroup')}: <span className="text-white">{selectedPciDevice.iommugroup}</span></div>
+                                                        </div>
+                                                    )}
+                                                </>
+                                            )}
+                                        </>
                                     )}
                                     <div className="space-y-2">
                                         <label className="flex items-center gap-2">
@@ -5788,8 +6644,8 @@
                                         </label>
                                     </div>
                                     <div className="flex gap-2 justify-end pt-4">
-                                        <button onClick={() => { setShowAddPci(false); setSelectedPciDevice(null); }} className="px-4 py-2 bg-proxmox-dark hover:bg-proxmox-hover rounded">{t('cancel')}</button>
-                                        <button onClick={handleAddPciDevice} disabled={!selectedPciDevice || passthroughLoading} className="px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded disabled:opacity-50">
+                                        <button onClick={() => { setShowAddPci(false); setSelectedPciDevice(null); setSelectedPciMapping(''); }} className="px-4 py-2 bg-proxmox-dark hover:bg-proxmox-hover rounded">{t('cancel')}</button>
+                                        <button onClick={handleAddPciDevice} disabled={(pciMode === 'mapping' ? !selectedPciMapping : (!selectedPciDevice || ptMappings.pci?.access?.root === false)) || passthroughLoading} className="px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded disabled:opacity-50" data-pt-add="pci">
                                             {passthroughLoading ? t('adding') : t('add')}
                                         </button>
                                     </div>
@@ -5804,31 +6660,41 @@
                             <div className="w-full max-w-lg bg-proxmox-card border border-proxmox-border rounded-xl p-6">
                                 <h3 className="text-lg font-semibold text-white mb-4">{t('addUsb')}</h3>
                                 <div className="space-y-4">
-                                    <div>
-                                        <label className="block text-xs text-gray-400 mb-1">{t('availableDevices')}</label>
-                                        <select
-                                            value={selectedUsbDevice ? `${selectedUsbDevice.vendid}:${selectedUsbDevice.prodid}` : ''}
-                                            onChange={(e) => {
-                                                const [vid, pid] = e.target.value.split(':');
-                                                setSelectedUsbDevice(availableUsb.find(d => d.vendid === vid && d.prodid === pid));
-                                            }}
-                                            className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white"
-                                        >
-                                            <option value="">-- {t('selectDevice')} --</option>
-                                            {availableUsb.map((dev, idx) => (
-                                                <option key={idx} value={`${dev.vendid}:${dev.prodid}`}>
-                                                    {dev.manufacturer || dev.vendid} - {dev.product || dev.prodid}
-                                                </option>
-                                            ))}
-                                        </select>
-                                    </div>
+                                    <PassthroughModeSwitch mode={usbMode} setMode={setUsbMode} t={t} />
+                                    {usbMode === 'mapping' ? (
+                                        <PassthroughMappingPicker kind="usb" info={ptMappings.usb} value={selectedUsbMapping} onChange={setSelectedUsbMapping} node={vm.node} t={t} />
+                                    ) : (
+                                        <>
+                                            <PassthroughRawNote info={ptMappings.usb} t={t} />
+                                            {ptMappings.usb?.access?.root !== false && (
+                                                <div>
+                                                    <label className="block text-xs text-gray-400 mb-1">{t('availableDevices')}</label>
+                                                    <select
+                                                        value={selectedUsbDevice ? `${selectedUsbDevice.vendid}:${selectedUsbDevice.prodid}` : ''}
+                                                        onChange={(e) => {
+                                                            const [vid, pid] = e.target.value.split(':');
+                                                            setSelectedUsbDevice(availableUsb.find(d => d.vendid === vid && d.prodid === pid));
+                                                        }}
+                                                        className="w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white"
+                                                    >
+                                                        <option value="">-- {t('selectDevice')} --</option>
+                                                        {availableUsb.map((dev, idx) => (
+                                                            <option key={idx} value={`${dev.vendid}:${dev.prodid}`}>
+                                                                {dev.manufacturer || dev.vendid} - {dev.product || dev.prodid}
+                                                            </option>
+                                                        ))}
+                                                    </select>
+                                                </div>
+                                            )}
+                                        </>
+                                    )}
                                     <label className="flex items-center gap-2">
                                         <input type="checkbox" checked={usbOptions.usb3} onChange={(e) => setUsbOptions({...usbOptions, usb3: e.target.checked})} className="rounded" />
                                         <span className="text-sm text-gray-300">{t('usb3')}</span>
                                     </label>
                                     <div className="flex gap-2 justify-end pt-4">
-                                        <button onClick={() => { setShowAddUsb(false); setSelectedUsbDevice(null); }} className="px-4 py-2 bg-proxmox-dark hover:bg-proxmox-hover rounded">{t('cancel')}</button>
-                                        <button onClick={handleAddUsbDevice} disabled={!selectedUsbDevice || passthroughLoading} className="px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded disabled:opacity-50">
+                                        <button onClick={() => { setShowAddUsb(false); setSelectedUsbDevice(null); setSelectedUsbMapping(''); }} className="px-4 py-2 bg-proxmox-dark hover:bg-proxmox-hover rounded">{t('cancel')}</button>
+                                        <button onClick={handleAddUsbDevice} disabled={(usbMode === 'mapping' ? !selectedUsbMapping : (!selectedUsbDevice || ptMappings.usb?.access?.root === false)) || passthroughLoading} className="px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded disabled:opacity-50" data-pt-add="usb">
                                             {passthroughLoading ? t('adding') : t('add')}
                                         </button>
                                     </div>
@@ -6043,6 +6909,17 @@
                         </div>
                     )}
                     
+                    {showRngDialog && !haReadOnly && (
+                        <VirtioRngDialog value={config?.raw?.rng0} onSave={saveRng} onClose={() => setShowRngDialog(false)} t={t} />
+                    )}
+
+                    {vfsDialog && !haReadOnly && (
+                        <VirtiofsDialog slot={vfsDialog.slot} value={vfsDialog.value} info={ptMappings.dir} node={vm.node}
+                            ostype={config?.raw?.ostype}
+                            others={Object.fromEntries(vfsKeys(config?.raw).map(k => [k, config.raw[k]]))}
+                            onSave={saveVirtiofs} onClose={() => setVfsDialog(null)} t={t} />
+                    )}
+
                     {/* MK: Add TPM Modal */}
                     {showAddTpm && (
                         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60">

@@ -7,3 +7,5 @@ web                           usr/lib/pegaprox
 images                        usr/lib/pegaprox
 debian/pegaprox-wrapper       usr/bin/pegaprox
 systemd/pegaprox.service      lib/systemd/system/
+packaging/witness/install.sh  usr/lib/pegaprox/packaging/witness
+systemd/pegaprox-witness.service usr/lib/pegaprox/systemd

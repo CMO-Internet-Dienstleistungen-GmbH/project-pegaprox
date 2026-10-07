@@ -18,6 +18,7 @@ from pegaprox.constants import *
 from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db, ENCRYPTION_AVAILABLE
+from pegaprox.core import ha
 
 import requests
 from pegaprox.utils.auth import require_auth, load_users, save_users, validate_session, TOTP_AVAILABLE, ARGON2_AVAILABLE, _check_default_password_in_use, verify_password, needs_password_rehash
@@ -29,11 +30,26 @@ from pegaprox.api.helpers import (
     load_server_settings, save_server_settings, check_cluster_access,
     get_login_settings, get_session_timeout, safe_error,
     acme_dns_config_from_settings, require_unconfined,
+    evacuation_options, evacuation_options_said, rolling_options_intro, rolling_node_templates,
+    rolling_moved_templates, rolling_rules_give_way, rolling_rules_back_on,
 )
 from pegaprox.app import get_allowed_origins, add_allowed_origin
 from pegaprox.globals import _cors_origins_env, _auto_allowed_origins
 
 bp = Blueprint('settings', __name__)
+
+
+def _live_sessions():
+    """The session store as it stands right now.
+
+    `active_sessions` is created in globals.py and pulled in here by name, but
+    utils.auth.load_sessions() replaces its own global with a fresh dict once the
+    database has been read at boot. Every module that grabbed the name earlier
+    keeps the empty original. Resolving the attribute off the module at call time
+    is what api/auth.py does for the session-listing route; do the same here.
+    """
+    from pegaprox.utils import auth as _authmod
+    return _authmod.active_sessions
 
 
 def _sanitize_acme_dns_settings(settings, data):
@@ -91,6 +107,35 @@ def get_pegaprox_version():
         'gevent_available': GEVENT_AVAILABLE,
         'encryption_available': ENCRYPTION_AVAILABLE,
     })
+
+
+# MK Oct 2026 - the API reference in the user menu reads this. Built from the route
+# table of the running app (cli/gen_openapi.py) instead of docs/openapi.json: the
+# Docker image has no docs/, and this way it is exactly what this instance answers.
+# The table is fixed once the app is up, so the document is built once per process.
+_openapi_doc = {}
+
+
+def _openapi_json(app):
+    key = (id(app), PEGAPROX_VERSION, sum(1 for _ in app.url_map.iter_rules()))
+    body = _openapi_doc.get(key)
+    if body is None:
+        from pegaprox.cli.gen_openapi import spec
+        body = json.dumps(spec(app, PEGAPROX_VERSION), ensure_ascii=False, separators=(',', ':'))
+        _openapi_doc.clear()
+        _openapi_doc[key] = body
+    return body
+
+
+@bp.route('/api/pegaprox/openapi.json', methods=['GET'])
+@require_auth()
+def get_openapi_description():
+    """The OpenAPI 3.1 description of this instance's API
+
+    Generated from the live route table: every path and method, its parameters and the
+    permission it demands. The same document as docs/openapi.json, for this version."""
+    from flask import current_app
+    return Response(_openapi_json(current_app._get_current_object()), mimetype='application/json')
 
 
 # NS: Military Grade Encryption Status & Migration - Jan 2026
@@ -155,7 +200,11 @@ def get_security_status():
         },
         'session_management': {
             'timeout_minutes': get_session_timeout() // 60,
-            'active_sessions': len(active_sessions),
+            # MK: read through the module, not the star-import. load_sessions()
+            # rebinds utils.auth's global at startup, so this file's imported name
+            # stays pointed at the pre-boot empty dict and the panel reported 0
+            # sessions on a box with a hundred people logged in.
+            'active_sessions': len(_live_sessions()),
             'encrypted_storage': True,
             'secure_cookies': True,
         },
@@ -294,6 +343,76 @@ def _managed_update_command(method):
     }.get(method, '')
 
 
+# MK Oct 2026 - the update, the rollback and the restart button hand the restart to
+# `systemctl restart pegaprox` only when this process runs in that unit. A second
+# PegaProx on the host (a test instance started by hand, one in a unit of another name)
+# restarted the other one that way and went on as it was.
+_SERVICE_UNIT = 'pegaprox.service'
+_CGROUP_FILE = '/proc/self/cgroup'
+
+
+def _in_service_unit():
+    """Whether the kernel lists this process in the cgroup of pegaprox.service, in the
+    hierarchy systemd keeps its units in (cgroup v2, or name=systemd under v1). False
+    where that cannot be read."""
+    try:
+        with open(_CGROUP_FILE, encoding='utf-8') as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return False
+    for line in lines:
+        parts = line.split(':', 2)
+        if len(parts) == 3 and parts[1] in ('', 'name=systemd') and _SERVICE_UNIT in parts[2].split('/'):
+            return True
+    return False
+
+
+def _restart_through_systemd():
+    """True once systemctl restarted the unit, False where the caller restarts in place
+    (ha.leave_process): not this process's unit, not active, or no root and no
+    password-less sudo (the unit of the .deb runs with NoNewPrivileges)."""
+    if not _in_service_unit():
+        logging.info(f"This process does not run in {_SERVICE_UNIT}, so that unit is left alone")
+        return False
+    is_root = os.geteuid() == 0 if hasattr(os, 'geteuid') else False
+    has_sudo = shutil.which('sudo') is not None
+    try:
+        result = subprocess.run(['systemctl', 'is-active', 'pegaprox'],
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            if is_root:
+                subprocess.run(['systemctl', 'restart', 'pegaprox'], capture_output=True, timeout=30)
+                return True
+            if has_sudo:
+                result = subprocess.run(['sudo', '-n', 'systemctl', 'restart', 'pegaprox'],
+                                        capture_output=True, text=True, timeout=30)
+                return result.returncode == 0
+    except Exception:
+        pass
+    return False
+
+
+def _refuse_confined_updater():
+    """403 unless the caller sees every cluster, else None.
+
+    NS Oct 2026 - the updater replaces and restarts the whole installation, every tenant's
+    included. update.manage is grantable like any other permission, so a role confined to a
+    tenant could hold it; the rule is the automated-installations one, reused so the two
+    cannot drift apart."""
+    from pegaprox.api.auto_install import _sees_every_cluster
+    from pegaprox.utils.auth import build_authz_user
+    try:
+        session = getattr(request, 'session', None) or {}
+        unconfined = _sees_every_cluster(build_authz_user(session.get('user', ''), session))
+    except Exception as e:
+        logging.warning(f"[update] could not resolve the caller's cluster scope: {e}")
+        unconfined = False
+    if not unconfined:
+        return jsonify({'error': 'The updater is only available to accounts that are not '
+                                 'limited to a tenant or to specific clusters'}), 403
+    return None
+
+
 @bp.route('/api/pegaprox/check-update', methods=['GET'])
 @require_auth(perms=['update.manage'])
 def check_pegaprox_update():
@@ -303,6 +422,9 @@ def check_pegaprox_update():
     current version with a hint flag so the UI can render "Air-gap mode active —
     update checks disabled" instead of a misleading "no updates available".
     """
+    _uerr = _refuse_confined_updater()
+    if _uerr:
+        return _uerr
     if load_server_settings().get('air_gap_mode', False):
         return jsonify({
             'current_version': PEGAPROX_VERSION,
@@ -430,6 +552,9 @@ def perform_pegaprox_update():
     - *.db, *.enc             (databases, encrypted files)
     - *.pem, *.key, *.crt    (certificates, private keys)
     """
+    _uerr = _refuse_confined_updater()
+    if _uerr:
+        return _uerr
     try:
         data = request.json or {}
         force = data.get('force', False)
@@ -833,6 +958,13 @@ def perform_pegaprox_update():
             if len(failed_files) > 5:
                 audit_detail += f" (+{len(failed_files) - 5} more)"
         log_audit(user, 'pegaprox.update_completed', audit_detail)
+        # MK Oct 2026 (#625): this updater takes main, whatever branch the install followed
+        # before (deploy.sh / update.sh with PEGAPROX_BRANCH, api/ha.py update_branch)
+        if downloaded_files:
+            try:
+                os.unlink(os.path.join(install_dir, '.pegaprox-branch'))
+            except OSError:
+                pass
 
         # MK 2026-08-11 — preflight the crypto/TLS stack in the interpreter the restarted
         # service will actually use (the venv), NOT this already-running one that still has the
@@ -864,35 +996,17 @@ def perform_pegaprox_update():
         def restart_server():
             time.sleep(restart_delay)
             logging.info("Restarting PegaProx server...")
+            # the leader of an automatic group: the members hold its lease meanwhile (#625)
+            ha.planned_restart(f'update to {new_version}')
+            if _restart_through_systemd():
+                return
 
-            is_root = os.geteuid() == 0 if hasattr(os, 'geteuid') else False
-            has_sudo = shutil.which('sudo') is not None
-
-            try:
-                result = subprocess.run(['systemctl', 'is-active', 'pegaprox'],
-                                       capture_output=True, text=True, timeout=5)
-                if result.returncode == 0:
-                    if is_root:
-                        subprocess.run(['systemctl', 'restart', 'pegaprox'], timeout=30)
-                        return
-                    elif has_sudo:
-                        result = subprocess.run(
-                            ['sudo', '-n', 'systemctl', 'restart', 'pegaprox'],
-                            capture_output=True, text=True, timeout=30)
-                        if result.returncode == 0:
-                            return
-
-                    # let systemd restart us
-                    logging.info("Exiting for systemd restart (Restart=always)...")
-                    os._exit(0)
-            except:
-                pass
-
-            # Fallback: restart via Python
-            try:
-                os.execv(sys.executable, [sys.executable] + sys.argv)
-            except:
-                os._exit(0)
+            # systemctl could not do it (not our unit, no root, no sudo - the unit of the
+            # .deb runs with NoNewPrivileges): the process restarts itself
+            # (ha.leave_process), it never just exits 0, which a unit with
+            # Restart=on-failure leaves stopped
+            logging.info("Restarting in place...")
+            ha.leave_process()
 
         if deps_ok:
             threading.Thread(target=restart_server, daemon=True).start()
@@ -966,6 +1080,9 @@ def rollback_pegaprox_update():
     
     NS: Rollback functionality - Jan 2026
     """
+    _uerr = _refuse_confined_updater()
+    if _uerr:
+        return _uerr
     try:
         data = request.json or {}
         backup_name = data.get('backup')
@@ -1040,32 +1157,12 @@ def rollback_pegaprox_update():
         # Schedule restart
         def restart_server():
             time.sleep(3)
-            is_root = os.geteuid() == 0 if hasattr(os, 'geteuid') else False
-            has_sudo = shutil.which('sudo') is not None
-            
-            try:
-                result = subprocess.run(['systemctl', 'is-active', 'pegaprox'], 
-                                       capture_output=True, text=True, timeout=5)
-                if result.returncode == 0:
-                    if is_root:
-                        subprocess.run(['systemctl', 'restart', 'pegaprox'], timeout=30)
-                        return
-                    elif has_sudo:
-                        result = subprocess.run(
-                            ['sudo', '-n', 'systemctl', 'restart', 'pegaprox'],
-                            capture_output=True, text=True, timeout=30
-                        )
-                        if result.returncode == 0:
-                            return
-                    # Fallback: exit for systemd restart
-                    logging.info("Exiting for systemd restart...")
-                    os._exit(0)
-            except:
-                pass
-            try:
-                os.execv(sys.executable, [sys.executable] + sys.argv)
-            except:
-                os._exit(0)
+            ha.planned_restart(f'rollback to {backup_name}')
+            if _restart_through_systemd():
+                return
+            # as after an update: never a plain exit 0
+            logging.info("Restarting in place...")
+            ha.leave_process()
         
         import threading
         threading.Thread(target=restart_server, daemon=True).start()
@@ -1190,14 +1287,21 @@ _SPONSOR_HEAL_SOURCES = (
 )
 _sponsor_heal_misses = {}  # name -> monotonic ts of last failed remote fetch
 _sponsor_mem_cache = {}    # name -> (bytes, content_type) — fallback when images/ isn't writable
+# NS Oct 2026 - the route needs no login, and every new name used to cost two outbound
+# fetches of up to 8 s each plus a miss entry kept forever (#1045). Only the names the
+# footer asks for (SponsorSlot in web/src/ui.js, slots 1-8) are healed, one fetch at a time;
+# a request that finds one running gets the usual 404 instead of waiting for it.
+_SPONSOR_HEAL_NAMES = frozenset(f'sponsor{n}.png' for n in range(1, 9))
+_sponsor_heal_lock = threading.Lock()
 
 def _get_healed_sponsor(filename):
     """Return (content, content_type) for a missing sponsors/* asset pulled from
     the mirror then GitHub. Caches to images/sponsors/ when writable, otherwise
     keeps it in memory so the logo still shows on read-only installs. Returns
-    (None, None) in air-gap mode, on a recent miss, or if it can't be fetched."""
+    (None, None) in air-gap mode, on a recent miss, while another fetch runs,
+    or if it can't be fetched."""
     name = os.path.basename(filename)
-    if not re.match(r'^sponsor[\w-]+\.(png|svg|jpg|jpeg|webp|gif)$', name, re.I):
+    if name not in _SPONSOR_HEAL_NAMES or filename != f'sponsors/{name}':
         return None, None
     if name in _sponsor_mem_cache:          # fetched before but couldn't write to disk
         return _sponsor_mem_cache[name]
@@ -1209,29 +1313,34 @@ def _get_healed_sponsor(filename):
     now = time.monotonic()
     if now - _sponsor_heal_misses.get(name, 0) < 600:
         return None, None
-    for tmpl in _SPONSOR_HEAL_SOURCES:
-        url = tmpl.format(name=name)
-        try:
-            r = requests.get(url, timeout=8)
-            if r.status_code == 200 and 0 < len(r.content) <= 5 * 1024 * 1024:
-                ctype = r.headers.get('Content-Type') or ('image/svg+xml' if name.lower().endswith('.svg') else 'image/png')
-                try:
-                    dst_dir = os.path.join(IMAGES_DIR, 'sponsors')
-                    os.makedirs(dst_dir, exist_ok=True)
-                    with open(os.path.join(dst_dir, name), 'wb') as fh:
-                        fh.write(r.content)
-                    logging.info(f"[sponsors] self-healed {name} via {url.split('/')[2]} (cached to disk)")
-                except Exception as werr:
-                    # images/ not writable — keep it in memory so the logo still
-                    # renders; perms must not be able to break a sponsor logo.
-                    _sponsor_mem_cache[name] = (r.content, ctype)
-                    logging.warning(f"[sponsors] fetched {name} via {url.split('/')[2]} but images/ not writable ({werr}); serving from memory")
-                _sponsor_heal_misses.pop(name, None)
-                return r.content, ctype
-        except Exception as e:
-            logging.debug(f"[sponsors] heal fetch failed ({url}): {e}")
-    _sponsor_heal_misses[name] = now
-    return None, None
+    if not _sponsor_heal_lock.acquire(blocking=False):
+        return None, None
+    try:
+        for tmpl in _SPONSOR_HEAL_SOURCES:
+            url = tmpl.format(name=name)
+            try:
+                r = requests.get(url, timeout=8)
+                if r.status_code == 200 and 0 < len(r.content) <= 5 * 1024 * 1024:
+                    ctype = r.headers.get('Content-Type') or ('image/svg+xml' if name.lower().endswith('.svg') else 'image/png')
+                    try:
+                        dst_dir = os.path.join(IMAGES_DIR, 'sponsors')
+                        os.makedirs(dst_dir, exist_ok=True)
+                        with open(os.path.join(dst_dir, name), 'wb') as fh:
+                            fh.write(r.content)
+                        logging.info(f"[sponsors] self-healed {name} via {url.split('/')[2]} (cached to disk)")
+                    except Exception as werr:
+                        # images/ not writable - keep it in memory so the logo still
+                        # renders; perms must not be able to break a sponsor logo.
+                        _sponsor_mem_cache[name] = (r.content, ctype)
+                        logging.warning(f"[sponsors] fetched {name} via {url.split('/')[2]} but images/ not writable ({werr}); serving from memory")
+                    _sponsor_heal_misses.pop(name, None)
+                    return r.content, ctype
+            except Exception as e:
+                logging.debug(f"[sponsors] heal fetch failed ({url}): {e}")
+        _sponsor_heal_misses[name] = now
+        return None, None
+    finally:
+        _sponsor_heal_lock.release()
 
 @bp.route('/images/<path:filename>')
 def serve_images(filename):
@@ -1325,6 +1434,10 @@ def get_server_settings():
         settings['acme_dns_rfc2136_secret'] = '********'
     if settings.get('acme_dns_cloudflare_token'):
         settings['acme_dns_cloudflare_token'] = '********'
+    # MK Oct 2026 - the banners have routes of their own, which keep them from an admin
+    # limited to a tenant (api/banners.py)
+    from pegaprox.api.banners import BANNERS_KEY
+    settings.pop(BANNERS_KEY, None)
     return jsonify(settings)
 
 
@@ -1577,7 +1690,8 @@ def update_server_settings():
                     'proxmoxDark', 'proxmoxLight', 'midnight', 'forest', 'rose', 'ocean',
                     'highContrast', 'dracula', 'nord', 'monokai', 'matrix', 'sunset',
                     'cyberpunk', 'github', 'solarizedDark', 'gruvbox',
-                    'corporateDark', 'corporateLight', 'enterpriseBlue'  # NS: Corporate themes
+                    'corporateDark', 'corporateLight', 'enterpriseBlue',  # NS: Corporate themes
+                    'cloud', 'system'  # MK Sep 2026 (#743); `cloud` was missing here
                 ]
                 if data['default_theme'] in allowed_themes:
                     settings['default_theme'] = data['default_theme']
@@ -1790,7 +1904,8 @@ def update_server_settings():
                 'proxmoxDark', 'proxmoxLight', 'midnight', 'forest', 'rose', 'ocean',
                 'highContrast', 'dracula', 'nord', 'monokai', 'matrix', 'sunset',
                 'cyberpunk', 'github', 'solarizedDark', 'gruvbox',
-                'corporateDark', 'corporateLight', 'enterpriseBlue'  # NS: Corporate themes
+                'corporateDark', 'corporateLight', 'enterpriseBlue',  # NS: Corporate themes
+                'cloud', 'system'  # MK Sep 2026 (#743); `cloud` was missing here
             ]
             if default_theme in allowed_themes:
                 settings['default_theme'] = default_theme
@@ -1948,31 +2063,14 @@ def restart_server():
         def do_restart():
             time.sleep(1)  # Give time for response to be sent
             logging.info("Server restart initiated by admin")
-            
-            is_root = os.geteuid() == 0 if hasattr(os, 'geteuid') else False
-            has_sudo = shutil.which('sudo') is not None
-            
-            try:
-                result = subprocess.run(['systemctl', 'is-active', 'pegaprox'],
-                                       capture_output=True, text=True, timeout=5)
-                if result.returncode == 0:
-                    if is_root:
-                        subprocess.run(['systemctl', 'restart', 'pegaprox'], 
-                                      capture_output=True, timeout=30)
-                        return
-                    elif has_sudo:
-                        result = subprocess.run(
-                            ['sudo', '-n', 'systemctl', 'restart', 'pegaprox'],
-                            capture_output=True, text=True, timeout=30
-                        )
-                        if result.returncode == 0:
-                            return
-            except Exception:
-                pass
-            
-            # Fallback: exit and let systemd restart
-            logging.info("Exiting for systemd restart...")
-            os._exit(0)
+            ha.planned_restart(f'restart asked for by {user}')
+            if _restart_through_systemd():
+                return
+
+            # systemctl could not do it: restart in place (never a plain exit 0, which a
+            # unit with Restart=on-failure leaves stopped)
+            logging.info("Restarting in place...")
+            ha.leave_process()
         
         restart_thread = threading.Thread(target=do_restart)
         restart_thread.daemon = True
@@ -2199,6 +2297,46 @@ def _strip_secret_fields(d):
     return d
 
 
+def _strip_cluster_secrets(cluster):
+    """A cluster row for a backup without secrets.
+
+    MK Oct 2026 (#625) - the sweep above looks at the keys of the row. The HA settings
+    are a dict of their own inside it and went out as they were: they hold the token
+    the node agents sign their leader question with, and the BMC password of each
+    node's fence."""
+    _strip_secret_fields(cluster)
+    ha_settings = cluster.get('ha_settings') if isinstance(cluster, dict) else None
+    if isinstance(ha_settings, dict):
+        _strip_secret_fields(ha_settings)
+        fencing = ha_settings.get('fencing')
+        for fence in (fencing.values() if isinstance(fencing, dict) else ()):
+            _strip_secret_fields(fence)
+    return cluster
+
+
+def _keep_guarded_ha_settings(cluster, existing):
+    """A merge restore over a cluster that is there: what only the HA routes write
+    stays as the cluster has it (#625). The backup's value would switch the cluster
+    claim or the unsafe two-node recovery without their proof, and a backup without
+    secrets, or one from before the agents had a token, would take the token away:
+    every installed tiebreak agent is then answered 403."""
+    from pegaprox.api.clusters import HA_SETTINGS_GUARDED
+    held = existing.get('ha_settings') if isinstance(existing.get('ha_settings'), dict) else {}
+    # a backup without HA settings for the cluster changes none of them
+    sent = cluster.get('ha_settings') if isinstance(cluster.get('ha_settings'), dict) else held
+    merged ={k: v for k, v in sent.items() if k not in HA_SETTINGS_GUARDED}
+    merged.update({k: held[k] for k in HA_SETTINGS_GUARDED if k in held})
+    # a row without the key reads as a setup from before the safety rules as soon as it
+    # forces quorum: written out as what this row is right now
+    forced_now = bool(held.get('two_node_mode') or held.get('force_quorum_on_failure'))
+    merged.setdefault('unsafe_two_node_recovery', forced_now)
+    if not forced_now and (merged.get('two_node_mode') or merged.get('force_quorum_on_failure')):
+        # the backup turns forced quorum on where the cluster has none: a new setup under
+        # the safety rules, whatever flag the row kept from an earlier one
+        merged['unsafe_two_node_recovery'] = False
+    cluster['ha_settings'] = merged
+
+
 @bp.route('/api/config/backup', methods=['POST'])
 
 @require_auth(roles=[ROLE_ADMIN])
@@ -2259,23 +2397,13 @@ def backup_config():
         # authenticate against the upstream IdP each time. The old code only
         # checked the local hash, so AD-mapped admins always got "Incorrect
         # password" when creating a config backup. Branch on auth_source.
-        auth_source = (user.get('auth_source') if isinstance(user, dict) else None) or 'local'
-        password_ok = False
-        if auth_source == 'ldap':
-            try:
-                from pegaprox.utils.ldap import ldap_authenticate
-                ldap_res = ldap_authenticate(username, user_password)
-                password_ok = bool(ldap_res and ldap_res.get('success'))
-            except Exception as _ldap_err:
-                logging.warning(f"[Backup] LDAP password verification failed for {username}: {_ldap_err}")
-                password_ok = False
-        else:
-            password_salt = user.get('password_salt', '') if isinstance(user, dict) else ''
-            password_hash = user.get('password_hash', '') if isinstance(user, dict) else ''
-            password_ok = verify_password(user_password, password_salt, password_hash)
+        # MK Sep 2026 (#625) - that branch lives in recheck_account_password now, shared
+        # with the standby pairing routes; it audits the failure the same way.
+        from pegaprox.utils.auth import recheck_account_password
+        password_ok, auth_source = recheck_account_password(
+            username, user_password, user, audit_action='config.backup_failed')
 
         if not password_ok:
-            log_audit(username, 'config.backup_failed', f'Password verification failed (auth_source={auth_source})')
             logging.warning(f"[Backup] Password verification failed for {username} (auth_source={auth_source})")
             return jsonify({'error': 'Incorrect password'}), 401
 
@@ -2303,6 +2431,10 @@ def backup_config():
         
         # Server settings
         backup_data['server_settings'] = load_server_settings()
+        # MK Oct 2026 (#625) - whether this instance is in an HA group is its own fact: a
+        # standalone that restored it came up passive at its next start
+        from pegaprox.core import ha
+        backup_data['server_settings'].pop(ha.MEMBER_SETTING, None)
         # Remove sensitive data if not requested
         if not include_secrets:
             if 'smtp_password' in backup_data['server_settings']:
@@ -2322,7 +2454,7 @@ def backup_config():
             # shape as well as by name so a newly added secret field can't slip through again.
             for cluster_id, cluster_data in clusters.items():
                 if isinstance(cluster_data, dict):
-                    _strip_secret_fields(cluster_data)
+                    _strip_cluster_secrets(cluster_data)
         backup_data['clusters'] = clusters
         
         # Users (optional)
@@ -2623,8 +2755,12 @@ def restore_config():
                     # neither enable nor disable it, so we drop the backup's values and
                     # preserve the live consent state for BOTH keys.
                     _PROTECTED_CONSENT = ('hardware_monitoring', 'hardware_monitoring_redfish')
+                    # MK Oct 2026 (#625) - nor the HA member marker, which says whether this
+                    # instance is in a group. The export leaves it out; an older backup
+                    # still carries it.
+                    from pegaprox.core import ha
                     incoming_ss = {k: v for k, v in (data['server_settings'] or {}).items()
-                                   if k not in _PROTECTED_CONSENT}
+                                   if k not in _PROTECTED_CONSENT and k != ha.MEMBER_SETTING}
                     if mode == 'merge':
                         # Only update non-empty values
                         for key, value in incoming_ss.items():
@@ -2688,7 +2824,16 @@ def restore_config():
                                 cluster[_sk] = existing[_sk]
                         if not cluster.get('ssh_key_encrypted') and existing.get('ssh_key_encrypted'):
                             cluster['ssh_key_encrypted'] = existing['ssh_key_encrypted']
-                    
+                        _keep_guarded_ha_settings(cluster, existing)
+
+                    # NS Oct 2026 - it goes onto the ssh command line; a bad one is not restored
+                    from pegaprox.utils.sanitization import validate_ssh_user
+                    _su = cluster.get('ssh_user')
+                    if _su not in (None, '') and not validate_ssh_user(_su):
+                        cluster['ssh_user'] = ''
+                        results['errors'].append(f"Cluster {cluster_id}: ssh_user is not a valid "
+                                                 f"user name, the default user is used")
+
                     if not dry_run:
                         database.save_cluster(cluster_id, cluster)
                     cluster_count += 1
@@ -2752,6 +2897,11 @@ def restore_config():
                     tenant_count += 1
                 except Exception as e:
                     results['errors'].append(f"Tenant: {str(e)}")
+            # NS Oct 2026 (#1046) - get_user_clusters reads a cached copy of the tenants, so
+            # a cluster the restore took away stayed reachable until the next restart
+            if not dry_run:
+                from pegaprox.utils.rbac import invalidate_tenants_cache
+                invalidate_tenants_cache()
             results['restored']['tenants'] = tenant_count
         
         # VM ACLs
@@ -2858,10 +3008,9 @@ def check_ip_allowed(client_ip: str) -> tuple:
     
     # Check blacklist first (always blocks)
     # NS: blacklist is checked before whitelist, security first
-    if _ip_blacklist:
-        for blocked in _ip_blacklist:
-            if _ip_matches(client_ip, blocked):
-                return False, f'IP blacklisted: {blocked}'
+    blocked = _ip_blacklisted(client_ip)
+    if blocked:
+        return False, f'IP blacklisted: {blocked}'
     
     # If whitelist is empty, allow all (only blacklist applies)
     if not _ip_whitelist:
@@ -2873,6 +3022,13 @@ def check_ip_allowed(client_ip: str) -> tuple:
             return True, f'IP allowed: {allowed}'
     
     return False, 'IP not in whitelist'
+
+def _ip_blacklisted(client_ip):
+    """The blacklist entry the address matches, or None."""
+    for blocked in _ip_blacklist:
+        if _ip_matches(_normalize_ip(client_ip), blocked):
+            return blocked
+    return None
 
 def _normalize_ip(ip_str: str) -> str:
     """Strip IPv6-mapped prefix so ::ffff:192.168.1.1 becomes 192.168.1.1
@@ -2919,6 +3075,52 @@ try:
 except:
     pass  # Settings might not exist yet
 
+def _peer_may_pass(client_ip, path):
+    # MK Sep 2026 (#625) - the list is synced, so a standby enforces the active's
+    # copy, and nobody lists the active's own address on the active: its watch and
+    # unpair calls to the standby would bounce here. The peer calls carry their own
+    # credential, a signature over the whole call, so a member gets through (and a
+    # removed one too, to hear 410 from the route). A wrong one counts against the
+    # same failure budget as on the peer routes, so the list does not turn into a
+    # free place to try credentials. The pairing call has no peer credential yet
+    # and stays behind the list.
+    # A blacklist entry is an explicit no and stays one, peer or not.
+    # MK Oct 2026 (#625): the witness's signed calls the same way - its update (the code
+    # bundle) and its leaving, under the key it paired with. The open witness code (the
+    # installer, the pairing) stays behind the list.
+    return ((path.startswith('/api/ha/peer/') and path != '/api/ha/peer/pair' or path in _WITNESS_SIGNED)
+            and not _ip_blacklisted(client_ip))
+
+
+# the calls the witness signs (api/ha.py WITNESS_SIGNED_PATHS)
+_WITNESS_SIGNED = ('/api/ha/witness/bundle', '/api/ha/peer/witness-leave')
+
+
+def _signed_call(path):
+    """Whether this request is a member's signed call, or the witness's on a path it signs."""
+    from pegaprox.api.ha import request_peer, request_witness
+    if path in _WITNESS_SIGNED and request_witness()[0]:
+        return True
+    return bool(request_peer()[0])
+
+
+def ip_lists_pass(client_ip, path, peer):
+    """(passes, reason): whether the allow and block lists let a request to `path` from
+    `client_ip` through. `peer()` says whether the call is a member's signed call (or the
+    witness's, on the paths it signs), asked only where the lists refuse the address and a
+    member may still pass (_peer_may_pass).
+    check_ip_whitelist goes by it, and so do the HA lease routes that answer before
+    Flask (app._LeaseFastPath, #625)."""
+    if not _ip_whitelist_enabled:
+        return True, 'Whitelist disabled'
+    allowed, reason = check_ip_allowed(client_ip)
+    if allowed:
+        return True, reason
+    if _peer_may_pass(client_ip, path) and peer():
+        return True, 'signed call of a member or the witness'
+    return False, reason
+
+
 @bp.before_app_request
 def check_ip_whitelist():
     """Check IP whitelist before processing request"""
@@ -2932,11 +3134,15 @@ def check_ip_whitelist():
     # Skip if whitelist not enabled
     if not _ip_whitelist_enabled:
         return None
-    
+
     client_ip = get_client_ip()
-    allowed, reason = check_ip_allowed(client_ip)
-    
+    path = request.path
+    allowed, reason = ip_lists_pass(client_ip, path, lambda: _signed_call(path))
+
     if not allowed:
+        if _peer_may_pass(client_ip, path):
+            from pegaprox.api.ha import _peer_failures
+            _peer_failures.allow(client_ip)
         logging.warning(f"IP blocked: {client_ip} - {reason}")
         return jsonify({
             'error': 'Access denied',
@@ -3080,13 +3286,26 @@ def get_audit_log_api():
     verify = request.args.get('verify', '').lower() == 'true'
     fmt = (request.args.get('format') or 'json').lower()
 
+    # NS Oct 2026 - admin.audit is in the auditor and monitoring templates, so a tenant's
+    # auditor read every tenant's trail here. A caller confined to some clusters gets the
+    # rows of the clusters they see whole, and their own (#1044).
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import get_user_clusters
+    from pegaprox.api.helpers import caller_is_scoped
+    _au = build_authz_user(request.session.get('user', ''), request.session)
+    _theirs = get_user_clusters(_au, include_pools=False)
+    scope = None
+    if _theirs is not None:
+        scope = ([c for c in _theirs if not caller_is_scoped(_au, c)], _au.get('username', ''))
+
     # Get from database with optional integrity verification
     database = get_db()
     entries = database.get_audit_log(
         limit=limit,
         user=user_filter,
         action=action_filter,
-        verify_integrity=verify
+        verify_integrity=verify,
+        scope=scope,
     )
 
     if fmt == 'csv':
@@ -3138,6 +3357,14 @@ def get_cluster_audit_log_api(cluster_id):
     database = get_db()
     entries = database.get_audit_log(limit=limit * 10)  # Get more to filter
     
+    # NS Oct 2026 - the name below is one a tenant admin can give their own cluster, and then
+    # this read another tenant's trail (#1121). A row that carries a cluster id belongs to that
+    # cluster only. Rows without one (older ones, ones that name no cluster) are matched by
+    # name as before for a caller who sees every cluster, and left out for anyone else.
+    from pegaprox.utils.rbac import get_user_clusters
+    from pegaprox.api.helpers import acting_user
+    sees_every_cluster = get_user_clusters(acting_user()) is None
+
     # Filter by cluster and vmid
     filtered = []
     for entry in entries:
@@ -3145,7 +3372,12 @@ def get_cluster_audit_log_api(cluster_id):
         details = entry.get('details', '')
         
         # Cluster filter
-        if cluster_name:
+        if entry.get('cluster_id'):
+            if entry['cluster_id'] != cluster_id:
+                continue
+        elif not sees_every_cluster:
+            continue
+        elif cluster_name:
             detected_cluster = None
             
             # First check the cluster field
@@ -3460,11 +3692,21 @@ def index():
         return send_from_directory(WEB_DIR, 'index.html')
 
 
+def _plugin_page_here(plugin_id):
+    """Whether a plugin's own page is served here. MK Oct 2026 (#625) - on a standby the
+    module stays loaded until a restart after the leader switched the plugin off, so it
+    goes by the synced plugin state there as well (api/plugins.py plugin_runs_here)."""
+    from pegaprox.api.plugins import _loaded_plugins, plugin_runs_here
+    from pegaprox.core import ha
+    if ha.is_standby():
+        return plugin_runs_here(plugin_id)
+    return plugin_id in _loaded_plugins
+
+
 @bp.route('/status')
 def status_page():
     """Serve public status page — only if plugin is enabled"""
-    from pegaprox.api.plugins import _loaded_plugins
-    if 'status_page' not in _loaded_plugins:
+    if not _plugin_page_here('status_page'):
         return '<h1>Status Page not available</h1><p>The Status Page plugin is not enabled.</p>', 404
     import os
     path = os.path.join(os.path.dirname(__file__), '..', '..', 'plugins', 'status_page', 'status.html')
@@ -3475,8 +3717,7 @@ def status_page():
 @bp.route('/api/public/status-page', methods=['GET'])
 def public_status_api():
     """NS: Apr 2026 — Public status endpoint, auth via URL key (no session)."""
-    from pegaprox.api.plugins import _loaded_plugins
-    if 'status_page' not in _loaded_plugins:
+    if not _plugin_page_here('status_page'):
         return jsonify({'error': 'Status Page plugin not enabled'}), 404
     try:
         from plugins.status_page import _public_status
@@ -3493,8 +3734,7 @@ def public_status_api():
 @bp.route('/portal/<path:subpath>')
 def client_portal_page(subpath=None):
     """Serve client portal — only if plugin is enabled"""
-    from pegaprox.api.plugins import _loaded_plugins
-    if 'client_portal' not in _loaded_plugins:
+    if not _plugin_page_here('client_portal'):
         return '<h1>Client Portal not available</h1><p>The Client Portal plugin is not enabled.</p>', 404
     import os
     portal_path = os.path.join(os.path.dirname(__file__), '..', '..', 'plugins', 'client_portal', 'portal.html')
@@ -3634,8 +3874,9 @@ def generate_support_bundle():
             zf.writestr(f"{bundle_prefix}/sse_connections.json", json.dumps(sse_info, indent=2))
             
             # 5. Active Sessions (anonymized)
-            sessions_info = {'total_active': len(active_sessions), 'sessions': []}
-            for sid, sess in list(active_sessions.items())[:50]:
+            _sessions = _live_sessions()
+            sessions_info = {'total_active': len(_sessions), 'sessions': []}
+            for sid, sess in list(_sessions.items())[:50]:
                 sessions_info['sessions'].append({
                     'user': sess.get('user', 'unknown'),
                     'role': sess.get('role', 'unknown'),
@@ -4008,45 +4249,122 @@ def check_cluster_updates(cluster_id):
             }
         })
     
-    for node_name in node_names:
-        # MK: Feb 2026 - Retry up to 2 times on failure, with clear error reporting
-        max_retries = 2
-        last_error = None
-        for attempt in range(max_retries + 1):
+    # SS (Sep 2026): validate each node name against an allow-list that permits letters,
+    # digits, dots and hyphens but rejects path separators, so a crafted name like
+    # `../foo` can't reach the URL builders. (node_names is already trimmed to online
+    # nodes upstream — the only thing added here is the name allow-list.)
+    import re as _re
+    _SAFE_NODE = _re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9.\-]{0,62}$')
+    safe_node_names = []
+    unsafe_node_names = []
+    for n in node_names:
+        if n and _SAFE_NODE.match(n):
+            safe_node_names.append(n)
+        else:
+            unsafe_node_names.append(n)
+
+    # SS (Sep 2026): Proxmox's GET /nodes/{node}/apt/update only ever returns the
+    # output of the LAST `apt update` that ran, and yum's `check-update` reads a local
+    # cache, so a bare GET reports stale / uncached data. We must POST first to trigger
+    # a fresh refresh, wait for it, then read. Doing that per node serially costs
+    # N×(apt-update time) and trips the gateway timeout on big clusters, so every node's
+    # refresh+read runs concurrently through the shared gevent pool instead.
+    from pegaprox.utils.concurrent import run_concurrent_dict
+
+    def _check_one(node_name):
+        # 1) Refresh first (POST for Proxmox, `yum makecache` for XCP-ng). Proxmox
+        #    hands back a UPID; wait on that task so the read below is guaranteed fresh.
+        #    XCP-ng's makecache has no task to await, so give it a moment to settle.
+        refresh_error = None
+        try:
+            refreshed = mgr.refresh_node_apt(node_name)
+            if not isinstance(refreshed, dict):
+                refresh_error = 'refresh returned an unexpected shape'
+            elif refreshed.get('success') is False:
+                refresh_error = refreshed.get('error') or 'apt refresh failed'
+            else:
+                task_ref = refreshed.get('task')
+                if task_ref:
+                    if not mgr._wait_for_task(node_name, task_ref, timeout=120):
+                        refresh_error = 'the apt refresh task did not finish cleanly'
+                else:
+                    time.sleep(10)
+        except Exception as e:
+            refresh_error = str(e)
+
+        # MK Sep 2026 - a failed refresh must NOT fall through to the read below.
+        # get_node_apt_updates answers from whatever apt last wrote on the node, so
+        # reading after a failed refresh returns stale data that then goes out as
+        # success: True and is held by the 24h update-check cache. "could not
+        # refresh" is not "no updates"; report it with the same count == -1 the
+        # read failures use.
+        if refresh_error:
+            logging.error(f"[UpdateCheck] {node_name} refresh failed: {refresh_error}")
+            return {
+                'success': False,
+                'error': f"apt refresh failed: {refresh_error}",
+                'updates': [],
+                'count': -1,
+            }
+
+        # 2) Read the available-updates list, retrying briefly on a transient failure so
+        #    one flaky node doesn't sink the whole cluster.
+        last_err = None
+        for attempt in range(3):
             try:
                 updates = mgr.get_node_apt_updates(node_name)
-                
+
                 if isinstance(updates, list):
                     update_list = updates
                 elif isinstance(updates, dict):
                     update_list = updates.get('data', [])
                 else:
                     update_list = []
-                
-                results[node_name] = {
+                return {
                     'success': True,
                     'updates': update_list,
                     'count': len(update_list),
-                    'retries': attempt
+                    'retries': attempt,
                 }
-                last_error = None
-                break  # Success, no more retries
             except Exception as e:
-                last_error = str(e)
-                if attempt < max_retries:
-                    logging.warning(f"[UpdateCheck] {node_name} attempt {attempt+1} failed: {e}, retrying...")
-                    time.sleep(2)
-        
-        # LW: If all retries failed, show clear error state
-        if last_error:
-            logging.error(f"[UpdateCheck] {node_name} failed after {max_retries+1} attempts: {last_error}")
-            results[node_name] = {
-                'success': False,
-                'error': last_error,
-                'updates': [],
-                'count': -1  # NS: -1 signals "check failed" vs 0 which means "no updates"
-            }
-    
+                last_err = e
+                logging.warning(f"[UpdateCheck] {node_name} read attempt {attempt+1} failed: {e}")
+                time.sleep(2)
+
+        # All retries failed — record a clear failed-check state (count == -1).
+        logging.error(f"[UpdateCheck] {node_name} failed after 3 attempts: {last_err}")
+        return {
+            'success': False,
+            'error': str(last_err),
+            'updates': [],
+            'count': -1,
+        }
+
+    per_node = run_concurrent_dict(
+        {n: (lambda nn=n: _check_one(nn)) for n in safe_node_names},
+        timeout=180,
+    )
+    for node_name, node_result in per_node.items():
+        results[node_name] = node_result or {
+            'success': False,
+            'error': 'Update check timed out',
+            'updates': [],
+            'count': -1,
+        }
+
+    # SS (Sep 2026): node names that fail the allow-list are excluded from the concurrent
+    # check above, but we still record them as an explicit unchecked failure (count == -1),
+    # same as a failed read. Otherwise a dropped node reads as "nothing to report" instead
+    # of "we never looked" — and a legal digit-led hostname like `1blade` would vanish.
+    for node_name in unsafe_node_names:
+        results[node_name] = {
+            'success': False,
+            'error': 'Node name failed allow-list validation',
+            'updates': [],
+            'count': -1,
+        }
+        logging.warning(f"[UpdateCheck] rejecting node name outside allow-list: {node_name!r}")
+
     # MK: count > 0 for updates, ignore -1 (failed checks)
     total_updates = sum(max(r.get('count', 0), 0) for r in results.values())
     nodes_with_updates = sum(1 for r in results.values() if r.get('count', 0) > 0)
@@ -4144,9 +4462,10 @@ def get_cluster_update_status(cluster_id):
     # A confined caller gets the progress but not the per-guest lines.
     if rolling_update:
         from pegaprox.utils.auth import build_authz_user
-        from pegaprox.api.helpers import caller_is_scoped
-        if caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session),
-                            cluster_id):
+        from pegaprox.api.helpers import sees_whole_maintenance
+        # the rule of /metrics and /node-progress, a lowered admin included
+        if not sees_whole_maintenance(build_authz_user(request.session.get('user', ''), request.session),
+                                      cluster_id):
             rolling_update = {k: v for k, v in rolling_update.items()
                               if k not in ('logs', 'paused_details')}
 
@@ -4261,6 +4580,15 @@ def start_rolling_update(cluster_id):
     
     mgr = cluster_managers[cluster_id]
     data = request.get_json() or {}
+
+    # MK Sep 2026 (#716) - alert channels to tell about this run, so the
+    # on-call monitoring can be muted for its actual duration instead of a guessed
+    # maintenance window. Opt-in: no ids, no traffic.
+    notify_channels = data.get('notify_channels', [])
+    if notify_channels is None:
+        notify_channels = []
+    if not isinstance(notify_channels, list) or not all(isinstance(c, str) for c in notify_channels):
+        return jsonify({'error': 'notify_channels must be a list of channel ids'}), 400
     
     # Configuration options
     include_reboot = data.get('include_reboot', False)
@@ -4294,6 +4622,11 @@ def start_rolling_update(cluster_id):
     ceph_health_gate = str(data.get('ceph_health_gate', 'off')).lower()
     if ceph_health_gate not in ('off', 'degraded', 'strict'):
         ceph_health_gate = 'off'
+    # MK Oct 2026 - both off by default, which is how a run behaved before. #763: move the
+    # templates of a node with its evacuation (offline). #954: let negative affinity rules
+    # give way for the run, so guests that must run apart may share a node until it ends.
+    # Proxmox only - XCP-ng has neither the templates nor the HA rules meant here.
+    migrate_templates, relax_anti_affinity = evacuation_options(mgr, data)
 
     # MK: Configurable timeouts (GitHub Issue fix)
     evacuation_timeout = data.get('evacuation_timeout', 1800)  # 30 minutes default (was 5 min!)
@@ -4340,6 +4673,8 @@ def start_rolling_update(cluster_id):
         'pause_on_evacuation_error': pause_on_evacuation_error,  # NS: GitHub #40
         'allow_local_disks': allow_local_disks,  # NS #330
         'ceph_health_gate': ceph_health_gate,  # NS #403 part 2
+        'migrate_templates': migrate_templates,  # #763
+        'relax_anti_affinity': relax_anti_affinity,  # #954
         'force_all': force_all,
         'evacuation_timeout': evacuation_timeout,
         'update_timeout': update_timeout,
@@ -4357,6 +4692,12 @@ def start_rolling_update(cluster_id):
         'logs': []
     }
     
+    usr = request.session.get('user', 'system')
+    log_audit(usr, 'node.rolling_update_started',
+              f"Rolling update of {len(nodes_to_update)} node(s) started"
+              + evacuation_options_said(migrate_templates, relax_anti_affinity),
+              cluster=mgr.config.name)
+
     # helper: one-line log with a timestamp prefix
     def _log(msg):
         try:
@@ -4364,15 +4705,34 @@ def start_rolling_update(cluster_id):
         except Exception:
             pass
 
+    # #763, #954 - shared with the scheduled run (api/helpers.py): off before the first
+    # evacuation, on again when the run ends however it ends
+    def _log_templates(task):
+        rolling_moved_templates(mgr, task)
+
+    def _rules_give_way():
+        rolling_rules_give_way(mgr, usr)
+
+    def _rules_back_on():
+        rolling_rules_back_on(mgr, usr)
+
     # Start the rolling update in a background thread
     def run_rolling_update():
+        from pegaprox.utils.webhooks import notify_lifecycle   # #716
         try:
             logging.info(f"[RollingUpdate] Starting rolling update for cluster, nodes: {nodes_to_update}")
             _log("Rolling update started")
-            _log(f"Settings: skip_up_to_date={skip_up_to_date}, skip_evacuation={skip_evacuation}, evacuation_timeout={evacuation_timeout}s, reboot_timeout={reboot_timeout}s, allow_local_disks={allow_local_disks}, ceph_health_gate={ceph_health_gate}")
+            # #716 - the signal the monitoring mutes on
+            notify_lifecycle('rolling_update.started',
+                             f"Rolling update started on {mgr.config.name}",
+                             f"{len(nodes_to_update)} node(s) queued: {', '.join(nodes_to_update)}"
+                             + (" · reboots included" if include_reboot else ""),
+                             cluster_id=cluster_id, channel_ids=notify_channels)
+            _log(f"Settings: skip_up_to_date={skip_up_to_date}, skip_evacuation={skip_evacuation}, evacuation_timeout={evacuation_timeout}s, reboot_timeout={reboot_timeout}s, allow_local_disks={allow_local_disks}, ceph_health_gate={ceph_health_gate}, migrate_templates={migrate_templates}, relax_anti_affinity={relax_anti_affinity}")
 
             if skip_evacuation:
                 _log("⚠️ WARNING: VM evacuation disabled - VMs may be affected if update fails!")
+            rolling_options_intro(mgr)   # #763, #954
 
             # MK #181 — pre-flight summary so admins see cluster-wide safety state up front,
             # not just per-node ticks.
@@ -4454,14 +4814,13 @@ def start_rolling_update(cluster_id):
                     # MK #181 — list the VMs about to move. Nothing is more reassuring to an admin
                     # at 02:00 than seeing the names roll past before evacuation kicks off.
                     if not skip_evacuation:
+                        # MK Oct 2026 - no manager has get_node_vms or get_cluster_resources, so
+                        # this always read "0 guests present"
                         try:
-                            vms_here = mgr.get_node_vms(node_name) or []
+                            vms_here = [r for r in (mgr.get_vm_resources() or [])
+                                        if r.get('node') == node_name and r.get('type') in ('qemu', 'lxc')]
                         except Exception:
-                            try:
-                                all_r = mgr.get_cluster_resources() or []
-                                vms_here = [r for r in all_r if r.get('node') == node_name and r.get('type') in ('qemu', 'lxc')]
-                            except Exception:
-                                vms_here = []
+                            vms_here = []
                         running = [v for v in vms_here if (v.get('status') or '').lower() == 'running']
                         _log(f"{node_name}: {len(vms_here)} guests present ({len(running)} running, {len(vms_here) - len(running)} stopped)")
                         for vm in running[:8]:
@@ -4469,6 +4828,7 @@ def start_rolling_update(cluster_id):
                             _log(f"  → will evacuate: {label} (VMID {vm.get('vmid','?')}, {vm.get('type','?')})")
                         if len(running) > 8:
                             _log(f"  → …and {len(running) - 8} more")
+                        rolling_node_templates(mgr, vms_here)   # #763
 
                     # Step 1: Enable maintenance mode (evacuate VMs unless skip_evacuation is set)
                     # enter_maintenance_mode() internally calls _set_ceph_maintenance_flags()
@@ -4482,10 +4842,16 @@ def start_rolling_update(cluster_id):
                         _log(f"  → Ceph (if present): noout + norebalance will be set on {node_name} to prevent rebalancing")
                         logging.info(f"[RollingUpdate] Enabling maintenance mode on {node_name}")
                     
+                    if not skip_evacuation:
+                        _rules_give_way()   # #954, once, before the first evacuation
+                    # before each node's evacuation and its update (design 5.2, #625)
+                    if not ha.confirm_step(f'rolling update of {node_name}'):
+                        raise Exception('this instance does not hold the lease of its group')
                     maintenance_task = mgr.enter_maintenance_mode(
                         node_name,
                         skip_evacuation=skip_evacuation,
                         allow_local_disks=allow_local_disks,  # NS #330
+                        **({'migrate_templates': True} if migrate_templates else {}),  # #763
                     )
                     
                     if not maintenance_task:
@@ -4511,9 +4877,11 @@ def start_rolling_update(cluster_id):
                                 maintenance_task = mgr.nodes_in_maintenance[node_name]
                                 if maintenance_task.status == 'completed':
                                     mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ Evacuation completed - all VMs migrated")
+                                    _log_templates(maintenance_task)
                                     evacuation_completed = True
                                     break
                                 elif maintenance_task.status == 'completed_with_errors':
+                                    _log_templates(maintenance_task)
                                     failed_vm_list = getattr(maintenance_task, 'failed_vms', [])
                                     failed_names = [f"{v.get('name', 'VM')} (VMID: {v.get('vmid', '?')})" for v in failed_vm_list]
                                     migrated = getattr(maintenance_task, 'migrated_vms', 0)
@@ -4572,8 +4940,10 @@ def start_rolling_update(cluster_id):
                     mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Installing updates on {node_name}")
                     logging.info(f"[RollingUpdate] Installing updates on {node_name}")
                     
+                    if not ha.confirm_step(f'update of {node_name}'):
+                        raise Exception('this instance does not hold the lease of its group')
                     update_task = mgr.start_node_update(node_name, reboot=include_reboot)
-                    
+
                     if not update_task:
                         logging.error(f"[RollingUpdate] start_node_update returned None for {node_name}")
                         raise Exception(f"Update failed: Could not start update task")
@@ -4588,7 +4958,9 @@ def start_rolling_update(cluster_id):
                         # Log phase changes
                         if hasattr(update_task, 'phase') and update_task.phase != last_phase:
                             last_phase = update_task.phase
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Update phase: {last_phase}")
+                            # the 'reboot' phase is over in seconds and rarely seen by this poll (#953)
+                            _note = ' (reboot sent)' if last_phase == 'wait_online' and getattr(update_task, 'reboot_issued', False) else ''
+                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Update phase: {last_phase}{_note}")
                         time.sleep(10)
                         update_waited += 10
                     
@@ -4606,10 +4978,14 @@ def start_rolling_update(cluster_id):
                     # records it on the task. A node that needs no reboot must NOT enter the offline-wait,
                     # or it logs a phantom "rebooting", sits 120s waiting for an offline that never comes,
                     # then "back online (0s)".
-                    _node_rebooted = include_reboot and getattr(update_task, 'reboot_issued', True)
+                    _node_rebooted = include_reboot and getattr(update_task, 'reboot_issued', False)
                     if include_reboot and not _node_rebooted:
                         mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Node {node_name} did not require a reboot — skipping reboot wait")
-                    if _node_rebooted:
+                    elif _node_rebooted and getattr(update_task, 'back_online', False):
+                        # MK Oct 2026 (#953) - the update task rebooted the node and waited for it
+                        # itself; waiting again looked for an offline that ended minutes ago
+                        _log(f"✓ {node_name} rebooted during the update and is back online")
+                    elif _node_rebooted:
                         mgr._rolling_update['current_step'] = 'rebooting'
                         mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Node {node_name} requires a reboot — rebooting (timeout: {reboot_timeout}s)...")
                         if 'rebooting_nodes' not in mgr._rolling_update:
@@ -4692,9 +5068,12 @@ def start_rolling_update(cluster_id):
                     # rejects the call and the node stays stuck.
                     # #715 — only sleep when the node actually rebooted; a no-reboot node's HA services
                     # never went down, so the 30s wait is pointless and delays the maintenance exit.
-                    if _node_rebooted:
+                    # #953 - the update task exits maintenance itself once the node is back;
+                    # a node it already took out is not a failed exit
+                    _still_in_maint = node_name in mgr.nodes_in_maintenance
+                    if _node_rebooted and _still_in_maint:
                         time.sleep(30)
-                    if not mgr.exit_maintenance_mode(node_name):
+                    if _still_in_maint and not mgr.exit_maintenance_mode(node_name):
                         _log(f"⚠ {node_name} maintenance exit failed (will retry at end of run)")
                     _log(f"  → Ceph (if present): noout + norebalance cleared for {node_name}")
 
@@ -4825,6 +5204,8 @@ def start_rolling_update(cluster_id):
                         mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ {nn} STILL stuck — run `ha-manager crm-command node-maintenance disable {nn}` manually")
                         mgr._rolling_update['failed_nodes'].append({'node': nn, 'error': 'Stuck in maintenance after rolling update'})
 
+            _rules_back_on()   # #954, every node is out of maintenance by now
+
             # Final summary
             completed = len(mgr._rolling_update['completed_nodes'])
             skipped = len(mgr._rolling_update['skipped_nodes'])
@@ -4835,16 +5216,32 @@ def start_rolling_update(cluster_id):
             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] === Rolling update completed ===")
             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Summary: {completed} updated, {skipped} skipped (up-to-date), {failed} failed")
             logging.info(f"[RollingUpdate] Rolling update completed: {completed} updated, {skipped} skipped, {failed} failed")
-            
+            # #716 - un-mute, and say whether anyone needs to look
+            notify_lifecycle('rolling_update.finished',
+                             f"Rolling update finished on {mgr.config.name}",
+                             f"{completed} updated, {skipped} skipped (up-to-date), {failed} failed",
+                             cluster_id=cluster_id,
+                             severity='warning' if failed else 'info',
+                             channel_ids=notify_channels)
+
         except Exception as e:
             logging.error(f"[RollingUpdate] Rolling update failed with exception: {e}")
+            _rules_back_on()   # #954, before the status says the run is over
             mgr._rolling_update['status'] = 'failed'
             mgr._rolling_update['completed_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
             mgr._rolling_update['error'] = str(e)
             mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Rolling update failed: {e}")
+            # #716 - a run that died is exactly when the on-call wants to be un-muted
+            notify_lifecycle('rolling_update.finished',
+                             f"Rolling update FAILED on {mgr.config.name}",
+                             f"The run stopped with an error: {e}",
+                             cluster_id=cluster_id, severity='critical',
+                             channel_ids=notify_channels)
     
     import threading
-    update_thread = threading.Thread(target=run_rolling_update, daemon=True)
+    # a user job: what goes out between the confirms asks at its exit (#625)
+    update_thread = threading.Thread(target=ha.as_job(run_rolling_update, f'rolling update of {cluster_id}'),
+                                     daemon=True)
     update_thread.start()
     
     return jsonify({
@@ -4942,6 +5339,30 @@ def clear_rolling_update_status(cluster_id):
             return jsonify({'error': 'Cannot clear running update'}), 400
     
     return jsonify({'success': True, 'message': 'Nothing to clear'})
+
+
+@bp.route('/api/clusters/<cluster_id>/updates/rolling/plan', methods=['GET'])
+@require_auth(perms=['node.update'])
+def get_rolling_update_plan(cluster_id):
+    """MK Oct 2026 (#763, #954) - what moving the templates and letting negative affinity
+    rules give way would change, for the dialog before a rolling update starts. Reads only.
+    The whole cluster's templates and HA rules: confined callers get nothing, as for the
+    run itself."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    mgr = cluster_managers[cluster_id]
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'supported': False})
+    try:
+        return jsonify(mgr.evacuation_plan())
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Failed to read the rolling update plan')}), 500
 
 
 

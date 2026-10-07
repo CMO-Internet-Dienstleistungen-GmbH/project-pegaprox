@@ -234,6 +234,10 @@ class SshVncTunnelPool:
                     connect_kwargs['pkey'] = pkey
             if 'pkey' not in connect_kwargs and ssh_password:
                 connect_kwargs['password'] = ssh_password
+            if 'pkey' not in connect_kwargs and 'password' not in connect_kwargs:
+                # a token cluster without a usable key: nothing to log in with, so no
+                # handshake with the node's sshd either (#941)
+                raise RuntimeError(f"no SSH key or password for the VNC tunnel to {pve_host}")
 
             client.connect(**connect_kwargs)
             persist_host_keys(client)

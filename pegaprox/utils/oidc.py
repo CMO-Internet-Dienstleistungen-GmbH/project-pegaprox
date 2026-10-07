@@ -3,6 +3,7 @@
 PegaProx OIDC/OAuth2 Authentication - Layer 4
 """
 
+import copy
 import json
 import logging
 import time
@@ -648,7 +649,7 @@ def oidc_map_groups_to_role(config: dict, groups: list, id_token_claims: dict = 
 
     LW: Works with Entra group IDs and generic OIDC group claims
     Returns: {'role': str, 'tenant': str, 'permissions': [], 'tenant_permissions': {},
-              '_authoritative': bool}
+              'groups': [], '_authoritative': bool}
 
     NS Sep 2026 - `_authoritative` says whether this mapping may be used to REVOKE, not
     just to grant. It is true only when we know the full group set: either the Entra
@@ -662,6 +663,7 @@ def oidc_map_groups_to_role(config: dict, groups: list, id_token_claims: dict = 
         'tenant': '',
         'permissions': [],
         'tenant_permissions': {},
+        'groups': [],
         '_authoritative': False,
     }
     if groups_complete:
@@ -689,8 +691,14 @@ def oidc_map_groups_to_role(config: dict, groups: list, id_token_claims: dict = 
     group_names = set()
     for g in groups:
         if isinstance(g, dict):
-            group_ids.add(g.get('id', '').lower())
-            group_names.add(g.get('name', '').lower())
+            # MK Oct 2026 (#962) - Graph sends "displayName": null for some groups, and
+            # .get(k, '') only covers a missing key; the .lower() on None was a 500 at login
+            gid = str(g.get('id') or '').strip().lower()
+            gname = str(g.get('name') or '').strip().lower()
+            if gid:
+                group_ids.add(gid)
+            if gname:
+                group_names.add(gname)
         elif isinstance(g, str):
             group_ids.add(g.lower())
             group_names.add(g.lower())
@@ -699,7 +707,24 @@ def oidc_map_groups_to_role(config: dict, groups: list, id_token_claims: dict = 
     if id_token_claims:
         for gid in id_token_claims.get('groups', []):
             group_ids.add(str(gid).lower())
-    
+
+    # MK Oct 2026 (#940) - the groups oidc_build_user_row stores on the user, which is what
+    # a pool grant on a group is matched against. Entra groups go in by object id only: the
+    # display name is the squattable identifier the name-match warning further down is
+    # about, and a pool grant must not be claimable by creating a group of the right name.
+    # A generic provider's groups claim is taken as the signed token carries it.
+    _claim = (id_token_claims or {}).get('groups') or []
+    if isinstance(_claim, str):
+        _claim = [_claim]
+    _seen = set()
+    for g in list(groups or []) + (list(_claim) if isinstance(_claim, (list, tuple)) else []):
+        v = g.get('id') if isinstance(g, dict) else g
+        if isinstance(v, int) and not isinstance(v, bool):
+            v = str(v)
+        if isinstance(v, str) and v.strip() and v.strip().lower() not in _seen:
+            _seen.add(v.strip().lower())
+            result['groups'].append(v.strip())
+
     # MK: Built-in group mappings (admin > user > viewer priority)
     admin_group = config.get('admin_group_id', '').strip().lower()
     user_group = config.get('user_group_id', '').strip().lower()
@@ -838,16 +863,18 @@ def oidc_derive_username(user_info: dict, users: dict = None) -> str:
     return username
 
 
-def oidc_provision_user(user_info: dict, role_mapping: dict, auth_source: str = 'oidc') -> dict:
-    from pegaprox.utils.auth import load_users, save_users
-    """Create or update local user from OIDC authentication
-    
-    NS: JIT provisioning - same pattern as LDAP but for OIDC providers
-    MK: username derived from email or preferred_username
+def oidc_build_user_row(user_info: dict, role_mapping: dict, auth_source: str, users: dict):
+    """The row an OIDC sign-in would store for this user, without storing it.
+
+    `users` is the users table as loaded. Returns (username, row), or None where an
+    account of another identity source owns the name; the caller leaves it alone then.
+
+    MK Oct 2026 (#625) - split out of oidc_provision_user, as ldap_build_user_row was:
+    a standby asks what the identity provider says without writing it down, its users
+    table is the active's copy and the next sync puts that copy back.
     """
     # Derive username from OIDC claims
     email = user_info.get('email') or user_info.get('preferred_username', '')
-    users = load_users()
     username = oidc_derive_username(user_info, users)
 
     display_name = user_info.get('name') or user_info.get('given_name', '')
@@ -868,8 +895,9 @@ def oidc_provision_user(user_info: dict, role_mapping: dict, auth_source: str = 
                             f"account of that name exists and cannot be taken over by OIDC")
             return None  # Caller should handle None return
         
-        # Update existing OIDC user
-        user = users[username]
+        # Update existing OIDC user - on a copy, so the table the caller handed in
+        # stays what it was
+        user = copy.deepcopy(users[username])
         user['display_name'] = display_name
         user['email'] = email
         user['auth_source'] = auth_source
@@ -899,6 +927,9 @@ def oidc_provision_user(user_info: dict, role_mapping: dict, auth_source: str = 
             user['tenant_permissions'] = dict(role_mapping.get('tenant_permissions') or {})
             if role_mapping.get('tenant'):
                 user['tenant_id'] = role_mapping['tenant']  # NS: Must be tenant_id
+            # the full set (#940), so a group the IdP dropped stops granting pool
+            # access with this sign-in
+            user['groups'] = list(role_mapping.get('groups') or [])
         else:
             logging.warning(
                 f"[OIDC] group set for '{username}' is not authoritative (fetch failed, "
@@ -919,11 +950,15 @@ def oidc_provision_user(user_info: dict, role_mapping: dict, auth_source: str = 
                 if 'tenant_permissions' not in user:
                     user['tenant_permissions'] = {}
                 user['tenant_permissions'].update(role_mapping['tenant_permissions'])
-        
-        logging.info(f"[OIDC] Updated user '{username}' (role={user['role']}, source={auth_source})")
+            # groups the same way as the permissions: add what this login saw, drop nothing.
+            # The stored ones by username - the users table a caller hands in leaves them out.
+            _held = get_db().get_user_directory_groups(username)
+            _have = {g.lower() for g in _held if isinstance(g, str)}
+            user['groups'] = _held + [g for g in (role_mapping.get('groups') or [])
+                                      if isinstance(g, str) and g.lower() not in _have]
     else:
         # Create new user
-        users[username] = {
+        user = {
             'role': role_mapping.get('role', ROLE_VIEWER),
             'enabled': True,
             'display_name': display_name,
@@ -938,9 +973,29 @@ def oidc_provision_user(user_info: dict, role_mapping: dict, auth_source: str = 
             'auth_source': auth_source,
             'oidc_sub': user_info.get('sub', ''),
             'last_oidc_sync': datetime.now().isoformat(),
-            'created_at': datetime.now().isoformat()
+            'created_at': datetime.now().isoformat(),
+            'groups': list(role_mapping.get('groups') or []),
         }
+    return username, user
+
+
+def oidc_provision_user(user_info: dict, role_mapping: dict, auth_source: str = 'oidc') -> dict:
+    from pegaprox.utils.auth import load_users, save_users
+    """Create or update local user from OIDC authentication
+    
+    NS: JIT provisioning - same pattern as LDAP but for OIDC providers
+    MK: username derived from email or preferred_username
+    """
+    users = load_users()
+    built = oidc_build_user_row(user_info, role_mapping, auth_source, users)
+    if built is None:
+        return None  # Caller should handle None return
+    username, user = built
+    if username in users:
+        logging.info(f"[OIDC] Updated user '{username}' (role={user['role']}, source={auth_source})")
+    else:
         logging.info(f"[OIDC] Provisioned new user '{username}' (role={role_mapping.get('role', ROLE_VIEWER)}, source={auth_source})")
+    users[username] = user
     
     save_users(users)
     return {**users[username], 'username': username}

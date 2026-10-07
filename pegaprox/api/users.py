@@ -31,9 +31,9 @@ from pegaprox.utils.rbac import (
     load_vm_acls, save_vm_acls, get_vm_acls, invalidate_vm_acls_cache,
     user_can_access_vm, get_user_vms,
     get_pool_membership_cache, invalidate_pool_cache, get_vm_pool_cached,
-    DEFAULT_TENANT_ID, ROLE_TEMPLATES,
+    DEFAULT_TENANT_ID, ROLE_TEMPLATES, acts_as_admin,
 )
-from pegaprox.api.helpers import load_server_settings, save_server_settings, get_login_settings, check_cluster_access, safe_error
+from pegaprox.api.helpers import load_server_settings, save_server_settings, get_login_settings, check_cluster_access, safe_error, caller_acts_as_admin
 
 bp = Blueprint('users', __name__)
 
@@ -53,7 +53,7 @@ def _caller_tenant_or_none():
     # MK Jun 2026 (sec-review): a global admin manages every tenant; a tenant-scoped admin
     # (custom role carrying admin.users) is confined to their own tenant. Returns the tenant
     # to scope to, or None when the caller is a global admin (no restriction).
-    if request.session.get('role') == ROLE_ADMIN:
+    if caller_acts_as_admin():
         return None
     caller = get_db().get_user(request.session.get('user', '')) or {}
     return caller.get('tenant_id', DEFAULT_TENANT_ID)
@@ -65,21 +65,32 @@ _ROLE_LEVEL = {ROLE_ADMIN: 3, ROLE_USER: 2, ROLE_VIEWER: 1}
 def _role_at_or_below_caller(target_role):
     # MK: stop a delegate holding admin.users from minting/assigning a role above their own
     # tier. Unknown/custom roles map to the 'user' level.
-    caller_lvl = _ROLE_LEVEL.get(request.session.get('role'), 2)
+    caller_lvl = _ROLE_LEVEL.get(request.session.get('effective_role', request.session.get('role')), 2)
     return _ROLE_LEVEL.get(target_role, 2) <= caller_lvl
 
 
 def _role_permissions(role):
-    """All permissions a role grants — builtin (ROLE_PERMISSIONS) or custom (load_custom_roles)."""
+    """All permissions a role grants — builtin (ROLE_PERMISSIONS) or custom (load_custom_roles).
+
+    MK Sep 2026 (audit) — a custom role id can live in BOTH namespaces, and the two
+    functions that resolve one walked them in opposite orders: this one took the global
+    definition first, while rbac.get_role_permissions_for_user — the one that decides what
+    the account may actually do — takes the tenant's. So with a harmless global `ops` and a
+    powerful tenant `ops`, the ceiling check in _caller_can_grant_role weighed ['vm.view']
+    and the account received admin.users and admin.settings.
+
+    For a ceiling check the only safe reading of an ambiguous name is the UNION: cover both
+    or assign neither. That holds however the runtime resolves it downstream, which is the
+    point — matching the other order would just move the disagreement.
+    """
     if role in ROLE_PERMISSIONS:
         return list(ROLE_PERMISSIONS.get(role, []))
     cr = load_custom_roles()
-    if role in cr.get('global', {}):
-        return list((cr['global'].get(role) or {}).get('permissions', []))
+    perms = set((cr.get('global', {}).get(role) or {}).get('permissions', []) or [])
     for _tid, _roles in cr.get('tenants', {}).items():
         if role in _roles:
-            return list((_roles.get(role) or {}).get('permissions', []))
-    return []
+            perms.update((_roles.get(role) or {}).get('permissions', []) or [])
+    return sorted(perms)
 
 
 def _caller_can_grant_role(target_role):
@@ -87,7 +98,7 @@ def _caller_can_grant_role(target_role):
     # level, so a custom role carrying admin.* perms would pass _role_at_or_below_caller for a
     # user-tier delegate. Require a non-global-admin caller to actually hold every permission the
     # role grants before assigning it. Global admins keep full delegation.
-    if request.session.get('role') == ROLE_ADMIN:
+    if caller_acts_as_admin():
         return True
     from pegaprox.utils.auth import build_authz_user
     caller = build_authz_user(request.session.get('user', ''), request.session)
@@ -99,7 +110,7 @@ def _caller_can_grant_perms(permissions):
     # template) must not grant it permissions the caller doesn't hold; otherwise an admin.roles
     # delegate could rewrite its own tenant role to admin.settings/admin.users and self-escalate to
     # global-admin-equivalent. Global admins keep full delegation.
-    if request.session.get('role') == ROLE_ADMIN:
+    if caller_acts_as_admin():
         return True
     from pegaprox.utils.auth import build_authz_user
     caller = build_authz_user(request.session.get('user', ''), request.session)
@@ -119,7 +130,7 @@ def _authz_object_write(cluster_id, subjects=(), permissions=(), groups=()):
     from pegaprox.utils.auth import build_authz_user
     from pegaprox.api.helpers import caller_is_scoped
     caller = build_authz_user(request.session.get('user', ''), request.session)
-    if caller.get('effective_role', caller.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(caller):
         return None
     if caller_is_scoped(caller, cluster_id):
         return jsonify({'error': 'Access denied: you cannot manage access rules on this cluster'}), 403
@@ -160,12 +171,26 @@ def _caller_can_manage_user(target_user):
     # user direct admin.* grants, and a lesser delegate must not be able to reset such a peer and
     # inherit those grants. Global admins pass; otherwise the caller must hold every effective perm
     # the target has.
-    if request.session.get('role') == ROLE_ADMIN:
+    if caller_acts_as_admin():
         return True
     from pegaprox.utils.auth import build_authz_user
-    from pegaprox.utils.rbac import get_user_permissions
     caller = build_authz_user(request.session.get('user', ''), request.session)
-    return all(has_permission(caller, p) for p in get_user_permissions(target_user or {}))
+    return all(has_permission(caller, p) for p in _account_reach(target_user))
+
+
+def _account_reach(target_user):
+    """Every permission an account holds or is one override removal away from holding."""
+    target = target_user or {}
+    theirs = set(get_user_permissions(target))
+    # NS Oct 2026 (#998) - and as the account stands without the override of its own tenant.
+    # That override is one DELETE away, so an administrator lowered there (by a directory
+    # mapping, or by whoever wrote it) is still an administrator to take over.
+    _tp = target.get('tenant_permissions') or {}
+    _home = target.get('tenant_id', DEFAULT_TENANT_ID)
+    if _home in _tp:
+        theirs.update(get_user_permissions(
+            dict(target, tenant_permissions={t: o for t, o in _tp.items() if t != _home})))
+    return theirs
 
 
 def _parse_avatar_data_url(value: str):
@@ -295,7 +320,8 @@ def update_user_preferences():
         'highContrast', 'dracula', 'nord', 'monokai', 'matrix', 'sunset',
         'cyberpunk', 'github', 'solarizedDark', 'gruvbox',
         'corporateDark', 'corporateLight', 'enterpriseBlue',  # NS: Corporate themes
-        'cloud'  # NS 2026-06-05: Cloud skin (Preview)
+        'cloud',  # NS 2026-06-05: Cloud skin (Preview)
+        'system'  # MK Sep 2026 (#743): resolves to a real palette in the browser
     ]
     
     if 'theme' in data:
@@ -560,7 +586,11 @@ def unlock_ip(ip_address):
     if ip_address in login_attempts_by_ip:
         del login_attempts_by_ip[ip_address]
         logging.info(f"Admin manually unlocked IP: {_sl(ip_address)}")
-        log_audit(request.headers.get('X-Username', 'admin'), 'security.unlock_ip', f"Manually unlocked IP: {ip_address}")
+        # MK Sep 2026 (audit) — the actor used to come from an X-Username REQUEST HEADER,
+        # which the caller sets and which app.py even lists in the CORS allow-list. The other
+        # 24 log_audit calls in this file read request.session. Practical effect without any
+        # attacker: every "manually unlocked IP" line in the trail said 'admin', the default.
+        log_audit(request.session.get('user', 'admin'), 'security.unlock_ip', f"Manually unlocked IP: {ip_address}")
         return jsonify({'success': True, 'message': f'IP {ip_address} unlocked'})
     else:
         return jsonify({'error': 'IP not found in locked list'}), 404
@@ -596,10 +626,12 @@ def unlock_user(username):
 @require_auth(perms=['security.lockout.manage'])
 def unlock_all_ips():
     """Unlock all IP addresses (admin only)"""
-    global login_attempts_by_ip
-    
+    # MK: clear() the store, never rebind it. `global` here names THIS module's
+    # copy of the import, so `= {}` left api/auth.py — the module the login path
+    # reads — holding the old dict with every lockout still in it, and pointed the
+    # listing and single-unlock routes at a detached empty one.
     count = len(login_attempts_by_ip)
-    login_attempts_by_ip = {}
+    login_attempts_by_ip.clear()
     
     logging.info(f"Admin manually unlocked all IPs ({count} entries cleared)")
     log_audit(request.session.get('user', 'admin'), 'security.unlock_all_ips', f"Cleared all {count} locked IPs")
@@ -614,11 +646,20 @@ def unlock_all_users():
     
     MK: New endpoint for clearing all username lockouts
     """
-    global login_attempts_by_user
-    
-    count = len(login_attempts_by_user)
-    login_attempts_by_user = {}
-    
+    _ct = _caller_tenant_or_none()
+    if _ct is None:
+        count = len(login_attempts_by_user)
+        login_attempts_by_user.clear()
+    else:
+        # NS Oct 2026 - a tenant delegate clears what the lockout list shows them (their own
+        # tenant's accounts), not every tenant's lockouts
+        _users_db = load_users()
+        mine = [u for u in list(login_attempts_by_user)
+                if _users_db.get(u, {}).get('tenant_id', DEFAULT_TENANT_ID) == _ct]
+        for u in mine:
+            login_attempts_by_user.pop(u, None)
+        count = len(mine)
+
     logging.info(f"Admin manually unlocked all users ({count} entries cleared)")
     log_audit(request.session.get('user', 'admin'), 'security.unlock_all_users', f"Cleared all {count} locked users")
     
@@ -641,12 +682,25 @@ def reset_all_password_expiry():
     users_db = load_users()
     reset_count = 0
     skipped_admins = 0
-    
+
+    # NS Oct 2026 - a tenant delegate holding security.lockout.manage expired every tenant's
+    # passwords, global admins' with include_admins. Their own tenant's accounts now, and of
+    # those only the ones they could reset a password for (_caller_can_manage_user).
+    _ct = _caller_tenant_or_none()
+    _held = None
+    if _ct is not None:
+        from pegaprox.utils.auth import build_authz_user
+        _held = set(get_user_permissions(build_authz_user(request.session.get('user', ''),
+                                                          request.session)))
+
     # Set password_changed_at to a date far in the past
     # this makes all passwords appear expired
     old_date = (datetime.now() - timedelta(days=9999)).isoformat()
-    
+
     for username, user in users_db.items():
+        if _ct is not None and (user.get('tenant_id', DEFAULT_TENANT_ID) != _ct
+                                or not _account_reach(user) <= _held):
+            continue
         if user.get('role') == ROLE_ADMIN and not include_admins:
             skipped_admins += 1
             continue
@@ -679,6 +733,15 @@ def get_security_audit(cluster_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    # MK Sep 2026 (audit) — and reachability is not enough for this one. It enumerates every
+    # online node, the cluster firewall state, pending security updates, sshd findings and
+    # fail2ban bans: whole-cluster posture with no per-object notion, which is exactly what
+    # require_unconfined() exists for. A pool-/ACL-scoped caller holding admin.audit reached
+    # it through the #248/#555 fallbacks.
+    from pegaprox.api.helpers import require_unconfined
+    _uerr = require_unconfined(cluster_id)
+    if _uerr:
+        return _uerr
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -826,8 +889,46 @@ def is_valid_role(role_id):
     for tenant_roles in custom.get('tenants', {}).values():
         if role_id in tenant_roles:
             return True
-    
+
     return False
+
+
+def _role_home_tenant(role_id, tenant_id):
+    """The tenant an account holding custom role `role_id` belongs in.
+
+    NS Oct 2026 (#1013) - create_user and update_user took the first tenant whose table
+    held the name, in whatever order the store returned them. With the same name in two
+    tenants, or a global role beside a tenant one, the account landed in a tenant nobody
+    chose. `tenant_id` when it defines the role or the role is global, else the single
+    tenant defining it; None when several do and the request does not say which."""
+    custom = load_custom_roles()
+    tenants = custom.get('tenants', {}) or {}
+    if role_id in (tenants.get(tenant_id) or {}) or role_id in (custom.get('global') or {}):
+        return tenant_id
+    owners = [tid for tid, roles in tenants.items() if role_id in (roles or {})]
+    return owners[0] if len(owners) == 1 else None
+
+
+def _role_id_clash(custom, role_id, tenant_id):
+    """Why `role_id` cannot be created in `tenant_id` (None = global), or None. A name lives in
+    the global namespace or in tenant tables, never both, so a tenant cannot shadow a global
+    role (see rbac._tenant_defining_role). NS Oct 2026 (#1013)
+
+    The default tenant's own table goes with the global one. A default-tenant account looks
+    its role up in every tenant table that has the name, so a second tenant taking a name the
+    default tenant defines, or the reverse, left those accounts with no permissions at all."""
+    tenants = custom.get('tenants') or {}
+    if tenant_id:
+        if role_id in (custom.get('global') or {}):
+            return 'A global role with this ID already exists'
+        others = [t for t, r in tenants.items() if t != tenant_id and role_id in (r or {})]
+        if DEFAULT_TENANT_ID in others:
+            return 'The default tenant has a role with this ID'
+        if tenant_id == DEFAULT_TENANT_ID and others:
+            return 'Another tenant has a role with this ID'
+    elif any(role_id in (r or {}) for r in tenants.values()):
+        return 'A tenant role with this ID already exists'
+    return None
 
 
 @bp.route('/api/users', methods=['POST'])
@@ -863,12 +964,10 @@ def create_user():
     
     # MK: Auto-set tenant_id if role belongs to a specific tenant
     if role not in BUILTIN_ROLES:
-        custom_roles = load_custom_roles()
-        for tid, roles in custom_roles.get('tenants', {}).items():
-            if role in roles:
-                tenant_id = tid  # override with role's tenant
-                break
-    
+        tenant_id = _role_home_tenant(role, tenant_id)
+        if tenant_id is None:
+            return jsonify({'error': 'More than one tenant defines this role - set tenant_id'}), 400
+
     # validate tenant exists
     tenants = load_tenants()
     if tenant_id not in tenants:
@@ -974,6 +1073,14 @@ def update_user(username):
             return jsonify({'error': 'Cannot assign a role with higher privileges than your own'}), 403
         if not _caller_can_grant_role(data['role']):
             return jsonify({'error': 'Cannot assign a role that grants permissions beyond your own'}), 403
+        # MK Sep 2026 (audit) — and the caller has to outrank the target AS IT STANDS, not as
+        # it will stand. Disabling an account already asks this question; re-roling one is the
+        # stronger operation and asked nothing, so a delegate could demote an administrator it
+        # could not touch and then reset that account's password on the next request. The same
+        # gap in one request: the `enabled` branch below calls _caller_can_manage_user on the
+        # dict this block has already mutated, and so does the last-admin check under it.
+        if not _caller_can_manage_user(user):
+            return jsonify({'error': 'Access denied: target has privileges beyond your own'}), 403
         # Prevent last admin from losing admin role
         if user['role'] == ROLE_ADMIN and data['role'] != ROLE_ADMIN:
             admin_count = sum(1 for u in users_db.values() if u['role'] == ROLE_ADMIN and u.get('enabled', True))
@@ -987,24 +1094,19 @@ def update_user(username):
         # MK: Auto-set tenant_id when assigning a tenant-specific role
         # This ensures the user is properly associated with the tenant
         if data['role'] not in BUILTIN_ROLES:
-            custom_roles = load_custom_roles()
-            # check if role belongs to a tenant
-            found_tenant = False
-            for tid, roles in custom_roles.get('tenants', {}).items():
-                if data['role'] in roles:
-                    # NS Aug 2026 (Aikido pentest) — a tenant-scoped admin must not assign a role
-                    # owned by another tenant; it would silently move the account into that tenant.
-                    if _ct is not None and tid != _ct:
-                        return jsonify({'error': 'Cannot assign a role from another tenant'}), 403
-                    user['tenant_id'] = tid
-                    found_tenant = True
-                    logging.info(f"Auto-set tenant_id={tid} for user with role {data['role']}")
-                    break
-            
-            # LW: Also check global roles (they don't change tenant)
-            if not found_tenant and data['role'] in custom_roles.get('global', {}):
-                logging.debug(f"Role {data['role']} is global, keeping existing tenant_id")
-    
+            # a global role keeps the tenant, a tenant role moves the account into its tenant
+            _tid = _role_home_tenant(data['role'],
+                                     data.get('tenant_id', user.get('tenant_id', DEFAULT_TENANT_ID)))
+            if _tid is None:
+                return jsonify({'error': 'More than one tenant defines this role - set tenant_id'}), 400
+            # NS Aug 2026 (Aikido pentest) — a tenant-scoped admin must not assign a role
+            # owned by another tenant; it would silently move the account into that tenant.
+            if _ct is not None and _tid != _ct:
+                return jsonify({'error': 'Cannot assign a role from another tenant'}), 403
+            if _tid != user.get('tenant_id', DEFAULT_TENANT_ID):
+                user['tenant_id'] = _tid
+                logging.info(f"Auto-set tenant_id={_tid} for user with role {data['role']}")
+
     if 'display_name' in data:
         user['display_name'] = data['display_name']
     
@@ -1138,6 +1240,14 @@ def delete_user(username):
     # NS: Fix - actually delete from database! Jan 2026
     try:
         db = get_db()
+        # MK Sep 2026 (audit) — revoke the API tokens FIRST and treat a failure as a failed
+        # deletion. This used to run after the account row was already gone, inside a
+        # try/except that only warned, so a revocation error left live pgx_ bearer tokens
+        # behind for a username that no longer existed. Tokens are keyed by username, and
+        # the name is free again the moment the row goes: recreating it re-activated
+        # somebody else's old tokens against the new account. Failing here leaves an
+        # account whose tokens are revoked, which is the harmless direction.
+        db.execute('UPDATE api_tokens SET revoked = 1 WHERE username = ?', (username,))
         db.delete_user(username)
         logging.info(f"Deleted user '{_sl(username)}' from database")
     except Exception as e:
@@ -1159,10 +1269,6 @@ def delete_user(username):
     invalidate_all_user_sessions(username)
     invalidate_user_ws_tokens(username)   # drop any pre-minted console/shell ws_token too
     invalidate_user_sse_tokens(username)  # and the SSE stream token (audit)
-    try:
-        db.execute('UPDATE api_tokens SET revoked = 1 WHERE username = ?', (username,))
-    except Exception as e:
-        logging.warning(f"Failed to revoke API tokens for deleted user '{_sl(username)}': {e}")
 
     logging.info(f"Admin '{_sl(request.session['user'])}' deleted user '{_sl(username)}'")
     log_audit(request.session['user'], 'user.deleted', f"Deleted user: {username}")
@@ -1218,10 +1324,9 @@ def get_tenants():
     
     # get user info from session
     username = request.session.get('user', '')
-    user_role = request.session.get('role', ROLE_VIEWER)
-    
+
     # admin always sees all tenants - no filtering
-    if user_role == ROLE_ADMIN:
+    if caller_acts_as_admin():
         result = []
         for tid, t in tenants_db.items():
             result.append({
@@ -1287,7 +1392,7 @@ def get_my_tenants():
     tenants = load_tenants() or {}
     user = build_authz_user(request.session.get('user', ''), request.session)
     home = user.get('tenant_id') or DEFAULT_TENANT_ID
-    is_admin = user.get('effective_role', user.get('role')) == ROLE_ADMIN
+    is_admin = acts_as_admin(user)
 
     if is_admin:
         ids = list(tenants.keys())
@@ -1316,7 +1421,12 @@ def create_tenant():
     MK: Improved to handle duplicate names by adding suffix
     """
     global tenants_db
-    
+
+    # NS Oct 2026 (#1060) - admin.tenants inside a tenant edits that tenant (update_tenant).
+    # A new tenant names its clusters, which only a global admin assigns.
+    if not caller_acts_as_admin():
+        return jsonify({'error': 'Only a global admin can create tenants'}), 403
+
     data = request.json
     name = data.get('name', '').strip()
     clusters = data.get('clusters', [])
@@ -1388,7 +1498,8 @@ def update_tenant(tenant_id):
 
     # NS Aug 2026 (Aikido pentest) — mirror get_tenant_quota: a tenant-scoped admin.tenants holder
     # may only edit its OWN tenant, else one tenant rewrites another's name/clusters/quota.
-    if request.session.get('role') != ROLE_ADMIN:
+    _global = caller_acts_as_admin()
+    if not _global:
         _caller = get_db().get_user(request.session.get('user', '')) or {}
         if tenant_id != _caller.get('tenant_id', DEFAULT_TENANT_ID):
             return jsonify({'error': 'Access denied to this tenant'}), 403
@@ -1405,7 +1516,7 @@ def update_tenant(tenant_id):
         return _ierr
     for _rk in ('vmid_range_start', 'vmid_range_end'):
         if _rk in _ints and _ints[_rk] != int(_before.get(_rk, 0) or 0):
-            if request.session.get('effective_role', request.session.get('role')) != ROLE_ADMIN:
+            if not _global:
                 return jsonify({'error': 'Only a global admin can change a tenant\'s VMID range'}), 403
 
     if 'name' in data:
@@ -1419,7 +1530,7 @@ def update_tenant(tenant_id):
         _cur = list(tenants_db[tenant_id].get('clusters') or [])
         _new = list(data['clusters'] or [])
         if sorted(map(str, _cur)) != sorted(map(str, _new)):
-            if request.session.get('effective_role', request.session.get('role')) != ROLE_ADMIN:
+            if not _global:
                 return jsonify({'error': 'Only a global admin can change a tenant\'s clusters'}), 403
             tenants_db[tenant_id]['clusters'] = _new
     # NS #502 — quota fields
@@ -1454,7 +1565,7 @@ def get_tenant_quota(tenant_id):
         # MK Jun 2026 (sec-review) — admin.tenants can be held by a tenant-scoped
         # custom role, so scope to the caller's own tenant unless a real admin —
         # otherwise one tenant could read another's live usage (BOLA).
-        if request.session.get('role') != ROLE_ADMIN:
+        if not caller_acts_as_admin():
             _caller = get_db().get_user(request.session.get('user', '')) or {}
             if tenant_id != _caller.get('tenant_id', DEFAULT_TENANT_ID):
                 return jsonify({'error': 'Access denied to this tenant'}), 403
@@ -1469,7 +1580,12 @@ def get_tenant_quota(tenant_id):
 def delete_tenant(tenant_id):
     """Delete tenant"""
     global tenants_db
-    
+
+    # same as create_tenant: a tenant-scoped admin.tenants holder deleted any tenant that had
+    # no accounts yet, another one's included (#1060)
+    if not caller_acts_as_admin():
+        return jsonify({'error': 'Only a global admin can delete tenants'}), 403
+
     if tenant_id == DEFAULT_TENANT_ID:
         return jsonify({'error': 'Cannot delete default tenant'}), 400
     
@@ -1511,13 +1627,17 @@ def delete_tenant(tenant_id):
 @require_auth()
 def get_all_permissions():
     """Get all available permissions"""
+    from pegaprox.models.permissions import PERMISSION_WARNINGS
     result = []
     for perm, desc in PERMISSIONS.items():
         category = perm.split('.')[0]
         result.append({
             'permission': perm,
             'description': desc,
-            'category': category
+            'category': category,
+            # MK Sep 2026 (#818) - '' for almost everything; the grid only renders a
+            # warning line when there is one to render.
+            'warning': PERMISSION_WARNINGS.get(perm, ''),
         })
     return jsonify(result)
 
@@ -1525,10 +1645,22 @@ def get_all_permissions():
 @require_auth()
 def get_role_permissions():
     """Get all roles - builtin + custom"""
+    # MK Sep 2026 (audit) — this handed back the whole custom-roles tree to ANY authenticated
+    # caller: every tenant's roles, their full permission lists, and the username that created
+    # each one. list_all_roles() right below has filtered tenant roles to the caller's own
+    # tenant since the multi-tenancy work; this endpoint never learned about tenants at all.
+    custom = get_custom_roles()
+    _u = build_authz_user(request.session.get('user', ''), request.session)
+    if not acts_as_admin(_u):
+        _ut = _u.get('tenant_id', DEFAULT_TENANT_ID)
+        custom = {
+            'global': custom.get('global', {}),
+            'tenants': {t: r for t, r in (custom.get('tenants', {}) or {}).items() if t == _ut},
+        }
     # builtin
     result = {
         'builtin': ROLE_PERMISSIONS,
-        'custom': get_custom_roles()
+        'custom': custom
     }
     return jsonify(result)
 
@@ -1545,7 +1677,7 @@ def list_all_roles():
     # Get user's tenant for filtering
     user = build_authz_user(request.session.get('user', ''), request.session)
     user_tenant = user.get('tenant_id', DEFAULT_TENANT_ID)
-    is_admin = user.get('effective_role', user.get('role')) == ROLE_ADMIN
+    is_admin = acts_as_admin(user)
     
     roles = []
     # builtins
@@ -1617,7 +1749,7 @@ def create_custom_role():
     
     # Tenant validation: non-admins can only create roles for their own tenant
     user = build_authz_user(request.session.get('user', ''), request.session)
-    if user.get('effective_role', user.get('role')) != ROLE_ADMIN:
+    if not acts_as_admin(user):
         user_tenant = user.get('tenant_id', DEFAULT_TENANT_ID)
         if tenant_id and tenant_id != user_tenant:
             log_audit(request.session['user'], 'role.create_denied',
@@ -1637,7 +1769,10 @@ def create_custom_role():
         custom['tenants'] = {}
     if 'global' not in custom:
         custom['global'] = {}
-    
+    _clash = _role_id_clash(custom, role_id, tenant_id)
+    if _clash:
+        return jsonify({'error': _clash}), 400
+
     if tenant_id:
         # tenant-specific role
         if tenant_id not in custom['tenants']:
@@ -1694,7 +1829,7 @@ def update_custom_role(role_id):
     
     # Tenant validation: non-admins can only update roles in their own tenant
     user = build_authz_user(request.session.get('user', ''), request.session)
-    if user.get('effective_role', user.get('role')) != ROLE_ADMIN:
+    if not acts_as_admin(user):
         user_tenant = user.get('tenant_id', DEFAULT_TENANT_ID)
         # Check if trying to update a role in a different tenant
         if tenant_id and tenant_id != user_tenant:
@@ -1751,7 +1886,7 @@ def delete_custom_role(role_id):
     
     # Tenant validation: non-admins can only delete roles in their own tenant
     user = build_authz_user(request.session.get('user', ''), request.session)
-    if user.get('effective_role', user.get('role')) != ROLE_ADMIN:
+    if not acts_as_admin(user):
         user_tenant = user.get('tenant_id', DEFAULT_TENANT_ID)
         # Check if trying to delete a role in a different tenant
         if tenant_id and tenant_id != user_tenant:
@@ -1779,12 +1914,27 @@ def delete_custom_role(role_id):
     # longer resolve. So removing a deliberately narrow role WIDENED its holders — a role
     # granting vm.view left them with 31 permissions including the whole node, cluster and PBS
     # read surface. An admin deleting a role means "revoke this", never "promote them".
-    _holders = sorted(
-        u for u, rec in (load_users() or {}).items()
-        if (rec or {}).get('role') == role_id
-        or any((_ov or {}).get('role') == role_id
-               for _ov in ((rec or {}).get('tenant_permissions', {}) or {}).values())
-    )
+    # MK Sep 2026 (audit) — ask who holds THIS role, not who holds a role by this name.
+    # The bare string was matched across every account, so deleting tenant A's 'ops' listed
+    # the holders of tenant B's unrelated 'ops' — other tenants' usernames handed to the
+    # caller, and a 409 blocking the delete over accounts they cannot see.
+    def _holds(rec):
+        rec = rec or {}
+        _tp = rec.get('tenant_permissions', {}) or {}
+        if tenant_id:
+            # A tenant role lives in one namespace, so there are exactly two ways to hold
+            # it: sit in that tenant, or carry an explicit override FOR that tenant from
+            # anywhere else. The override is the one that is easy to miss — the account's
+            # own tenant_id says nothing about it.
+            if (_tp.get(tenant_id) or {}).get('role') == role_id:
+                return True
+            return (rec.get('tenant_id', DEFAULT_TENANT_ID) == tenant_id
+                    and rec.get('role') == role_id)
+        # a global role resolves for anyone, by role or by any override
+        return (rec.get('role') == role_id
+                or any((_ov or {}).get('role') == role_id for _ov in _tp.values()))
+
+    _holders = sorted(u for u, rec in (load_users() or {}).items() if _holds(rec))
     if _holders:
         return jsonify({
             'error': 'Role still assigned',
@@ -1851,7 +2001,7 @@ def apply_role_template(template_id):
     # value cached when the session was minted, so a demoted admin kept the old answer here until
     # they logged out — build_authz_user resolves it live and applies a token's floor.
     _caller = build_authz_user(request.session.get('user', ''), request.session)
-    if _caller.get('effective_role', _caller.get('role')) != ROLE_ADMIN:
+    if not acts_as_admin(_caller):
         _caller_tenant = _caller_tenant_or_none()
         if tenant_id and tenant_id != _caller_tenant:
             return jsonify({'error': 'Access denied - cannot create roles in other tenants'}), 403
@@ -1860,6 +2010,9 @@ def apply_role_template(template_id):
             return jsonify({'error': 'Cannot grant permissions beyond your own'}), 403
 
     custom = get_custom_roles()
+    _clash = _role_id_clash(custom, role_id, tenant_id)
+    if _clash:
+        return jsonify({'error': _clash}), 400
 
     template = ROLE_TEMPLATES[template_id]
     role_data = {
@@ -1920,7 +2073,16 @@ def get_cluster_vm_acls(cluster_id):
             'permissions': acl.get('permissions', []),
             'inherit_role': acl.get('inherit_role', True)
         })
-    
+
+    # MK Sep 2026 (audit) — set_vm_acl got the per-VM gate; the reads beside it did not, and
+    # this one returns the cluster's whole access map: which accounts reach which VM. An
+    # ACL-scoped caller arrives here through the #248 fallback in check_cluster_access, so
+    # cluster reach proves nothing. A plain cluster-wide operator still sees every row.
+    from pegaprox.api.helpers import caller_is_scoped, scope_vm_rows
+    _caller = build_authz_user(request.session.get('user', ''), request.session)
+    if caller_is_scoped(_caller, cluster_id):
+        result = scope_vm_rows(cluster_id, result)
+
     return jsonify(result)
 
 
@@ -1930,7 +2092,13 @@ def get_vm_acl(cluster_id, vmid):
     """Get ACL for a specific VM"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
-    
+    # same gap as the list route above, one object at a time
+    from pegaprox.api.helpers import caller_is_scoped
+    _caller = build_authz_user(request.session.get('user', ''), request.session)
+    if caller_is_scoped(_caller, cluster_id) and not user_can_access_vm(
+            _caller, cluster_id, vmid, 'vm.view'):
+        return jsonify({'error': 'Access denied to this VM'}), 403
+
     acls = get_vm_acls()
     cluster_acls = acls.get(cluster_id, {})
     vm_acl = cluster_acls.get(str(vmid), {})
@@ -1955,7 +2123,16 @@ def set_vm_acl(cluster_id, vmid):
     users = data.get('users', [])
     permissions = data.get('permissions', [])
     inherit_role = data.get('inherit_role', True)
-    
+
+    # NS Oct 2026 (#1085) - one reading of each field for the ceiling below and the row the
+    # DB stores. inherit_role=[] was weighed as false here and stored as true, a string of
+    # users matched any name inside it (acl_grants_user asks `in`).
+    if not isinstance(inherit_role, bool):
+        return jsonify({'error': 'inherit_role must be true or false'}), 400
+    for _name, _val in (('users', users), ('permissions', permissions)):
+        if not isinstance(_val, list) or not all(isinstance(x, str) for x in _val):
+            return jsonify({'error': f'{_name} must be a list of names'}), 400
+
     # validate permissions
     for p in permissions:
         if p not in PERMISSIONS:
@@ -2064,7 +2241,7 @@ def _pool_visibility(cluster_id):
     from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import _pool_perms_for
     user = build_authz_user(request.session.get('user', ''), request.session)
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    if acts_as_admin(user):
         return False, set()
     _pp = _pool_perms_for(cluster_id, user.get('username', ''), user.get('groups', []))
     granted = {pid for pid, perms in (_pp or {}).items() if perms}
@@ -2145,7 +2322,14 @@ def get_pool_permissions_api(cluster_id, pool_id):
     """Get permissions for a pool"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
-    
+    # MK Sep 2026 (audit) — the H3 disclosure gave get_pool_details() the pool-level gate
+    # because check_cluster_access's #555 fallback admits a pool-scoped caller to the whole
+    # cluster. This route sits directly beside it, answers for the same object, and was left
+    # on cluster reach alone: pool-A's admin could read who holds what on pool B.
+    _confined, _granted = _pool_visibility(cluster_id)
+    if _confined and pool_id not in _granted:
+        return jsonify({'error': 'Access denied to this pool'}), 403
+
     db = get_db()
     perms = db.get_pool_permissions(cluster_id, pool_id)
     
@@ -2377,8 +2561,14 @@ def rm_pool(cluster_id, pool_id):
         db = get_db()
         for p in db.get_pool_permissions(cluster_id, pool_id):
             db.delete_pool_permission(cluster_id, pool_id, p['subject_type'], p['subject_id'])
-    except:
-        pass  # NS: not critical, orphaned perms don't hurt
+    except Exception as e:
+        # MK Sep 2026 (audit) — "orphaned perms don't hurt" is not true: grants are keyed by
+        # (cluster, pool_id) and a pool id is free to reuse, so a pool recreated under the same
+        # name silently inherits whoever was granted on the old one. We cannot undo the PVE
+        # delete at this point, so the honest thing is to say so loudly rather than swallow it.
+        logging.error(f"[POOL] deleted pool '{_sl(pool_id)}' on {_sl(cluster_id)} but could not "
+                      f"remove its permission rows - a pool recreated under this id would "
+                      f"inherit them: {e}")
     return jsonify({'success': True})
 
 

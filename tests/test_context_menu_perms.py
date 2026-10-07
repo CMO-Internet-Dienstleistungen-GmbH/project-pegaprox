@@ -36,7 +36,13 @@ def test_the_wrapper_filters_on_the_callers_permissions():
     s = open(DASH, encoding='utf-8').read()
 
     assert 'const buildContextMenuItemsRaw' in s, 'the raw builder is gone'
-    assert '.filter(i => !i.perm || can(i.perm))' in s, 'entries are no longer filtered'
+    # a console entry asks what the account holds: a member that serves users opens consoles
+    # with its leader away too, when can() keeps only the reading permissions (#625)
+    assert 'const menuAllows = (i) => !i.perm || (i.console ? holds(i.perm) : can(i.perm));' in s
+    menu = s[s.index('const buildContextMenuItems = (type, target) => {'):]
+    menu = menu[:menu.index('return out;')]
+    assert '.filter(menuAllows);' in menu, 'entries are no longer filtered'
+    assert 'item.submenu.filter(menuAllows);' in menu, 'submenu entries are no longer filtered'
     # a submenu that loses all its children must not stay behind as a dead parent
     assert 'if (!sub.length) continue;' in s
 
@@ -44,13 +50,20 @@ def test_the_wrapper_filters_on_the_callers_permissions():
 def test_every_actionable_entry_declares_a_permission(menu_src):
     """Two deliberate exceptions: `Refresh` only reads, and `Power` is a submenu container —
     its three children carry the permissions and the wrapper drops the parent when none of
-    them survive, so gating the container as well would just hide it twice."""
+    them survive, so gating the container as well would just hide it twice. The node's
+    `Guests` submenu is a container of the same kind: start, shut down and migrate all ask
+    for different permissions, each child carries its own."""
     entries = re.findall(r"\{ (?:perm: '([a-z.]+)', )?label: t\('([a-zA-Z]+)'\)", menu_src)
     assert entries, 'no menu entries found — did the builder move?'
 
     ungated = sorted({label for perm, label in entries if not perm})
 
-    assert ungated == ['power', 'refreshData'], f'entries without a permission: {ungated}'
+    assert ungated == ['nodeGuestsMenu', 'power', 'refreshData'], f'entries without a permission: {ungated}'
+    guests = menu_src[menu_src.index("label: t('nodeGuestsMenu')"):]
+    guests = guests[:guests.index(']}')]
+    children = re.findall(r"\{ (?:perm: '([a-z.]+)', )?label: t\('(nodeGuests\w+)'\)", guests)
+    assert children == [('vm.start', 'nodeGuestsStartAll'), ('vm.stop', 'nodeGuestsStopAll'),
+                        ('vm.migrate', 'nodeGuestsMigrateAll')], children
 
 
 def test_the_permissions_used_actually_exist(menu_src):

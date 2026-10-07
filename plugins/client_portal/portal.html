@@ -276,7 +276,11 @@ async function login(u,p,totpCode){
                 S.loading=false;render();return;
             }
             S.sid=d.session_id;S.user=d.user;sessionStorage.setItem('portal-sid',d.session_id);
-            S.screen='dashboard';S.pending2fa=null;await loadCfg();await loadVMs();
+            S.screen='dashboard';S.pending2fa=null;
+            // NS Oct 2026 (#1076) - with forced 2FA the server answers nothing else until the
+            // code is verified, so enrol first; verify2FA loads the guests afterwards
+            if(d.requires_2fa_setup){S.loading=false;render();await setup2FA();return;}
+            await loadCfg();await loadVMs();
         }else{S.err=d.error||'Login failed';S.pending2fa=null;}
     }catch(e){S.err='Connection error';}
     S.loading=false;render();
@@ -328,7 +332,9 @@ async function checkSess(){
             if(d.authenticated){
                 // NS: also check portal_only on session restore
                 if(d.user?.role==='admin'||!d.user?.portal_only){logout();return;}
-                S.user=d.user;S.screen='dashboard';await loadCfg();await loadVMs();
+                S.user=d.user;S.screen='dashboard';
+                if(d.requires_2fa_setup){render();await setup2FA();return;}
+                await loadCfg();await loadVMs();
             }else logout();
         }else logout();
     }catch(e){logout();}
@@ -351,6 +357,8 @@ async function vmAction(vm,action){
 async function openConsole(vm){
     try{const r=await api(`${P}/vm/console?cluster_id=${vm.cluster_id}&vmid=${vm.vmid}`);
     if(r&&r.ok){const d=await r.json();if(d.success){S.modal={type:'console',vm,ticket:d.ticket,ws_token:d.ws_token,port:d.port,host:d.host,node:d.node,vncStatus:'connecting'};render();}else toast(d.error,'error');}
+    // LW Oct 2026 (#625) - a standby that does not open consoles says why (409)
+    else if(r){let msg='Console not available here';try{const d=await r.json();if(d&&d.error)msg=d.error;}catch(_){}toast(msg,'error');}
     }catch(e){toast('Error','error');}
 }
 
@@ -416,7 +424,7 @@ async function setup2FA(){
 async function verify2FA(code){
     try{
         const r=await api(`${API}/api/auth/2fa/verify`,{method:'POST',body:{code}});
-        if(r&&r.ok){const d=await r.json();if(d.success){toast('2FA enabled successfully!','success');S.user.totp_enabled=true;S.modal=null;render();}else toast(d.error||'Invalid code','error');}
+        if(r&&r.ok){const d=await r.json();if(d.success){toast('2FA enabled successfully!','success');S.user.totp_enabled=true;S.modal=null;render();await loadCfg();await loadVMs();}else toast(d.error||'Invalid code','error');}
         else{const d=await r?.json().catch(()=>({}));toast(d?.error||'Verification failed','error');}
     }catch(e){toast('Error','error');}
 }
@@ -460,7 +468,7 @@ function renderLogin(){
                     <input id="tc" class="input" placeholder="000000" maxlength="6" pattern="[0-9]{6}" required autofocus style="text-align:center;font-size:20px;letter-spacing:8px">
                 </div>
                 <button class="btn btn-accent w-full py-2" type="submit" style="justify-content:center" ${S.loading?'disabled':''}>Verify</button>
-                <button type="button" class="btn btn-ghost w-full py-2" style="justify-content:center" onclick="S.pending2fa=null;S.err=null;render()">Back to Login</button>
+                <button type="button" class="btn btn-ghost w-full py-2" style="justify-content:center" onclick="pBackToLogin()">Back to Login</button>
             </form>
         </div></div>`;
     }
@@ -669,11 +677,11 @@ function renderCreateCtModal(){
     const uv=u.vms||u.used_vms||0, uc=u.cores||u.used_cores||0, um=Math.round(u.memory_gb||u.used_memory_gb||0);
     const quotaLine=(qv||qc||qm)?`<div class="text-xs mt-1" style="color:var(--muted)">Quota — VMs ${uv}/${qv||'∞'} · Cores ${uc}/${qc||'∞'} · Mem ${um}/${qm||'∞'} GB</div>`:'';
     const inp='padding:8px;background:var(--surface);border:1px solid var(--border);border-radius:8px';
-    return`<div class="modal-backdrop" onclick="S.modal=null;render()">
+    return`<div class="modal-backdrop" onclick="closeModal()">
     <div class="card modal-card" onclick="event.stopPropagation()" style="max-width:460px;width:100%">
         <div class="flex items-center justify-between mb-4">
             <h2 class="text-lg font-bold">&#x2795; New Container</h2>
-            <button class="btn btn-ghost text-xs" onclick="S.modal=null;render()">&times;</button>
+            <button class="btn btn-ghost text-xs" onclick="closeModal()">&times;</button>
         </div>
         ${tmpls.length===0?`<div style="text-align:center;padding:20px;color:var(--muted)"><p>No templates available</p><p class="text-xs mt-2">Ask your administrator to allow container templates.</p></div>`:`
         <div class="space-y-3">
@@ -716,11 +724,11 @@ function pDestroy(cid,vmid){
 function renderDestroyModal(){
     const m=S.modal;
     const inp='padding:8px;background:var(--surface);border:1px solid var(--border);border-radius:8px';
-    return`<div class="modal-backdrop" onclick="S.modal=null;render()">
+    return`<div class="modal-backdrop" onclick="closeModal()">
     <div class="card modal-card" onclick="event.stopPropagation()" style="max-width:440px;width:100%">
         <div class="flex items-center justify-between mb-4">
             <h2 class="text-lg font-bold" style="color:var(--danger,#e5484d)">&#x1f5d1; Destroy ${esc(m.vtype)} — ${esc(m.name)}</h2>
-            <button class="btn btn-ghost text-xs" onclick="S.modal=null;render()">&times;</button>
+            <button class="btn btn-ghost text-xs" onclick="closeModal()">&times;</button>
         </div>
         <div class="space-y-3">
             <div class="text-xs p-3 rounded-lg" style="background:var(--surface);color:var(--muted)">
@@ -749,11 +757,11 @@ function renderIsoModal(){
     const vm=m.vm;
     const isos=m.isos||[];
     const escCid=esc(vm.cluster_id);
-    return`<div class="modal-backdrop" onclick="S.modal=null;render()">
+    return`<div class="modal-backdrop" onclick="closeModal()">
     <div class="card modal-card" onclick="event.stopPropagation()" style="max-width:500px;width:100%">
         <div class="flex items-center justify-between mb-4">
             <h2 class="text-lg font-bold">&#x1f4bf; Mount ISO — ${esc(vm.name)}</h2>
-            <button class="btn btn-ghost text-xs" onclick="S.modal=null;render()">&times;</button>
+            <button class="btn btn-ghost text-xs" onclick="closeModal()">&times;</button>
         </div>
         ${isos.length===0?`<div style="text-align:center;padding:24px;color:var(--muted)">
             <p>No ISOs available</p>
@@ -998,6 +1006,18 @@ window.pDeleteSnap=function(c,v,snapname){const vm=S.vms.find(x=>x.cluster_id===
 // against window, found nothing, and threw ReferenceError — the +Container / Destroy buttons did
 // nothing for everyone with those features enabled. Export them like every other inline handler.
 window.pCreateCt=pCreateCt;window.submitCreateCt=submitCreateCt;window.pDestroy=pDestroy;window.submitDestroy=submitDestroy;
+// #810 - same shape: the SSO button carries onclick="startOidcLogin()" and the
+// function lives inside the IIFE, so every click threw ReferenceError. That has
+// been the case since the button went in (April), and it was the only inline
+// handler in the file without an export.
+window.startOidcLogin=startOidcLogin;
+// Same family, found by the handler/export test rather than by a user: the New
+// Container, Destroy and Mount ISO dialogs closed via S.modal=null;render(), and
+// neither S nor render is global, so their close button and the backdrop threw and
+// only a page reload got you out - Mount ISO since April, the other two since #765
+// made them open. They go through closeModal() now like the other eight sites, which
+// also tears down a live noVNC session instead of orphaning it (#396).
+window.pBackToLogin=function(){S.pending2fa=null;S.err=null;render();};
 window.closeModal=function(){
     // MK May 2026 (#396): if a noVNC console is open, disconnect cleanly so
     // Proxmox releases the vncproxy task. Without this the server-side ws

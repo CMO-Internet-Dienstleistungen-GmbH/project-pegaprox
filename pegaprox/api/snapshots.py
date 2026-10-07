@@ -40,8 +40,9 @@ from flask import Blueprint, jsonify, request
 
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth, load_users, build_authz_user
-from pegaprox.api.helpers import check_cluster_access
+from pegaprox.api.helpers import check_cluster_access, xapi_permission_missing
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.rbac import user_can_access_vm
 from pegaprox.models.permissions import ROLE_ADMIN
@@ -58,6 +59,16 @@ def _current_user():
         u = request.session.get('user') if hasattr(request, 'session') else ''
         if isinstance(u, dict): return u.get('username', '') or ''
         return u or ''
+    except Exception:
+        return ''
+
+
+def _current_token_role():
+    """The role of the API token behind this request, '' for a signed-in session. NS Oct 2026 -
+    kept with the policy, so a scheduled run is judged as that token and not as its owner (#1073)"""
+    try:
+        s = request.session
+        return str(s.get('role') or '') if s.get('api_token') else ''
     except Exception:
         return ''
 
@@ -218,7 +229,9 @@ def _is_due(policy, now=None):
     """Check whether the policy should fire right now. Idempotent: also reads
     last_run_at to avoid double-fires when the scheduler wakes during the
     same minute."""
-    now = now or datetime.now()
+    # the group's zone when this instance is in one, so a failover does not shift a
+    # schedule; datetime.now() on an instance of its own (#625)
+    now = now or ha.schedule_now()
     last_run = policy['last_run_at']
     last_dt = None
     if last_run:
@@ -330,7 +343,9 @@ def _prune(mgr, node, vmid, vm_type, policy):
         if cutoff and snap_t >= cutoff:
             keep_set.add(name)
             continue
-        # delete this snapshot
+        # delete this snapshot: not from a leader that lost its lease (#625)
+        if not ha.confirm_step(f'pruning {name} of {vmid}'):
+            break
         try:
             if hasattr(mgr, 'delete_snapshot'):
                 mgr.delete_snapshot(node, vmid, vm_type, name)
@@ -363,7 +378,7 @@ def _execute_policy(policy_id, force=False):
     if policy['schedule'] == 'once':
         try:
             c.execute("UPDATE snapshot_policies SET last_run_at=? WHERE id=?",
-                      (datetime.now().isoformat(), policy_id))
+                      (ha.schedule_now().isoformat(), policy_id))
             db.conn.commit()
         except Exception:
             pass
@@ -416,6 +431,11 @@ def _execute_policy(policy_id, force=False):
             policy_creator = load_users().get(creator_name)
             if policy_creator:
                 policy_creator['username'] = creator_name
+                _token_role = row['created_role'] if 'created_role' in row.keys() else ''
+                if _token_role:
+                    # NS Oct 2026 - written through an API token: the run is that token (#1073)
+                    from pegaprox.utils.auth import apply_token_role
+                    policy_creator = apply_token_role(policy_creator, _token_role)
             else:
                 # MK Sep 2026 - this said "per-VM authz not applied" and then ran the
                 # policy over every resolved target. An off-boarded account's policy
@@ -444,7 +464,13 @@ def _execute_policy(policy_id, force=False):
     prune_only = bool(policy.get('prune_only'))
     if prune_only:
         log_lines.append('prune-only policy — not creating new snapshots, retention sweep only')
+    _xapi_missing = policy_creator and xapi_permission_missing(policy['cluster_id'], policy_creator,
+                                                                'vm.snapshot')
     for node, vmid, vm_type in targets:
+        if _xapi_missing:
+            skipped_authz += 1
+            log_lines.append(f"  ⊘ {vm_type}/{vmid}@{node}: skipped (creator lacks {_xapi_missing})")
+            continue
         if policy_creator and not user_can_access_vm(policy_creator, policy['cluster_id'], vmid, 'vm.snapshot', vm_type):
             skipped_authz += 1
             log_lines.append(f"  ⊘ {vm_type}/{vmid}@{node}: skipped (creator lacks vm.snapshot)")
@@ -461,6 +487,9 @@ def _execute_policy(policy_id, force=False):
             continue
         snap = _snap_name(policy['id'])
         create_ok = False
+        if not ha.confirm_step(f"snapshot policy {policy['name']} on {vmid}"):
+            log_lines.append(f"  ✗ {vm_type}/{vmid}@{node}: not taken - this instance does not hold the lease")
+            break
         try:
             res = mgr.create_snapshot(node, vmid, vm_type, snap, f"PegaProx policy {policy['name']}", policy['include_ram'])
             if res.get('success'):
@@ -513,8 +542,10 @@ def _execute_policy(policy_id, force=False):
                  WHERE id=?''',
               (status, finished_at, '\n'.join(log_lines), summary,
                created, failed, pruned_total, run_id))
+    # last_run_at is what _is_due counts from, on the same clock as its `now`
     c.execute('''UPDATE snapshot_policies SET last_run_at=?, last_run_status=? WHERE id=?''',
-              (finished_at, status, policy['id']))
+              (ha.schedule_now().isoformat() if ha.group_timezone() else finished_at,
+               status, policy['id']))
     db.conn.commit()
 
     try:
@@ -541,7 +572,8 @@ def _scheduler_loop():
             c.execute("SELECT * FROM snapshot_policies WHERE enabled = 1")
             for row in c.fetchall():
                 p = _row_to_policy(row)
-                if _is_due(p):
+                # a standby takes no snapshots, the policies run on the active instance
+                if _is_due(p) and ha.is_active():
                     try:
                         _execute_policy(p['id'])
                     except Exception as e:
@@ -636,6 +668,9 @@ def create_policy(cluster_id):
     if not mgr:
         return jsonify({'error': 'cluster manager not found'}), 404
     creator = build_authz_user(request.session.get('user', ''), request.session)
+    _missing = xapi_permission_missing(cluster_id, creator, 'vm.snapshot')
+    if _missing:
+        return jsonify({'error': f'Permission denied: {_missing}'}), 403
     try:
         denied = [f"{t}/{v}@{n}" for n, v, t in _resolve_targets(mgr, {
                       'target_type': target_type, 'target_value': target_value, 'cluster_id': cluster_id})
@@ -655,12 +690,12 @@ def create_policy(cluster_id):
             (id, cluster_id, name, target_type, target_value, schedule, schedule_at,
              schedule_cron, schedule_day, run_once_at, prune_only,
              retention_count, retention_days, include_ram, enabled, notes,
-             created_by, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+             created_by, created_role, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
             (pid, cluster_id, name, target_type, target_value, schedule, schedule_at,
              schedule_cron, schedule_day, run_once_at, 1 if prune_only else 0,
              retention_count, retention_days, 1 if include_ram else 0, 1 if enabled else 0,
-             notes, _current_user(), datetime.now().isoformat()))
+             notes, _current_user(), _current_token_role(), datetime.now().isoformat()))
         get_db().conn.commit()
         c.execute('SELECT * FROM snapshot_policies WHERE id=?', (pid,))
         return jsonify({'policy': _row_to_policy(c.fetchone())})
@@ -691,21 +726,29 @@ def update_policy(cluster_id, pid):
     tt = body.get('target_type', cur['target_type'])
     tv = body.get('target_value', cur['target_value'])
     creator = build_authz_user(request.session.get('user', ''), request.session)
+    _missing = xapi_permission_missing(cluster_id, creator, 'vm.snapshot')
+    if _missing:
+        return jsonify({'error': f'Permission denied: {_missing}'}), 403
     mgr = cluster_managers.get(cluster_id)
-    if mgr:
-        try:
-            denied = [f"{t}/{v}@{n}" for n, v, t in _resolve_targets(mgr, {
-                          'target_type': tt, 'target_value': tv, 'cluster_id': cluster_id})
-                      if not user_can_access_vm(creator, cluster_id, v, 'vm.snapshot', t)]
-        except Exception as e:
-            return jsonify({'error': f'failed to resolve targets: {e}'}), 400
-    else:
-        _tv = str(tv).strip()
-        if str(tt).lower() in ('vm', 'vmid') and _tv.lstrip('-').isdigit():
-            denied = [] if user_can_access_vm(creator, cluster_id, int(_tv), 'vm.snapshot') else [_tv]
+    # NS Oct 2026 - a retarget answers for the guests the policy had as well as for the new
+    # ones, and the policy then runs as whoever retargeted it, not as its old creator (#1011)
+    retarget = (str(tt), str(tv)[:300]) != (cur['target_type'], cur['target_value'])
+    denied = []
+    for _tt, _tvv in [(tt, tv)] + ([(cur['target_type'], cur['target_value'])] if retarget else []):
+        if mgr:
+            try:
+                denied += [f"{t}/{v}@{n}" for n, v, t in _resolve_targets(mgr, {
+                               'target_type': _tt, 'target_value': _tvv, 'cluster_id': cluster_id})
+                           if not user_can_access_vm(creator, cluster_id, v, 'vm.snapshot', t)]
+            except Exception as e:
+                return jsonify({'error': f'failed to resolve targets: {e}'}), 400
         else:
-            from pegaprox.api.helpers import caller_is_scoped
-            denied = ['<unresolved: cluster offline>'] if caller_is_scoped(creator, cluster_id) else []
+            _tv = str(_tvv).strip()
+            if str(_tt).lower() in ('vm', 'vmid') and _tv.lstrip('-').isdigit():
+                denied += [] if user_can_access_vm(creator, cluster_id, int(_tv), 'vm.snapshot') else [_tv]
+            else:
+                from pegaprox.api.helpers import caller_is_scoped
+                denied += ['<unresolved: cluster offline>'] if caller_is_scoped(creator, cluster_id) else []
     if denied:
         logging.warning(f"[SNAP-POLICY] {request.session.get('user','?')} denied on {len(denied)} out-of-scope target VM(s) updating policy {pid}@{cluster_id}")
         return jsonify({'error': "Permission denied: you lack vm.snapshot on some of this policy's target VMs"}), 403
@@ -745,6 +788,9 @@ def update_policy(cluster_id, pid):
         fields.append('enabled=?'); params.append(1 if body['enabled'] else 0)
     if not fields:
         return jsonify({'error': 'nothing to update'}), 400
+    if retarget:
+        fields += ['created_by=?', 'created_role=?']
+        params += [_current_user(), _current_token_role()]
     params.extend([pid, cluster_id])
     try:
         c = get_db().conn.cursor()
@@ -821,6 +867,9 @@ def run_policy_now(cluster_id, pid):
     if not mgr:
         return jsonify({'error': 'cluster manager not found'}), 404
     caller = build_authz_user(request.session.get('user', ''), request.session)
+    _missing = xapi_permission_missing(cluster_id, caller, 'vm.snapshot')
+    if _missing:
+        return jsonify({'error': f'Permission denied: {_missing}'}), 403
     try:
         denied = [f"{t}/{v}@{n}" for n, v, t in _resolve_targets(mgr, _row_to_policy(prow))
                   if not user_can_access_vm(caller, cluster_id, v, 'vm.snapshot', t)]

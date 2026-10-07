@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 class _ESXiConfig:
     """duck-type config object for SSH access to ESXi host"""
     def __init__(self, vmw):
+        self._vmw = vmw
         self.host = vmw.host
         self.user = vmw.username
         self.pass_ = vmw.password
@@ -21,6 +22,21 @@ class _ESXiConfig:
         self.ssh_key = ''
         self.ssh_port = 22
         self.ssl_verification = not vmw.ssl_verify  # invert
+        # MK Sep 2026 - what the cluster list (GET /api/clusters) reads of every cluster
+        # manager's config. Without them one ESXi host registered for XHM made the whole
+        # list a 500. No balancing and no PegaProx HA here, so all of it stays off.
+        self.enabled = bool(getattr(vmw, 'enabled', True))
+        self.migration_threshold = 20
+        self.check_interval = 300
+        self.auto_migrate = False
+        self.dry_run = False
+        self.ha_enabled = False
+        self.fallback_hosts = []
+
+    @property
+    def name(self):
+        # the VMware manager's, which a rename (or an HA sync) changes in place
+        return self._vmw.name
 
 
 class ESXiClusterManager:
@@ -41,9 +57,18 @@ class ESXiClusterManager:
         self.ha_node_status = {}
         self.nodes_in_maintenance = set()
 
+        # for the cluster list: there is no loop of its own to be stopped or to run
+        # a balance check, it serves as long as it is registered
+        self.running = True
+        self.last_run = None
+
     @property
     def is_connected(self):
         return self._vmware.connected
+
+    @property
+    def connection_error(self):
+        return getattr(self._vmware, 'last_error', None)
 
     @property
     def name(self):

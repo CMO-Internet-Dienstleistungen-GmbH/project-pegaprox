@@ -193,6 +193,10 @@ def test_an_empty_store_is_still_reported_as_a_fresh_install(no_marker, monkeypa
     class _Empty:
         def get_all_users(self):
             return {}
+
+        def holds_configuration(self):
+            # empty all through; one that still holds clusters is not fresh (#991)
+            return False
     monkeypatch.setattr(authmod, 'get_db', lambda: _Empty())
     assert authmod.initialization_state() == authmod.INIT_UNINITIALIZED
     assert authmod.is_initialized() is False
@@ -333,6 +337,9 @@ def test_login_still_reports_a_genuinely_fresh_install(api, marker, monkeypatch)
     class _Empty:
         def get_all_users(self):
             return {}
+
+        def holds_configuration(self):
+            return False
     monkeypatch.setattr(authmod, 'get_db', lambda: _Empty())
 
     r = api.anon().post('/api/auth/login', json={'username': 'ops', 'password': 'x'})

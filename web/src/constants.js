@@ -12,7 +12,7 @@
         // const API_URL = 'https://pegaprox.internal/api' // old staging
         
         // NS: Central version constant - keep in sync with backend PEGAPROX_VERSION
-        const PEGAPROX_VERSION = "1.2.0";
+        const PEGAPROX_VERSION = "1.3.0";
         const DEBUG = false; // set true for verbose logging
 
         // Human-readable cluster label. Rename only writes display_name; name is
@@ -34,7 +34,9 @@
             if (!f) {
                 const base = kind === 'T'
                     ? { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: h12 }
-                    : { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: h12 };
+                    : kind === 'M'
+                        ? { hour: '2-digit', minute: '2-digit', hour12: h12 }
+                        : { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: h12 };
                 try { f = new Intl.DateTimeFormat(undefined, { ...base, ...(opts || {}) }); }
                 catch (_) { f = new Intl.DateTimeFormat(); }
                 _dtfCache[key] = f;
@@ -55,6 +57,15 @@
             const h12 = localStorage.getItem('pegaprox-time-format') === '12h';
             return _dtf('T', h12, null).format(dt);
         }
+        // LW Oct 2026 - hour and minute in browser time on the same 12h/24h setting, for
+        // chart axes where seconds are noise; opts add parts (month, day, second)
+        function fmtClock(d, opts) {
+            if (!d) return '';
+            const dt = d instanceof Date ? d : new Date(typeof d === 'number' && d < 1e12 ? d * 1000 : d);
+            if (isNaN(dt)) return '';
+            const h12 = localStorage.getItem('pegaprox-time-format') === '12h';
+            return _dtf('M', h12, opts || null).format(dt);
+        }
 
         // NS: timezone list for node time config (matches backend get_timezones)
         const TIMEZONES = [
@@ -70,6 +81,18 @@
             'Pacific/Auckland', 'Pacific/Fiji',
             'Africa/Cairo', 'Africa/Johannesburg', 'Africa/Lagos',
         ];
+
+
+        // MK Sep 2026 (#642) - a plugin can be limited to certain clusters.
+        // Both layouts build their own plugin list, so the rule lives here once.
+        // No scope at all means every cluster: that is where every plugin starts and
+        // what every installation had before the column existed. Getting this the
+        // wrong way round would hide all of them.
+        function pluginAppliesToCluster(plugin, clusterId) {
+            const scope = (plugin && plugin.clusters) || [];
+            if (!scope.length) return true;
+            return !!clusterId && scope.indexOf(clusterId) >= 0;
+        }
 
 
         // =====================================================

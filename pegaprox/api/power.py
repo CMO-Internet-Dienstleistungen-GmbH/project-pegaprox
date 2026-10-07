@@ -201,14 +201,11 @@ def list_rates():
         # leaking every cluster's rates to any authenticated user. Always keep the shared
         # '__default__' fallback row (every cluster reads it when it has no own row).
         from pegaprox.utils.rbac import get_user_clusters
-        from flask import g as _g
+        from pegaprox.api.helpers import acting_user
         # NS Aug 2026 — honour a token's floored effective_role (not the owner's account role),
         # so an admin-owned but scoped token can't enumerate every cluster's rates.
-        _cu = dict(getattr(_g, 'current_user', None) or {})
-        _eff = request.session.get('effective_role') if getattr(request, 'session', None) else None
-        if _eff:
-            _cu['role'] = _eff
-        allowed = get_user_clusters(_cu)
+        # NS Oct 2026 - next to the owner's role, not in place of it (see costs.list_rates)
+        allowed = get_user_clusters(acting_user())
         if allowed is not None:
             rows = [r for r in rows if r['cluster_id'] == '__default__' or r['cluster_id'] in allowed]
         return jsonify({'rates': rows})

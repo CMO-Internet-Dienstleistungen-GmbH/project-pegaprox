@@ -1048,13 +1048,210 @@
             );
         }
 
+        // LW Oct 2026 - one ZFS pool in full, from GET .../disks/zfs/<pool>: the devices with
+        // their state and error counts, the last scrub and the data errors. Modern opens it as
+        // a dialog over the node, Corporate as a panel under its pool table
+        function zfsTone(state) {
+            const s = String(state || '').toUpperCase();
+            if (s === 'ONLINE') return 'ok';
+            if (s === 'AVAIL' || s === 'INUSE') return 'idle';
+            if (s === 'DEGRADED') return 'warn';
+            return s ? 'bad' : 'none';
+        }
+
+        function ZfsPoolDetail({ clusterId, node, pool, corporate = false, onClose }) {
+            const { t } = useTranslation();
+            const { getAuthHeaders } = useAuth();
+            const key = `${clusterId}/${node}/${pool}`;
+            const [view, setView] = useState({ key, loading: true, data: null, error: null });
+            const [reloads, setReloads] = useState(0);
+
+            useEffect(() => {
+                // an answer belongs to the pool it was asked for; a refresh keeps the last one up
+                let current = true;
+                setView(v => ({ key, loading: true, data: v.key === key ? v.data : null, error: null }));
+                const url = `${API_URL}/clusters/${encodeURIComponent(clusterId)}/nodes/${encodeURIComponent(node)}/disks/zfs/${encodeURIComponent(pool)}`;
+                fetch(url, { credentials: 'include', headers: getAuthHeaders() })
+                    .then(async res => {
+                        const body = await res.json().catch(() => ({}));
+                        if (!current) return;
+                        if (res.ok) setView({ key, loading: false, data: body, error: null });
+                        else setView({ key, loading: false, data: null, error: body.error || `HTTP ${res.status}` });
+                    })
+                    .catch(e => { if (current) setView({ key, loading: false, data: null, error: e.message || String(e) }); });
+                return () => { current = false; };
+            }, [key, reloads]);
+
+            const d = view.key === key ? view.data : null;
+            const tones = corporate
+                ? { ok: 'corp-badge corp-badge-online', warn: 'corp-badge corp-badge-maintenance', bad: 'corp-badge corp-badge-offline', idle: 'corp-badge corp-badge-stopped', none: '' }
+                : { ok: 'bg-green-500/20 text-green-400', warn: 'bg-yellow-500/20 text-yellow-400', bad: 'bg-red-500/20 text-red-400', idle: 'bg-gray-500/20 text-gray-400', none: '' };
+            const badge = (s) => s
+                ? <span data-zfs-state={s} className={corporate ? tones[zfsTone(s)] : `px-2 py-0.5 rounded text-xs font-medium ${tones[zfsTone(s)]}`}>{s}</span>
+                : null;
+            const red = corporate ? '#f54f47' : '#f87171';
+            const label = corporate ? 'text-[11px] mb-1' : 'text-xs text-gray-400 mb-1';
+            const labelStyle = corporate ? { color: 'var(--corp-text-secondary)' } : undefined;
+            const count = (n) => (n === null || n === undefined) ? '' : <span style={n > 0 ? { color: red, fontWeight: 600 } : undefined}>{n}</span>;
+
+            const scan = d ? d.scan || {} : {};
+            const scanKind = scan.kind === 'resilver' ? t('zfsResilver') : t('zfsScrub');
+            const scanSays = {
+                finished: 'zfsScanFinished', running: 'zfsScanRunning', paused: 'zfsScanPaused', canceled: 'zfsScanCanceled',
+            }[scan.state];
+            const scanLine = !scan.state || scan.state === 'none' ? t('zfsScanNone')
+                : scanSays ? t(scanSays).replace('{kind}', scanKind).replace('{when}', scan.when || '?')
+                : (scan.text || '-');
+
+            const rows = [];
+            const walk = (list, depth) => (list || []).forEach(v => { rows.push({ v, depth }); walk(v.children, depth + 1); });
+            if (d) walk(d.vdevs, 0);
+            const cell = corporate ? '' : 'p-2';
+
+            const body = (
+                <div className={corporate ? 'space-y-3 text-[12px]' : 'space-y-4 text-sm'} data-zfs-pool={pool}>
+                    {view.loading && !d && (
+                        <div className="flex items-center justify-center h-24 gap-2" style={labelStyle}>
+                            <Icons.RotateCw /> {t('loading')}
+                        </div>
+                    )}
+                    {view.error && (
+                        <div data-zfs-error className={corporate ? 'p-2' : 'bg-red-500/10 border border-red-500/30 rounded p-3 text-red-300'}
+                            style={corporate ? { color: red, border: '1px solid rgba(245,79,71,0.3)' } : undefined}>
+                            {t('zfsPoolUnreadable')}: {view.error}
+                        </div>
+                    )}
+                    {d && (
+                        <>
+                            <div className="flex items-center gap-3 flex-wrap">
+                                {badge(d.state)}
+                                {(d.devices || []).length > 0 && (
+                                    <span data-zfs-problems style={{ color: red }}>{t('zfsProblemDevices').replace('{n}', d.devices.length)}</span>
+                                )}
+                            </div>
+                            {d.status && (
+                                <div>
+                                    <div className={label} style={labelStyle}>{t('status')}</div>
+                                    <div data-zfs-status>{d.status}</div>
+                                </div>
+                            )}
+                            {d.action && (
+                                <div>
+                                    <div className={label} style={labelStyle}>{t('zfsPoolAction')}</div>
+                                    <div>{d.action}</div>
+                                </div>
+                            )}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div data-zfs-scan>
+                                    <div className={label} style={labelStyle}>{t('zfsLastScan')}</div>
+                                    <div title={scan.text || ''}>{scanLine}</div>
+                                    {scan.state === 'finished' && (
+                                        <div className={corporate ? 'mt-1' : 'mt-1 text-xs text-gray-400'} style={scan.errors > 0 ? { color: red } : labelStyle}>
+                                            {t('zfsScanResult').replace('{repaired}', scan.repaired || '0B').replace('{errors}', scan.errors ?? 0).replace('{duration}', scan.duration || '?')}
+                                        </div>
+                                    )}
+                                    {scan.state === 'running' && typeof scan.progress === 'number' && (
+                                        <div className="mt-2 flex items-center gap-2">
+                                            <div className="flex-1 h-2 rounded-full overflow-hidden" style={{ background: corporate ? 'var(--corp-surface-2)' : 'rgba(255,255,255,0.08)' }}>
+                                                <div className="h-full rounded-full bg-blue-500" style={{ width: `${Math.max(0, Math.min(100, scan.progress))}%` }} />
+                                            </div>
+                                            <span className="text-xs" style={labelStyle}>{scan.progress}%</span>
+                                        </div>
+                                    )}
+                                </div>
+                                <div data-zfs-data-errors>
+                                    <div className={label} style={labelStyle}>{t('zfsDataErrors')}</div>
+                                    {d.data_errors
+                                        ? <div style={{ color: red }}>{d.data_errors}</div>
+                                        : <div style={{ color: corporate ? '#60b515' : '#4ade80' }}>{t('zfsNoDataErrors')}</div>}
+                                </div>
+                            </div>
+                            <div>
+                                <div className={label} style={labelStyle}>{t('zfsDevices')}</div>
+                                <div className="overflow-x-auto">
+                                    <table className={corporate ? 'corp-datagrid' : 'w-full text-sm'}>
+                                        <thead className={corporate ? '' : 'bg-proxmox-dark text-xs text-gray-400'}>
+                                            <tr>
+                                                <th className={corporate ? '' : 'text-left p-2'}>{t('name')}</th>
+                                                <th className={corporate ? '' : 'text-left p-2'}>{t('zfsColState')}</th>
+                                                <th className={corporate ? '' : 'text-right p-2'}>{t('zfsColRead')}</th>
+                                                <th className={corporate ? '' : 'text-right p-2'}>{t('zfsColWrite')}</th>
+                                                <th className={corporate ? '' : 'text-right p-2'}>{t('zfsColChecksum')}</th>
+                                                <th className={corporate ? '' : 'text-left p-2'}>{t('zfsColNote')}</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {rows.map(({ v, depth }, i) => (
+                                                <tr key={i} data-zfs-vdev={v.name} className={corporate ? '' : 'border-t border-proxmox-border'}>
+                                                    <td className={cell} style={{ paddingLeft: `${8 + depth * 16}px` }}>
+                                                        <span className="font-mono text-xs" style={!v.state ? labelStyle || { color: '#9ca3af' } : undefined}>{v.name}</span>
+                                                    </td>
+                                                    <td className={cell}>{badge(v.state)}</td>
+                                                    <td className={`${cell} text-right font-mono`}>{count(v.read)}</td>
+                                                    <td className={`${cell} text-right font-mono`}>{count(v.write)}</td>
+                                                    <td className={`${cell} text-right font-mono`}>{count(v.cksum)}</td>
+                                                    <td className={`${cell} text-xs`} style={labelStyle}>{v.msg}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                                {d.truncated && <div className="mt-2 text-xs" style={labelStyle}>{t('zfsTruncated')}</div>}
+                            </div>
+                        </>
+                    )}
+                </div>
+            );
+
+            if (corporate) return (
+                <div data-zfs-panel className="mt-3" style={{ background: 'var(--corp-surface-1)', border: '1px solid var(--corp-border-medium)' }}>
+                    <div className="flex items-center justify-between px-3 py-2" style={{ borderBottom: '1px solid var(--corp-border-medium)' }}>
+                        <span className="text-[13px] font-medium" style={{ color: 'var(--color-text)' }}>ZFS {pool} <span style={labelStyle}>({node})</span></span>
+                        <div className="flex items-center gap-2">
+                            <button onClick={() => setReloads(n => n + 1)} disabled={view.loading} title={t('refresh')}
+                                className="px-2 py-1 text-[11px] flex items-center gap-1 disabled:opacity-40" style={{ color: '#49afd9', border: '1px solid #485764' }}>
+                                <Icons.RefreshCw /> {t('refresh')}
+                            </button>
+                            <button onClick={onClose} title={t('close')} className="px-2 py-1 text-[11px]" style={{ color: 'var(--corp-text-secondary)', border: '1px solid #485764' }}>
+                                <Icons.X />
+                            </button>
+                        </div>
+                    </div>
+                    <div className="p-3">{body}</div>
+                </div>
+            );
+            return (
+                <div className="fixed inset-0 z-[60] bg-black/60 flex items-center justify-center p-4" onClick={onClose}>
+                    <div data-zfs-panel className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-4xl max-h-[85vh] overflow-hidden flex flex-col" onClick={e => e.stopPropagation()}>
+                        <div className="p-4 border-b border-proxmox-border flex items-center justify-between">
+                            <div>
+                                <h3 className="font-medium text-white flex items-center gap-2">
+                                    <Icons.Database />
+                                    ZFS {pool}
+                                </h3>
+                                <div className="text-xs text-gray-500 mt-1">{node}</div>
+                            </div>
+                            <div className="flex items-center gap-1">
+                                <button onClick={() => setReloads(n => n + 1)} disabled={view.loading} title={t('refresh')}
+                                    className="p-2 hover:bg-proxmox-hover rounded-lg text-gray-400 hover:text-white disabled:opacity-40">
+                                    <Icons.RefreshCw />
+                                </button>
+                                <button onClick={onClose} title={t('close')} className="p-2 hover:bg-proxmox-hover rounded-lg text-gray-400 hover:text-white"><Icons.X /></button>
+                            </div>
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-4">{body}</div>
+                    </div>
+                </div>
+            );
+        }
+
         // Node Management Modal Component
         // NS: Full node management - shell, network, disks, etc.
         // Shell tab uses xterm.js (web terminal), pretty cool
         // LW: I did the UI, Marcus handled the backend websocket stuff
         function NodeModal({ node, clusterId, clusterType, onClose, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders } = useAuth();  // NS: Fix - need auth!
+            const { getAuthHeaders, haReadOnly, haConsolesElsewhere } = useAuth();  // NS: Fix - need auth!
             const { isCorporate } = useLayout();
             const [activeTab, setActiveTab] = useState('summary');
             const [loading, setLoading] = useState(true);
@@ -1076,11 +1273,12 @@
             const [perfTimeframe, setPerfTimeframe] = useState('hour'); // NS: For performance metrics
             // LW May 2026 — SMART modal state (replaces ugly alert(JSON.stringify) call site)
             const [smartModal, setSmartModal] = useState(null); // { disk, loading, data, error }
+            const [zfsPool, setZfsPool] = useState(null);  // the ZFS pool shown in full
 
             const authHeaders = getAuthHeaders();  // NS: Get auth headers
 
             // LW: XCP-ng doesn't have Ceph, repos differ, subscription not applicable
-            const tabs = isXcpng ? [
+            const allTabs = isXcpng ? [
                 { id: 'summary', label: 'Summary', icon: Icons.Activity },
                 { id: 'performance', label: 'Performance', icon: Icons.BarChart },
                 { id: 'shell', label: 'Shell', icon: Icons.Terminal },
@@ -1101,6 +1299,15 @@
                 { id: 'subscription', label: 'Subscription', icon: Icons.Shield },
                 { id: 'ceph', label: 'Ceph', icon: Icons.Database },
             ];
+            // #625 v2 - a standby shows the node but changes nothing on it: every tab that can
+            // change something renders with its controls disabled. A forwarding standby
+            // changes it through the active, so only a read-only one locks them. The shell
+            // tab points to the shell on the active instead, unless this one serves users.
+            const tabs = allTabs;
+            const lockedTab = haReadOnly && !['summary', 'performance', 'tasks'].includes(activeTab);
+            // spread on the fieldsets around the parts that change the node; what only reads
+            // (Refresh, SMART) sits outside them and keeps working on a standby
+            const haLock = { disabled: lockedTab, 'data-ha-locked': lockedTab ? '' : undefined };
 
             useEffect(() => { loadTabData(activeTab); }, [activeTab, perfTimeframe]);
 
@@ -1900,7 +2107,9 @@
                                         </div>
                                     )}
 
-                                    {activeTab === 'shell' && (
+                                    {activeTab === 'shell' && haConsolesElsewhere && <HaConsoleOnActive />}
+
+                                    {activeTab === 'shell' && !haConsolesElsewhere && (
                                         <div className="h-full flex flex-col">
                                             <div className="flex items-center justify-between mb-4">
                                                 <div className="flex items-center gap-3">
@@ -1926,6 +2135,7 @@
                                     )}
 
                                     {activeTab === 'network' && (
+                                        <fieldset {...haLock} className="contents">
                                         <div className="space-y-4">
                                             {/* Action Buttons */}
                                             <div className="flex items-center gap-3 flex-wrap">
@@ -2278,6 +2488,7 @@
                                                 </div>
                                             )}
                                         </div>
+                                        </fieldset>
                                     )}
 
                                     {activeTab === 'system' && (
@@ -2453,6 +2664,7 @@
                                                     </>)}
                                                 </div>
                                             )}
+                                            <fieldset {...haLock} className="space-y-6 min-w-0">
                                             {/* DNS */}
                                             <div className="p-4 bg-proxmox-dark rounded-lg border border-proxmox-border">
                                                 <div className="flex justify-between items-center mb-4">
@@ -2635,6 +2847,7 @@
                                                     </div>
                                                 )}
                                             </div>
+                                            </fieldset>
 
                                             {/* Syslog */}
                                             <div className="p-4 bg-proxmox-dark rounded-lg border border-proxmox-border">
@@ -2660,7 +2873,9 @@
                                     )}
 
                                     {activeTab === 'hardware' && (
+                                        <fieldset {...haLock} className="contents">
                                         <HardwareMonitoringPanel clusterId={clusterId} node={node} t={t} addToast={addToast} getAuthHeaders={getAuthHeaders} />
+                                        </fieldset>
                                     )}
 
                                     {activeTab === 'disks' && (
@@ -2752,7 +2967,7 @@
                                                                                 <Icons.Activity />
                                                                             </button>
                                                                             {(d.used === 'unused' || !d.used) && (
-                                                                                <>
+                                                                                <fieldset {...haLock} className="contents">
                                                                                     <button 
                                                                                         onClick={async () => {
                                                                                             if (!confirm(`Initialize ${d.devpath} with GPT partition table?\n\nThis will ERASE all data on the disk!`)) return;
@@ -2802,7 +3017,7 @@
                                                                                     >
                                                                                         <Icons.Trash />
                                                                                     </button>
-                                                                                </>
+                                                                                </fieldset>
                                                                             )}
                                                                         </div>
                                                                     </td>
@@ -2815,6 +3030,7 @@
                                                 </div>
                                             </div>
 
+                                            <fieldset {...haLock} className="space-y-6 min-w-0">
                                             {isXcpng ? (
                                                 /* XCP-ng: Storage Repositories - NS Mar 2026 */
                                                 <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
@@ -2916,14 +3132,19 @@
                                                     ) : <div className="text-gray-500 text-sm text-center py-4">No LVM-Thin Pools</div>}
                                                 </div>
                                             </div>
+                                                </>
+                                            )}
+                                            </fieldset>
 
-                                            {/* ZFS Pools */}
+                                            {/* ZFS Pools - LW Oct 2026: outside the lock, the pool view only reads */}
+                                            {!isXcpng && (
                                             <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                 <div className="p-4 border-b border-proxmox-border flex items-center justify-between">
                                                     <h3 className="font-medium text-white flex items-center gap-2">
                                                         <Icons.Database />
                                                         ZFS Pools
                                                     </h3>
+                                                    <fieldset {...haLock} className="contents">
                                                     <div className="flex gap-2">
                                                         <button
                                                             onClick={() => openDiskModal('directory')}
@@ -2938,6 +3159,7 @@
                                                             <Icons.Plus className="inline mr-1" /> Create ZFS
                                                         </button>
                                                     </div>
+                                                    </fieldset>
                                                 </div>
                                                 <div className="p-4">
                                                     {(data.zfs||[]).length > 0 ? (
@@ -2968,19 +3190,29 @@
                                                                             </div>
                                                                         </>
                                                                     )}
+                                                                    {z.name && (
+                                                                        <button
+                                                                            onClick={() => setZfsPool(z.name)}
+                                                                            data-zfs-open={z.name}
+                                                                            title={t('zfsPoolDetails')}
+                                                                            className="mt-3 px-2 py-1 text-xs bg-proxmox-darker hover:bg-proxmox-hover border border-proxmox-border rounded-lg flex items-center gap-1 text-gray-300"
+                                                                        >
+                                                                            <Icons.HardDrive className="w-3.5 h-3.5" /> {t('zfsPoolDetails')}
+                                                                        </button>
+                                                                    )}
                                                                 </div>
                                                             ))}
                                                         </div>
                                                     ) : <div className="text-gray-500 text-sm text-center py-4">No ZFS Pools</div>}
                                                 </div>
                                             </div>
-                                                </>
                                             )}
                                         </div>
                                     )}
 
                                     {/* APT Repos tab */}
                                     {activeTab === 'repos' && (
+                                        <fieldset {...haLock} className="contents">
                                         <div className="space-y-4">
                                             <div className="flex items-center justify-between">
                                                 <h3 className="text-lg font-medium text-white flex items-center gap-2">
@@ -3148,6 +3380,7 @@
                                                 </div>
                                             </div>
                                         </div>
+                                        </fieldset>
                                     )}
 
                                     {activeTab === 'tasks' && (
@@ -3234,7 +3467,7 @@
                                             <div className="p-6 bg-proxmox-dark rounded-lg border border-proxmox-border">
                                                 <h4 className="font-medium text-white mb-4">{t('enterLicenseKey')}</h4>
                                                 <div className="space-y-4">
-                                                    <div>
+                                                    <fieldset {...haLock} className="min-w-0">
                                                         <label className="block text-xs text-gray-400 mb-2">{t('subscriptionKey')}</label>
                                                         <input 
                                                             type="text" 
@@ -3246,8 +3479,9 @@
                                                         <p className="text-xs text-gray-500 mt-2">
                                                             Format: pve1c-xxxxxxxxxx, pve2c-xxxxxxxxxx, pve4c-xxxxxxxxxx, etc.
                                                         </p>
-                                                    </div>
+                                                    </fieldset>
                                                     <div className="flex gap-3">
+                                                        <fieldset {...haLock} className="contents">
                                                         <button
                                                             onClick={async () => {
                                                                 if(!data.newLicenseKey) {
@@ -3279,6 +3513,7 @@
                                                             <Icons.Shield />
                                                             {t('activateLicense')}
                                                         </button>
+                                                        </fieldset>
                                                         <button
                                                             onClick={() => loadTabData('subscription')}
                                                             className="flex items-center gap-2 px-4 py-2 bg-proxmox-card border border-proxmox-border rounded-lg text-gray-300 hover:text-white transition-colors"
@@ -3308,6 +3543,7 @@
                                     )}
 
                                     {activeTab === 'ceph' && (
+                                        <fieldset {...haLock} className="contents">
                                         <div className="space-y-6">
                                             {loading ? (
                                                 <div className="flex items-center justify-center py-12">
@@ -3548,6 +3784,7 @@
                                                 </>
                                             )}
                                         </div>
+                                        </fieldset>
                                     )}
                                 </>
                             )}
@@ -3555,7 +3792,7 @@
                     </div>
 
                     {/* Fullscreen Shell Modal */}
-                    {data.shellFullscreen && (
+                    {!haConsolesElsewhere && data.shellFullscreen && (
                         <div className="fixed inset-0 z-[70] bg-black flex flex-col">
                             <div className="flex items-center justify-between px-4 py-2 bg-proxmox-dark border-b border-proxmox-border">
                                 <div className="flex items-center gap-3">
@@ -3583,6 +3820,9 @@
                     {smartModal && (
                         <SmartModal modal={smartModal} onClose={() => setSmartModal(null)} formatBytes={formatBytes} />
                     )}
+                    {zfsPool && (
+                        <ZfsPoolDetail clusterId={clusterId} node={node} pool={zfsPool} onClose={() => setZfsPool(null)} />
+                    )}
                 </div>
             );
         }
@@ -3597,6 +3837,9 @@
             const { t } = useTranslation();
             const { isCorporate } = useLayout(); // LW: corporate corporate chrome
             const canvasRef = useRef(null);
+            // #959 - the datacenter keymap, as reported by the console ticket. A ref and not
+            // state: only the paste handler reads it, and it must not re-render the canvas.
+            const keymapRef = useRef('');
             const [isFullscreen, setIsFullscreen] = useState(false);
             const [connectionStatus, setConnectionStatus] = useState('connecting');
             const [vncPort, setVncPort] = useState(null);
@@ -3677,6 +3920,7 @@
                             return;
                         }
 
+                        keymapRef.current = ticketData.keymap || '';
                         const vncPassword = ticketData.ticket;
                         const stableHandle = ticketData.stable;   // {session_id, key_b64, ...} when stable mode active
                         console.log('VNC: Got ticket' + (stableHandle ? ' + crypto session' : ''));
@@ -3973,18 +4217,95 @@
             // Shift for us, so paste has to do the same: hold Shift_L, tap the *base* key on that
             // physical key, release Shift_L — exactly what pressing it by hand does. Uppercase
             // already works (qemu shifts A-Z itself), so leave those on the plain path.
+            // MK Sep 2026 #959 - and only while the datacenter runs a US keymap.
+            // With `keyboard: es` set, qemu maps the keysym to the Spanish layout itself, so
+            // holding Shift over the US base key produced '"' where the reporter pasted '@'.
+            // An unset keymap stays on this path: qemu assumes en-us when it is given none,
+            // which is the situation #653 was reported from.
             const SHIFTED_US = {
                 '!':0x31,'@':0x32,'#':0x33,'$':0x34,'%':0x35,'^':0x36,'&':0x37,'*':0x38,'(':0x39,')':0x30,
                 '_':0x2D,'+':0x3D,'{':0x5B,'}':0x5D,'|':0x5C,':':0x3B,'"':0x27,'<':0x2C,'>':0x2E,'?':0x2F,'~':0x60,
             };
-            const typeTextToVM = (conn, text) => {
+            // LW Oct 2026 (#959) - that still left every other keymap with bare keysyms, and qemu
+            // never presses a modifier for a keysym: '@' on a Spanish guest arrived as a plain 2.
+            // So paste types like a hand on that keyboard: the physical key (KeyboardEvent.code,
+            // which noVNC turns into a scancode) with Shift and/or AltGr held - what noVNC itself
+            // sends for a real key press. One string per modifier level, the 48 keys in the order
+            // of PASTE_KEYS, rows split by a space, '•' where that level has nothing. Positions
+            // that are dead keys on Windows AND Linux get a Space after them; where only Windows
+            // has a dead key (the '~' of es and fr, for one) the key is sent as it is.
+            const PASTE_KEYS = ('Backquote 1 2 3 4 5 6 7 8 9 0 Minus Equal Q W E R T Y U I O P BracketLeft BracketRight '
+                + 'A S D F G H J K L Semicolon Quote Backslash IntlBackslash Z X C V B N M Comma Period Slash')
+                .split(' ').map(k => k.length > 1 ? k : ((k >= '0' && k <= '9' ? 'Digit' : 'Key') + k));
+            const PASTE_LAYOUTS = {
+                'en-gb': { base:  '`1234567890-= qwertyuiop[] asdfghjkl;\'# \\zxcvbnm,./',
+                           shift: '¬!"£$%^&*()_+ QWERTYUIOP{} ASDFGHJKL:@~ |ZXCVBNM<>?',
+                           altgr: '••••€•••••••• •••••••••••• •••••••••••• •••••••••••' },
+                de: { base:  '^1234567890ß´ qwertzuiopü+ asdfghjklöä# <yxcvbnm,.-',
+                      shift: '°!"§$%&/()=?` QWERTZUIOPÜ* ASDFGHJKLÖÄ\' >YXCVBNM;:_',
+                      altgr: '••²³•••{[]}\\• @•€••••••••~ •••••••••••• |••••••µ•••',
+                      dead: '^´`' },
+                es: { base:  'º1234567890\'¡ qwertyuiop`+ asdfghjklñ´ç <zxcvbnm,.-',
+                      shift: 'ª!"·$%&/()=?¿ QWERTYUIOP^* ASDFGHJKLÑ¨Ç >ZXCVBNM;:_',
+                      altgr: '\\|@#~•¬•••••• ••€•••••••[] ••••••••••{} •••••••••••',
+                      dead: '`^´¨' },
+                fr: { base:  '²&é"\'(-è_çà)= azertyuiop^$ qsdfghjklmù* <wxcvbn,;:!',
+                      shift: '•1234567890°+ AZERTYUIOP¨£ QSDFGHJKLM%µ >WXCVBN?./§',
+                      altgr: '••~#{[|`\\^@]} ••€••••••••¤ •••••••••••• •••••••••••',
+                      dead: '^¨' },
+                it: { base:  '\\1234567890\'ì qwertyuiopè+ asdfghjklòàù <zxcvbnm,.-',
+                      shift: '|!"£$%&/()=?^ QWERTYUIOPé* ASDFGHJKLç°§ >ZXCVBNM;:_',
+                      altgr: '•••••••••••`~ ••€•••••••[] •••••••••@#• •••••••••••',
+                      altgrShift: '••••••••••••• ••••••••••{} •••••••••••• •••••••••••' },
+                pt: { base:  '\\1234567890\'« qwertyuiop+´ asdfghjklçº~ <zxcvbnm,.-',
+                      shift: '|!"#$%&/()=?» QWERTYUIOP*` ASDFGHJKLÇª^ >ZXCVBNM;:_',
+                      altgr: '••@£§••{[]}•• ••€•••••••¨• •••••••••••• •••••••••••',
+                      dead: '´`~^¨' },
+                pl: { base:  '`1234567890-= qwertyuiop[] asdfghjkl;\'\\ •zxcvbnm,./',
+                      shift: '~!@#$%^&*()_+ QWERTYUIOP{} ASDFGHJKL:"| •ZXCVBNM<>?',
+                      altgr: '••••••••••••• ••ę•••€•ó••• ąś••••••ł••• •żźć••ń••••',
+                      altgrShift: '••••••••••••• ••Ę•••••Ó••• ĄŚ••••••Ł••• •ŻŹĆ••Ń••••' },
+            };
+            const PASTE_SHIFT = [0xFFE1, 'ShiftLeft'];
+            const PASTE_ALTGR = [0xFE03, 'AltRight'];     // ISO_Level3_Shift, as noVNC sends AltGraph
+            const DEAD_KEYSYMS = { '`': 0xFE50, '´': 0xFE51, '^': 0xFE52, '~': 0xFE53, '¨': 0xFE57 };
+            // Latin-2 letters have keysyms of their own, and a keymap only knows those
+            const LATIN2_KEYSYMS = { 'ą': 0x1B1, 'Ą': 0x1A1, 'ć': 0x1E6, 'Ć': 0x1C6, 'ę': 0x1EA, 'Ę': 0x1CA,
+                'ł': 0x1B3, 'Ł': 0x1A3, 'ń': 0x1F1, 'Ń': 0x1D1, 'ś': 0x1B6, 'Ś': 0x1A6,
+                'ź': 0x1BC, 'Ź': 0x1AC, 'ż': 0x1BF, 'Ż': 0x1AF };
+            const pasteKeyMap = (keymap) => {
+                const layout = PASTE_LAYOUTS[keymap];
+                if (!layout) return null;
+                const map = {};
+                [['base', []], ['shift', [PASTE_SHIFT]], ['altgr', [PASTE_ALTGR]],
+                 ['altgrShift', [PASTE_ALTGR, PASTE_SHIFT]]].forEach(([level, mods]) => {
+                    Array.from((layout[level] || '').replace(/ /g, '')).forEach((ch, i) => {
+                        if (ch === '•' || map[ch] || !PASTE_KEYS[i]) return;
+                        const cp = ch.codePointAt(0);
+                        const dead = (layout.dead || '').includes(ch);
+                        map[ch] = { code: PASTE_KEYS[i], mods, dead,
+                                    keysym: dead ? DEAD_KEYSYMS[ch]
+                                          : (cp <= 0xFF ? cp : (LATIN2_KEYSYMS[ch] || 0x01000000 + cp)) };
+                    });
+                });
+                return map;
+            };
+            const typeTextToVM = (conn, text, keymap) => {
+                const usLayout = !keymap || keymap === 'en-us';
+                const keys = usLayout ? null : pasteKeyMap(keymap);
                 for (const ch of text) {
                     const code = ch.charCodeAt(0);
+                    const key = keys && keys[ch];
                     if (code === 10 || code === 13) {
                         conn.sendKey(0xFF0D); // Return
                     } else if (code === 9) {
                         conn.sendKey(0xFF09); // Tab
-                    } else if (SHIFTED_US[ch] !== undefined) {
+                    } else if (key) {
+                        key.mods.forEach(([ks, c]) => conn.sendKey(ks, c, true));
+                        conn.sendKey(key.keysym, key.code);
+                        key.mods.slice().reverse().forEach(([ks, c]) => conn.sendKey(ks, c, false));
+                        if (key.dead) conn.sendKey(0x20, 'Space');   // dead key + Space = the character itself
+                    } else if (usLayout && SHIFTED_US[ch] !== undefined) {
                         conn.sendKey(0xFFE1, 'ShiftLeft', true);   // Shift_L down
                         conn.sendKey(SHIFTED_US[ch]);              // tap the unshifted base key
                         conn.sendKey(0xFFE1, 'ShiftLeft', false);  // Shift_L up
@@ -4119,7 +4440,7 @@
                                             const conn = rfbRef.current;
                                             if (!conn) return;
                                             const text = prompt('Paste text:');
-                                            if (text) typeTextToVM(conn, text);
+                                            if (text) typeTextToVM(conn, text, keymapRef.current);
                                         }}
                                         className="corp-vm-btn corp-vm-btn-ghost flex items-center gap-1"
                                         title={t('pasteClipboard') || 'Paste from clipboard'}
@@ -4202,7 +4523,7 @@
                                             const conn = rfbRef.current;
                                             if (!conn) return;
                                             const text = prompt('Paste text:');
-                                            if (text) typeTextToVM(conn, text);
+                                            if (text) typeTextToVM(conn, text, keymapRef.current);
                                         }}
                                         className="px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-xs text-gray-300 hover:text-white hover:border-proxmox-orange transition-colors"
                                         title={t('pasteClipboard') || 'Paste from clipboard'}
@@ -4326,6 +4647,8 @@
         // NodeModal. Theme-adaptive via var(--color-text) + a shared status palette.
         function HardwareMonitoringPanel({ clusterId, node, t, addToast, getAuthHeaders }) {
             const { language } = useTranslation();   // request + record the localized warning (#609 phase 2)
+            // both consents are this instance's own settings: no standby saves them (#625)
+            const { haStandby } = useAuth();
             const [consent, setConsent] = useState(null);   // {enabled, warning, current_version, acknowledged_by, acknowledged_at, ack_lang}
             const [hw, setHw] = useState(null);              // {available, health, sensors, chassis, power_w, fru, events} | {error}
             const [loading, setLoading] = useState(true);
@@ -4489,11 +4812,13 @@
                             <div style={cardHead}><span className="text-[13px] font-medium" style={txt}>{t('hardwareMonitoring') || 'Hardware Monitoring'}</span></div>
                             <div className="p-4 space-y-3">
                                 <p className="text-[13px]" style={sub}>{t('hardwareMonitoringDisabledDesc') || 'In-band hardware monitoring (IPMI) is not enabled. It reads sensors, power, inventory and the hardware event log directly on the node — credential-free, read-only.'}</p>
+                                {haStandby ? <HaSettingsOnActive own /> : (
                                 <button onClick={openWarn}
                                     className="px-3 py-1.5 text-sm rounded flex items-center gap-1.5"
                                     style={{background: '#49afd9', color: '#08131b'}}>
                                     <Icons.Cpu className="w-3.5 h-3.5" />{t('enableHardwareMonitoring') || 'Enable hardware monitoring'}
                                 </button>
+                                )}
                             </div>
                         </div>
                     )}
@@ -4624,9 +4949,11 @@
                                 {!rfConsent.enabled && (
                                     <React.Fragment>
                                         <p className="text-[13px]" style={sub}>{t('redfishOobDesc') || 'Read hardware health over the management network via the BMC Redfish API — a credential-based, out-of-band fallback when in-band IPMI is unavailable.'}</p>
+                                        {haStandby ? <HaSettingsOnActive own /> : (
                                         <button onClick={openRfWarn} className="px-3 py-1.5 text-sm rounded flex items-center gap-1.5" style={{background: '#efc006', color: '#08131b'}}>
                                             <Icons.Server className="w-3.5 h-3.5" />{t('enableRedfish') || 'Enable out-of-band monitoring'}
                                         </button>
+                                        )}
                                     </React.Fragment>
                                 )}
                                 {rfConsent.enabled && (
@@ -4745,14 +5072,32 @@
 
         function CorporateNodeDetailView({ node, clusterId, clusterHost, clusterMetrics, clusterResources, onBack, onOpenNodeConfig, onMaintenanceToggle, onNodeAction, onStartUpdate, onSelectVm, addToast }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, reverseProxyEnabled } = useAuth();
+            const { getAuthHeaders, reverseProxyEnabled, haReadOnly, haConsolesElsewhere } = useAuth();
+            // #625 v2 - a standby shows the node: no power, maintenance or update actions, no
+            // shell, and the configure and hardware forms render disabled
+            // A forwarding standby acts through the active again; the shell tab points
+            // to the shell on the active on every standby that does not serve users
             const [activeDetailTab, setActiveDetailTab] = useState('summary');
             const [showActionsMenu, setShowActionsMenu] = useState(false);
+            // LW Oct 2026 (#763, #954) - entering maintenance asks with the evacuation options
+            const [showMaintConfirm, setShowMaintConfirm] = useState(false);
+            const [maintOptions, setMaintOptions] = useState({});
             const [configSubTab, setConfigSubTab] = useState('network');
+            const [zfsPool, setZfsPool] = useState(null);  // the ZFS pool shown in full
             const [monitorSubTab, setMonitorSubTab] = useState('performance');
             const [perfTimeframe, setPerfTimeframe] = useState('hour');
             const [loading, setLoading] = useState(false);
             const [data, setData] = useState({});
+            // LW Oct 2026 (#828) - an answer belongs to the node it was asked for. navGen moves
+            // on every node or cluster switch, slotSeq on every new request for one slot, so a
+            // late answer for the previous node (or an older reload) never lands, and loading
+            // only counts the requests that still matter
+            const navGenRef = useRef(0);
+            const slotSeqRef = useRef({});
+            const inflightRef = useRef(new Set());
+            const navKey = `${clusterId}/${node}`;
+            const navKeyRef = useRef(navKey);
+            navKeyRef.current = navKey;
             // LW: Feb 2026 - edit states for configure tab
             const [editingDns, setEditingDns] = useState(false);
             const [editingHosts, setEditingHosts] = useState(false);
@@ -4842,6 +5187,14 @@
 
             // Fetch tab data
             const loadTabData = async (tab, tf) => {
+                // a save that finished after the switch reloads its own node, not this one
+                if (navKeyRef.current !== navKey) return;
+                const gen = navGenRef.current;
+                const seq = (slotSeqRef.current[tab] || 0) + 1;
+                slotSeqRef.current[tab] = seq;
+                const inflight = inflightRef.current;
+                const token = {};
+                inflight.add(token);
                 setLoading(true);
                 try {
                     const endpoints = {
@@ -4878,8 +5231,9 @@
                         ],
                     };
                     const urls = endpoints[tab] || [];
-                    if (urls.length === 0) { setLoading(false); return; }
+                    if (urls.length === 0) return;
                     const results = await Promise.all(urls.map(u => authFetch(u).then(r => r && r.ok ? r.json() : null).catch(() => null)));
+                    if (gen !== navGenRef.current || navKeyRef.current !== navKey || slotSeqRef.current[tab] !== seq) return;
                     // NS: Feb 2026 - Use functional setData to avoid stale closure bugs
                     setData(prev => {
                         const newData = { ...prev };
@@ -4912,11 +5266,17 @@
                         return newData;
                     });
                 } catch (e) { console.error(e); }
-                setLoading(false);
+                finally {
+                    inflight.delete(token);
+                    if (inflight === inflightRef.current) setLoading(inflight.size > 0);
+                }
             };
 
             // LW: Feb 2026 - reset data and load summary when node changes
-            useEffect(() => { setData({}); setConfigSubTab('network'); setMonitorSubTab('performance'); setActiveDetailTab('summary'); loadTabData('summary'); }, [node]);
+            useEffect(() => {
+                setData({}); setConfigSubTab('network'); setZfsPool(null); setMonitorSubTab('performance'); setActiveDetailTab('summary'); loadTabData('summary');
+                return () => { navGenRef.current++; inflightRef.current = new Set(); };
+            }, [clusterId, node]);
 
             useEffect(() => {
                 let cancelled = false;
@@ -5003,7 +5363,8 @@
                                 </button>
                                 {showActionsMenu && (
                                     <div className="corp-dropdown absolute right-0 top-full mt-1 w-52 z-50 py-1" onClick={(e) => e.stopPropagation()}>
-                                        <button onClick={() => { if(!confirm(`${isMaint ? 'Disable' : 'Enable'} maintenance mode on "${node}"?`)) return; onMaintenanceToggle(node, !isMaint); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
+                                        {!haReadOnly && (<>
+                                        <button onClick={() => { if (!isMaint) { setMaintOptions({}); setShowMaintConfirm(true); setShowActionsMenu(false); return; } if(!confirm(`${isMaint ? 'Disable' : 'Enable'} maintenance mode on "${node}"?`)) return; onMaintenanceToggle(node, !isMaint); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
                                             <Icons.Wrench className="w-3.5 h-3.5" /> {isMaint ? t('disableMaintenance') || 'Disable Maintenance' : t('maintenance')}
                                         </button>
                                         <button onClick={() => { if(!confirm(`Reboot node "${node}"?`)) return; onNodeAction(node, 'reboot'); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
@@ -5016,6 +5377,7 @@
                                             <Icons.Download className="w-3.5 h-3.5" /> {t('update') || 'Update'}
                                         </button>
                                         <div className="my-1" style={{borderTop: '1px solid var(--corp-border-medium)'}}></div>
+                                        </>)}
                                         <button onClick={() => { onOpenNodeConfig(node); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
                                             <Icons.Settings className="w-3.5 h-3.5" /> {t('nodeSettings')}
                                         </button>
@@ -5235,6 +5597,7 @@
                                     <button className={`corp-subnav-item ${configSubTab === 'ceph' ? 'active' : ''}`} onClick={() => { setConfigSubTab('ceph'); if (!data.ceph) loadTabData('ceph'); }}>Ceph</button>
                                 </div>
                                 <div className="flex-1 pl-4">
+                                    <fieldset disabled={haReadOnly} className="contents">
                                     {loading && !data.network && !data.dns && !data.disks ? (
                                         <div className="flex items-center justify-center h-32"><Icons.RotateCw className="w-5 h-5 animate-spin" style={{color: '#49afd9'}} /></div>
                                     ) : (
@@ -5646,20 +6009,6 @@
                                                     </table>
                                                 </div>
                                             )}
-                                            {configSubTab === 'zfs' && (
-                                                <div>
-                                                    <span className="text-[13px] font-medium mb-3 block" style={{color: '#e9ecef'}}>{t('zfsStorage')}</span>
-                                                    <table className="corp-datagrid">
-                                                        <thead><tr><th>{t('name')}</th><th>Size</th><th>Free</th><th>Health</th></tr></thead>
-                                                        <tbody>
-                                                            {(Array.isArray(data.zfs) ? data.zfs : []).map((pool, i) => (
-                                                                <tr key={i}><td>{pool.name || '-'}</td><td>{formatBytes(pool.size)}</td><td>{formatBytes(pool.free)}</td><td>{pool.health || '-'}</td></tr>
-                                                            ))}
-                                                            {(!data.zfs || data.zfs.length === 0) && <tr><td colSpan={4} className="text-center py-4" style={{color: '#728b9a'}}>No ZFS pools</td></tr>}
-                                                        </tbody>
-                                                    </table>
-                                                </div>
-                                            )}
                                             {configSubTab === 'repos' && (
                                                 <div>
                                                     <div className="flex items-center justify-between mb-3">
@@ -5714,6 +6063,33 @@
                                             )}
                                         </>
                                     )}
+                                    </fieldset>
+                                    {/* LW Oct 2026 - the pools and the pool view only read: outside the standby lock */}
+                                    {configSubTab === 'zfs' && !(loading && !data.network && !data.dns && !data.disks) && (
+                                        <div>
+                                            <span className="text-[13px] font-medium mb-3 block" style={{color: '#e9ecef'}}>{t('zfsStorage')}</span>
+                                            <table className="corp-datagrid">
+                                                <thead><tr><th>{t('name')}</th><th>Size</th><th>Free</th><th>Health</th><th></th></tr></thead>
+                                                <tbody>
+                                                    {(Array.isArray(data.zfs) ? data.zfs : []).map((pool, i) => (
+                                                        <tr key={i} className={pool.name && zfsPool === pool.name ? 'corp-row-selected' : ''}>
+                                                            <td>{pool.name || '-'}</td><td>{formatBytes(pool.size)}</td><td>{formatBytes(pool.free)}</td>
+                                                            <td>{pool.health ? <span className={`corp-badge ${pool.health === 'ONLINE' ? 'corp-badge-online' : pool.health === 'DEGRADED' ? 'corp-badge-maintenance' : 'corp-badge-offline'}`}>{pool.health}</span> : '-'}</td>
+                                                            <td>{pool.name && (
+                                                                <button onClick={() => setZfsPool(zfsPool === pool.name ? null : pool.name)} data-zfs-open={pool.name} title={t('zfsPoolDetails')}
+                                                                    className="px-2 py-0.5 text-[11px]" style={{color: '#49afd9', border: '1px solid #485764'}}>{t('details')}</button>
+                                                            )}</td>
+                                                        </tr>
+                                                    ))}
+                                                    {(!data.zfs || data.zfs.length === 0) && <tr><td colSpan={5} className="text-center py-4" style={{color: '#728b9a'}}>No ZFS pools</td></tr>}
+                                                </tbody>
+                                            </table>
+                                            {/* the pool picked above, in full */}
+                                            {zfsPool && (
+                                                <ZfsPoolDetail corporate clusterId={clusterId} node={node} pool={zfsPool} onClose={() => setZfsPool(null)} />
+                                            )}
+                                        </div>
+                                    )}
                                 </div>
                             </div>
                         )}
@@ -5750,7 +6126,9 @@
                         {/* Hardware Tab (#609 in-band BMC) */}
                         {activeDetailTab === 'hardware' && (
                             <div className="space-y-6">
-                                <HardwareMonitoringPanel clusterId={clusterId} node={node} t={t} addToast={addToast} getAuthHeaders={getAuthHeaders} />
+                                <fieldset disabled={haReadOnly} className="contents">
+                                    <HardwareMonitoringPanel clusterId={clusterId} node={node} t={t} addToast={addToast} getAuthHeaders={getAuthHeaders} />
+                                </fieldset>
                                 {/* #601 — lm-sensors panel + temperature chart (was fetched but never rendered on the Corporate node view) */}
                                 {data.sensors && data.sensors.length > 0 && (
                                     <div className="p-4 bg-proxmox-dark rounded-lg border border-proxmox-border">
@@ -5837,7 +6215,8 @@
                         )}
 
                         {/* Shell Tab */}
-                        {activeDetailTab === 'shell' && (
+                        {activeDetailTab === 'shell' && haConsolesElsewhere && <HaConsoleOnActive />}
+                        {activeDetailTab === 'shell' && !haConsolesElsewhere && (
                             // NS #727 — clip (not hidden) so Firefox's selection-autoscroll can't
                             // scroll this panel; hidden boxes stay programmatically scrollable, clip doesn't.
                             <div className="bg-black border border-proxmox-border" style={{height: '500px', overflow: 'clip'}}>
@@ -5865,6 +6244,22 @@
                             </div>
                         )}
                     </div>
+
+                    {showMaintConfirm && !haReadOnly && (
+                        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60" onClick={() => setShowMaintConfirm(false)}>
+                            <div className="w-full max-w-sm max-h-[90vh] overflow-y-auto bg-proxmox-card border border-proxmox-border p-5" data-testid="maint-dialog" onClick={e => e.stopPropagation()}>
+                                <h3 className="text-[14px] font-semibold mb-2" style={{color: '#e9ecef'}}>{t('enterMaintenance') || 'Enter Maintenance Mode'}: {node}</h3>
+                                <p className="text-[13px] mb-4" style={{color: '#adbbc4'}}>{t('maintenanceWarning')}</p>
+                                <div className="mb-4">
+                                    <MaintenanceEvacOptions clusterId={clusterId} node={node} value={maintOptions} onChange={setMaintOptions} />
+                                </div>
+                                <div className="flex justify-end gap-2">
+                                    <button onClick={() => setShowMaintConfirm(false)} className="px-3 py-1.5 text-[13px] border border-proxmox-border hover:text-white" style={{color: '#adbbc4'}}>{t('cancel')}</button>
+                                    <button onClick={() => { setShowMaintConfirm(false); onMaintenanceToggle(node, true, maintOptions); }} className="px-3 py-1.5 text-[13px] text-white" style={{background: '#efc006', border: '1px solid #d4a905'}}>{t('startMaintenance')}</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
                 </div>
             );
         }

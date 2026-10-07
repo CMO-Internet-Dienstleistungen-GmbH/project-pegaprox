@@ -38,6 +38,42 @@ def _validate_pbs_host(host: str) -> bool:
     # hostname, FQDN, IPv4, or IPv6 — no scheme, no path, no whitespace
     return bool(re.match(r'^[a-zA-Z0-9\.\-\:]+$', host))
 
+
+def pbs_target_refusal(host: str, allow_loopback: bool = True) -> str:
+    """Why PegaProx will not dial a PBS host somebody typed in, or '' when it may.
+
+    NS Oct 2026 - the format check above let every address through. A PBS sits on the LAN,
+    so private ranges stay open, but link-local (where the cloud metadata services answer)
+    has no PBS on it, and the errors of a connection attempt tell whether anything listens
+    there. Loopback only for a global admin, who may run PegaProx on the PBS host itself.
+    A name that does not resolve is left to the connection, which reports it anyway.
+    """
+    import ipaddress
+    import socket
+    from pegaprox.utils.url_security import _embedded_ipv4
+
+    host = (host or '').strip()
+    if not _validate_pbs_host(host):
+        return 'Invalid PBS host'
+    try:
+        found = socket.getaddrinfo(host, None)
+    except (OSError, UnicodeError):
+        return ''
+    for info in found:
+        try:
+            ip = ipaddress.ip_address(str(info[4][0]).split('%', 1)[0])
+        except ValueError:
+            continue
+        # the address itself and an IPv4 one carried inside it (mapped, 6to4, NAT64)
+        for addr in (ip, _embedded_ipv4(ip)):
+            if addr is None:
+                continue
+            if addr.is_link_local or str(addr) == 'fd00:ec2::254':
+                return 'The PBS host is a link-local or cloud metadata address'
+            if not allow_loopback and (addr.is_loopback or addr.is_unspecified):
+                return 'The PBS host is a loopback address of this server'
+    return ''
+
 class _PinnedFingerprintAdapter(requests.adapters.HTTPAdapter):
     """Verify the peer certificate against a configured SHA-256 fingerprint.
 
@@ -106,9 +142,24 @@ class PBSManager:
             self._session.mount('https://', _PinnedFingerprintAdapter(_pin))
             logging.info(f"[PBS] {self.name}: pinning the server certificate to its "
                          f"configured fingerprint")
+        # an automatic leader that lost its lease changes nothing on the PBS (#625)
+        from pegaprox.core import ha_transport
+        ha_transport.guard_session(self._session)
         self._ticket = None
         self._csrf_token = None
-        self._using_api_token = bool(self.api_token_id and self.api_token_secret)
+        # MK Oct 2026 (#805) - accept the token the way PVE clusters take it as well:
+        # 'user@realm!tokenid' as the user name, secret in the password field (or in the
+        # secret field). PBS refuses a token id on /access/ticket, so such a user used to
+        # end in "Ticket auth failed: HTTP 401" without ever trying the token.
+        # The stored fields stay as entered; only the connection uses the resolved pair.
+        if self.api_token_id and self.api_token_secret:
+            self._token_id, self._token_secret = self.api_token_id, self.api_token_secret
+        elif '!' in (self.user or ''):
+            self._token_id = self.user
+            self._token_secret = self.api_token_secret or self.password
+        else:
+            self._token_id, self._token_secret = '', ''
+        self._using_api_token = bool(self._token_id)
         self._ticket_time = 0
         self.connected = False
         self.last_error = ''
@@ -130,8 +181,13 @@ class PBSManager:
         """
         try:
             if self._using_api_token:
+                if not self._token_secret:
+                    self.last_error = "API token secret missing"
+                    logging.warning(f"[PBS:{self.name}] {self.last_error}")
+                    self.connected = False
+                    return False
                 # API Token auth - just verify it works
-                self._session.headers['Authorization'] = f"PBSAPIToken={self.api_token_id}:{self.api_token_secret}"
+                self._session.headers['Authorization'] = f"PBSAPIToken={self._token_id}:{self._token_secret}"
                 resp = self._session.get(f"{self.base_url}/version", timeout=10)
                 if resp.status_code == 200:
                     self.connected = True
@@ -167,6 +223,9 @@ class PBSManager:
                     return True
                 else:
                     self.last_error = f"Ticket auth failed: HTTP {resp.status_code}"
+                    if self.api_token_id:
+                        # a token id without its secret falls back to the password login
+                        self.last_error += " (API token ID set, but no token secret)"
                     logging.warning(f"[PBS:{self.name}] {self.last_error}")
                     self.connected = False
                     return False
@@ -359,7 +418,8 @@ class PBSManager:
                                    pkey=key, timeout=15, banner_timeout=15, auth_timeout=15,
                                    allow_agent=False, look_for_keys=False)
                     persist_host_keys(client)
-                    return client, None
+                    from pegaprox.core import ha_transport
+                    return ha_transport.guard_client(client, self.host), None
             except Exception as e:
                 logging.warning(f"[PBS:{self.name}] SSH key auth failed: {e}")
 
@@ -370,7 +430,8 @@ class PBSManager:
                                password=self.password, timeout=15, banner_timeout=15, auth_timeout=15,
                                allow_agent=False, look_for_keys=False)
                 persist_host_keys(client)
-                return client, None
+                from pegaprox.core import ha_transport
+                return ha_transport.guard_client(client, self.host), None
             except Exception as e:
                 return None, f"SSH auth failed for {ssh_user}@{self.host}: {e}"
 
@@ -389,14 +450,17 @@ class PBSManager:
             task = UpdateTask(self.name, reboot)
             self._update_task = task
 
+        # a user job: in an automatic group each command asks for the lease (#625)
+        from pegaprox.core import ha
+        perform = ha.as_job(self._perform_update, f'update of PBS {self.name}')
         if GEVENT_PATCHED:
             try:
                 import gevent
-                gevent.spawn(self._perform_update, task)
+                gevent.spawn(perform, task)
                 return task
             except Exception:
                 pass
-        t = _th.Thread(target=self._perform_update, args=(task,), daemon=True)
+        t = _th.Thread(target=perform, args=(task,), daemon=True)
         t.start()
         return task
 
@@ -470,6 +534,8 @@ class PBSManager:
                 task.phase = 'reboot'
                 task.status = 'rebooting'
                 task.add_output("Rebooting PBS...")
+                from pegaprox.core import ha_transport
+                ha_transport.guard_ssh(self.host, 'shutdown')
                 try:
                     transport = ssh.get_transport()
                     channel = transport.open_session()
@@ -1074,59 +1140,55 @@ class PBSManager:
         }
 
 
-def load_pbs_servers():
-    """Load all PBS server configs from DB and create managers"""
+def pbs_config_from_row(db, row_dict):
+    """A pbs_servers row as the config dict PBSManager takes, secrets decrypted.
+
+    NS Oct 2026 (#999, #1033) - shared with the update route, which used to rebuild the live
+    manager from the request body alone. A secret that does not decrypt comes back empty."""
+    def _secret(col):
+        if not row_dict.get(col):
+            return ''
+        try:
+            return db._decrypt(row_dict[col])
+        except Exception:
+            return ''
+
+    return {
+        'name': row_dict.get('name', 'PBS'),
+        'host': row_dict.get('host', ''),
+        'port': row_dict.get('port', 8007),
+        'user': row_dict.get('user', 'root@pam'),
+        'password': _secret('pass_encrypted'),
+        'api_token_id': row_dict.get('api_token_id', ''),
+        'api_token_secret': _secret('api_token_secret_encrypted'),
+        'fingerprint': row_dict.get('fingerprint', ''),
+        'ssl_verify': bool(row_dict.get('ssl_verify', 0)),
+        'enabled': bool(row_dict.get('enabled', 1)),
+        'linked_clusters': json.loads(row_dict.get('linked_clusters', '[]') or '[]'),
+        'notes': row_dict.get('notes', ''),
+        'ssh_user': row_dict.get('ssh_user', '') or '',
+        'ssh_port': row_dict.get('ssh_port', 22) or 22,
+        'ssh_key': _secret('ssh_key_encrypted'),
+    }
+
+
+def load_pbs_servers(only=None):
+    """Load all PBS server configs from DB and create managers. `only` limits it to
+    those ids (a warm standby rebuilding a few, core/ha.py reload_managers)."""
     global pbs_managers
     try:
         db = get_db()
         cursor = db.conn.cursor()
         cursor.execute("SELECT * FROM pbs_servers WHERE enabled = 1")
         rows = cursor.fetchall()
-        
+        if only is not None:
+            rows = [r for r in rows if r['id'] in only]
+
         for row in rows:
             row_dict = dict(row)
             pbs_id = row_dict['id']
-            
-            # Decrypt credentials
-            password = ''
-            if row_dict.get('pass_encrypted'):
-                try:
-                    password = db._decrypt(row_dict['pass_encrypted'])
-                except Exception:
-                    password = ''
-            
-            api_token_secret = ''
-            if row_dict.get('api_token_secret_encrypted'):
-                try:
-                    api_token_secret = db._decrypt(row_dict['api_token_secret_encrypted'])
-                except Exception:
-                    api_token_secret = ''
-            
-            ssh_key = ''
-            if row_dict.get('ssh_key_encrypted'):
-                try:
-                    ssh_key = db._decrypt(row_dict['ssh_key_encrypted'])
-                except Exception:
-                    ssh_key = ''
+            config = pbs_config_from_row(db, row_dict)
 
-            config = {
-                'name': row_dict.get('name', 'PBS'),
-                'host': row_dict.get('host', ''),
-                'port': row_dict.get('port', 8007),
-                'user': row_dict.get('user', 'root@pam'),
-                'password': password,
-                'api_token_id': row_dict.get('api_token_id', ''),
-                'api_token_secret': api_token_secret,
-                'fingerprint': row_dict.get('fingerprint', ''),
-                'ssl_verify': bool(row_dict.get('ssl_verify', 0)),
-                'enabled': bool(row_dict.get('enabled', 1)),
-                'linked_clusters': json.loads(row_dict.get('linked_clusters', '[]')),
-                'notes': row_dict.get('notes', ''),
-                'ssh_user': row_dict.get('ssh_user', '') or '',
-                'ssh_port': row_dict.get('ssh_port', 22) or 22,
-                'ssh_key': ssh_key,
-            }
-            
             try:
                 mgr = PBSManager(pbs_id, config)
                 if config['enabled']:

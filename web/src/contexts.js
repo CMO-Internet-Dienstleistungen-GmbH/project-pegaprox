@@ -187,11 +187,59 @@
             // hasn't run the first-admin setup yet. Frontend gates this to render
             // <SetupWizard /> instead of <LoginScreen />.
             const [needsSetup, setNeedsSetup] = useState(false);
+            // LW Sep 2026 (#625) - role of this instance in a warm standby pair, as the
+            // server reports it on login and /auth/check. A standby also sends peer_url
+            // and last_sync_at for the banner, and forwarding: true while it hands
+            // changes to the active. serving: true on a member that serves users as an
+            // active instance, leader_reachable: false once the leader stops answering.
+            const [ha, setHa] = useState({ role: 'standalone' });
             
             // Check session on mount
             useEffect(() => {
                 checkSession();
             }, []);
+
+            // keeps the old object when nothing changed, so a poll does not re-render
+            // every useAuth() consumer for nothing
+            const applyHa = (next) => {
+                const v = (next && typeof next === 'object' && next.role) ? next : { role: 'standalone' };
+                setHa(prev => JSON.stringify(prev) === JSON.stringify(v) ? prev : v);
+            };
+
+            // re-read only the ha part of /auth/check (last sync time, role after a sync)
+            const refreshHa = useCallback(async () => {
+                try {
+                    const r = await fetch(`${API_URL}/auth/check?t=${Date.now()}`, { credentials: 'include' });
+                    if (!r.ok) return;
+                    const d = await r.json();
+                    if (d.authenticated) applyHa(d.ha);
+                } catch (_) {}
+            }, []);
+
+            // a standby syncs every few seconds; without this the banner would show the
+            // sync time from the moment of login forever.
+            // LW Oct 2026 (#625) - the leader too: a page opened there while the group was manual
+            // has to hear once it fails over automatically, and then within seconds when the
+            // leader is gone or a new one takes over
+            useEffect(() => {
+                if (!isAuthenticated || (ha.role !== 'standby' && ha.role !== 'active')) return;
+                const h = setInterval(refreshHa, ha.automatic === true ? 10000 : 30000);
+                return () => clearInterval(h);
+            }, [isAuthenticated, ha.role, ha.automatic, refreshHa]);
+
+            // a change refused because the group has no leader right now, or hands the lead on
+            // (503 HA_NO_LEASE / HA_TRANSFER, see authFetch): the banner says so at once
+            useEffect(() => {
+                if (!isAuthenticated) return;
+                let last = 0;
+                const onLease = () => {
+                    if (Date.now() - last < 2000) return;
+                    last = Date.now();
+                    refreshHa();
+                };
+                window.addEventListener('pegaprox-ha-lease', onLease);
+                return () => window.removeEventListener('pegaprox-ha-lease', onLease);
+            }, [isAuthenticated, refreshHa]);
             
             // check if session still valid (cookie is sent automatically)
             const checkSession = async () => {
@@ -262,7 +310,10 @@
                             // in sync; reading the toggle avoids a stale server value overriding it on F5.
                             let userTheme = d.user?.theme || d.default_theme || 'proxmoxDark';
                             try {
-                                if (d.user?.ui_layout === 'corporate') {
+                                // LW Sep 2026 (#743) - 'system' is a deliberate choice and outranks
+                                // the local toggle; reading corp-theme here would turn "follow my
+                                // desktop" into whatever the toggle was last set to.
+                                if (d.user?.ui_layout === 'corporate' && userTheme !== 'system') {
                                     const isLight = localStorage.getItem('corp-theme') === 'light';
                                     userTheme = isLight ? 'corporateLight' : 'corporateDark';
                                 }
@@ -275,6 +326,7 @@
                             if (d.reverse_proxy_enabled !== undefined) {
                                 setReverseProxyEnabled(d.reverse_proxy_enabled);
                             }
+                            applyHa(d.ha);
                         } else {
                             logout();
                         }
@@ -282,6 +334,7 @@
                         // NS: Feb 2026 - Capture ldap_enabled from 401 response
                         try {
                             const errData = await r.json();
+                            if (errData.ha_role) applyHa({ role: errData.ha_role });
                             if (errData.ldap_enabled !== undefined) setLdapEnabled(errData.ldap_enabled);
                             if (errData.oidc_enabled !== undefined) { setOidcEnabled(errData.oidc_enabled); setOidcButtonText(errData.oidc_button_text || 'Sign in with SSO'); }
                             if (errData.login_background) setLoginBackground(errData.login_background);
@@ -362,7 +415,7 @@
                         // NS: Apply user's theme (with fallback to default)
                         let userTheme = data.user?.theme || data.default_theme || 'proxmoxDark';
                         try {
-                            if (data.user?.ui_layout === 'corporate') {
+                            if (data.user?.ui_layout === 'corporate' && userTheme !== 'system') {
                                 const isLight = localStorage.getItem('corp-theme') === 'light';
                                 userTheme = isLight ? 'corporateLight' : 'corporateDark';
                             }
@@ -375,6 +428,7 @@
                         if (data.reverse_proxy_enabled !== undefined) {
                             setReverseProxyEnabled(data.reverse_proxy_enabled);
                         }
+                        applyHa(data.ha);
                         // NS: Security warning for default password
                         if (data.security_warning === 'DEFAULT_PASSWORD') {
                             setTimeout(() => {
@@ -465,6 +519,7 @@
                     if (d.oidc_enabled !== undefined) { setOidcEnabled(d.oidc_enabled); setOidcButtonText(d.oidc_button_text || 'Sign in with SSO'); }
                     if (d.ldap_enabled !== undefined) setLdapEnabled(d.ldap_enabled);
                     if (d.login_background) setLoginBackground(d.login_background);
+                    applyHa(d.ha_role ? { role: d.ha_role } : null);
                 } catch(e) {}
             };
             
@@ -478,11 +533,95 @@
                 return {};  // Empty - credentials: 'include' handles auth for fetch
             }, []);
             
+            // LW Sep 2026 (#625 v2) - a standby may be connected to the clusters, but only the
+            // active acts on them. One flag for every place that hides actions; isAdmin stays
+            // as it is, the HA tab and the promote flow hang off it.
+            // A standby that forwards hands every change to the active, so it shows the
+            // actions again. It is read-only while it does not (switched off here, or the
+            // active it follows does not answer). haStandby holds on every standby: the
+            // settings that belong to this instance or are saved on the leader only.
+            // haConsolesElsewhere: consoles, shells, SPICE and the console preview run on the
+            // leader, except on a member that serves users, which opens them itself.
+            // haServing: that member, an active instance to its users, so its texts name
+            // the leader where a standby's say "the active instance".
+            const haStandby = ha.role === 'standby';
+            const haReadOnly = haStandby && ha.forwarding !== true;
+            const haConsolesElsewhere = haStandby && ha.serving !== true;
+            const haServing = haStandby && ha.serving === true;
+
             return(
-                <AuthContext.Provider value={{ user, sessionId, isAuthenticated, loading, error, login, logout, getAuthHeaders, isAdmin: user?.role === 'admin', passwordExpiry, requires2FASetup, setRequires2FASetup, updatePreferences, updateCurrentUser, ldapEnabled, oidcEnabled, oidcButtonText, loginBackground, reverseProxyEnabled, needsSetup, setNeedsSetup }}>
+                <AuthContext.Provider value={{ user, sessionId, isAuthenticated, loading, error, login, logout, getAuthHeaders, isAdmin: user?.role === 'admin', passwordExpiry, requires2FASetup, setRequires2FASetup, updatePreferences, updateCurrentUser, ldapEnabled, oidcEnabled, oidcButtonText, loginBackground, reverseProxyEnabled, needsSetup, setNeedsSetup, ha, refreshHa, haReadOnly, haStandby, haConsolesElsewhere, haServing }}>
                     {children}
                 </AuthContext.Provider>
             );
+        }
+
+        // #625 v2 - what a standby still lets through the permission helpers: the *.view ones
+        function haReadPermission(permission) {
+            return typeof permission === 'string' && permission.endsWith('.view');
+        }
+
+        // #625 - a list only the leader keeps (drift, firing alerts, the push inbox) answers
+        // 503 HA_ACTIVE_UNREACHABLE on a member while the leader does not answer, rather
+        // than this instance's own rows. The view that asked says so instead of showing an
+        // empty list; authFetch leaves such a read without a toast.
+        async function haLeaderAway(res) {
+            if (!res || res.status !== 503) return false;
+            const body = await res.clone().json().catch(() => null);
+            return !!body && body.code === 'HA_ACTIVE_UNREACHABLE';
+        }
+
+        // LW Oct 2026 (#625) - the maintenance and update of the nodes as the leader runs them,
+        // over the node figures this instance reads itself. progress is the leader's
+        // /node-progress answer for clusterId ({cluster, nodes}); a node it names takes
+        // all five fields from it, the others keep their own. Same object when nothing
+        // changes, so nothing renders again for it.
+        const HA_NODE_JOB_FIELDS = ['maintenance_mode', 'maintenance_task', 'maintenance_acknowledged', 'is_updating', 'update_task'];
+        function haWithLeaderProgress(metrics, progress, clusterId) {
+            const nodes = progress && progress.cluster === clusterId ? progress.nodes : null;
+            if (!metrics || !nodes || typeof nodes !== 'object') return metrics;
+            let out = metrics;
+            Object.keys(nodes).forEach(name => {
+                const here = metrics[name], there = nodes[name];
+                if (!here || typeof here !== 'object' || !there || typeof there !== 'object') return;
+                if (out === metrics) out = { ...metrics };
+                const job = {};
+                HA_NODE_JOB_FIELDS.forEach(k => { job[k] = there[k] ?? (k.endsWith('_task') ? null : false); });
+                out[name] = { ...here, ...job };
+            });
+            return out;
+        }
+
+        // #625 - this view on the active instance, for what a standby never runs itself.
+        // peer_url is the active as this standby reaches it (a path behind a proxy stays);
+        // search is '' for its start page or a console window's '?console=...'. Only an
+        // https:// address gives a link, anything else null, and then no link is shown.
+        function haActiveHref(peerUrl, search = '') {
+            if (typeof peerUrl !== 'string' || !/^https:\/\/\S+$/i.test(peerUrl.trim())) return null;
+            try {
+                const u = new URL(peerUrl.trim().replace(/\/*$/, '/'));
+                if (u.protocol !== 'https:') return null;
+                u.search = search || '';
+                u.hash = '';
+                return u.href;
+            } catch (_) {
+                return null;
+            }
+        }
+
+        // the key a console window (#767) takes: cluster, type, vmid, node. Cluster ids are
+        // synced, so the active knows the same one. '' for anything that has no window.
+        function haConsoleSearch(vm, clusterId) {
+            const cid = (vm && vm._clusterId) || clusterId;
+            if (!vm || !cid || (vm.type !== 'qemu' && vm.type !== 'lxc')) return '';
+            return '?console=' + encodeURIComponent(`${cid}:${vm.type}:${vm.vmid}:${vm.node}`);
+        }
+
+        // the same from a click handler; false when there is no address to go to
+        function haOpenOnActive(peerUrl, search = '') {
+            const href = haActiveHref(peerUrl, search);
+            if (href) window.open(href, '_blank', 'noopener,noreferrer');
+            return !!href;
         }
         
         function useAuth() {
@@ -503,6 +642,12 @@
             useEffect(() => {
                 document.body.setAttribute('data-layout', layout);
                 if (isCorporate) {
+                    // LW Sep 2026 (#743) - applyTheme('system') resolves and sets the
+                    // corp gate itself, so the stored choice wins over the local toggle
+                    // here too. Anything else keeps the old path unchanged.
+                    if (localStorage.getItem('pegaprox-theme') === 'system') {
+                        applyTheme('system');
+                    } else {
                     const isLight = localStorage.getItem('corp-theme') === 'light';
                     // MK May 2026 (#296): the data-corp-theme attribute gates ALL light-mode
                     // CSS overrides. The header toggle sets this on click, but on a fresh
@@ -510,6 +655,7 @@
                     // body still had no data-corp-theme, leaving every component in dark.
                     document.body.dataset.corpTheme = isLight ? 'light' : '';
                     applyTheme(isLight ? 'corporateLight' : 'corporateDark');
+                    }
                 } else if (isCloud) {
                     // NS: force the cloud theme on layout change + F5-restore so the
                     // teal/navy variables apply even if a stale theme was stored.

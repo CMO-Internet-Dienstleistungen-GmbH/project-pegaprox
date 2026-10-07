@@ -87,7 +87,8 @@ class _RecordingSession:
 
 def _migrate_with(ssl_verification, monkeypatch):
     """Drive remote_migrate_vm far enough to build the target session, and hand back
-    the kwargs it used."""
+    the kwargs it used. The target leg now logs into the TARGET pool with the target
+    pool's own URL, credentials and TLS setting (#1088)."""
     import types
     from pegaprox.core import xcpng
 
@@ -96,17 +97,22 @@ def _migrate_with(ssl_verification, monkeypatch):
                         types.SimpleNamespace(Session=_RecordingSession))
 
     mgr = object.__new__(xcpng.XcpngManager)
-    mgr.config = types.SimpleNamespace(ssl_verification=ssl_verification,
-                                       user='root', pass_='secret')
+    mgr.config = types.SimpleNamespace(ssl_verification=not ssl_verification,
+                                       user='src', pass_='srcpw')
     fake_api = types.SimpleNamespace(
         VM=types.SimpleNamespace(get_power_state=lambda ref: 'Halted'))
     mgr._api = lambda: fake_api
     mgr._resolve_vm = lambda vmid: 'OpaqueRef:vm'
     mgr.logger = logging.getLogger('test.xcpng')
 
+    target = object.__new__(xcpng.XcpngManager)
+    target.config = types.SimpleNamespace(ssl_verification=ssl_verification,
+                                          user='root', pass_='secret', name='target-pool')
+    target._get_xapi_url = lambda: 'https://target.example'
+
     # everything past the session build may fail; the call we care about already
     # happened by then and the method funnels errors into a result dict.
-    mgr.remote_migrate_vm('node1', 101, target_endpoint='https://target.example')
+    mgr.remote_migrate_vm('node1', 101, target_pool=target)
     assert _RecordingSession.calls, "the target session was never built"
     return _RecordingSession.calls[0]
 

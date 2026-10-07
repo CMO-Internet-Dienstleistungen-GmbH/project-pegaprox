@@ -37,6 +37,8 @@ from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth
 from pegaprox.api.helpers import check_cluster_access, require_unconfined
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
+from pegaprox.background import guest_index
 from pegaprox.models.permissions import ROLE_ADMIN
 
 bp = Blueprint('drift', __name__)
@@ -93,10 +95,35 @@ def _strip_volatile(d, volatile_keys):
     return out
 
 
+class _State(list):
+    """The (kind, scope, snapshot) tuples _fetch_state read, and what it could not read.
+
+    A read that failed is not an empty answer. Both came back as "nothing there", so a
+    guest list that timed out at 10k guests turned every guest baseline into a removal,
+    and a storage read answering 500 did the same to every storage. MK Oct 2026
+    """
+    def __init__(self):
+        super().__init__()
+        self.unread_kinds = set()    # the read of the whole kind failed
+        self.unread_scopes = set()   # (kind, scope): listed, but its own read failed
+        self.unread_nodes = set()    # nodes whose network read failed
+
+
+def _not_read(state, kind, scope):
+    """True when this fetch never saw the scope, so its absence says nothing.
+    A plain list (no record of failures) reads as everything answered."""
+    if kind in getattr(state, 'unread_kinds', ()):
+        return True
+    if (kind, scope) in getattr(state, 'unread_scopes', ()):
+        return True
+    return kind == 'network' and scope.split('/', 1)[0] in getattr(state, 'unread_nodes', ())
+
+
 def _fetch_state(mgr, cluster_id):
     """Return list of (kind, scope, snapshot_dict). Robust to per-call fails;
-    a single dead node shouldn't poison the whole snapshot."""
-    out = []
+    a single dead node shouldn't poison the whole snapshot. The list also
+    records what did not answer (see _State)."""
+    out = _State()
     host, port = mgr.host, mgr.api_port
 
     # cluster options
@@ -105,7 +132,10 @@ def _fetch_state(mgr, cluster_id):
         if r is not None and getattr(r, 'status_code', 0) == 200:
             data = r.json().get('data') or {}
             out.append(('cluster_options', 'global', data))
+        else:
+            out.unread_kinds.add('cluster_options')
     except Exception as e:
+        out.unread_kinds.add('cluster_options')
         logging.debug(f"[drift] cluster/options fetch failed: {e}")
 
     # storage configs (cluster-wide)
@@ -118,18 +148,25 @@ def _fetch_state(mgr, cluster_id):
                 # _strip_volatile sorts comma-list fields like `content`, `nodes`
                 # which Proxmox returns in non-deterministic order
                 out.append(('storage', sid, _strip_volatile(s, set())))
+        else:
+            out.unread_kinds.add('storage')
     except Exception as e:
+        out.unread_kinds.add('storage')
         logging.debug(f"[drift] storage fetch failed: {e}")
 
     # per-node network state
     try:
-        nodes = (mgr.nodes or {}).keys()
+        nodes = list((mgr.nodes or {}).keys())
     except Exception:
         nodes = []
+    if not nodes:
+        # a cluster has at least one node: no node list is a failed read
+        out.unread_kinds.add('network')
     for node in nodes:
         try:
             r = mgr._api_get(f"https://{host}:{port}/api2/json/nodes/{node}/network")
             if r is None or getattr(r, 'status_code', 0) != 200:
+                out.unread_nodes.add(node)
                 continue
             for nic in (r.json().get('data') or []):
                 iface = nic.get('iface')
@@ -137,11 +174,17 @@ def _fetch_state(mgr, cluster_id):
                 clean = _strip_volatile(nic, _NETWORK_VOLATILE)
                 out.append(('network', f"{node}/{iface}", clean))
         except Exception as e:
+            out.unread_nodes.add(node)
             logging.debug(f"[drift] network/{node} fetch failed: {e}")
 
     # per-VM/CT configs
     try:
-        for r in (mgr.get_vm_resources() or []):
+        guests = mgr.get_vm_resources()
+        if getattr(guests, 'unavailable', False):
+            # the guest list itself did not answer (UnreadList), not an empty cluster
+            out.unread_kinds.add('vm_config')
+            guests = []
+        for r in (guests or []):
             t = r.get('type')
             vmid = r.get('vmid')
             node = r.get('node')
@@ -151,13 +194,18 @@ def _fetch_state(mgr, cluster_id):
             try:
                 resp = mgr._api_get(url)
                 if resp is None or getattr(resp, 'status_code', 0) != 200:
+                    out.unread_scopes.add(('vm_config', f"{t}/{vmid}"))
                     continue
                 cfg = resp.json().get('data') or {}
+                # the search index takes the same read (MAC, notes, configured IPs)
+                guest_index.ingest(cluster_id, t, vmid, cfg)
                 clean = _strip_volatile(cfg, _VM_VOLATILE_KEYS)
                 out.append(('vm_config', f"{t}/{vmid}", clean))
             except Exception:
+                out.unread_scopes.add(('vm_config', f"{t}/{vmid}"))
                 continue
     except Exception as e:
+        out.unread_kinds.add('vm_config')
         logging.debug(f"[drift] vm enumeration failed: {e}")
 
     return out
@@ -283,6 +331,20 @@ def _record_event(cluster_id, kind, scope, diffs, severity, summary):
         return None
 
 
+def _refuse_baseline_write():
+    """403 unless the caller may also change the cluster's configuration, else None.
+
+    NS Oct 2026 - admin.audit reads drift. Rewriting a baseline accepts whatever changed
+    as the new normal, so a read-only auditor could make drift disappear. Plain
+    acknowledging stays with the reader: it keeps the row and who acknowledged it."""
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import has_permission
+    if not has_permission(build_authz_user(_current_user(), request.session), 'cluster.config'):
+        return jsonify({'error': 'Permission denied: changing a drift baseline needs cluster.config',
+                        'code': 'MISSING_PERMISSION', 'required': 'cluster.config'}), 403
+    return None
+
+
 def _current_user():
     try:
         u = request.session.get('user') if hasattr(request, 'session') else ''
@@ -291,6 +353,90 @@ def _current_user():
         return u or ''
     except Exception:
         return ''
+
+
+def _owning_node(kind, scope, guest_nodes=None):
+    """Node a drift scope belongs to, when a single one owns it. network scopes
+    are '<node>/<iface>'. A guest config carries no node of its own, so a
+    vm_config scope ('qemu/<vmid>', 'lxc/<vmid>') is looked up in guest_nodes,
+    the live guest list. Cluster-wide kinds (storage, cluster_options) have no
+    single owning node -> None -> the removal guard never masks them."""
+    if kind == 'network':
+        node = scope.split('/', 1)[0]
+        return node or None
+    if kind == 'vm_config' and guest_nodes:
+        return guest_nodes.get(scope) or None
+    return None
+
+
+# the guest list _fetch_state read moments ago is still in the manager's cache
+_GUEST_LIST_MAX_AGE = 600
+
+
+def _guest_nodes(mgr):
+    """'qemu/101' -> node. PVE keeps listing an offline node's guests in
+    cluster/resources (status unknown), only their config read fails."""
+    out = {}
+    try:
+        for r in (mgr.get_vm_resources(max_age=_GUEST_LIST_MAX_AGE) or []):
+            t, vmid, node = r.get('type'), r.get('vmid'), r.get('node')
+            if t in ('qemu', 'lxc') and vmid and node:
+                out[f"{t}/{vmid}"] = node
+    except Exception as e:
+        logging.debug(f"[drift] guest list for node ownership failed: {e}")
+    return out
+
+
+def _offline_nodes(mgr):
+    """Set of node names the manager currently reports NOT online. Uses the
+    node status PegaProx already tracks (get_node_status), so a node reboot or
+    power outage is visible to the drift scanner without any new collector.
+    Best effort: any error means NO node is considered offline, i.e. removal
+    detection behaves exactly as before - never mask a removal because the
+    liveness read hiccupped."""
+    try:
+        st = mgr.get_node_status() or {}
+        return {name for name, data in st.items()
+                if isinstance(data, dict) and data.get('status') != 'online'}
+    except Exception as e:
+        logging.debug(f"[drift] node liveness read failed (removals unmasked): {e}")
+        return set()
+
+
+def _is_presence_unknown(diffs):
+    return (isinstance(diffs, list) and len(diffs) == 1 and isinstance(diffs[0], dict)
+            and diffs[0].get('op') == 'unknown')
+
+
+def _open_unknown_events(cluster_id):
+    """(kind, scope) -> ids of the open 'presence unknown' rows of a cluster."""
+    out = {}
+    try:
+        c = get_db().conn.cursor()
+        c.execute("SELECT id, kind, scope, diff FROM drift_events "
+                  "WHERE cluster_id=? AND status='open' AND diff LIKE ?",
+                  (cluster_id, '%"op": "unknown"%'))
+        for r in c.fetchall():
+            try:
+                if _is_presence_unknown(json.loads(r['diff'])):
+                    out.setdefault((r['kind'], r['scope']), []).append(r['id'])
+            except Exception:
+                continue
+    except Exception as e:
+        logging.debug(f"[drift] open unknown events read failed: {e}")
+    return out
+
+
+def _supersede_events(ids):
+    if not ids:
+        return
+    try:
+        c = get_db().conn.cursor()
+        c.executemany("UPDATE drift_events SET status='superseded' WHERE id=? AND status='open'",
+                      [(i,) for i in ids])
+        get_db().conn.commit()
+    except Exception as e:
+        logging.warning(f"[drift] superseding events failed: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -330,9 +476,51 @@ def _scan_cluster(cluster_id, autobaseline=False):
                            'severity': sev, 'summary': summary})
 
     # detect deletions: baseline keys that are no longer in current state
+    missing = [(key, bk) for key, bk in baselines.items() if key not in seen_keys]
+    if missing and not state:
+        # MK Oct 2026 - nothing answered at all (API down while the manager still
+        # counts as connected). An empty read says nothing about what exists.
+        return {'error': 'cluster did not answer', 'status': 'skipped'}
+
+    # An offline node does not answer its per-node reads, so its NICs and guest
+    # configs never reach `state` and their absence would read as a removal on
+    # every node reboot (#968). Such a scope is recorded once per outage as
+    # 'presence unknown' (info, no alert) and keeps its baseline: if it is really
+    # gone, the first scan after the node is back reports the removal. Liveness
+    # and the guest list are only read when something is missing.
     removed = []
-    for (kind, scope), bk in baselines.items():
-        if (kind, scope) in seen_keys:
+    masked = set()
+    # MK Oct 2026 - a scope whose read failed (the guest list timed out, storage answered
+    # an error, one node's network did not) was not seen, which is not the same as gone.
+    # Like an offline node's scopes it keeps its baseline; unlike them it records no row,
+    # a failed read is no news about the cluster. The scan result and the log say so.
+    not_read = set()
+    unread_kinds = getattr(state, 'unread_kinds', set())
+    open_unknown = _open_unknown_events(cluster_id)
+    guest_nodes = offline_nodes = None
+    for (kind, scope), bk in missing:
+        if kind in unread_kinds:
+            # before the guest list below, which is the read that just failed
+            not_read.add((kind, scope))
+            continue
+        if kind == 'vm_config' and guest_nodes is None:
+            guest_nodes = _guest_nodes(mgr)
+        owning_node = _owning_node(kind, scope, guest_nodes)
+        if owning_node and offline_nodes is None:
+            offline_nodes = _offline_nodes(mgr)
+        if owning_node and owning_node in offline_nodes:
+            masked.add((kind, scope))
+            if (kind, scope) in open_unknown:
+                continue
+            summary = f"{kind} {scope}: on offline node {owning_node}, presence unknown"
+            diffs = [{'path': '*', 'op': 'unknown', 'before': bk['snapshot'], 'after': None,
+                      'node-offline': owning_node}]
+            eid = _record_event(cluster_id, kind, scope, diffs, 'info', summary)
+            new_events.append({'id': eid, 'kind': kind, 'scope': scope, 'severity': 'info',
+                               'summary': summary, 'node_offline': owning_node})
+            continue
+        if _not_read(state, kind, scope):
+            not_read.add((kind, scope))
             continue
         diffs = [{'path': '*', 'op': 'removed', 'before': bk['snapshot'], 'after': None}]
         summary = f"{kind} {scope}: object removed"
@@ -342,13 +530,25 @@ def _scan_cluster(cluster_id, autobaseline=False):
                            'severity': sev, 'summary': summary})
         removed.append(scope)
 
-    # fire alert handler so configured Slack/Discord/etc. + push pick it up
-    if new_events:
+    unread = sorted({kind for kind, _ in not_read})
+    if not_read:
+        logging.warning(f"[drift] {cluster_id}: {len(not_read)} object(s) not read this scan "
+                        f"({', '.join(unread)}), their baselines are kept")
+
+    # rows of an earlier outage are done with once the node answers again; one that
+    # was not read this time is not known to be back
+    _supersede_events([i for key, ids in open_unknown.items()
+                       if key not in masked and key not in not_read for i in ids])
+
+    # fire alert handler so configured Slack/Discord/etc. + push pick it up. A
+    # presence-unknown row is no drift; the node being down has its own alert.
+    if any(not e.get('node_offline') for e in new_events):
         try:
             from pegaprox.background import alerts as alerts_mod
-            count = len(new_events)
-            top_sev = 'critical' if any(e['severity'] == 'critical' for e in new_events) \
-                else 'warning' if any(e['severity'] == 'warning' for e in new_events) \
+            alertable = [e for e in new_events if not e.get('node_offline')]
+            count = len(alertable)
+            top_sev = 'critical' if any(e['severity'] == 'critical' for e in alertable) \
+                else 'warning' if any(e['severity'] == 'warning' for e in alertable) \
                 else 'info'
             payload = {
                 'alert_name': 'Config Drift',
@@ -384,6 +584,9 @@ def _scan_cluster(cluster_id, autobaseline=False):
         'events_count': len(new_events),
         'seeded_baselines': seeded,
         'removed': removed,
+        'suppressed_offline': len(masked),
+        'suppressed_unread': len(not_read),
+        'unread': unread,
         'events': new_events,
     }
 
@@ -401,6 +604,9 @@ def _scanner_loop():
     while _scanner_running:
         try:
             for cid in list(cluster_managers.keys()):
+                # standby: baselines and events are the active instance's business
+                if not ha.is_active():
+                    break
                 try:
                     _scan_cluster(cid, autobaseline=True)
                 except Exception as e:
@@ -435,6 +641,15 @@ def drift_status(cluster_id):
     """Counts of open events grouped by kind + severity."""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # MK Sep 2026 - the four siblings in this file (events, scan, baseline, acknowledge)
+    # all settled on "drift is a whole-cluster notion" and refuse a confined caller. This
+    # one was left on cluster.view alone, so an ACL- or pool-scoped user still read the
+    # per-kind and per-severity counts for the entire cluster - how much storage, network
+    # and node config has drifted, and when it last did. The dashboard fetches this
+    # side by side with /drift/events, which already refuses them, so the panel was
+    # never usable for these callers anyway.
+    _cerr = require_unconfined(cluster_id)
+    if _cerr: return _cerr
     try:
         c = get_db().conn.cursor()
         c.execute('''
@@ -532,21 +747,35 @@ def acknowledge_event(eid):
         from pegaprox.api.helpers import check_cluster_access
         ok, err = check_cluster_access(ev['cluster_id'])
         if not ok:
-            return err
+            # NS Sep 2026 (audit) — returning the cluster-access refusal here answers a
+            # question the caller was not allowed to ask: it says the event id exists.
+            # A drift event they may not touch is, to them, an event that is not there.
+            return jsonify({'error': 'not found'}), 404
         # acknowledging - and especially promoting, which rewrites the baseline the next
         # scan compares against - is a whole-cluster act for the same reason
         _cerr = require_unconfined(ev['cluster_id'])
         if _cerr:
             return _cerr
+        if promote:
+            _werr = _refuse_baseline_write()
+            if _werr:
+                return _werr
         c.execute('''UPDATE drift_events SET status='acknowledged',
                      acknowledged_at=?, acknowledged_by=? WHERE id=?''',
                   (datetime.now().isoformat(), user, eid))
 
         if promote:
-            # re-fetch the live state for that scope and store as new baseline
+            # re-fetch the live state for that scope and store as new baseline.
+            # A presence-unknown row (#968) has no change to accept: rebaselining
+            # it once the node is back would swallow whatever changed meanwhile.
+            # The row keeps its real kind, the diff says what it is.
+            try:
+                unknown = _is_presence_unknown(json.loads(ev['diff'] or '[]'))
+            except Exception:
+                unknown = False
             cid = ev['cluster_id']
             mgr = cluster_managers.get(cid)
-            if mgr:
+            if mgr and not unknown:
                 state = _fetch_state(mgr, cid)
                 for kind, scope, snap in state:
                     if kind == ev['kind'] and scope == ev['scope']:
@@ -570,6 +799,10 @@ def manual_scan(cluster_id):
         return _cerr
     body = request.get_json(silent=True) or {}
     seed = bool(body.get('seed', False))
+    if seed:
+        _werr = _refuse_baseline_write()
+        if _werr:
+            return _werr
     return jsonify(_scan_cluster(cluster_id, autobaseline=seed))
 
 
@@ -583,14 +816,26 @@ def reset_baseline(cluster_id):
     _cerr = require_unconfined(cluster_id)
     if _cerr:
         return _cerr
+    _werr = _refuse_baseline_write()
+    if _werr:
+        return _werr
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'cluster not found'}), 404
     mgr = cluster_managers[cluster_id]
     user = _current_user()
     state = _fetch_state(mgr, cluster_id)
+    # what this fetch could not read keeps its baseline: a guest list that timed out
+    # would otherwise drop every guest baseline without a word
+    fresh = {(kind, scope) for kind, scope, _ in state}
+    baselines = _load_baselines(cluster_id)
+    keep = {key for key in baselines if key not in fresh and _not_read(state, *key)}
     try:
         c = get_db().conn.cursor()
-        c.execute('DELETE FROM drift_baselines WHERE cluster_id=?', (cluster_id,))
+        if keep:
+            c.executemany('DELETE FROM drift_baselines WHERE id=?',
+                          [(bk['id'],) for key, bk in baselines.items() if key not in keep])
+        else:
+            c.execute('DELETE FROM drift_baselines WHERE cluster_id=?', (cluster_id,))
         c.execute("UPDATE drift_events SET status='superseded' WHERE cluster_id=? AND status='open'",
                   (cluster_id,))
         for kind, scope, snap in state:
@@ -600,6 +845,7 @@ def reset_baseline(cluster_id):
             ''', (uuid.uuid4().hex[:12], cluster_id, kind, scope,
                   json.dumps(snap), datetime.now().isoformat(), user))
         get_db().conn.commit()
-        return jsonify({'ok': True, 'baselines': len(state)})
+        return jsonify({'ok': True, 'baselines': len(state), 'kept_unread': len(keep),
+                        'unread': sorted({kind for kind, _ in keep})})
     except Exception as e:
         logging.exception('handler error in drift.py'); return jsonify({'error': 'internal error'}), 500

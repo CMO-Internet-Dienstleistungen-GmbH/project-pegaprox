@@ -13,6 +13,8 @@ from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.models.tasks import PegaProxConfig
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
+from pegaprox.core.cache import StorageDataCache
 
 from pegaprox.utils.auth import require_auth, load_users, build_authz_user
 from pegaprox.utils.audit import log_audit
@@ -26,9 +28,10 @@ from pegaprox.utils.realtime import broadcast_sse, broadcast_update, push_immedi
 from pegaprox.core.config import load_config, save_config
 from pegaprox.core.manager import PegaProxManager
 from pegaprox.core.xcpng import XcpngManager, XENAPI_AVAILABLE
-from pegaprox.utils.sanitization import bounded_list
+from pegaprox.utils.sanitization import bounded_list, validate_ssh_user, validate_host_address
 from pegaprox.api.helpers import (load_server_settings, get_connected_manager, check_cluster_access,
-                                  safe_error, scope_vm_rows, require_unconfined, parse_pve_error)
+                                  safe_error, scope_vm_rows, require_unconfined, parse_pve_error,
+                                  bounded_limit, node_maintenance_for_caller)
 
 # MK: this used to be 200 lines down in the monolith, good luck finding anything there
 bp = Blueprint('clusters', __name__)
@@ -120,6 +123,12 @@ def get_clusters():
                 # the sshd_hardening control (PermitRootLogin prohibit-password) cuts off PegaProx's
                 # own access on a cluster we reach by root password with no key deployed.
                 'has_ssh_key': bool(getattr(mgr.config, 'ssh_key', '')),
+                # MK Sep 2026 (#941) — the listing is what the cluster dialog reads back, so
+                # a field missing here is a toggle that reverts on refresh. Same trap as
+                # proxlb_tags_enabled below (#628); the round-trip test I wrote went through
+                # save_cluster/get_cluster and never touched this serializer, so only the
+                # live E2E caught it.
+                'ssh_disabled': bool(getattr(mgr.config, 'ssh_disabled', False)),
                 'migration_threshold': mgr.config.migration_threshold,
                 'migration_tolerance': getattr(mgr.config, 'migration_tolerance', 10),
                 'check_interval': mgr.config.check_interval,
@@ -127,6 +136,8 @@ def get_clusters():
                 'balance_containers': getattr(mgr.config, 'balance_containers', False),
                 'balance_local_disks': getattr(mgr.config, 'balance_local_disks', False),
                 'proxlb_tags_enabled': getattr(mgr.config, 'proxlb_tags_enabled', False),  # #628 — was missing from GET, made the UI toggle revert on refresh
+                'proxlb_pins_auto_migrate': bool(getattr(mgr.config, 'proxlb_pins_auto_migrate', False)),
+                'proxlb_pins_strict': bool(getattr(mgr.config, 'proxlb_pins_strict', False)),
                 'dry_run': mgr.config.dry_run,
                 'predictive_balancing': getattr(mgr.config, 'predictive_balancing', False),
                 'predictive_threshold': getattr(mgr.config, 'predictive_threshold', 75),
@@ -178,10 +189,16 @@ def add_cluster():
         return jsonify({'error': 'Password or SSH key is required'}), 400
     if 'pass' not in data:
         data['pass'] = ''
+    _uerr = _ssh_user_error(data)
+    if _uerr:
+        return _uerr
 
     # Generate unique ID
     cluster_id = str(uuid.uuid4())[:8]
     cluster_type = data.get('cluster_type', 'proxmox')
+
+    # the manager below is built from this body and started: no HA settings from it (#625)
+    data['ha_settings'] = _ha_settings_for_new_cluster()
 
     # Create config
     config = PegaProxConfig(data)
@@ -246,9 +263,12 @@ def export_cluster_config(cluster_id):
         'balance_containers': getattr(c, 'balance_containers', False),
         'balance_local_disks': getattr(c, 'balance_local_disks', False),
         'proxlb_tags_enabled': getattr(c, 'proxlb_tags_enabled', False),  # #628
+        'proxlb_pins_auto_migrate': bool(getattr(c, 'proxlb_pins_auto_migrate', False)),
+        'proxlb_pins_strict': bool(getattr(c, 'proxlb_pins_strict', False)),
         'dry_run': c.dry_run,
         'cluster_type': getattr(mgr, 'cluster_type', 'proxmox'),
         'vnc_tunnel': bool(getattr(c, 'vnc_tunnel', False)),  # MK Apr 2026
+        'ssh_disabled': bool(getattr(c, 'ssh_disabled', False)),  # MK Sep 2026 (#941)
         # secrets intentionally omitted: pass, ssh_key, api_token_secret
     })
 
@@ -378,8 +398,21 @@ def reconfigure_cluster(cluster_id):
         return jsonify({'error': 'Password or SSH key is required'}), 400
     if 'pass' not in data:
         data['pass'] = ''
+    _uerr = _ssh_user_error(data)
+    if _uerr:
+        return _uerr
 
     cluster_type = data.get('cluster_type', getattr(cluster_managers[cluster_id], 'cluster_type', 'proxmox'))
+
+    # MK Oct 2026 (#625) - the dialog sends the connection, never the HA settings, and
+    # the new manager is built from this body alone: the agent token, the two-node
+    # settings and the cluster claim went with the old manager. They stay the cluster's.
+    old_mgr = cluster_managers[cluster_id]
+    if hasattr(old_mgr, 'ha_config'):
+        data['ha_settings'] = _ha_settings_of(old_mgr)
+    else:
+        kept = getattr(old_mgr.config, 'ha_settings', None)
+        data['ha_settings'] = dict(kept) if isinstance(kept, dict) else {}
 
     # Create new config + manager, test connection
     new_config = PegaProxConfig(data)
@@ -396,7 +429,6 @@ def reconfigure_cluster(cluster_id):
                             'error_code': getattr(new_mgr, 'connection_error_code', None)}), 400
 
     # Stop old manager, swap in new one
-    old_mgr = cluster_managers[cluster_id]
     try:
         old_mgr.stop()
     except Exception:
@@ -547,6 +579,111 @@ def repin_cluster_host_keys(cluster_id):
         return jsonify({'error': safe_error(e, 'Re-pin failed')}), 500
 
 
+@bp.route('/api/clusters/<cluster_id>/connection-check', methods=['POST'])
+@require_auth(perms=['cluster.config'])
+def check_cluster_connection(cluster_id):
+    """Read-only connection check of one Proxmox VE cluster, on demand (core/conncheck.py).
+
+    MK Oct 2026 - API addresses with timing and certificate, the credential and the
+    privileges it carries, versions, clocks, quorum and SSH per node. POST because it
+    logs in to the nodes over SSH (once each, only where a credential applies), which
+    an admin should ask for; {"ssh": false} leaves that part out. A standby forwards it
+    to the active or refuses it like any other write (app.py), so the check always
+    runs where the clusters are acted on.
+    """
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+
+    mgr = cluster_managers[cluster_id]
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'error': 'The connection check covers Proxmox VE clusters only',
+                        'code': 'PVE_ONLY'}), 400
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'The request body must be a JSON object'}), 400
+    with_ssh = data.get('ssh', True) is not False
+    from pegaprox.core import conncheck
+    try:
+        report = conncheck.run_check(mgr, include_ssh=with_ssh)
+    except Exception as e:
+        logging.exception(f"connection check failed for {_sl(cluster_id)}")
+        return jsonify({'error': safe_error(e, 'The connection check failed')}), 500
+    report['cluster_id'] = cluster_id
+    report['ssh_checked'] = with_ssh
+    s = report['summary']
+    log_audit(request.session['user'], 'cluster.connection_check',
+              f"Connection check of {mgr.config.name}: {s['ok']} ok, {s['warn']} warnings, "
+              f"{s['fail']} failed" + ('' if with_ssh else ' (without SSH)'),
+              cluster=mgr.config.name)
+    return jsonify(report)
+
+
+def _retire_cluster_claim(mgr, every_node=False):
+    """Take our cluster claim off the cluster and switch the claim off, for HA disable,
+    for deleting the cluster and for the switch itself. What the response reports
+    about it; None where the claim was off, or the cluster is of a kind that has none.
+
+    A removal that raised is reported as one that failed. It answered None before,
+    which the responses show as "the claim was off": the file may still be in
+    /etc/pve/pegaprox then, and nothing said so."""
+    if not hasattr(mgr, '_ha_claim_retire'):
+        return None
+    try:
+        claim = mgr._ha_claim_retire(every_node=True) if every_node else mgr._ha_claim_retire()
+    except Exception as e:
+        logging.warning(f"[HA] cluster claim removal failed: {e}")
+        return _claim_removal_failed(mgr)
+    return claim if isinstance(claim, dict) else None
+
+
+def _claim_removal_failed(mgr):
+    """The report of _ha_claim_retire for a removal that did not get that far. The
+    switch goes off as it does there, and the command for the admin removes the file
+    only while it is ours."""
+    by_hand = None
+    try:
+        from pegaprox.core import ha
+        instance, epoch = ha.lock_holder()
+        by_hand = mgr._claim_by_hand(epoch, instance)
+    except Exception:
+        pass
+    try:
+        mgr.ha_config['claim_enabled'] = False
+        mgr.ha_config.pop('claim_state', None)
+    except Exception:
+        pass
+    warning = ("The cluster claim could not be removed (the removal ended with an error): "
+               "/etc/pve/pegaprox/claim may still be there. "
+               + (f"To remove it by hand, run on one node of the cluster, which has to be quorate for it: `{by_hand}`"
+                  if by_hand else
+                  "Look at the file on one node of the cluster and remove it when it names this PegaProx instance."))
+    return {'state': 'failed', 'removed': False, 'path': '/etc/pve/pegaprox/claim', 'instance': None,
+            'epoch': None, 'warning': warning, 'by_hand': by_hand}
+
+
+def _ensure_cluster_claim(mgr, takeover=False):
+    """_ha_claim_ensure for the claim route. A write that raised is the state 'failed',
+    as a write the node refused is: the switch stays where the admin put it, and the
+    next look at the claim tries again."""
+    try:
+        return mgr._ha_claim_ensure(takeover=takeover)
+    except Exception as e:
+        logging.warning(f"[HA] cluster claim write failed: {e}")
+        from datetime import datetime as _dt
+        result = {'state': 'failed', 'node': None, 'checked_at': _dt.now().isoformat(),
+                  'epoch': None, 'instance': None}
+        mgr.ha_config['claim_state'] = result
+        return result
+
+
 @bp.route('/api/clusters/<cluster_id>', methods=['DELETE'])
 @require_auth(perms=['cluster.delete'])
 def delete_cluster(cluster_id):
@@ -578,6 +715,11 @@ def delete_cluster(cluster_id):
                 logging.warning(f"Could not revoke API token {token_user}: HTTP {resp.status_code}")
         except Exception as e:
             logging.debug(f"Token revocation failed (non-critical): {e}")
+
+    # Our cluster claim leaves the cluster with it (#625): once the cluster is gone
+    # from PegaProx nobody could take the file out of /etc/pve/pegaprox any more.
+    # Before the host-key pins go, the removal is an SSH call.
+    claim = _retire_cluster_claim(mgr)
 
     # Clean up pinned SSH host keys for this cluster's hosts BEFORE stopping the
     # manager (so re-adding a node that was reinstalled meanwhile works via TOFU
@@ -662,9 +804,16 @@ def delete_cluster(cluster_id):
     except Exception as e:
         logging.error(f"Failed to delete cluster from database: {e}")
     
-    log_audit(request.session['user'], 'cluster.deleted', f"Deleted cluster: {cluster_name}")
-    
-    return jsonify({'message': 'Cluster deleted successfully'})
+    log_audit(request.session['user'], 'cluster.deleted', f"Deleted cluster: {cluster_name}"
+              + (f" (our cluster claim: {claim.get('state')})" if claim else ''))
+
+    result = {'message': 'Cluster deleted successfully'}
+    if claim:
+        # the cluster is gone from here either way; what is left on it has to be said
+        result['claim'] = claim
+        if claim.get('warning'):
+            result['warning'] = claim['warning']
+    return jsonify(result)
 
 
 @bp.route('/api/clusters/reorder', methods=['POST'])
@@ -873,13 +1022,14 @@ def get_cluster_metrics(cluster_id):
             if metrics:
                 # Cache the metrics
                 mgr._cached_metrics = metrics
-                return jsonify(metrics)
+                # MK Oct 2026 - a node in maintenance names its guests: not to a confined caller
+                return jsonify(node_maintenance_for_caller(cluster_id, metrics))
         except Exception as e:
             logging.debug(f"Error getting metrics for {cluster_id}: {e}")
     
     # If live data failed, try cached data
     if hasattr(mgr, '_cached_metrics') and mgr._cached_metrics:
-        return jsonify(mgr._cached_metrics)
+        return jsonify(node_maintenance_for_caller(cluster_id, mgr._cached_metrics))
     
     # If HA is tracking nodes, build metrics from HA data
     if mgr.ha_node_status:
@@ -896,6 +1046,63 @@ def get_cluster_metrics(cluster_id):
     
     # Return error with empty metrics - frontend will keep old data
     return jsonify({'error': 'Connection temporarily unavailable', 'offline': True}), 503
+
+
+# MK Oct 2026 (#946) - the health pill polls from every open tab, so the storage part of the
+# score is shared per cluster for a short while instead of being fetched per request.
+_HEALTH_STORAGE_TTL = 30
+_health_storage_cache = StorageDataCache()
+
+
+def cluster_storage_resources(cluster_id, mgr):
+    """Every storage on every node of a Proxmox cluster as /cluster/resources?type=storage
+    lists it, or None when the read failed (not cached, so the next caller tries again).
+    The health check and the storage overview share one read per cluster for the TTL."""
+    rows, hit = _health_storage_cache.get(cluster_id, 'resources')
+    if hit:
+        return rows
+    # /nodes/<n>/storage builds live status for every storage one after another, a login
+    # per PBS datastore, seconds per node. /cluster/resources is served from pvestatd's cache
+    # and covers all nodes in one call. Storages of offline nodes come back 'unknown'.
+    url = f"https://{mgr.host}:{mgr.api_port}/api2/json/cluster/resources?type=storage"
+    r = mgr._api_get(url, timeout=8)
+    if r is None or r.status_code != 200:
+        return None
+    rows = [s for s in (r.json().get('data') or []) if isinstance(s, dict)]
+    _health_storage_cache.set(cluster_id, 'resources', rows, ttl_seconds=_HEALTH_STORAGE_TTL)
+    return rows
+
+
+def _health_storage_rows(cluster_id, mgr, ns):
+    """(node, storage, used, total) for every active storage, or None when the lookup failed
+    (not cached, so the next poll tries again)."""
+    if getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox':
+        rows = cluster_storage_resources(cluster_id, mgr)
+        if rows is None:
+            return None
+        return [(s.get('node') or '?', s.get('storage') or '?', s.get('disk') or 0, s.get('maxdisk') or 0)
+                for s in rows if s.get('status') == 'available']
+
+    # XCP-ng has no cluster-wide storage view, keep the per-node listing.
+    # MK 2026-05-31 (F1a) - parallel fanout, ONLINE nodes only: a dead node's
+    # storage call would otherwise park the whole batch at the gevent-pool
+    # timeout. (D2) node names are checked before they go into a URL.
+    from pegaprox.utils.concurrent import run_concurrent_dict
+    _SAFE_NODE = re.compile(r'^[a-zA-Z][a-zA-Z0-9.\-]{0,62}$')
+    online_node_names = [
+        name for name, d in ns.items()
+        if (d.get('status') in ('online', 'running') or not d.get('offline'))
+        and name and _SAFE_NODE.match(name)
+    ]
+    if not online_node_names:
+        return []
+    tasks = {n: (lambda nn=n: mgr.get_storage_list(nn) or []) for n in online_node_names}
+    rows = []
+    for node_name, stors in run_concurrent_dict(tasks, timeout=8).items():
+        for s in (stors or []):
+            if s.get('active'):
+                rows.append((node_name, s.get('storage', '?'), s.get('used') or 0, s.get('total') or 0))
+    return rows
 
 
 # NS May 2026 — single-number cluster health score (0-100). Inputs are cheap-to-compute
@@ -947,49 +1154,21 @@ def get_cluster_health(cluster_id):
             issues.append(f'{offline} node(s) offline: {", ".join(offline_names) or "?"}')
 
     # 2) Storage pressure — worst-offender across all nodes
-    # MK 2026-05-31 (F1a) — parallelise the per-node get_storage_list fanout.
-    # Was sequential: N nodes × ~200ms = up to 1.2s for a 6-node cluster, and
-    # one slow node could push past 5s. /health is dashboard-polled every
-    # ~10-20s, so this used to chew gevent workers. run_concurrent_dict skips
-    # the broken `if GEVENT_POOL` truthy check in the older inline callsites.
     worst_pct = 0.0
     worst_label = None
     try:
-        from pegaprox.utils.concurrent import run_concurrent_dict
-        # Only scan ONLINE nodes — a dead node's storage call would otherwise
-        # park the whole parallel batch at the 10s gevent-pool timeout (we'd
-        # be waiting for joinall to finish). Sequential code masked this
-        # because the connection failed fast, but parallel waits the full
-        # timeout. Net: post-parallelise /health was SLOWER on degraded
-        # clusters until this filter went in.
-        # MK 2026-05-31 (D2) — also drop any node-name that doesn't pass the
-        # RFC-1035-ish check. PVE controls these but if PVE itself were ever
-        # compromised, a crafted name like `../foo` would be interpolated
-        # into the storage-list URL. Belt-and-suspenders.
-        import re as _re
-        _SAFE_NODE = _re.compile(r'^[a-zA-Z][a-zA-Z0-9.\-]{0,62}$')
-        online_node_names = [
-            name for name, d in ns.items()
-            if (d.get('status') in ('online', 'running') or not d.get('offline'))
-            and name and _SAFE_NODE.match(name)
-        ]
-        if online_node_names:
-            tasks = {n: (lambda nn=n: mgr.get_storage_list(nn) or []) for n in online_node_names}
-            per_node_stors = run_concurrent_dict(tasks, timeout=8)
-        else:
-            per_node_stors = {}
-        for node_name, stors in per_node_stors.items():
-            for s in (stors or []):
-                if not s.get('active'):
-                    continue
-                total = s.get('total') or 0
-                used = s.get('used') or 0
-                if total <= 0:
-                    continue
-                pct = (used / total) * 100.0
-                if pct > worst_pct:
-                    worst_pct = pct
-                    worst_label = f"{s.get('storage', '?')} @ {node_name}"
+        rows, hit = _health_storage_cache.get(cluster_id, 'storage')
+        if not hit:
+            rows = _health_storage_rows(cluster_id, mgr, ns)
+            if rows is not None:
+                _health_storage_cache.set(cluster_id, 'storage', rows, ttl_seconds=_HEALTH_STORAGE_TTL)
+        for node_name, stor_name, used, total in (rows or []):
+            if total <= 0:
+                continue
+            pct = (used / total) * 100.0
+            if pct > worst_pct:
+                worst_pct = pct
+                worst_label = f"{stor_name} @ {node_name}"
     except Exception as e:
         logging.debug(f"[health] storage scan failed: {e}")
     if worst_label is not None:
@@ -1187,7 +1366,8 @@ def get_cluster_resources(cluster_id):
     from pegaprox.utils.auth import build_authz_user
     user = build_authz_user(request.session['user'], request.session)
     user['username'] = request.session['user']
-    if user.get('effective_role', user.get('role')) == ROLE_ADMIN:
+    from pegaprox.utils.rbac import acts_as_admin
+    if acts_as_admin(user):
         return jsonify(all_resources)
 
     # Aikido 469089182 re-verify — the RESTRICTIVE ACL listing below (an ACL'd VM is hidden from
@@ -1258,18 +1438,144 @@ def get_cluster_resources(cluster_id):
 # NS: Feb 2026 - SECURITY: explicit allowlist prevents mass assignment attacks
 # Password/key changes must go through dedicated endpoints with their own auth
 # MK: also keeps 'sort_order' out because that was causing issues with drag-and-drop
+# MK Oct 2026 (#625) - 'ha_settings' is out as well. It was taken as it came and stored
+# whole: cluster.config (an API token too) could switch the cluster claim and the unsafe
+# two-node recovery on past their own routes, and the same request dropped the agent
+# token and what the agent installs had recorded. The HA routes write those settings.
+# 'user' is out too: it is half of the credential. Editing it alone turned a token cluster
+# ('user@realm!tokenid' + the token secret in pass_) into an account cluster whose SSH
+# password was that secret, offered to every node. /reconfigure changes both together.
 ALLOWED_CONFIG_FIELDS = {
-    'name', 'host', 'user', 'ssl_verification', 'migration_threshold', 'migration_tolerance',
+    'name', 'host', 'ssl_verification', 'migration_threshold', 'migration_tolerance',
     'check_interval', 'auto_migrate', 'balance_containers', 'balance_local_disks',
     'dry_run', 'enabled', 'ha_enabled', 'fallback_hosts', 'ssh_user', 'ssh_port',
-    'ha_settings', 'excluded_nodes',
+    'excluded_nodes',
     'predictive_balancing', 'predictive_threshold',
     'balance_cpu_weight', 'balance_mem_weight', 'balance_io_weight',
     'cpu_baseline',
     'vnc_tunnel',  # MK Apr 2026 — SSH-tunnel-mode for VNC console
+    'ssh_disabled',  # MK Sep 2026 (#941) — no SSH to this cluster's nodes at all
     'proxlb_tags_enabled',  # MK Jul 2026 (#426) — derive placement from ProxLB VM tags
+    'proxlb_pins_auto_migrate',  # opt-in: migrate guests back onto their plb_pin_ node
+    'proxlb_pins_strict',  # opt-in: a pin also vetoes a maintenance evacuation
     'node_ui_suffix',  # MK Aug 2026 (#689) — FQDN suffix for "Open in Proxmox" node links
 }
+
+# These persist as INTEGER (db.py save_cluster) and reload through bool(), so a
+# truthy string like "false" would round-trip back to True and silently flip an
+# opt-in on. Only a real bool is accepted for them, no bool() coercion.
+BOOLEAN_CONFIG_FIELDS = {'proxlb_pins_auto_migrate', 'proxlb_pins_strict'}
+
+
+def _ssh_user_error(data):
+    """A 400 when the body names an ssh_user that is no login name. Normalises it in
+    place; empty means the default user."""
+    if 'ssh_user' not in data:
+        return None
+    user = data.get('ssh_user')
+    user = user.strip() if isinstance(user, str) else user
+    if user not in (None, '') and not validate_ssh_user(user):
+        return jsonify({'error': 'ssh_user must be a user name: letters, digits and ._- only, '
+                                 'not starting with - or .'}), 400
+    data['ssh_user'] = user or ''
+    return None
+
+
+def _host_key(h):
+    return str(h or '').strip().strip('[]').lower()
+
+
+# NS Oct 2026 - the stored password or token secret goes to the cluster's host and fallback
+# hosts on every reconnect and console ticket mint, over TLS verified or not as the cluster
+# says. An edit that adds an address, changes the SSH port or turns verification off moves
+# that credential, so like PBS and the ESXi servers it needs the credential typed again,
+# and a stored secret nobody re-entered is dropped instead of carried along.
+def _config_edit_checks(mgr, data):
+    """Check a cluster config edit. Returns (error, rebind): error is a response to hand
+    back as it is; rebind is None when the credential stays where it was, else
+    {'creds': what this request typed, 'moved': which fields moved it}.
+    ssh_user, ssh_port, host and fallback_hosts are normalised in place."""
+    cfg = mgr.config
+    err = _ssh_user_error(data)
+    if err:
+        return err, None
+
+    def bad(msg):
+        return (jsonify({'error': msg}), 400), None
+
+    known = set()
+    if 'host' in data or 'fallback_hosts' in data:
+        known = {_host_key(cfg.host)} | {_host_key(h) for h in (getattr(cfg, 'fallback_hosts', None) or [])}
+    moved = []
+    if 'host' in data:
+        host = data.get('host')
+        if not isinstance(host, str) or not host.strip():
+            return bad('host must be a host name or an IP address')
+        data['host'] = host = host.strip()
+        if _host_key(host) != _host_key(cfg.host):
+            if not validate_host_address(host):
+                return bad('host must be a host name or an IP address')
+            if _host_key(host) not in known:
+                moved.append('host')
+    if 'fallback_hosts' in data:
+        hosts, lerr = bounded_list(data.get('fallback_hosts'), max_items=32, max_length=253,
+                                   name='fallback_hosts')
+        if lerr:
+            return bad(lerr)
+        data['fallback_hosts'] = hosts
+        new = [h for h in hosts if _host_key(h) not in known]
+        if any(not validate_host_address(h) for h in new):
+            return bad('fallback_hosts entries must be host names or IP addresses')
+        if new:
+            moved.append('fallback_hosts')
+    if data.get('ssh_port') in (None, ''):
+        data.pop('ssh_port', None)
+    if 'ssh_port' in data:
+        port = data.get('ssh_port')
+        if isinstance(port, bool) or not str(port).strip().isdigit() or not 1 <= int(port) <= 65535:
+            return bad('ssh_port must be a port number')
+        data['ssh_port'] = int(port)
+        try:
+            old_port = int(getattr(cfg, 'ssh_port', 22) or 22)
+        except (TypeError, ValueError):
+            old_port = 22
+        if data['ssh_port'] != old_port:
+            moved.append('ssh_port')
+    if 'ssl_verification' in data and getattr(cfg, 'ssl_verification', False) \
+            and not data.get('ssl_verification'):
+        moved.append('ssl_verification')
+    if not moved:
+        return None, None
+
+    def typed(key):
+        return isinstance(data.get(key), str) and data[key] not in ('', '********')
+
+    token_user = getattr(cfg, 'api_token_user', '') or ''
+    creds = {'pass_': data['pass'] if typed('pass') else '',
+             'api_token_user': '', 'api_token_secret': ''}
+    if token_user and typed('api_token_secret'):
+        creds.update(api_token_user=token_user, api_token_secret=data['api_token_secret'])
+    if not creds['pass_'] and not creds['api_token_secret']:
+        return (jsonify({'error': 'Re-enter the cluster password (pass) or the API token secret '
+                                  '(api_token_secret) to change ' + ', '.join(moved) + '.',
+                         'code': 'CREDENTIAL_REQUIRED'}), 400), None
+    return None, {'creds': creds, 'moved': moved}
+
+
+def _rebind(mgr, rebind):
+    """Swap in the credential the request typed and forget the login of the old
+    destination, so the next call logs in afresh where the admin pointed it."""
+    for key, value in rebind['creds'].items():
+        setattr(mgr.config, key, value)
+    for attr in ('_ticket', '_csrf_token', '_api_token', '_original_host'):
+        if hasattr(mgr, attr):
+            setattr(mgr, attr, None)
+    mgr.current_host = None
+    mgr.is_connected = False
+    reset = getattr(mgr, '_reset_auth_failures', None)
+    if callable(reset):
+        reset()
+
 
 @bp.route('/api/clusters/<cluster_id>', methods=['PUT'])
 @require_auth(perms=['cluster.config'])
@@ -1286,7 +1592,20 @@ def update_cluster_config(cluster_id):
         return jsonify({'error': 'Cluster not found'}), 404
 
     data = request.json
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Expected a JSON object'}), 400
     mgr = cluster_managers[cluster_id]
+
+    # Reject non-boolean pin flags before any assignment, so a partial apply
+    # can't leave mgr.config half-mutated.
+    for _bk in BOOLEAN_CONFIG_FIELDS:
+        if _bk in data and type(data[_bk]) is not bool:
+            return jsonify({'error': f"'{_bk}' must be a boolean"}), 400
+    _err, rebind = _config_edit_checks(mgr, data)
+    if _err:
+        return _err
+    if rebind:
+        _rebind(mgr, rebind)
 
     # update config - only allowed fields
     updated = []
@@ -1299,6 +1618,9 @@ def update_cluster_config(cluster_id):
     save_config()
 
     usr = getattr(request, 'session', {}).get('user', 'system')
+    if rebind:
+        log_audit(usr, 'cluster.endpoint_changed', f"Cluster {mgr.config.name}: "
+                  f"{', '.join(rebind['moved'])} changed with the credential re-entered")
     log_audit(usr, 'cluster.config_changed', f"Cluster {mgr.config.name} config updated: {', '.join(updated)}")
 
     return jsonify({'message': 'Configuration updated successfully', 'updated_fields': updated})
@@ -1318,7 +1640,20 @@ def update_cluster_config_live(cluster_id):
         return jsonify({'error': 'Cluster not found'}), 404
 
     data = request.json
+    if not isinstance(data, dict):
+        return jsonify({'error': 'Expected a JSON object'}), 400
     mgr = cluster_managers[cluster_id]
+
+    # Reject non-boolean pin flags before any assignment, so a partial apply
+    # can't leave mgr.config half-mutated.
+    for _bk in BOOLEAN_CONFIG_FIELDS:
+        if _bk in data and type(data[_bk]) is not bool:
+            return jsonify({'error': f"'{_bk}' must be a boolean"}), 400
+    _err, rebind = _config_edit_checks(mgr, data)
+    if _err:
+        return _err
+    if rebind:
+        _rebind(mgr, rebind)
 
     updated = []
     for key, value in data.items():
@@ -1327,6 +1662,10 @@ def update_cluster_config_live(cluster_id):
             updated.append(key)
 
     save_config()
+    if rebind:
+        log_audit(getattr(request, 'session', {}).get('user', 'system'), 'cluster.endpoint_changed',
+                  f"Cluster {mgr.config.name}: {', '.join(rebind['moved'])} changed with the "
+                  f"credential re-entered")
 
     return jsonify({'message': 'Configuration updated successfully', 'updated_fields': updated})
 
@@ -1767,10 +2106,22 @@ def set_fallback_hosts(cluster_id):
         return jsonify({'error': _lerr}), 400
     
     mgr = cluster_managers[cluster_id]
+    # a new fallback host gets the stored credential on the next reconnect
+    edit = {'fallback_hosts': fallback_hosts,
+            **{k: data[k] for k in ('pass', 'api_token_secret') if k in data}}
+    _err, rebind = _config_edit_checks(mgr, edit)
+    if _err:
+        return _err
+    fallback_hosts = edit['fallback_hosts']
+    if rebind:
+        _rebind(mgr, rebind)
     mgr.config.fallback_hosts = fallback_hosts
     
     # Save to database
     try:
+        if rebind:
+            # the credential changed with it, so the whole row
+            save_config()
         db = get_db()
         cursor = db.conn.cursor()
         cursor.execute(
@@ -1820,7 +2171,7 @@ def get_cluster_tasks(cluster_id):
     if not mgr.is_connected:
         return jsonify([])
 
-    limit = request.args.get('limit', 50, type=int)
+    limit = bounded_limit(request.args.get('limit'), 50, 1000)
     tasks = mgr.get_tasks(limit=limit) or []
 
     # sec (private disclosure Sep 2026 — audit M3): the task log carries per-VM UPIDs (vmid/node/type,
@@ -2042,6 +2393,292 @@ def set_backup_sla_config(cluster_id):
     return jsonify({'ok': True, 'max_age_hours': v})
 
 
+# MK Oct 2026 - the guests no backup job covers, on every cluster the caller reaches.
+# Proxmox answers it in one call per cluster (/cluster/backup-info/not-backed-up); the
+# read is shared with the backup_coverage alert (background/alert_events.py), so a page
+# that stays open and the alert tick ask a cluster once between them.
+COVERAGE_MAX_AGE = 120
+COVERAGE_REFRESH_AGE = 10
+
+
+@bp.route('/api/backup-coverage', methods=['GET'])
+@require_auth(perms=['backup.view'])
+def get_backup_coverage():
+    import time
+    from pegaprox.background import alert_events
+    from pegaprox.utils.concurrent import run_concurrent
+    max_age = COVERAGE_REFRESH_AGE if request.args.get('refresh') in ('1', 'true') else COVERAGE_MAX_AGE
+
+    def _name(cid, mgr):
+        name = getattr(getattr(mgr, 'config', None), 'name', None)
+        return name if isinstance(name, str) and name else cid
+
+    reach, out_clusters = [], []
+    for cid, mgr in sorted(list(cluster_managers.items()), key=lambda kv: _name(*kv).lower()):
+        if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+            continue
+        ok, _err = check_cluster_access(cid)
+        if not ok:
+            continue
+        entry = {'cluster_id': cid, 'cluster_name': _name(cid, mgr),
+                 'state': 'ok', 'count': 0, 'checked_at': None}
+        out_clusters.append(entry)
+        if not mgr.is_connected:
+            entry['state'] = 'offline'
+            continue
+        reach.append((cid, mgr, entry))
+
+    def _read(cid, mgr):
+        status, rows, at = alert_events.not_backed_up(cid, mgr, max_age=max_age)
+        resources = []
+        if rows:
+            resources = mgr.get_vm_resources(max_age=60) or []
+        return status, rows, at, resources
+
+    results = run_concurrent([lambda c=cid, m=mgr: _read(c, m) for cid, mgr, _ in reach],
+                             timeout=alert_events.BACKUP_TIMEOUT + 10)
+    guests = []
+    for (cid, mgr, entry), res in zip(reach, results):
+        status, rows, at, resources = res if res else (0, None, None, [])
+        if rows is None:
+            entry['state'] = 'denied' if status == 403 else 'unreadable'
+            continue
+        entry['checked_at'] = int(at or time.time())
+        by_id = {}
+        for r in resources:
+            if r.get('type') in ('qemu', 'lxc') and str(r.get('vmid', '')).isdigit():
+                by_id[int(r['vmid'])] = r
+        tags = alert_events.guest_tags(cid, resources) if rows else {}
+        found = []
+        for g in rows:
+            r = by_id.get(g['vmid']) or {}
+            found.append({
+                'cluster_id': cid, 'cluster_name': entry['cluster_name'], 'vmid': g['vmid'],
+                'name': r.get('name') or g['name'], 'type': r.get('type') or g['type'],
+                'node': r.get('node') or '', 'status': r.get('status') or 'unknown',
+                'template': bool(r.get('template')), 'tags': sorted(tags.get(g['vmid'], ())),
+            })
+        # per guest: a pool or ACL grant sees its own guests, another tenant none (#773)
+        found = scope_vm_rows(cid, found)
+        entry['count'] = len(found)
+        guests += found
+    guests.sort(key=lambda g: (g['cluster_name'].lower(), g['vmid']))
+    return jsonify({'guests': guests, 'clusters': out_clusters})
+
+
+def _overview_name(cid, mgr):
+    name = getattr(getattr(mgr, 'config', None), 'name', None)
+    return name if isinstance(name, str) and name else cid
+
+
+def _overview_reach(only=None):
+    """(cluster_id, manager, entry) of every Proxmox and XCP-ng cluster the caller reaches, by
+    name, and the entries to answer with (state 'ok' until a read says otherwise)."""
+    out = []
+    for cid, mgr in sorted(list(cluster_managers.items()), key=lambda kv: _overview_name(*kv).lower()):
+        if only is not None and cid != only:
+            continue
+        if getattr(mgr, 'cluster_type', 'proxmox') not in ('proxmox', 'xcpng'):
+            continue
+        ok, _err = check_cluster_access(cid)
+        if ok:
+            out.append((cid, mgr, {'cluster_id': cid, 'cluster_name': _overview_name(cid, mgr),
+                                   'state': 'ok', 'count': 0}))
+    return out
+
+
+def _storage_overview_rows(resources):
+    """Rows of the storage overview from /cluster/resources?type=storage: one per node and
+    storage, and one per shared storage, which Proxmox lists once for every node. Figures
+    of a storage that is not active there are pvestatd's last ones, so they are left out."""
+    def _row(s, node, shared):
+        return {'node': node, 'storage': s.get('storage'), 'type': s.get('plugintype') or '',
+                'content': s.get('content') or '', 'shared': shared, 'used': None, 'total': None,
+                'percent': None, 'active': False, 'nodes': 0, 'inactive_on': []}
+
+    def _figures(row, s):
+        used, total = int(s.get('disk') or 0), int(s.get('maxdisk') or 0)
+        # a node that has not mounted it yet says 0: the largest figure counts
+        if row['total'] is None or total > row['total']:
+            row['used'], row['total'] = used, total
+            row['percent'] = round(used * 100.0 / total, 1) if total > 0 else None
+
+    rows, shared = [], {}
+    for s in resources:
+        if not s.get('storage'):
+            continue
+        up = s.get('status') == 'available'
+        node = s.get('node') or ''
+        if s.get('shared'):
+            row = shared.get(s['storage'])
+            if row is None:
+                row = shared[s['storage']] = _row(s, '', True)
+                rows.append(row)
+            row['nodes'] += 1
+            if not up:
+                row['inactive_on'].append(node)
+                continue
+        else:
+            row = _row(s, node, False)
+            row['nodes'] = 1
+            rows.append(row)
+            if not up:
+                continue
+        row['active'] = True
+        _figures(row, s)
+    for row in shared.values():
+        row['inactive_on'].sort()
+    rows.sort(key=lambda r: (not r['shared'], r['node'], r['storage']))
+    return rows
+
+
+def _xcpng_storage_rows(cid, mgr):
+    """The storage repositories of an XCP-ng pool as overview rows. XAPI does not say which
+    host a local repository belongs to here, so node stays empty."""
+    srs, hit = _health_storage_cache.get(cid, 'srs')
+    if not hit:
+        srs = [s for s in (mgr.get_storages() or []) if isinstance(s, dict)]
+        _health_storage_cache.set(cid, 'srs', srs, ttl_seconds=_HEALTH_STORAGE_TTL)
+    rows = []
+    for s in srs:
+        used, total = int(s.get('used') or 0), int(s.get('total') or 0)
+        rows.append({'node': '', 'storage': s.get('storage') or '?', 'type': s.get('type') or '',
+                     'content': s.get('content') or '', 'shared': bool(s.get('shared')),
+                     'used': used, 'total': total,
+                     'percent': round(used * 100.0 / total, 1) if total > 0 else None,
+                     'active': s.get('status', 'available') == 'available', 'nodes': 0, 'inactive_on': [],
+                     # every host's local SR is called "Local storage": the uuid tells them apart
+                     'uuid': str(s.get('uuid') or '')})
+    rows.sort(key=lambda r: (not r['shared'], r['storage']))
+    return rows
+
+
+# MK Oct 2026 - every storage of every cluster the caller reaches, in one table: Proxmox in
+# one read per cluster from pvestatd's cache (the read the health check makes, shared with
+# it), XCP-ng from its SR list. No node is asked on its own.
+@bp.route('/api/storage-overview', methods=['GET'])
+@require_auth(perms=['storage.view'])
+def get_storage_overview():
+    from pegaprox.api.helpers import caller_is_scoped
+    from pegaprox.utils.concurrent import run_concurrent
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    reach, out_clusters = [], []
+    for cid, mgr, entry in _overview_reach():
+        out_clusters.append(entry)
+        # a pool or a guest grant is a claim on guests, not on the storage of the cluster
+        if caller_is_scoped(user, cid):
+            entry['state'] = 'confined'
+        elif not mgr.is_connected:
+            entry['state'] = 'offline'
+        else:
+            reach.append((cid, mgr, entry))
+
+    def _read(cid, mgr):
+        if getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng':
+            return _xcpng_storage_rows(cid, mgr)
+        rows = cluster_storage_resources(cid, mgr)
+        return None if rows is None else _storage_overview_rows(rows)
+
+    results = run_concurrent([lambda c=cid, m=mgr: _read(c, m) for cid, mgr, _ in reach], timeout=20)
+    storages = []
+    for (cid, _mgr, entry), rows in zip(reach, results):
+        if rows is None:
+            entry['state'] = 'unreadable'
+            continue
+        for row in rows:
+            row['cluster_id'], row['cluster_name'] = cid, entry['cluster_name']
+        entry['count'] = len(rows)
+        storages += rows
+    return jsonify({'storages': storages, 'clusters': out_clusters})
+
+
+def _agent_cache(mgr, name):
+    """A copy of one of the guest agent caches of a Proxmox manager, {(node, vmid): ...}."""
+    cache = getattr(mgr, name, None)
+    if not isinstance(cache, dict):
+        return {}
+    lock = getattr(mgr, name + '_lock', None)
+    if lock is None:
+        return dict(cache)
+    with lock:
+        return dict(cache)
+
+
+def _inventory_guests(mgr):
+    """The guests of one cluster for the inventory, None when they could not be read."""
+    if getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox':
+        # not get_vm_resources: that puts the agent's filesystem figures over maxdisk, and the
+        # inventory wants the size Proxmox has allocated
+        url = f"https://{mgr.host}:{mgr.api_port}/api2/json/cluster/resources?type=vm"
+        r = mgr._api_get(url, timeout=15)
+        if r is None or r.status_code != 200:
+            return None
+        rows = r.json().get('data') or []
+    else:
+        rows = mgr.get_vm_resources(max_age=60) or []
+    return [g for g in rows if isinstance(g, dict) and g.get('type') in ('qemu', 'lxc')
+            and str(g.get('vmid', '')).isdigit()]
+
+
+# MK Oct 2026 - the guest inventory behind the CSV export, of one cluster (?cluster=) or of
+# all the caller reaches, guest by guest as far as they may see it. One read per cluster;
+# addresses and the used disk come from the guest agent sweep where it has them.
+@bp.route('/api/inventory/guests', methods=['GET'])
+@require_auth()
+def get_guest_inventory():
+    from pegaprox.background import alert_events
+    from pegaprox.utils.concurrent import run_concurrent
+    only = request.args.get('cluster') or None
+    if only is not None:
+        ok, err = check_cluster_access(only)
+        if not ok:
+            return err
+        if only not in cluster_managers:
+            return jsonify({'error': 'Cluster not found'}), 404
+
+    reach, out_clusters = [], []
+    for cid, mgr, entry in _overview_reach(only):
+        out_clusters.append(entry)
+        if mgr.is_connected:
+            reach.append((cid, mgr, entry))
+        else:
+            entry['state'] = 'offline'
+
+    results = run_concurrent([lambda m=mgr: _inventory_guests(m) for _, mgr, _ in reach], timeout=30)
+    guests = []
+    for (cid, mgr, entry), rows in zip(reach, results):
+        if rows is None:
+            entry['state'] = 'unreadable'
+            continue
+        # per guest: a pool or ACL grant sees its own guests, another tenant none (#773)
+        rows = scope_vm_rows(cid, rows)
+        ips, disks = _agent_cache(mgr, '_ip_cache'), _agent_cache(mgr, '_disk_cache')
+        tags = alert_events.guest_tags(cid, rows)
+        for g in rows:
+            vmid, node = int(g['vmid']), g.get('node') or ''
+            running = g.get('status') == 'running'
+            # the agent caches keep a guest that has stopped since
+            agent_ips = ips.get((node, vmid)) if running else None
+            if g.get('type') == 'lxc':
+                used = int(g.get('disk') or 0) or None
+            else:
+                used = ((disks.get((node, vmid)) if running else None) or {}).get('used') or None
+            guests.append({
+                'cluster_id': cid, 'cluster_name': entry['cluster_name'], 'vmid': vmid,
+                'name': g.get('name') or '', 'type': g['type'], 'node': node,
+                'status': g.get('status') or 'unknown', 'template': bool(g.get('template')),
+                'vcpus': int(g.get('maxcpu') or 0), 'cpu': float(g.get('cpu') or 0),
+                'mem': int(g.get('mem') or 0), 'memory': int(g.get('maxmem') or 0),
+                'disk_allocated': int(g.get('maxdisk') or 0), 'disk_used': used,
+                'ip_addresses': list(agent_ips or g.get('ip_addresses') or []),
+                'ha_state': g.get('hastate') or '', 'pool': g.get('pool') or '',
+                'tags': sorted(tags.get(vmid, ())),
+            })
+        entry['count'] = len(rows)
+    guests.sort(key=lambda g: (g['cluster_name'].lower(), g['vmid']))
+    return jsonify({'guests': guests, 'clusters': out_clusters})
+
+
 @bp.route('/api/clusters/<cluster_id>/nodes/<node>/tasks/<path:upid>', methods=['DELETE'])
 @require_auth(perms=['vm.stop'])  # cancelling task is like stopping
 def cancel_task(cluster_id, node, upid):
@@ -2173,12 +2810,12 @@ def disable_ha(cluster_id):
     # recovery actions while we're tearing down the on-node agents.
     mgr.stop_ha_monitor()
 
-    # SSH-uninstall on every reachable node. The existing
-    # `_ha_uninstall_self_fence_on_all_nodes` removes both agent shapes
-    # because they share `pegaprox-agent.service` + the binary path.
+    # SSH-uninstall on every reachable node. MK Oct 2026 (#625) - the two agents have
+    # their own names now (pegaprox-fence-agent.* and pegaprox-agent.*), so this takes
+    # both off; the self-fence uninstall alone would leave the node agent running.
     uninstall_results = {}
     try:
-        uninstall_results = mgr._ha_uninstall_self_fence_on_all_nodes() or {}
+        uninstall_results = mgr._ha_uninstall_agents_on_all_nodes() or {}
     except Exception as e:
         logging.error(f"[HA disable] agent teardown failed: {e}")
 
@@ -2192,6 +2829,11 @@ def disable_ha(cluster_id):
     except Exception as e:
         logging.warning(f"[HA disable] storage heartbeat cleanup: {e}")
 
+    # MK Oct 2026 (#625) - the cluster claim goes with HA: our file out of
+    # /etc/pve/pegaprox, the switch off. It stayed on the cluster and in the
+    # settings before.
+    claim = _retire_cluster_claim(mgr)
+
     # Flip the flag + clear in-memory ha_config bookkeeping last so the
     # state we report back to the UI matches what's actually on disk.
     mgr.config.ha_enabled = False
@@ -2201,24 +2843,61 @@ def disable_ha(cluster_id):
     # bookkeeping. A node we believe has no agent, still running one, is a self-fence agent
     # acting on heartbeat state nobody is maintaining any more - it can reboot the node.
     # Keep the ones that did not come off; drop only what actually went.
-    if isinstance(mgr.ha_config.get('node_agent_installed'), dict):
-        _still_there = {n: True for n, ok in (uninstall_results or {}).items() if not ok}
-        if _still_there:
-            logging.warning(
-                "[HA disable] agent still installed on %s - keeping it in node_agent_installed "
-                "so the next enable does not assume a clean slate", sorted(_still_there))
-        mgr.ha_config['node_agent_installed'] = _still_there
+    # MK Oct 2026 (#625) - a node leaves the books only when its own teardown answered.
+    # When the cluster did not list its nodes nothing came off, and the empty result
+    # read as a clean slate: the agents kept running with nothing left to stop them.
+    nodes_gone = {n for n, ok in uninstall_results.items() if ok}
+    nodes_failed = sorted(n for n, ok in uninstall_results.items() if not ok)
+    had_node_agent = mgr.ha_config.get('node_agent_installed')
+    had_node_agent = {n for n, v in had_node_agent.items() if v} if isinstance(had_node_agent, dict) else set()
+    had_fence_agent = {n for n in (mgr.ha_config.get('self_fence_nodes') or []) if isinstance(n, str)}
+    had_any = bool(mgr.ha_config.get('self_fence_installed') or had_fence_agent or had_node_agent)
+    # on the books and not asked: the cluster did not list them, or listed nothing
+    nodes_unconfirmed = sorted((had_fence_agent | had_node_agent) - set(uninstall_results))
+    _still_there = {n: True for n in (had_node_agent - nodes_gone) | set(nodes_failed)}
+    if _still_there:
+        logging.warning(
+            "[HA disable] agent still installed on %s - keeping it in node_agent_installed "
+            "so the next enable does not assume a clean slate", sorted(_still_there))
+    mgr.ha_config['node_agent_installed'] = _still_there
+    # the self-fence agents went with it, except where the teardown failed or never ran
+    mgr.ha_config['self_fence_nodes'] = sorted((had_fence_agent - nodes_gone) | set(nodes_failed))
+    mgr.ha_config['self_fence_installed'] = bool(mgr.ha_config['self_fence_nodes']) or (
+        not uninstall_results and bool(mgr.ha_config.get('self_fence_installed')))
+    mgr.config.ha_settings = _ha_settings_of(mgr)
     save_config()
 
-    nodes_ok = sum(1 for v in uninstall_results.values() if v)
+    nodes_ok = len(nodes_gone)
     nodes_total = len(uninstall_results)
-    nodes_failed = sorted([n for n, ok in uninstall_results.items() if not ok])
+    by_hand = ("`systemctl disable --now pegaprox-fence-agent.service pegaprox-agent.service; "
+               "rm -f /usr/local/bin/pegaprox-fence-agent.sh /usr/local/bin/pegaprox-agent.sh "
+               "/etc/systemd/system/pegaprox-fence-agent.service "
+               "/etc/systemd/system/pegaprox-agent.service; systemctl daemon-reload`")
 
     user = getattr(request, 'session', {}).get('user', 'system')
     audit_detail = (f"HA disabled for cluster {mgr.config.name} — "
                     f"agents removed from {nodes_ok}/{nodes_total} nodes")
+    warnings = []
     if nodes_failed:
         audit_detail += f" (teardown FAILED on: {', '.join(nodes_failed)} — manual cleanup required)"
+        warnings.append(f"Could not tear down agents on {len(nodes_failed)} node(s): "
+                        f"{', '.join(nodes_failed)}. SSH to those nodes manually and run {by_hand}")
+    if not uninstall_results and had_any:
+        where = ', '.join(nodes_unconfirmed) or 'every node of the cluster'
+        audit_detail += (f" (the cluster did not list its nodes, NO agent was removed - "
+                         f"manual cleanup required on: {where})")
+        warnings.append(f"The cluster did not list its nodes, so no agent was stopped or removed. "
+                        f"The agents keep running, and can still stop the guests of a node, on: {where}. "
+                        f"Disable HA again once the cluster answers, or SSH to those nodes and run {by_hand}")
+    elif nodes_unconfirmed:
+        audit_detail += (f" (not listed by the cluster, agents may still run on: "
+                         f"{', '.join(nodes_unconfirmed)} - manual cleanup required)")
+        warnings.append(f"Not listed by the cluster, agents may still run on: "
+                        f"{', '.join(nodes_unconfirmed)}. SSH to those nodes and run {by_hand}")
+    if claim:
+        audit_detail += f" (cluster claim switched off, our claim: {claim.get('state')})"
+        if claim.get('warning'):
+            warnings.append(claim['warning'])
     log_audit(user, 'ha.disabled', audit_detail, cluster=mgr.config.name)
 
     return jsonify({
@@ -2226,15 +2905,12 @@ def disable_ha(cluster_id):
         'agents_uninstalled': nodes_ok,
         'agents_total': nodes_total,
         'agents_failed': nodes_failed,
+        'agents_unconfirmed': nodes_unconfirmed,
+        # what became of our claim in /etc/pve/pegaprox, null where the claim was off
+        'claim': claim,
         'storage_cleanup': storage_cleanup,
         'status': mgr.get_ha_status(),
-        'warning': (
-            f"Could not tear down agents on {len(nodes_failed)} node(s): "
-            f"{', '.join(nodes_failed)}. SSH to those nodes manually and run "
-            f"`systemctl disable --now pegaprox-agent.service && "
-            f"rm -f /usr/local/bin/pegaprox-agent.sh "
-            f"/etc/systemd/system/pegaprox-agent.service && systemctl daemon-reload`"
-        ) if nodes_failed else None,
+        'warning': ' '.join(warnings) or None,
     })
 
 
@@ -2253,7 +2929,44 @@ def update_ha_config(cluster_id):
     
     manager = cluster_managers[cluster_id]
     data = request.json or {}
-    
+
+    def _agents_decide_by():
+        # what of the settings goes into the self-fence script: whether quorum gets
+        # forced, and whether without a fence (the leader then decides for a node
+        # that lost quorum)
+        cfg = manager.ha_config
+        return (bool(cfg.get('two_node_mode') or cfg.get('force_quorum_on_failure')),
+                cfg.get('unsafe_two_node_recovery') is True)
+    old_forces = _agents_decide_by()
+
+    # MK Oct 2026 (#625) - forcing quorum without a fence that was read back. Setups
+    # from before the safety rules have it on and may switch it off; switching it on
+    # is a decision to run with the split-brain risk and has to be typed out. Asked
+    # before anything of this request is applied. Stored on where nothing forces
+    # quorum it is off (the status says so), and is switched on like any off switch.
+    if (data.get('unsafe_two_node_recovery') is True and not all(old_forces)
+            and data.get('confirm_unsafe_two_node') != UNSAFE_TWO_NODE_PHRASE):
+        return jsonify({'error': f'Type {UNSAFE_TWO_NODE_PHRASE} to confirm: with this on, quorum '
+                                 'is forced on the surviving node without proof that the failed '
+                                 'node is off, and both can run the same VM in a network split',
+                        'code': 'HA_UNSAFE_CONFIRM'}), 400
+    # the fence of each node (#625): checked as a whole before anything is applied
+    new_fencing = None
+    if 'fencing' in data:
+        if not hasattr(manager, '_fencing_from_request'):
+            return jsonify({'error': 'Node fencing exists on Proxmox clusters only'}), 400
+        try:
+            new_fencing = manager._fencing_from_request(data['fencing'])
+        except ValueError as e:
+            return jsonify({'error': f'fencing: {e}', 'code': 'HA_FENCING_INVALID'}), 400
+    # the two numbers the start of a recovery is worked out from (#625). They were
+    # stored as sent: a JSON true or false counts as 1 or 0 where the recovery
+    # waits, and took away the time a node's self-fence agent is given
+    for key in ('recovery_delay', 'failure_threshold'):
+        if key in data and not PegaProxManager._ha_countable(data[key]):
+            return jsonify({'error': f'{key} must be a number, zero or more',
+                            'code': 'HA_TIMING_INVALID'}), 400
+
     # Update HA config
     if 'quorum_enabled' in data:
         manager.ha_config['quorum_enabled'] = data['quorum_enabled']
@@ -2279,7 +2992,24 @@ def update_ha_config(cluster_id):
         manager.ha_config['two_node_mode'] = data['two_node_mode']
     if 'force_quorum_on_failure' in data:
         manager.ha_config['force_quorum_on_failure'] = data['force_quorum_on_failure']
-    
+    if 'unsafe_two_node_recovery' in data:
+        manager.ha_config['unsafe_two_node_recovery'] = data['unsafe_two_node_recovery'] is True
+    # The switch only counts where quorum gets forced, and the status reports it as off
+    # everywhere else. Kept on underneath, it came back without a word with the next
+    # save of 2-node mode. A cluster this request leaves without forced quorum drops it,
+    # and one it starts forcing quorum on is a new setup under the safety rules: unsafe
+    # only when this request switches it on, with the phrase asked for above.
+    forces = _agents_decide_by()[0]
+    if not forces or (not old_forces[0] and data.get('unsafe_two_node_recovery') is not True):
+        manager.ha_config['unsafe_two_node_recovery'] = False
+    fencing_change = None
+    if new_fencing is not None:
+        old_fencing = manager.ha_config.get('fencing') or {}
+        fencing_change = ', '.join(
+            f"{n} ({(new_fencing.get(n) or {}).get('type') or 'removed'})"
+            for n in sorted(set(old_fencing) | set(new_fencing)) if old_fencing.get(n) != new_fencing.get(n))
+        manager.ha_config['fencing'] = new_fencing
+
     # Storage-based Split-Brain Protection - NS Jan 2026
     if 'storage_heartbeat_enabled' in data:
         manager.ha_config['storage_heartbeat_enabled'] = data['storage_heartbeat_enabled']
@@ -2290,7 +3020,7 @@ def update_ha_config(cluster_id):
         # value breaks out of the assignment. Config is not code — constrain it to a plain
         # absolute path before it can reach the splice in manager._NODE_AGENT_SCRIPT.
         _shp = str(data['storage_heartbeat_path'] or '')
-        if _shp and not re.fullmatch(r'/[A-Za-z0-9._@/+-]{0,255}', _shp):
+        if _shp and not PegaProxManager.HEARTBEAT_PATH_RE.fullmatch(_shp):
             return jsonify({'error': 'storage_heartbeat_path must be an absolute path '
                                      '(letters, digits and . _ @ + - / only)'}), 400
         manager.ha_config['storage_heartbeat_path'] = _shp
@@ -2313,7 +3043,8 @@ def update_ha_config(cluster_id):
                 except Exception as e:
                     manager.logger.error(f"[HA] ✗ Agent installation failed: {e}")
             
-            threading.Thread(target=install_agents, daemon=True).start()
+            # user jobs over every node: each SSH step asks for the lease in an automatic group (#625)
+            threading.Thread(target=ha.as_job(install_agents, 'node agent install'), daemon=True).start()
     
     if 'storage_heartbeat_timeout' in data:
         manager.ha_config['storage_heartbeat_timeout'] = data['storage_heartbeat_timeout']
@@ -2336,43 +3067,27 @@ def update_ha_config(cluster_id):
     
     # Save to config
     # Store HA settings in cluster config for persistence
-    if not hasattr(manager.config, 'ha_settings'):
-        manager.config.ha_settings = {}
-    
-    manager.config.ha_settings = {
-        'quorum_enabled': manager.ha_config.get('quorum_enabled', True),
-        'quorum_hosts': manager.ha_config.get('quorum_hosts', []),
-        'quorum_gateway': manager.ha_config.get('quorum_gateway', ''),
-        'quorum_required_votes': manager.ha_config.get('quorum_required_votes', 2),
-        'self_fence_enabled': manager.ha_config.get('self_fence_enabled', True),
-        'watchdog_enabled': manager.ha_config.get('watchdog_enabled', False),
-        'verify_network': manager.ha_config.get('verify_network_before_recovery', True),
-        'recovery_delay': manager.ha_config.get('recovery_delay', 30),
-        'failure_threshold': manager.ha_failure_threshold,
-        # 2-Node Cluster Mode
-        'two_node_mode': manager.ha_config.get('two_node_mode', False),
-        'force_quorum_on_failure': manager.ha_config.get('force_quorum_on_failure', False),
-        # Storage-based Split-Brain Protection - NS Jan 2026
-        'storage_heartbeat_enabled': manager.ha_config.get('storage_heartbeat_enabled', False),
-        'storage_heartbeat_path': manager.ha_config.get('storage_heartbeat_path', ''),
-        'storage_heartbeat_timeout': manager.ha_config.get('storage_heartbeat_timeout', 30),
-        'poison_pill_enabled': manager.ha_config.get('poison_pill_enabled', True),
-        'strict_fencing': manager.ha_config.get('strict_fencing', False),
-        'pegaprox_vmid': manager.ha_config.get('pegaprox_vmid', ''),
-    }
+    manager.config.ha_settings = _ha_settings_of(manager)
     
     save_config()
 
-    # re-deploy self-fence agents if pegaprox_vmid changed
+    # re-deploy self-fence agents if pegaprox_vmid changed, or whether quorum gets
+    # forced: the agents decide by quorum alone or ask for the leader depending on it
     new_pegaprox_vmid = manager.ha_config.get('pegaprox_vmid', '')
-    if 'pegaprox_vmid' in data and str(old_pegaprox_vmid) != str(new_pegaprox_vmid) and manager.ha_config.get('self_fence_installed'):
+    vmid_changed = 'pegaprox_vmid' in data and str(old_pegaprox_vmid) != str(new_pegaprox_vmid)
+    forces_changed = old_forces != _agents_decide_by()
+    if (vmid_changed or forces_changed) and manager.ha_config.get('self_fence_installed'):
         def _reinstall():
             try:
-                manager.logger.info(f"[HA] pegaprox_vmid changed ({old_pegaprox_vmid} -> {new_pegaprox_vmid}), re-deploying agents")
-                results = manager._ha_install_self_fence_on_all_nodes()
+                manager.logger.info(f"[HA] pegaprox_vmid ({old_pegaprox_vmid} -> {new_pegaprox_vmid}) or the "
+                                    "two-node settings changed, re-deploying agents")
+                # MK Oct 2026 (#625) - the v2 agents only. This installed on every node,
+                # so saving a setting replaced the agent of an older PegaProx with v2.
+                # That one stays as it is, with the settings it was installed with,
+                # until the install from the HA settings; the status names the nodes.
+                results = manager._ha_redeploy_fence_agents('the HA settings changed', wait=True)
                 ok = sum(1 for v in results.values() if v)
                 manager.logger.info(f"[HA] agent redeploy: {ok}/{len(results)} nodes")
-                manager.ha_config['self_fence_nodes'] = [k for k, v in results.items() if v]
                 _save_ha_config_to_db(cluster_id, manager)
             except Exception as e:
                 manager.logger.error(f"[HA] agent redeploy failed: {e}")
@@ -2380,15 +3095,86 @@ def update_ha_config(cluster_id):
         # one at top of file is enough. Local re-import made `threading` a local
         # for the whole function and broke the earlier ref in the storage-heartbeat
         # branch with UnboundLocalError before save_config could even run.
-        threading.Thread(target=_reinstall, daemon=True).start()
+        threading.Thread(target=ha.as_job(_reinstall, 'self-fence agents'), daemon=True).start()
 
     user = getattr(request, 'session', {}).get('user', 'system')
     log_audit(user, 'ha.config_updated', f"HA configuration updated for cluster {manager.config.name}", cluster=manager.config.name)
+    if fencing_change:
+        # which node and which kind, never the BMC password
+        log_audit(user, 'ha.fencing_updated', f"Node fencing of cluster {manager.config.name} changed: "
+                                              f"{fencing_change}", cluster=manager.config.name)
 
     return jsonify({
         'message': 'HA-Konfiguration gespeichert',
         'status': manager.get_ha_status()
     })
+
+
+UNSAFE_TWO_NODE_PHRASE = 'UNSAFE'
+CLAIM_ON_PHRASE = 'WRITE CLAIM'
+CLAIM_RELEASE_PHRASE = 'RELEASE CLAIM'
+
+
+def _ha_settings_of(manager):
+    """A cluster's HA settings as they are stored, from the running manager.
+
+    MK Oct 2026 (#625) - the one place that lists them. The config route used to
+    rebuild the stored dict from its own form fields, which dropped what the agent
+    installs had recorded (self_fence_installed, self_fence_nodes,
+    node_agent_installed) at the next save; the install helper wrote the database
+    row only, so the next save_config put the older copy back over it. A stored key
+    that no route writes (node_ips, the timings) stays as it is."""
+    cfg = manager.ha_config
+    stored = getattr(manager.config, 'ha_settings', None)
+    return dict(stored if isinstance(stored, dict) else {}, **{
+        'quorum_enabled': cfg.get('quorum_enabled', True),
+        'quorum_hosts': cfg.get('quorum_hosts', []),
+        'quorum_gateway': cfg.get('quorum_gateway', ''),
+        'quorum_required_votes': cfg.get('quorum_required_votes', 2),
+        'self_fence_enabled': cfg.get('self_fence_enabled', True),
+        'watchdog_enabled': cfg.get('watchdog_enabled', False),
+        'verify_network': cfg.get('verify_network_before_recovery', True),
+        'recovery_delay': cfg.get('recovery_delay', 30),
+        'failure_threshold': manager.ha_failure_threshold,
+        # 2-Node Cluster Mode
+        'two_node_mode': cfg.get('two_node_mode', False),
+        'force_quorum_on_failure': cfg.get('force_quorum_on_failure', False),
+        'unsafe_two_node_recovery': cfg.get('unsafe_two_node_recovery') is True,
+        # Storage-based Split-Brain Protection - NS Jan 2026
+        'storage_heartbeat_enabled': cfg.get('storage_heartbeat_enabled', False),
+        'storage_heartbeat_path': cfg.get('storage_heartbeat_path', ''),
+        'storage_heartbeat_timeout': cfg.get('storage_heartbeat_timeout', 30),
+        'poison_pill_enabled': cfg.get('poison_pill_enabled', True),
+        'strict_fencing': cfg.get('strict_fencing', False),
+        'pegaprox_vmid': cfg.get('pegaprox_vmid', ''),
+        # what the installs recorded
+        'self_fence_installed': cfg.get('self_fence_installed', False),
+        'self_fence_nodes': cfg.get('self_fence_nodes', []),
+        'node_agent_installed': cfg.get('node_agent_installed', {}),
+        'fence_agent_versions': cfg.get('fence_agent_versions', {}),
+        'agent_token': cfg.get('agent_token', ''),
+        'claim_enabled': cfg.get('claim_enabled') is True,
+        # per node, BMC password included: the column is encrypted like the token above
+        'fencing': cfg.get('fencing') or {},
+    })
+
+
+# What only the HA routes put into the stored HA settings, each behind its own check:
+# the two switches, the agent token, what the installs recorded, the node fences. A
+# backup restore over a cluster that is there leaves them as they are.
+HA_SETTINGS_GUARDED = frozenset({
+    'claim_enabled', 'unsafe_two_node_recovery', 'agent_token', 'self_fence_installed',
+    'self_fence_nodes', 'node_agent_installed', 'fence_agent_versions', 'fencing',
+})
+
+
+def _ha_settings_for_new_cluster():
+    """The HA settings a cluster starts with when it is added: none from the request.
+    The HA config route checks what it takes (the heartbeat path goes into a script
+    that runs as root on the nodes), the body of the add route went in as it came.
+    unsafe_two_node_recovery is written out as off: a missing key would read as a
+    setup from before the safety rules (#625)."""
+    return {'unsafe_two_node_recovery': False}
 
 
 def _save_ha_config_to_db(cluster_id: str, manager):
@@ -2397,16 +3183,12 @@ def _save_ha_config_to_db(cluster_id: str, manager):
     NS: Called after self-fence install/uninstall so status survives restart
     """
     try:
+        # the copy on the manager too: save_config writes that one over the row
+        manager.config.ha_settings = _ha_settings_of(manager)
         db = get_db()
         cluster = db.get_cluster(cluster_id)
         if cluster:
-            # Update ha_settings with current ha_config
-            ha_settings = cluster.get('ha_settings', {})
-            ha_settings['self_fence_installed'] = manager.ha_config.get('self_fence_installed', False)
-            ha_settings['self_fence_nodes'] = manager.ha_config.get('self_fence_nodes', [])
-            ha_settings['node_agent_installed'] = manager.ha_config.get('node_agent_installed', {})
-            ha_settings['pegaprox_vmid'] = manager.ha_config.get('pegaprox_vmid', '')
-            cluster['ha_settings'] = ha_settings
+            cluster['ha_settings'] = dict(manager.config.ha_settings)
             db.save_cluster(cluster_id, cluster)
             logging.info(f"[HA] Persisted ha_config to database for {cluster_id}")
     except Exception as e:
@@ -2447,7 +3229,7 @@ def install_self_fence_agent(cluster_id):
         except Exception as e:
             manager.logger.error(f"[HA] ✗ Self-fence installation failed: {e}")
     
-    threading.Thread(target=do_install, daemon=True).start()
+    threading.Thread(target=ha.as_job(do_install, 'self-fence agents'), daemon=True).start()
     
     user = getattr(request, 'session', {}).get('user', 'system')
     log_audit(user, 'ha.self_fence_install', f"Self-fence agent installation started for cluster {manager.config.name}", cluster=manager.config.name)
@@ -2492,7 +3274,7 @@ def uninstall_self_fence_agent(cluster_id):
         except Exception as e:
             manager.logger.error(f"[HA] ✗ Self-fence uninstallation failed: {e}")
     
-    threading.Thread(target=do_uninstall, daemon=True).start()
+    threading.Thread(target=ha.as_job(do_uninstall, 'self-fence agents'), daemon=True).start()
     
     user = getattr(request, 'session', {}).get('user', 'system')
     log_audit(user, 'ha.self_fence_uninstall', f"Self-fence agent uninstallation started for cluster {manager.config.name}", cluster=manager.config.name)
@@ -2501,6 +3283,216 @@ def uninstall_self_fence_agent(cluster_id):
         'message': 'Self-fence agent uninstallation started',
         'status': 'uninstalling'
     })
+
+
+@bp.route('/api/clusters/<cluster_id>/ha/agent-check', methods=['POST'])
+@require_auth(perms=['ha.config'])
+def check_ha_agents(cluster_id):
+    """The install check: which agents every node of the cluster runs (#625).
+
+    Read over SSH from each node. For every node: the self-fence agent's version
+    (0 none, 1 the agent that pings one PegaProx address, 2 quorum first), its mode,
+    whether it runs and whether it is the script this instance would install now;
+    whether the node agent is there; and, where the agents ask the PegaProx instances
+    for the leader, the instances the node cannot reach. `outdated` names the nodes
+    below the current version, `unreachable` the ones that did not answer. An outdated
+    agent keeps running as it is: `outdated_warning` says so and that the install
+    from the HA settings replaces it."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    manager = cluster_managers[cluster_id]
+    if not hasattr(manager, '_ha_check_agents'):
+        return jsonify({'error': 'Node agents exist on Proxmox clusters only'}), 400
+    try:
+        report = manager._ha_check_agents()
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The agent check failed')}), 502
+    if report is None:
+        return jsonify({'error': 'The cluster did not list its nodes'}), 502
+    # the versions found are what the HA status reports from now on
+    _save_ha_config_to_db(cluster_id, manager)
+
+    nodes = report['nodes']
+    report['unreachable'] = sorted(n for n, info in nodes.items() if info is None)
+    report['outdated'] = sorted(n for n, info in nodes.items()
+                                if info and 0 < info['fence_agent']['version'] < report['expected_version'])
+    report['outdated_warning'] = (PegaProxManager.FENCE_AGENT_OUTDATED.format(
+        nodes=', '.join(report['outdated']), version=report['expected_version'])
+        if report['outdated'] else None)
+    report['not_current'] = sorted(n for n, info in nodes.items()
+                                   if info and info['fence_agent']['version'] == report['expected_version']
+                                   and not info['fence_agent']['current'])
+    return jsonify(report)
+
+
+def _recovery_runs_asked():
+    """The run ids of an interrupted-recoveries body, None when it is not a list of them."""
+    data = request.get_json(silent=True)
+    runs = data.get('runs') if isinstance(data, dict) else None
+    if (not isinstance(runs, list) or not runs or len(runs) > ha.RECOVERY_KEEP
+            or not all(isinstance(r, str) and 0 < len(r) <= 64 for r in runs)):
+        return None
+    return list(dict.fromkeys(runs))
+
+
+@bp.route('/api/clusters/<cluster_id>/ha/interrupted-recoveries/start', methods=['POST'])
+@require_auth(perms=['ha.config'])
+def start_interrupted_recoveries(cluster_id):
+    """Start the guests that node recoveries an automatic leader left half done moved and
+    did not start (#625, design 5.6) - the one way on from there, nothing resumes them on
+    its own. Body {runs: [run id]}, the runs of interrupted_recoveries in the HA status.
+
+    A guest held on purpose (moved while its node was online) is not started: `held`
+    names it with the reason. A run is forgotten once each of its moved guests started
+    and nothing else is left in it; `unknown` are runs this cluster does not list."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    manager = cluster_managers[cluster_id]
+    if not hasattr(manager, 'ha_start_moved_vms'):
+        return jsonify({'error': 'Node recoveries exist on Proxmox clusters only'}), 400
+    runs = _recovery_runs_asked()
+    if runs is None:
+        return jsonify({'error': 'runs must be a list of run ids'}), 400
+
+    asked = [r for r in manager.ha_interrupted_recoveries() if r['run'] in runs]
+    started = manager.ha_start_moved_vms(runs=[r['run'] for r in asked], listed=asked)
+    held = [{'vmid': v, 'run': r['run'], 'node': r['node'], 'note': r['held_note']}
+            for r in asked for v in r['held']]
+    ok_ids = sorted(v for v, went in started.items() if went)
+    failed = sorted(v for v, went in started.items() if not went)
+    user = getattr(request, 'session', {}).get('user', 'system')
+    name = manager.config.name
+    log_audit(user, 'ha.interrupted_recoveries_started',
+              f"Cluster {name}: moved guests of interrupted recoveries started: "
+              f"{', '.join(map(str, ok_ids)) or 'none'}; not started: {', '.join(map(str, failed)) or 'none'}; "
+              f"held: {', '.join(str(h['vmid']) for h in held) or 'none'}", cluster=name)
+    return jsonify({'started': ok_ids, 'failed': failed, 'held': held,
+                    'unknown': sorted(set(runs) - {r['run'] for r in asked})})
+
+
+@bp.route('/api/clusters/<cluster_id>/ha/interrupted-recoveries/dismiss', methods=['POST'])
+@require_auth(perms=['ha.config'])
+def dismiss_interrupted_recoveries(cluster_id):
+    """An admin dealt with what these interrupted recoveries left (#625, design 5.6): they
+    are not listed or said any more. Body {runs: [run id]}; runs of this cluster only,
+    nothing on the cluster changes."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    runs = _recovery_runs_asked()
+    if runs is None:
+        return jsonify({'error': 'runs must be a list of run ids'}), 400
+
+    known = {r['run'] for r in ha.recovery_leftovers(cluster_id)}
+    gone = [r for r in runs if r in known]
+    ha.recovery_forget(gone)
+    if gone:
+        user = getattr(request, 'session', {}).get('user', 'system')
+        name = cluster_managers[cluster_id].config.name
+        log_audit(user, 'ha.interrupted_recoveries_dismissed',
+                  f"Cluster {name}: interrupted recoveries dismissed: {', '.join(gone)}", cluster=name)
+    return jsonify({'dismissed': gone, 'unknown': sorted(set(runs) - known)})
+
+
+@bp.route('/api/clusters/<cluster_id>/ha/claim', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def set_cluster_claim(cluster_id):
+    """Switch the cluster claim of one cluster on or off, or release a foreign claim (#625).
+
+    The claim is off unless an admin switches it on. With it on, PegaProx writes
+    /etc/pve/pegaprox/claim into the cluster's file system; node recovery then runs
+    only while that file names this instance, and its SSH steps are refused at the
+    node otherwise. The HA status of the cluster carries the full warning text.
+
+    action "enable" wants confirm "WRITE CLAIM", "release" (write over the claim of
+    another instance) wants "RELEASE CLAIM", "disable" removes our claim again. All
+    three want user_password, like the instance HA routes; no API token."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+    from pegaprox.api.ha import _refuse_confined_admin, _refuse_without_reauth
+    denied = _refuse_confined_admin()
+    if denied:
+        return denied
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    manager = cluster_managers[cluster_id]
+    if not hasattr(manager, '_ha_claim_ensure'):
+        return jsonify({'error': 'The cluster claim exists on Proxmox clusters only'}), 400
+    data = request.get_json(silent=True)
+    data = data if isinstance(data, dict) else {}
+    action = data.get('action')
+    if action not in ('enable', 'disable', 'release'):
+        return jsonify({'error': 'action must be enable, disable or release'}), 400
+    phrase = {'enable': CLAIM_ON_PHRASE, 'release': CLAIM_RELEASE_PHRASE}.get(action)
+    if phrase and data.get('confirm') != phrase:
+        return jsonify({'error': f'Type {phrase} to confirm', 'code': 'HA_CLAIM_CONFIRM',
+                        'warning': manager.CLAIM_WARNING}), 400
+    if action == 'release' and not manager._ha_claim_enabled():
+        return jsonify({'error': 'The cluster claim is off for this cluster'}), 409
+    if action != 'disable' and manager.ssh_blocked_reason():
+        return jsonify({'error': 'The cluster claim is written over SSH, which is not available '
+                                 'for this cluster'}), 409
+    denied = _refuse_without_reauth(f'the cluster claim of {manager.config.name} ({action})')
+    if denied:
+        return denied
+
+    user = getattr(request, 'session', {}).get('user', 'system')
+    name = manager.config.name
+    if action == 'disable':
+        # what became of the file, as HA disable and the delete report it: where it
+        # may still be there this said the state and nothing else, with the switch
+        # already off and no word on how to remove it
+        removed = _retire_cluster_claim(manager, every_node=True) or {'state': 'off'}
+        manager.ha_config['claim_enabled'] = False
+        _save_ha_config_to_db(cluster_id, manager)
+        log_audit(user, 'ha.claim_disabled', f"Cluster claim switched off for cluster {name} "
+                                             f"(our claim: {removed.get('state')})", cluster=name)
+        return jsonify({'claim': manager._ha_claim_status(), 'removed': removed.get('state'),
+                        'warning': removed.get('warning'), 'by_hand': removed.get('by_hand')})
+
+    if action == 'enable':
+        manager.ha_config['claim_enabled'] = True
+        _save_ha_config_to_db(cluster_id, manager)
+        result = _ensure_cluster_claim(manager)
+        log_audit(user, 'ha.claim_enabled', f"Cluster claim switched on for cluster {name}: PegaProx "
+                                            f"writes /etc/pve/pegaprox/claim there ({result.get('state')})",
+                  cluster=name)
+        return jsonify({'claim': manager._ha_claim_status()})
+
+    # release: whose claim it is goes into the audit trail before it is written over
+    before = _ensure_cluster_claim(manager)
+    if before.get('state') == 'ours':
+        return jsonify({'error': 'The claim is this instance\'s already',
+                        'claim': manager._ha_claim_status()}), 409
+    result = _ensure_cluster_claim(manager, takeover=True)
+    log_audit(user, 'ha.claim_released',
+              f"Cluster {name}: claim of instance {before.get('instance') or '?'} (epoch "
+              f"{before.get('epoch')}, {before.get('state')}) written over with ours "
+              f"({result.get('state')})", cluster=name)
+    return jsonify({'claim': manager._ha_claim_status()})
 
 
 @bp.route('/api/clusters/<cluster_id>/ha', methods=['PUT'])
@@ -2842,3 +3834,102 @@ def trigger_balance_now(cluster_id):
     log_audit(usr, 'balance.manual', f"Manual balance check triggered for {mgr.config.name}", cluster=mgr.config.name)
 
     return jsonify({'message': 'Balance check started'})
+
+
+@bp.route('/api/clusters/<cluster_id>/proxlb-pins/violations', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_proxlb_pin_violations(cluster_id):
+    """Guests running somewhere their plb_pin_<node> tag does not allow.
+
+    Read-only. A pin only vetoes moves the balancer proposes, so this is the
+    only way to see a guest that ended up off its pinned node and stayed there.
+    """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    mgr = cluster_managers[cluster_id]
+    # MK Oct 2026 - plb_ tags are PVE tags; an XCP-ng pool or ESXi host has none to report
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'enabled': False, 'auto_migrate': False, 'violations': [], 'unresolved': [],
+                        'can_reconcile': False})
+    # the "move back now" button asks what the reconcile route asks: vm.migrate AND
+    # the whole cluster. The permission list in the browser only knows the first half,
+    # a pool or VM-ACL scoped caller holds vm.migrate and is still turned away there.
+    from pegaprox.api.helpers import caller_is_scoped
+    _user = build_authz_user(request.session.get('user', ''), request.session)
+    can_reconcile = has_permission(_user, 'vm.migrate') and not caller_is_scoped(_user, cluster_id)
+    try:
+        return jsonify({
+            'enabled': bool(getattr(mgr.config, 'proxlb_tags_enabled', False)),
+            'auto_migrate': bool(getattr(mgr.config, 'proxlb_pins_auto_migrate', False)),
+            'can_reconcile': bool(can_reconcile),
+            # Both lists are per-VM rows (vmid / name / node / pinned nodes) for
+            # every guest on the cluster, and check_cluster_access only gates
+            # cluster REACHABILITY - its pool/ACL fallbacks admit a caller who may
+            # see one VM. Same #773 class of leak as the other per-VM reads, so
+            # the same filter: admins and cluster-wide operators keep every row.
+            'violations': scope_vm_rows(cluster_id, mgr.get_pin_violations()),
+            # a pin naming a node this cluster does not have is the most common
+            # reason a pin looks like it does nothing at all
+            'unresolved': scope_vm_rows(cluster_id, mgr.get_unresolved_pins()),
+        })
+    except Exception as e:
+        logging.error(f"proxlb pin scan failed: {_sl(str(e))}")
+        return jsonify({'error': 'Failed to scan pins'}), 500
+
+
+@bp.route('/api/clusters/<cluster_id>/proxlb-pins/reconcile', methods=['POST'])
+@require_auth(perms=['vm.migrate'])
+def reconcile_proxlb_pins_api(cluster_id):
+    """Migrate guests that drifted off their pinned node back onto it.
+
+    Honours config.proxlb_pins_auto_migrate unless the body sets force=true,
+    which is the manual "do it now" button - it still refuses under dry_run.
+    """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+
+    # Same gate as /balance-now (Aikido 469089250): this migrates guests across the
+    # whole cluster, so a caller who reached it through a single VM-ACL / pool grant
+    # (the #248/#555 fallbacks in check_cluster_access) must not be able to move
+    # other guests. require_unconfined is the predicate that asks that correctly -
+    # the open-coded get_user_clusters form does NOT, because it defaults to
+    # include_pools=True and a pool-scoped caller's cluster is in the result.
+    _sess = getattr(request, 'session', {})
+    _usr = _sess.get('user', 'system')
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        log_audit(_usr, 'balance.pin_reconcile_denied',
+                  f"Denied pin reconcile on {cluster_id} (caller is confined)")
+        return _cerr
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    mgr = cluster_managers[cluster_id]
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'error': 'plb_pin_ tags are read on Proxmox VE clusters only',
+                        'code': 'PVE_ONLY'}), 400
+    body = request.get_json(silent=True)
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        return jsonify({'error': 'Request body must be a JSON object'}), 400
+    force = body.get('force', False)
+    if not isinstance(force, bool):
+        return jsonify({'error': "'force' must be a boolean"}), 400
+    try:
+        result = mgr.reconcile_proxlb_pins(force=force)
+    except Exception as e:
+        logging.error(f"proxlb pin reconcile failed: {_sl(str(e))}")
+        return jsonify({'error': 'Reconciliation failed'}), 500
+
+    usr = getattr(request, 'session', {}).get('user', 'system')
+    log_audit(usr, 'balance.pin_reconcile',
+              f"Cluster {mgr.config.name}: {len(result['migrated'])} guest(s) returned to their "
+              f"pinned node, {len(result['failed'])} failed"
+              + (' (forced)' if force else ''),
+              cluster=mgr.config.name)
+    return jsonify(result)

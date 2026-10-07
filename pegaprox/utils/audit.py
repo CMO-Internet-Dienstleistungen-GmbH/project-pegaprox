@@ -107,20 +107,69 @@ def cleanup_audit_log():
     except Exception as e:
         logging.error(f"Failed to cleanup audit log: {e}")
 
-def log_audit(user: str, action: str, details: str = None, ip_address: str = None, cluster: str = None):
+def _via_standby():
+    """The standby a write came through while this active runs it for one (#625), ''
+    for anything else. The client address is the request's own there: the one the
+    standby saw."""
+    if not has_request_context():
+        return ''
+    from pegaprox.core.ha import FORWARD_ENVIRON
+    mark = request.environ.get(FORWARD_ENVIRON)
+    return str(mark.get('via') or '') if isinstance(mark, dict) else ''
+
+
+def _audit_cluster_id(cluster):
+    """The id of the cluster an entry names, '' when it cannot be told.
+
+    NS Oct 2026 (#1121) - callers pass the display name (a few the id), and any cluster.config
+    holder can rename their cluster to another tenant's. The route's own cluster wins when
+    the entry names it, else the one cluster that answers to the name or id, else none.
+    With no name at all, a cluster route's own cluster is the one the entry is about."""
+    from pegaprox.globals import cluster_managers
+    route_cid = ''
+    if has_request_context():
+        route_cid = (request.view_args or {}).get('cluster_id') or ''
+    if not cluster:
+        return route_cid if route_cid in cluster_managers else ''
+    if not isinstance(cluster, str):
+        return ''
+
+    def _answers(cid):
+        return cluster in (cid, getattr(getattr(cluster_managers.get(cid), 'config', None), 'name', None))
+
+    if route_cid in cluster_managers and _answers(route_cid):
+        return route_cid
+    hits = [cid for cid in list(cluster_managers) if _answers(cid)]
+    return hits[0] if len(hits) == 1 else ''
+
+
+def log_audit(user: str, action: str, details: str = None, ip_address: str = None, cluster: str = None,
+              cluster_id: str = None):
     """Add an entry to the audit log
-    
-    writes to db now
+
+    writes to db now. cluster is the name shown with the entry, cluster_id the cluster it
+    belongs to; left out, it is worked out from the name (_audit_cluster_id).
     """
     global audit_log
-    
+
+    if cluster_id is None:
+        try:
+            cluster_id = _audit_cluster_id(cluster)
+        except Exception:
+            cluster_id = ''
+
+    via = _via_standby()
+    if via:
+        details = f'{details} (via standby {via})' if details else f'via standby {via}'
+
     entry = {
         'timestamp': datetime.now().isoformat(),
         'user': user,
         'action': action,
         'details': details,
         'ip_address': ip_address or get_client_ip(),
-        'cluster': cluster  # Which cluster this action was performed on
+        'cluster': cluster,  # Which cluster this action was performed on
+        'cluster_id': cluster_id,
     }
     
     # Add to in-memory list (for backwards compatibility)
@@ -137,6 +186,7 @@ def log_audit(user: str, action: str, details: str = None, ip_address: str = Non
             details=f"{details}" + (f" [{cluster}]" if cluster else ""),
             ip=ip_address or get_client_ip(),
             cluster=cluster or '',
+            cluster_id=cluster_id or '',
         )
     except Exception as e:
         logging.error(f"Failed to save audit entry to database: {e}")
@@ -221,9 +271,17 @@ def get_client_ip():
     """
     if not has_request_context():
         return 'system'
+    return client_ip_from(request.remote_addr, request.headers.get)
+
+
+def client_ip_from(remote_addr, header):
+    """get_client_ip() for a request read straight from its WSGI environ: `remote_addr`
+    the peer address, `header(name)` the value of a request header or None. MK Oct 2026
+    (#625) - the HA lease routes answer before Flask (app._LeaseFastPath) and go by the
+    same address the IP lists see."""
     # trust proxy headers from loopback + configured trusted proxies
-    if _is_trusted_proxy(request.remote_addr):
-        xff = request.headers.get('X-Forwarded-For')
+    if _is_trusted_proxy(remote_addr):
+        xff = header('X-Forwarded-For')
         if xff:
             # sec (audit): the LEFTMOST entry is whatever the client sent — a proxy APPENDS the
             # peer it saw, so `X-Forwarded-For: 1.2.3.4` from the client arrives as
@@ -238,11 +296,11 @@ def get_client_ip():
                 if not _is_trusted_proxy(_cand):
                     return _canonical_ip(_cand)
             # every hop is one of our own proxies — the peer is as close as we get
-            return _canonical_ip(request.remote_addr)
-        xri = request.headers.get('X-Real-IP')
+            return _canonical_ip(remote_addr)
+        xri = header('X-Real-IP')
         if xri:
             return _canonical_ip(xri.strip())
-    return _canonical_ip(request.remote_addr)
+    return _canonical_ip(remote_addr)
 
 # Global users store (loaded at startup)
 users_db = {}

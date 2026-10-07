@@ -82,6 +82,7 @@ def start_verification(pve_mgr, params):
     def run():
         start_time = time.time()
         test_vmid = None
+        restore_accepted = False
         host, port = pve_mgr.host, pve_mgr.api_port
         node = params.get('node', '')
         vm_type = params.get('vm_type', 'qemu')
@@ -129,6 +130,9 @@ def start_verification(pve_mgr, params):
 
             if restore_resp.status_code != 200:
                 raise Exception(f"Restore failed: {restore_resp.text[:200]}")
+            # PVE creates and locks the guest config before it answers, so from here on
+            # the VMID is ours to clean up
+            restore_accepted = True
 
             restore_upid = restore_resp.json().get('data')
             _log(f"Restore task started: {restore_upid}")
@@ -276,7 +280,12 @@ def start_verification(pve_mgr, params):
             _log(f"ERROR: {e}")
 
             # cleanup on error
-            if test_vmid:
+            # NS Oct 2026 (#1018) - nextid only names a free VMID, it does not reserve it.
+            # When another create took it first our restore was refused, and this purged
+            # that other guest. Only what our accepted restore created goes.
+            if test_vmid and not restore_accepted:
+                _log(f"Restore to VMID {test_vmid} was not accepted - a guest there is not ours, left alone")
+            elif test_vmid:
                 try:
                     pve_mgr._api_post(
                         f"https://{host}:{port}/api2/json/nodes/{node}/{vm_type}/{test_vmid}/status/stop"
@@ -305,7 +314,10 @@ def start_verification(pve_mgr, params):
                     _active_verifications.pop(task_id, None)
             threading.Thread(target=_cleanup, daemon=True).start()
 
-    thread = threading.Thread(target=run, daemon=True, name=f"verify-{task_id}")
+    # a user job: in an automatic group each call it sends asks for the lease (#625)
+    from pegaprox.core import ha
+    thread = threading.Thread(target=ha.as_job(run, f'backup verification {task_id}'), daemon=True,
+                              name=f"verify-{task_id}")
     thread.start()
 
     return task_id
@@ -360,6 +372,14 @@ def _save_result(status):
 
 def get_verification_history(cluster_id=None, vmid=None, limit=50):
     """Get verification history from database."""
+    # NS Sep 2026 (audit) — the route clamps this too, but the cap belongs here as well:
+    # the limit goes straight into a SQL LIMIT and this function has callers that never
+    # pass through the HTTP boundary. A bound that only exists at one of two entrances
+    # is the shape of most of what this audit turned up.
+    try:
+        limit = max(1, min(int(limit), 1000))
+    except (TypeError, ValueError):
+        limit = 50
     try:
         db = get_db()
         if cluster_id and vmid:

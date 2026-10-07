@@ -34,7 +34,7 @@ import json as _json
 import ipaddress
 import logging
 import socket
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 try:
     import requests
@@ -218,6 +218,15 @@ def _host_is_forbidden_target(hostname):
     holder point the stored-credential GET back at the PegaProx host itself or
     at a metadata endpoint. Returns True (forbidden) on any resolution failure —
     better to reject than to send a credential blind."""
+    candidates = _bmc_addresses(hostname)
+    if not candidates:
+        return True
+    return any(_is_forbidden_ip(ip) for ip in candidates)
+
+
+def _bmc_addresses(hostname):
+    """The addresses hostname stands for, in resolver order (a literal is its own),
+    or [] when it does not resolve."""
     literal = hostname
     if literal.startswith('[') and literal.endswith(']'):
         literal = literal[1:-1]
@@ -231,18 +240,49 @@ def _host_is_forbidden_target(hostname):
                 if '%' in ip_str:
                     ip_str = ip_str.split('%', 1)[0]
                 try:
-                    candidates.append(ipaddress.ip_address(ip_str))
+                    ip = ipaddress.ip_address(ip_str)
                 except ValueError:
                     continue
+                if ip not in candidates:
+                    candidates.append(ip)
         except socket.gaierror:
-            return True
-    if not candidates:
-        return True
-    for ip in candidates:
-        if ip.is_loopback or ip.is_unspecified or ip.is_link_local \
-                or ip.is_multicast or ip.is_reserved:
-            return True
-    return False
+            return []
+    return candidates
+
+
+def _is_forbidden_ip(ip):
+    return (ip.is_loopback or ip.is_unspecified or ip.is_link_local
+            or ip.is_multicast or ip.is_reserved)
+
+
+def _url_host(ip):
+    return f'[{ip}]' if ip.version == 6 else str(ip)
+
+
+def _pinned_addresses(parsed, tls_verified):
+    """Where the credentialed GETs connect: [None] (the name, as given) or the vetted
+    addresses of the name, tried in order. None when one of them is not allowed.
+
+    NS Oct 2026 - _validate_host resolved the name to vet it and requests resolved it
+    again to connect, so a name answering a LAN address first and 127.0.0.1 next carried
+    the Basic-auth credential to this host. Connect to addresses vetted in one lookup.
+    Verified https keeps the name: a rebind there fails the certificate check, as in
+    url_security.resolve_and_pin_url."""
+    host = parsed.hostname or ''
+    if parsed.scheme == 'https' and tls_verified:
+        return [None]
+    try:
+        ipaddress.ip_address(host)
+        return [None]          # a literal was vetted as it is, nothing to rebind
+    except ValueError:
+        pass
+    from pegaprox.utils.url_security import is_safe_outbound_url
+    addrs = _bmc_addresses(host)
+    for ip in addrs:
+        if _is_forbidden_ip(ip) or not is_safe_outbound_url(
+                f'https://{_url_host(ip)}/', allow_private=True)[0]:
+            return None
+    return addrs or None
 
 
 def _validate_host(host):
@@ -285,6 +325,12 @@ def read_node_bmc_redfish(host, user, password, verify_ssl=False, timeout=10):
     auth = (user or '', password or '')
     bu = urlparse(base)
     base_origin = (bu.scheme, bu.hostname, bu.port)
+    pins = _pinned_addresses(bu, bool(verify_ssl))
+    if not pins:
+        return {'available': False, 'reason': 'BMC host not permitted'}
+    # a pinned request still names the BMC in Host, as the unpinned one did
+    port_part = f':{bu.port}' if bu.port else ''
+    host_header = (bu.hostname or '') + port_part
 
     # GET-only; refuse redirects; and CRITICALLY: pin every follow-on request to the
     # validated origin. A hostile BMC's @odata.id (system/chassis/thermal/power/log
@@ -301,11 +347,23 @@ def read_node_bmc_redfish(host, user, password, verify_ssl=False, timeout=10):
         ju = urlparse(joined)
         if (ju.scheme, ju.hostname, ju.port) != base_origin:
             return None, 'off-origin Redfish reference rejected'
-        r = None
+        r, ip = None, None
         try:
-            r = requests.get(joined, auth=auth, timeout=timeout, allow_redirects=False,
-                             verify=bool(verify_ssl), stream=True,
-                             headers={'Accept': 'application/json'})
+            for i, ip in enumerate(pins):
+                url, headers = joined, {'Accept': 'application/json'}
+                if ip is not None:
+                    url = urlunparse(ju._replace(netloc=_url_host(ip) + port_part))
+                    headers['Host'] = host_header
+                try:
+                    r = requests.get(url, auth=auth, timeout=timeout, allow_redirects=False,
+                                     verify=bool(verify_ssl), stream=True, headers=headers)
+                    break
+                except requests.exceptions.ConnectionError:
+                    # the next vetted address, as a resolver-order connect would try it
+                    if i + 1 == len(pins):
+                        raise
+            if len(pins) > 1:
+                pins[:] = [ip]          # stay on the one that answered
             if r.status_code == 401:
                 return None, 'auth failed (401)'
             if r.status_code >= 400:
@@ -322,7 +380,9 @@ def read_node_bmc_redfish(host, user, password, verify_ssl=False, timeout=10):
                     return None, 'Redfish response too large'
             return _json.loads(buf.decode('utf-8', errors='replace')), None
         except Exception as e:  # noqa: BLE001 — surface as unavailable
-            return None, str(e)[:120]
+            # a pinned address reads as the name it stands for, as before (no resolver oracle)
+            msg = str(e) if ip is None else str(e).replace(str(ip), bu.hostname or '')
+            return None, msg[:120]
         finally:
             if r is not None:
                 try:

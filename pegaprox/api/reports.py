@@ -29,6 +29,40 @@ from pegaprox.api.schedules import start_scheduler
 bp = Blueprint('reports', __name__)
 
 
+# The three report endpoints below take period=hour|day|week and used to cut the
+# window out of "the newest 1000 snapshot rows". At the 5-min cadence that cap is
+# ~3.5 days, and less whenever rows land more often, so "Last Week" quietly ended
+# wherever those rows ended and looked identical to "Last 24h". Load the window
+# the caller actually asked for instead.
+# All three read a cluster's name and totals and nothing else, so they ask the
+# loader for just that (totals_only): the cached window stays small at 10k guests.
+def _period_cutoff(period):
+    """(window_days, cutoff_datetime) for a period param. hour shares the 1-day
+    window with day so the two views hit the same cached read."""
+    now = datetime.now()
+    if period == 'hour':
+        return 1, now - timedelta(hours=1)
+    if period == 'week':
+        return 7, now - timedelta(days=7)
+    return 1, now - timedelta(days=1)
+
+
+def _with_offset(ts):
+    """A stored timestamp as ISO with the server's UTC offset.
+
+    MK Oct 2026 - snapshots, scans and syslog rows store datetime.now().isoformat():
+    server-local and naive. A browser reads a naive ISO string as ITS local time, so
+    with server and browser in different zones every chart label was off by the
+    difference. The stored format stays, the answer carries the offset.
+    """
+    if not ts or not isinstance(ts, str):
+        return ts
+    try:
+        return datetime.fromisoformat(ts).astimezone().isoformat()
+    except ValueError:
+        return ts
+
+
 def _syslog_search_terms(search_text):
     return [term for term in re.split(r'\s+', search_text.strip()) if term]
 
@@ -79,7 +113,8 @@ def _syslog_hostname_tokens(value):
     if not value:
         return set()
     tokens = {value}
-    if '.' in value:
+    # the short form of an address is its first octet, and LIKE '10.%' is every sender in 10/8 (#1119)
+    if '.' in value and not re.fullmatch(r'[0-9.]+', value):
         tokens.add(value.split('.', 1)[0])
     return tokens
 
@@ -149,15 +184,25 @@ def _syslog_ambiguous_hostnames():
         return tokens
 
 
+def _syslog_like_literal(value):
+    """`value` with LIKE's wildcards escaped, for `LIKE ? ESCAPE '\\'`."""
+    return value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
+
 def _syslog_host_clause(values, params):
-    """`(host = x OR host LIKE 'x.%' OR ...)` over the tokens that identify one cluster."""
+    """`(host = x OR host LIKE 'x.%' OR ...)` over the tokens that identify one cluster.
+
+    NS Oct 2026 - the tokens come from the cluster name and host, which a cluster.config
+    holder sets on their own cluster. A name of '%' made the LIKE half match every host
+    with a dot in it, so the caller read every tenant's syslog (#1119). Only the '.%' we
+    add is a wildcard now."""
     _ambiguous = _syslog_ambiguous_hostnames()
     parts = []
     for value in sorted(set(values) - _ambiguous):
         parts.append("LOWER(logs.hostname) = ?")
         params.append(value)
-        parts.append("LOWER(logs.hostname) LIKE ?")
-        params.append(f"{value}.%")
+        parts.append("LOWER(logs.hostname) LIKE ? ESCAPE '\\'")
+        params.append(f"{_syslog_like_literal(value)}.%")
     return f"({' OR '.join(parts)})" if parts else "1 = 0"
 
 
@@ -180,20 +225,12 @@ def get_reports_summary():
     user_data = build_authz_user(usr, getattr(request, 'session', {}) or {})
     accessible_clusters = get_user_clusters(user_data)  # None = admin (all clusters)
 
-    history = load_metrics_history()
+    window_days, cutoff = _period_cutoff(period)
+    history = load_metrics_history(days=window_days, totals_only=True)
     snapshots = history.get('snapshots', [])
 
     if not snapshots:
         return jsonify({'error': 'No historical data available yet'}), 404
-
-    # Filter by period
-    now = datetime.now()
-    if period == 'hour':
-        cutoff = now - timedelta(hours=1)
-    elif period == 'week':
-        cutoff = now - timedelta(days=7)
-    else:  # day
-        cutoff = now - timedelta(days=1)
 
     cutoff_str = cutoff.isoformat()
     filtered = [s for s in snapshots if s.get('timestamp', '') >= cutoff_str]
@@ -205,8 +242,8 @@ def get_reports_summary():
     report = {
         'period': period,
         'data_points': len(filtered),
-        'start_time': filtered[0].get('timestamp'),
-        'end_time': filtered[-1].get('timestamp'),
+        'start_time': _with_offset(filtered[0].get('timestamp')),
+        'end_time': _with_offset(filtered[-1].get('timestamp')),
         'clusters': {}
     }
 
@@ -388,7 +425,10 @@ def get_integrated_syslog_events():
     # cluster's syslog to a tenant-scoped admin.audit holder.
     from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import get_user_clusters
-    _acc = get_user_clusters(build_authz_user(request.session.get('user', ''), request.session))
+    # NS Oct 2026 - a node's syslog is the whole node's, so only clusters the caller's tenant
+    # owns count. A pool grant on a foreign cluster reaches that pool's guests, not its hosts (#1010).
+    _acc = get_user_clusters(build_authz_user(request.session.get('user', ''), request.session),
+                             include_pools=False)
     if _acc is not None:  # None = global-admin / all-cluster; a list = confine to it
         _allowed_hosts = set()
         for _cid in _acc:
@@ -440,7 +480,7 @@ def get_integrated_syslog_events():
     total_pages = (total + per_page - 1) // per_page if total else 0
 
     return jsonify({
-        'items': [dict(row) for row in rows],
+        'items': [dict(dict(row), timestamp=_with_offset(row['timestamp'])) for row in rows],
         'pagination': {
             'page': page,
             'per_page': per_page,
@@ -477,20 +517,12 @@ def get_reports_timeline():
     user_data = build_authz_user(usr, getattr(request, 'session', {}) or {})
     accessible_clusters = get_user_clusters(user_data)  # None = admin (all clusters)
 
-    history = load_metrics_history()
+    window_days, cutoff = _period_cutoff(period)
+    history = load_metrics_history(days=window_days, totals_only=True)
     snapshots = history.get('snapshots', [])
 
     if not snapshots:
         return jsonify({'error': 'No historical data available'}), 404
-
-    # Filter by period
-    now = datetime.now()
-    if period == 'hour':
-        cutoff = now - timedelta(hours=1)
-    elif period == 'week':
-        cutoff = now - timedelta(days=7)
-    else:
-        cutoff = now - timedelta(days=1)
 
     cutoff_str = cutoff.isoformat()
     filtered = [s for s in snapshots if s.get('timestamp', '') >= cutoff_str]
@@ -504,7 +536,7 @@ def get_reports_timeline():
 
     for snapshot in filtered:
         timestamp = snapshot.get('timestamp', '')
-        timeline['timestamps'].append(timestamp)
+        timeline['timestamps'].append(_with_offset(timestamp))
 
         for cluster_id, cluster_data in snapshot.get('clusters', {}).items():
             if filter_cluster and cluster_id != filter_cluster:
@@ -657,6 +689,8 @@ def scan_all_nodes_cves(cluster_id):
             continue
         try:
             scan = mgr.scan_node_packages(node_name)
+            if isinstance(scan, dict) and scan.get('timestamp'):
+                scan['timestamp'] = _with_offset(scan['timestamp'])
             results.append(scan)
         except Exception as e:
             logging.warning(f"[cve-scan] node {node_name} scan failed: {e}")  # detail to logs, not the response
@@ -670,7 +704,7 @@ def scan_all_nodes_cves(cluster_id):
     return jsonify({
         'cluster_id': cluster_id,
         'cluster_name': getattr(mgr.config, 'name', cluster_id),
-        'scanned_at': datetime.now().isoformat(),
+        'scanned_at': datetime.now().astimezone().isoformat(),
         'nodes': results,
         'summary': {
             'nodes_scanned': len(results),
@@ -708,6 +742,8 @@ def scan_single_node_cves(cluster_id, node):
         return jsonify({'error': 'Cluster not connected'}), 503
 
     result = mgr.scan_node_packages(node)
+    if isinstance(result, dict) and result.get('timestamp'):
+        result['timestamp'] = _with_offset(result['timestamp'])
     return jsonify(result)
 
 
@@ -763,6 +799,9 @@ _SSH_ERRORS = {
     'SSH_NO_CREDENTIALS': (412, 'Add an SSH key or a password to this cluster under '
                                 'Settings > Clusters. An API token alone cannot open a '
                                 'shell, which these checks need.'),
+    'SSH_DISABLED':       (412, 'SSH to this cluster is switched off in its settings. '
+                                'These checks read the node over SSH, so they cannot '
+                                'run until it is switched back on.'),
     'NODE_BACKOFF':       (503, 'The node stopped answering and is being retried with a '
                                 'backoff. Check that it is up and reachable from PegaProx.'),
     'SSH_FAILED':         (502, 'Credentials are configured but the connection did not '
@@ -803,6 +842,11 @@ def check_hardening(cluster_id, node):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    # NS Oct 2026 - runs root checks over SSH and reads back the node's own security
+    # evidence, nothing a pool or VM grant reaches; same gate as the apply route below
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     mgr = cluster_managers[cluster_id]
@@ -1068,18 +1112,11 @@ def get_cluster_report_summary(cluster_id):
     live_cpu_pct = round(live_cpu, 1)
     live_mem_pct = round(mem_used / max(mem_total, 1) * 100, 1) if mem_total > 0 else 0
 
-    # Load historical metrics
-    history = load_metrics_history()
+    # Load historical metrics for the requested window (oldest first, so the
+    # chart below runs left-to-right and 'current' really is the newest sample)
+    window_days, cutoff = _period_cutoff(period)
+    history = load_metrics_history(days=window_days, totals_only=True)
     snapshots = history.get('snapshots', [])
-
-    # Filter by period
-    now = datetime.now()
-    if period == 'hour':
-        cutoff = now - timedelta(hours=1)
-    elif period == 'week':
-        cutoff = now - timedelta(days=7)
-    else:
-        cutoff = now - timedelta(days=1)
 
     cutoff_str = cutoff.isoformat()
     filtered = [s for s in snapshots if s.get('timestamp', '') >= cutoff_str]
@@ -1111,7 +1148,7 @@ def get_cluster_report_summary(cluster_id):
         if not cluster_data:
             continue
 
-        report['timestamps'].append(snapshot.get('timestamp', ''))
+        report['timestamps'].append(_with_offset(snapshot.get('timestamp', '')))
         report['data_points'] += 1
 
         totals = cluster_data.get('totals', {})

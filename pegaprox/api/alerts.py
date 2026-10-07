@@ -17,6 +17,7 @@ from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
 from pegaprox.api.helpers import check_cluster_access, safe_error, scope_vm_rows, require_unconfined
 from pegaprox.background.alerts import load_alerts_config, save_alerts_config
+from pegaprox.background import alert_events
 
 bp = Blueprint('alerts', __name__)
 
@@ -32,6 +33,15 @@ def _mask_channel(ch):
         c['url'] = '********'
     if c.get('token'):
         c['token'] = '********'
+    # NS Oct 2026 - an ntfy topic is the channel: without a token, whoever knows it reads
+    # and posts the feed (#993). Same when it was typed into the url instead.
+    if c.get('topic'):
+        c['topic'] = '********'
+    if c.get('type') == 'ntfy' and u:
+        from urllib.parse import urlsplit
+        p = urlsplit(u)
+        if p.path.strip('/'):
+            c['url'] = f"{p.scheme}://{p.netloc.rpartition('@')[2]}/…"
     return c
 
 
@@ -122,20 +132,24 @@ def load_cluster_alerts():
     try:
         db = get_db()
         cursor = db.conn.cursor()
-        cursor.execute('SELECT * FROM cluster_alerts WHERE enabled = 1')
-        
+        # MK Oct 2026 - every row, the switched-off ones too: with `enabled = 1` here a
+        # rule switched off vanished from the list on reload, and the PUT that would
+        # switch it on again answered 404. The background loop reads the column itself.
+        cursor.execute('SELECT * FROM cluster_alerts')
+
         alerts = {}
         for row in cursor.fetchall():
             cluster_id = row['cluster_id']
             if cluster_id not in alerts:
                 alerts[cluster_id] = []
-            
+
             try:
                 # config contains the full alert object as JSON
                 alert_data = json.loads(row['config'] or '{}')
                 # ensure id is present
                 if 'id' not in alert_data:
                     alert_data['id'] = row['alert_type']
+                alert_data['enabled'] = bool(row['enabled']) and alert_data.get('enabled', True)
                 alerts[cluster_id].append(alert_data)
             except:
                 # fallback for old format where config was just settings
@@ -281,15 +295,17 @@ def create_cluster_alert(cluster_id):
     # background loop never knew where to dispatch and which cluster the alert
     # belonged to. Persist both in the JSON config.
     channels = _sanitize_channels(data.get('channels'))
+    metric = data.get('metric', 'cpu')
+    is_rolling_update = metric == 'rolling_update'
     alert = {
         'id': str(uuid.uuid4())[:8],
         'name': data.get('name', 'Unnamed Alert'),
         'cluster_id': cluster_id,
-        'metric': data.get('metric', 'cpu'),
+        'metric': metric,
         # #609: the categorical hardware_health code (0/1/2) is only meaningful with '>';
         # a '<' rule would silently never fire on degraded hardware — pin it to '>'.
-        'operator': '>' if data.get('metric') == 'hardware_health' else data.get('operator', '>'),
-        'threshold': data.get('threshold', 80),
+        'operator': 'event' if is_rolling_update else ('>' if metric == 'hardware_health' else data.get('operator', '>')),
+        'threshold': 1 if is_rolling_update else data.get('threshold', 80),
         'target_type': data.get('target_type', 'cluster'),
         'target_id': data.get('target_id'),
         'channels': channels,
@@ -299,9 +315,14 @@ def create_cluster_alert(cluster_id):
         'enabled': data.get('enabled', True),
         'created_at': datetime.now().isoformat()
     }
+    bad = alert_events.normalize_rule(alert, data)
+    if bad:
+        return jsonify({'error': bad}), 400
 
     alerts[cluster_id].append(alert)
     save_cluster_alerts(alerts)
+    log_audit(request.session.get('user', 'unknown'), 'alert.created',
+              f"Created alert '{alert['name']}' ({metric})", cluster=cluster_id)
 
     return jsonify({'success': True, 'alert': alert})
 
@@ -322,6 +343,7 @@ def update_cluster_alert(cluster_id, alert_id):
     
     for alert in cluster_alerts:
         if alert['id'] == alert_id:
+            before = {k: alert.get(k) for k in alert_events.MATCH_FIELDS}
             for k in ('enabled', 'name', 'threshold', 'metric', 'operator',
                       'target_type', 'target_id', 'action', 'severity'):
                 if k in data:
@@ -331,13 +353,42 @@ def update_cluster_alert(cluster_id, alert_id):
             if 'escalation' in data:
                 alert['escalation'] = _sanitize_escalation(data['escalation'])  # NS #501 (F1: bounded)
             # #609: keep hardware_health rules on '>' (the categorical 0/1/2 ladder)
-            if alert.get('metric') == 'hardware_health':
+            if alert.get('metric') in alert_events.EVENT_METRICS:
+                pass  # normalize_rule below pins operator and threshold
+            elif alert.get('metric') == 'hardware_health':
                 alert['operator'] = '>'
+            elif alert.get('metric') == 'rolling_update':
+                alert['operator'] = 'event'
+                alert['threshold'] = 1
+            elif alert.get('operator') == 'event':
+                # MK Sep 2026 (scan) - this rule WAS a rolling-update rule and has just
+                # been moved to a metric that is compared against a number. 'event' is
+                # not a comparison, so the poll would stop skipping the rule and then
+                # never match anything: a rule that looks configured and silently never
+                # fires.
+                # The operator is reset unconditionally. Guarding on "the caller did not
+                # send one" reads careful and is dead: the copy loop above has already
+                # written any operator from the request, so reaching here at all means
+                # the value IS 'event' - either left over or sent that way, and neither
+                # belongs on a metric that gets compared. The threshold is different: a
+                # caller-supplied number is meaningful, so only a leftover 1 is replaced.
+                alert['operator'] = '>'
+                if 'threshold' not in data:
+                    alert['threshold'] = 80
+            bad = alert_events.normalize_rule(alert, data, prev_metric=before.get('metric'))
+            if bad:
+                return jsonify({'error': bad}), 400
             # ensure cluster_id is always present for older rows
             alert.setdefault('cluster_id', cluster_id)
             save_cluster_alerts(alerts)
+            # MK Oct 2026 - what the rule matches changed: what it reported under the old
+            # terms is closed, and the next tick raises what still holds under the new ones
+            if any(alert.get(k) != v for k, v in before.items()):
+                alert_events.rule_changed(cluster_id, alert_id)
+            log_audit(request.session.get('user', 'unknown'), 'alert.updated',
+                      f"Updated alert '{alert.get('name')}' ({alert_id})", cluster=cluster_id)
             return jsonify({'success': True, 'alert': alert})
-    
+
     return jsonify({'error': 'Alert not found'}), 404
 
 @bp.route('/api/clusters/<cluster_id>/alerts/<alert_id>', methods=['DELETE'])
@@ -357,8 +408,14 @@ def delete_cluster_alert(cluster_id, alert_id):
         cursor = db.conn.cursor()
         cursor.execute('DELETE FROM cluster_alerts WHERE cluster_id = ? AND alert_type = ?',
                       (cluster_id, alert_id))
-        db.conn.commit()
         deleted = cursor.rowcount > 0
+        # its own mutes go with it; a mute of an object stays for the other rules
+        cursor.execute('DELETE FROM alert_mutes WHERE cluster_id = ? AND rule_id = ?',
+                       (cluster_id, alert_id))
+        db.conn.commit()
+        if deleted:
+            log_audit(request.session.get('user', 'unknown'), 'alert.deleted',
+                      f"Deleted alert {alert_id}", cluster=cluster_id)
         return jsonify({'success': True, 'deleted': deleted})
     except Exception as e:
         logging.error(f"Error deleting cluster alert: {e}")
@@ -377,7 +434,7 @@ def get_active_alerts(cluster_id):
         cur = db.conn.cursor()
         cols = ['id', 'alert_id', 'severity', 'message', 'target_type', 'target_name', 'metric',
                 'current_value', 'threshold', 'operator', 'triggered_at', 'last_fired_at',
-                'acked_at', 'acked_by', 'escalation_step']
+                'acked_at', 'acked_by', 'escalation_step', 'object_key']
         # target_id is not part of the response, but we need it to scope the rows
         _q = cols + ['target_id']
         rows = cur.execute(
@@ -387,9 +444,18 @@ def get_active_alerts(cluster_id):
         incidents = [dict(zip(_q, r)) for r in rows]
         _ok = _alert_scoper(cluster_id)
         if _ok is not None:
-            incidents = [i for i in incidents
-                         if i.get('target_type') != 'vm' or _ok(i.get('target_id'))]
-        return jsonify({'active_alerts': [{k: i[k] for k in cols} for i in incidents]})
+            # MK Oct 2026 - a ZFS pool is storage of a node, which a pool or guest grant does not reach
+            incidents = [i for i in incidents if i.get('metric') != 'zfs_health'
+                         and (i.get('target_type') != 'vm' or _ok(i.get('target_id')))]
+        mutes = alert_events.active_mutes(cluster_id)
+        out = []
+        for i in incidents:
+            row = {k: i[k] for k in cols}
+            m = alert_events.mute_for(mutes, cluster_id, i.get('alert_id') or '', i.get('object_key') or '',
+                                      _incident_target_key(i))
+            row['muted_until'] = m['until'] if m else None
+            out.append(row)
+        return jsonify({'active_alerts': out})
     except Exception as e:
         logging.error(f"Error listing active alerts: {e}")
         return jsonify({'active_alerts': [], 'error': safe_error(e, 'Alert operation failed')})
@@ -419,6 +485,142 @@ def ack_active_alert(cluster_id, fired_id):
     except Exception as e:
         logging.error(f"Error acknowledging alert: {e}")
         return jsonify({'error': safe_error(e, 'Alert operation failed')}), 500
+
+
+# MK Oct 2026 - mutes: hold back what a rule, an object (a guest, a node, a task, a
+# replication job) or both would send, until a set time. alert_events.mute_for decides.
+MUTE_OBJECT_MAX = 200
+
+
+def _incident_target_key(row):
+    """The guest or node an incident is about, as a mute names it ('' for the cluster)."""
+    ttype, tid = row.get('target_type'), row.get('target_id')
+    if ttype in ('vm', 'node') and tid not in (None, ''):
+        return f"{ttype}:{tid}"
+    return ''
+
+
+def _mute_out(m):
+    return {k: m.get(k) for k in ('id', 'cluster_id', 'rule_id', 'object_key', 'object_label',
+                                  'until', 'reason', 'created_by', 'created_at')}
+
+
+@bp.route('/api/clusters/<cluster_id>/alert-mutes', methods=['GET'])
+@require_auth()
+def list_alert_mutes(cluster_id):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    mutes = alert_events.active_mutes(cluster_id)
+    _ok = _alert_scoper(cluster_id)
+    if _ok is not None:
+        # a confined caller sees the mutes of the guests it sees, and none that would
+        # name another guest through its rule's target
+        vm_rules = {a.get('id'): a.get('target_id') for a in load_cluster_alerts().get(cluster_id, [])
+                    if a.get('target_type') == 'vm'}
+
+        def _visible(m):
+            if str(m.get('object_key') or '').startswith('zfs:'):
+                return False
+            vmid = alert_events.object_vmid(m.get('object_key'))
+            if vmid is not None and not _ok(vmid):
+                return False
+            if m.get('rule_id') in vm_rules and not _ok(vm_rules[m['rule_id']]):
+                return False
+            return True
+        mutes = [m for m in mutes if _visible(m)]
+    mutes.sort(key=lambda m: m.get('until') or '')
+    return jsonify({'mutes': [_mute_out(m) for m in mutes]})
+
+
+@bp.route('/api/clusters/<cluster_id>/alert-mutes', methods=['POST'])
+@require_auth(perms=['cluster.config'])
+def create_alert_mute(cluster_id):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'The request body must be a JSON object'}), 400
+    minutes = data.get('minutes')
+    if isinstance(minutes, bool) or not isinstance(minutes, int) \
+            or not 1 <= minutes <= alert_events.MUTE_MAX_MINUTES:
+        return jsonify({'error': f'minutes must be a whole number from 1 to {alert_events.MUTE_MAX_MINUTES}'}), 400
+    db = get_db()
+    cur = db.conn.cursor()
+    label = None
+    if data.get('active_alert_id'):
+        row = cur.execute(
+            "SELECT alert_id, object_key, target_type, target_id, target_name FROM active_alerts "
+            "WHERE id = ? AND cluster_id = ? AND resolved_at IS NULL",
+            (str(data['active_alert_id']), cluster_id)).fetchone()
+        if row is None:
+            return jsonify({'error': 'Active alert not found'}), 404
+        row = {k: row[k] for k in row.keys()}
+        target = _incident_target_key(row)
+        label = row.get('target_name')
+        if data.get('whole_object'):
+            if not target:
+                return jsonify({'error': 'this alert is about the whole cluster: mute its rule instead'}), 400
+            rule_id, object_key = '', target
+        else:
+            rule_id, object_key = row.get('alert_id') or '', row.get('object_key') or target
+    else:
+        rule_id = str(data.get('rule_id') or '')
+        object_key = str(data.get('object_key') or '').strip()
+        if not rule_id and not object_key:
+            return jsonify({'error': 'name a rule, an object or an active alert'}), 400
+        if len(object_key) > MUTE_OBJECT_MAX:
+            return jsonify({'error': f'object_key is longer than {MUTE_OBJECT_MAX} characters'}), 400
+        if rule_id and not any(a.get('id') == rule_id for a in load_cluster_alerts().get(cluster_id, [])):
+            return jsonify({'error': 'Alert not found'}), 404
+        label = str(data.get('object_label') or '')[:MUTE_OBJECT_MAX] or None
+    from datetime import timedelta
+    user = request.session.get('user', 'unknown')
+    now = datetime.now()
+    mute = {
+        'id': uuid.uuid4().hex[:12], 'cluster_id': cluster_id, 'rule_id': rule_id,
+        'object_key': object_key, 'object_label': label,
+        'until': (now + timedelta(minutes=minutes)).isoformat(timespec='seconds'),
+        'reason': str(data.get('reason') or '')[:MUTE_OBJECT_MAX] or None,
+        'created_by': user, 'created_at': now.isoformat(timespec='seconds'),
+    }
+    cur.execute("INSERT INTO alert_mutes (id, cluster_id, rule_id, object_key, object_label, until, "
+                "reason, created_by, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                tuple(mute[k] for k in ('id', 'cluster_id', 'rule_id', 'object_key', 'object_label',
+                                        'until', 'reason', 'created_by', 'created_at')))
+    db.conn.commit()
+    what = ' / '.join(x for x in (f"rule {rule_id}" if rule_id else '', object_key) if x)
+    log_audit(user, 'alert.muted', f"Muted {what} until {mute['until']}", cluster=cluster_id)
+    return jsonify({'success': True, 'mute': mute})
+
+
+@bp.route('/api/clusters/<cluster_id>/alert-mutes/<mute_id>', methods=['DELETE'])
+@require_auth(perms=['cluster.config'])
+def delete_alert_mute(cluster_id, mute_id):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+    db = get_db()
+    cur = db.conn.cursor()
+    row = cur.execute("SELECT rule_id, object_key FROM alert_mutes WHERE id = ? AND cluster_id = ?",
+                      (mute_id, cluster_id)).fetchone()
+    if row is None:
+        return jsonify({'error': 'Mute not found'}), 404
+    cur.execute("DELETE FROM alert_mutes WHERE id = ? AND cluster_id = ?", (mute_id, cluster_id))
+    db.conn.commit()
+    what = ' / '.join(x for x in (f"rule {row['rule_id']}" if row['rule_id'] else '', row['object_key']) if x)
+    log_audit(request.session.get('user', 'unknown'), 'alert.unmuted', f"Lifted the mute of {what}",
+              cluster=cluster_id)
+    return jsonify({'success': True})
 
 
 # ============================================
@@ -620,8 +822,12 @@ def get_alerts():
     # NS Jul 2026 (CodeAnt IDOR) — scope alert configs to the caller's reachable clusters
     # (was exposing every tenant's alert rules — names, cluster/VM targets — to any viewer).
     from pegaprox.utils.rbac import get_user_clusters
-    from flask import g as _g
-    _allowed = get_user_clusters(getattr(_g, 'current_user', None) or {})
+    # MK Sep 2026 - g.current_user is the RAW stored record; it has no effective_role, so a
+    # restricted bearer token was scoped as its OWNER. For an admin owner get_user_clusters
+    # then answers None ("all clusters") and the filter below is skipped entirely, which is
+    # how a viewer-capped token read every tenant's rows. acting_user applies the token floor.
+    from pegaprox.api.helpers import acting_user
+    _allowed = get_user_clusters(acting_user())
     if _allowed is not None:
         cfg = dict(cfg)
         cfg['alerts'] = [a for a in cfg.get('alerts', []) if a.get('cluster_id') in _allowed]
@@ -799,7 +1005,7 @@ def update_alert_channel(cid):
         for k in ('name', 'type', 'enabled', 'topic', 'url', 'token'):
             if k in data:
                 v = data[k]
-                if k in ('url', 'token') and isinstance(v, str) and ('…' in v or v == '********'):
+                if k in ('url', 'token', 'topic') and isinstance(v, str) and ('…' in v or v == '********'):
                     continue  # untouched
                 updated[k] = v
         channels[i] = updated
@@ -831,6 +1037,10 @@ def delete_alert_channel(cid):
 @bp.route('/api/alert-channels/<cid>/test', methods=['POST'])
 @require_auth(perms=['alert.manage'])
 def test_alert_channel(cid):
+    # NS Oct 2026 - the channel list is installation-wide, so is firing at it (#989)
+    _serr = _require_settings_admin()
+    if _serr:
+        return _serr
     from pegaprox.api.helpers import load_server_settings
     from pegaprox.utils.webhooks import send_to_channel
     channels = (load_server_settings() or {}).get('alert_webhooks') or []
@@ -877,18 +1087,21 @@ def alerts_diagnostics():
     _allowed = get_user_clusters(build_authz_user(request.session.get('user', ''), request.session))
     _reach = (lambda cid: True) if _allowed is None else (lambda cid: cid in _allowed)
     _rules = [a for a in cfg.get('alerts', []) if _reach(a.get('cluster_id'))]
+    # NS Oct 2026 - the count, the recipients and the channels were the whole installation's
+    # for a caller confined to some clusters; they get their own rules and nothing global
+    _whole = _allowed is None
     return jsonify({
         'last_tick_at': A._last_tick_at,
         'tick_interval_seconds': 60,
-        'alerts_in_config': len(cfg.get('alerts', [])),
+        'alerts_in_config': len(_rules),
         'enabled': cfg.get('enabled', True),
         'cooldown_seconds': settings.get('alert_cooldown', 300),
-        'email_recipients': len(settings.get('alert_email_recipients') or []),
+        'email_recipients': len(settings.get('alert_email_recipients') or []) if _whole else None,
         'webhook_channels': [
             {'id': c.get('id'), 'name': c.get('name'), 'type': c.get('type'),
              'enabled': c.get('enabled', True)}
             for c in (settings.get('alert_webhooks') or [])
-        ],
+        ] if _whole else None,
         'clusters_loaded': sorted([
             {'id': cid, 'connected': bool(getattr(m, 'is_connected', False))}
             for cid, m in cluster_managers.items() if _reach(cid)
@@ -906,6 +1119,9 @@ def alerts_diagnostics():
              'last_evaluation': A._last_eval.get(a.get('id'))}
             for a in _rules
         ],
+        # what the event sources last read per cluster (failed tasks, Ceph, replication,
+        # snapshots), same cluster filter as the rules
+        'event_sources': alert_events.source_status(None if _allowed is None else set(_allowed)),
     })
 
 
@@ -921,8 +1137,8 @@ def alerts_force_check():
     # cooldown that stops repeat sends. Both side effects are global; only a global admin gets
     # them. Everyone else still gets the diagnostic read below, scoped to their own clusters.
     from pegaprox.utils.auth import build_authz_user as _bau
-    _fc_admin = (_bau(request.session.get('user', ''), request.session)
-                 .get('effective_role', request.session.get('role')) == ROLE_ADMIN)
+    from pegaprox.utils.rbac import acts_as_admin
+    _fc_admin = acts_as_admin(_bau(request.session.get('user', ''), request.session))
     if not _fc_admin:
         _ev_only = A._last_eval
         from pegaprox.utils.rbac import get_user_clusters as _guc
@@ -954,4 +1170,3 @@ def alerts_force_check():
 
 
 # =====================================================
-

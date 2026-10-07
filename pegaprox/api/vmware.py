@@ -12,13 +12,14 @@ from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db
 
-from pegaprox.utils.auth import require_auth, load_users, build_authz_user
+from pegaprox.utils.auth import require_auth, load_users, build_authz_user, resolve_authz_user
 from pegaprox.utils.audit import log_audit
 # MK 2026-06-04 (CWE-117): mgr.name is from cluster-config (admin-controlled),
 # vmware_id from URL. Sanitise both before logging for consistency.
 from pegaprox.utils.sanitization import sanitize_log_message as _sl
-from pegaprox.utils.rbac import user_can_access_vmware_vm
-from pegaprox.api.helpers import check_cluster_access, check_vmware_access, caller_is_scoped
+from pegaprox.utils.rbac import user_can_access_vmware_vm, acts_as_admin
+from pegaprox.api.helpers import (check_cluster_access, check_vmware_access, caller_is_scoped,
+                                  acting_user, vmware_server_reach)
 from pegaprox.core.vmware import VMwareManager, load_vmware_servers, save_vmware_server
 from pegaprox.core.v2p import V2PMigrationTask, _run_v2p_migration
 from pegaprox.background.broadcast import broadcast_resources_loop
@@ -34,19 +35,39 @@ _migration_lock_v2p = threading.Lock()
 @bp.route('/api/vmware', methods=['GET'])
 @require_auth(perms=['vmware.view'])
 def list_vmware_servers():
-    """List all configured VMware/vCenter servers"""
+    """List the ESXi servers the caller may reach"""
+    # NS Oct 2026 - this handed every tenant's servers to any vmware.view holder; each row
+    # now has to pass the rule check_vmware_access applies to the server it names
+    user = acting_user()
+    if not user:
+        return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
+    reaches = vmware_server_reach(user)
     result = []
-    for vmware_id, mgr in vmware_managers.items():
-        result.append(mgr.to_dict())
+    for vmware_id, mgr in list(vmware_managers.items()):
+        if reaches(getattr(mgr, 'linked_clusters', None)):
+            result.append(mgr.to_dict())
     
     # Also include disabled servers from DB
     try:
+        import json as _json
         db = get_db()
         cursor = db.conn.cursor()
-        cursor.execute("SELECT id, name, host, port, enabled, server_type FROM vmware_servers")
+        cursor.execute("SELECT id, name, host, port, enabled, server_type, linked_clusters "
+                       "FROM vmware_servers")
         for row in cursor.fetchall():
             row_dict = dict(row)
             if row_dict['id'] not in vmware_managers:
+                try:
+                    _linked = _json.loads(row_dict.get('linked_clusters') or '[]')
+                except (TypeError, ValueError):
+                    _linked = False
+                # a linkage we cannot read shows the row to an admin and nobody else
+                if not isinstance(_linked, (list, type(None))):
+                    if not acts_as_admin(user):
+                        continue
+                    _linked = []
+                if not reaches(_linked):
+                    continue
                 result.append({
                     'id': row_dict['id'],
                     'name': row_dict['name'],
@@ -98,7 +119,29 @@ def update_vmware_server(vmware_id):
     if not ok:
         return err
     data = request.json or {}
-    
+
+    # NS Oct 2026 (#981) - linked_clusters is the list check_vmware_access reads, and an
+    # empty one opens the server to everybody. Same rule as the PBS twin: a non-admin may
+    # only narrow it, to clusters they reach themselves.
+    if 'linked_clusters' in data:
+        _lc = data.get('linked_clusters')
+        # a string was stored as its characters and kept raw on the live manager
+        if _lc is not None and not (isinstance(_lc, list) and all(isinstance(c, str) for c in _lc)):
+            return jsonify({'error': 'linked_clusters must be a list of cluster ids'}), 400
+        from pegaprox.utils.rbac import get_user_clusters, acts_as_admin
+        _caller = build_authz_user(request.session.get('user', ''), request.session)
+        if not acts_as_admin(_caller):
+            _new_links = list(data.get('linked_clusters') or [])
+            if not _new_links:
+                return jsonify({'error': 'Access denied: only a global admin may unlink an ESXi '
+                                         'server from every cluster'}), 403
+            _reachable = get_user_clusters(_caller, include_pools=False)
+            if _reachable is not None:
+                _beyond = [c for c in _new_links if c not in set(_reachable)]
+                if _beyond:
+                    return jsonify({'error': 'Access denied: cannot link this ESXi server to '
+                                             + ', '.join(_beyond)}), 403
+
     if vmware_id not in vmware_managers:
         db = get_db()
         row = db.conn.cursor().execute("SELECT * FROM vmware_servers WHERE id = ?", (vmware_id,)).fetchone()
@@ -108,25 +151,69 @@ def update_vmware_server(vmware_id):
     # MK May 2026 (#469 port) — cred-exfil guard. If host changes WHILE the
     # password is preserved (came in as ********), don't auto-connect — that
     # would ship the saved credential to a potentially attacker-controlled host.
+    #
+    # NS Aug 2026 (Aikido pentest) — never persist the preserved password against a CHANGED
+    # host: the saved row is reused verbatim by diagnose / Test Connection / the boot-time
+    # auto-connect, any of which would ship the secret to the new (possibly attacker-chosen)
+    # host. Require a full password whenever the host changes.
     credentials_preserved = False
     host_changed = False
 
-    if vmware_id in vmware_managers:
-        old_mgr = vmware_managers[vmware_id]
-        if (data.get('host') and data.get('host') != old_mgr.host) or \
-           (data.get('port') and int(data.get('port', 443)) != old_mgr.port):
-            host_changed = True
-        if data.get('password') == '********':
-            # NS Aug 2026 (Aikido pentest) — never persist the preserved password against a CHANGED
-            # host: the saved row is reused verbatim by diagnose / Test Connection / the boot-time
-            # auto-connect, any of which would ship the secret to the new (possibly attacker-chosen)
-            # host. Require a full password whenever the host changes.
-            if host_changed:
-                return jsonify({'error': 'Re-enter the password when changing the VMware host.'}), 400
-            data['password'] = old_mgr.password
-            credentials_preserved = True
+    # MK Sep 2026 (Aikido 700489023) — two ways past that guard, both closed here.
+    #
+    # First, it hung off vmware_managers, and load_vmware_servers only loads `enabled = 1`.
+    # A DISABLED server is therefore absent from that dict and the whole block was skipped:
+    # disable, repoint the host, re-enable, and the boot-time auto-connect hands the saved
+    # credential to the new destination. The stored ROW is the authority for what gets
+    # reused, so compare against it.
+    _row = get_db().conn.cursor().execute(
+        "SELECT host, port FROM vmware_servers WHERE id = ?", (vmware_id,)).fetchone()
+    if _row is None:
+        # MK Sep 2026 — no stored row means we cannot tell what the destination is today,
+        # so we cannot tell whether this request moves it. The guard below only refuses a
+        # preserved credential when host_changed is True, so leaving it False on a failed
+        # read would wave an UNKNOWN destination through with the stored secret attached.
+        # "Cannot tell" has to mean "changed" here; the cost is re-typing the password.
+        # The 404 above only runs when the id is absent from vmware_managers, so a manager
+        # without a row reaches this line.
+        host_changed = True
+    elif (data.get('host') and data.get('host') != _row['host']) or \
+         (data.get('port') and int(data.get('port', 443)) != int(_row['port'] or 443)):
+        host_changed = True
+
+    # Second, "keep the password" has three spellings and the guard knew one.
+    # save_vmware_server writes `pass_encrypted or <the stored one>`, so an OMITTED or an
+    # EMPTY password preserves the credential exactly as the UI's ******** sentinel does —
+    # and only the sentinel was checked. Leaving the field out walked straight past it and
+    # the row ended up holding the real credential against the caller's new host.
+    _pw = data.get('password')
+    if _pw is None or _pw == '' or _pw == '********':
+        if host_changed:
+            return jsonify({
+                'error': 'Re-enter the password when changing the VMware host or port.'}), 400
+        credentials_preserved = True
+        # Hand the in-memory manager the credential it is keeping. save_vmware_server
+        # falls back to the stored row either way, but VMwareManager is rebuilt from
+        # `data` a few lines down and then reconnected — without this it comes up with an
+        # empty password and the live connection stays broken until a restart, while the
+        # row it was built from still holds the secret. Pre-dates the omitted/empty arm;
+        # it only ever hydrated the ******** spelling. Host changes returned 400 above,
+        # so this can only ever re-supply a credential to the destination it already had.
+        if vmware_id in vmware_managers:
+            data['password'] = vmware_managers[vmware_id].password
 
     save_vmware_server(vmware_id, data)
+
+    # an update that leaves linked_clusters out keeps them (the row already does); the
+    # live manager below is built from `data` and came up unlinked, open to everybody (#981)
+    if 'linked_clusters' not in data:
+        if vmware_id in vmware_managers:
+            data['linked_clusters'] = list(getattr(vmware_managers[vmware_id], 'linked_clusters', None) or [])
+        else:
+            import json as _json
+            _lr = get_db().conn.cursor().execute(
+                "SELECT linked_clusters FROM vmware_servers WHERE id = ?", (vmware_id,)).fetchone()
+            data['linked_clusters'] = _json.loads(_lr['linked_clusters'] or '[]') if _lr else []
 
     mgr = VMwareManager(vmware_id, data)
     if data.get('enabled', True):
@@ -822,10 +909,14 @@ def get_vmware_console(vmware_id, vm_id):
         return jsonify({'error': 'VMware server not found'}), 404
 
     # Security fix: Check VM-level authorization
-    from pegaprox.utils.auth import load_users
     # #491 — token-scoped identity so an admin-owned viewer/user API token can't reach a VM
     # outside its token scope (user_can_access_vmware_vm honors effective_role).
-    user = build_authz_user(request.session.get('user', ''), request.session)
+    # NS Oct 2026 (#1101) - read by the account's own row. This route has no cluster gate of
+    # its own, so the {} a failed whole-table read answers (default tenant, every cluster)
+    # passed the tenant check in user_can_access_vmware_vm for any ESXi server.
+    user = resolve_authz_user(request.session)
+    if not user:
+        return jsonify({'error': 'Unauthorized', 'code': 'AUTH_REQUIRED'}), 401
 
     if not user_can_access_vmware_vm(user, vmware_id, vm_id, 'vmware.vm.view'):
         return jsonify({'error': 'Permission denied: You do not have access to this VM'}), 403
@@ -1155,6 +1246,35 @@ def start_vmware_migration(vmware_id, vm_id):
     if _aio and _aio not in ('threads', 'native', 'io_uring'):
         return jsonify({'error': 'Invalid aio_mode: must be threads, native or io_uring.'}), 400
 
+    # NS Oct 2026 (#1090) - root loop-mounts this on the node; empty = the default places
+    from pegaprox.utils.sanitization import validate_node_iso_path
+    _iso = data.get('virtio_iso_path')
+    if data.get('install_virtio_drivers') and _iso not in (None, '') and not validate_node_iso_path(_iso):
+        return jsonify({'error': 'Invalid virtio_iso_path: an absolute path to an .iso file '
+                                 'on the node'}), 400
+
+    # NS Oct 2026 (#1106) - esxi_host decides which host the PVE node SSHes/sshfs-mounts and
+    # reads disks from as root. Left to the caller it could aim the node at an attacker's SSH
+    # server serving a crafted descriptor. It is the configured server's host; pin it there.
+    # The wizard never sends it (it defaults to the server host); an explicit mismatch is refused.
+    _reg_host = vmware_managers[vmware_id].host
+    _req_host = data.get('esxi_host')
+    if _req_host not in (None, '') and str(_req_host).strip().lower() != str(_reg_host or '').lower():
+        return jsonify({'error': 'esxi_host must match the registered ESXi server'}), 400
+    # the task reads data['esxi_host'] as is, so hand it the registered value, not the
+    # spelling that passed the compare
+    data['esxi_host'] = _reg_host
+    # NS Oct 2026 - user and host go onto the local sshpass/ssh argv and into the ssh, scp,
+    # sshfs and ssh_config text the node runs as root. A user starting with '-' is an
+    # OpenSSH option there, a newline in the host a new ssh_config line.
+    from pegaprox.utils.sanitization import validate_ssh_user, validate_host_address
+    _esxi_user = data.get('esxi_user')
+    if _esxi_user not in (None, '') and not validate_ssh_user(_esxi_user):
+        return jsonify({'error': 'Invalid esxi_user: letters, digits and ._- only, '
+                                 'not starting with - or .'}), 400
+    if not validate_host_address(data['esxi_host']):
+        return jsonify({'error': 'Invalid esxi_host: a host name or an IP address'}), 400
+
     if not data.get('esxi_password'):
         return jsonify({'error': 'esxi_password is required for SSHFS-based migration'}), 400
     if data['target_cluster'] not in cluster_managers:
@@ -1193,7 +1313,10 @@ def start_vmware_migration(vmware_id, vm_id):
     with _migration_lock_v2p:
         _vmware_migrations[mid] = task
     
-    thread = threading.Thread(target=_run_v2p_migration, args=(task,), daemon=True)
+    # a user job: in an automatic group each call it sends asks for the lease (#625)
+    from pegaprox.core import ha
+    thread = threading.Thread(target=ha.as_job(_run_v2p_migration, 'ESXi migration'), args=(task,),
+                              daemon=True)
     thread.start()
     
     log_audit(request.session.get('user', 'admin'), 'vmware.migration.started',
@@ -1262,6 +1385,13 @@ def confirm_vmware_cutover(mid):
     if getattr(task, 'phase', None) != 'awaiting_confirmation':
         return jsonify({'error': 'Migration is not waiting for cutover confirmation',
                         'phase': getattr(task, 'phase', None)}), 409
+    # NS Oct 2026 (#984) - on a run started with remove_source this click is what sets the
+    # source deletion off, so it asks the same right the start asked for that
+    if getattr(task, 'remove_source', False):
+        _cu = build_authz_user(request.session.get('user', ''), request.session)
+        if not user_can_access_vmware_vm(_cu, task.vmware_id, str(task.vm_id), 'vmware.vm.manage'):
+            return jsonify({'error': 'Permission denied: this cutover removes the source guest, '
+                                     'which needs vmware.vm.manage on it'}), 403
     task._cutover_confirmed = True
     log_audit(request.session.get('user', 'admin'), 'vmware.migration.cutover_confirmed',
               f"V2P cutover confirmed for {getattr(task, 'vm_name', mid)} (migration {mid})")

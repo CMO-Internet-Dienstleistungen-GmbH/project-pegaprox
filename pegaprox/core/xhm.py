@@ -15,7 +15,9 @@ import shlex
 from datetime import datetime
 
 from pegaprox.globals import cluster_managers, _xhm_migrations
-from pegaprox.utils.ssh import _ssh_exec, _pve_node_exec
+from pegaprox.core import ha_transport
+from pegaprox.utils.ssh import _ssh_exec, _pve_node_exec, ssh_password_for
+from pegaprox.utils.sanitization import validate_ssh_user
 from pegaprox.utils.realtime import broadcast_sse
 from pegaprox.utils.audit import log_audit
 
@@ -720,7 +722,7 @@ def _run_xcpng_to_pve(task):
                     return
 
                 pve_user = getattr(tgt_mgr.config, 'ssh_user', '') or 'root'
-                pve_pass = getattr(tgt_mgr.config, 'pass_', '')
+                pve_pass = ssh_password_for(tgt_mgr.config)
                 pve_key = getattr(tgt_mgr.config, 'ssh_key', '')
                 pve_port = int(getattr(tgt_mgr.config, 'ssh_port', 22))
 
@@ -1054,7 +1056,6 @@ def _run_pve_to_xcpng(task):
     so we SSH in and dd/qemu-img convert the disk to raw, then stream
     to XCP-ng's import_raw_vdi endpoint.
     """
-    import requests as _req
     import os
 
     try:
@@ -1083,6 +1084,7 @@ def _run_pve_to_xcpng(task):
 
         task.vm_name = task.vm_name or raw.get('name', f'vm-{task.source_vmid}')
         task.log(f"Source VM: {task.vm_name} (VMID {task.source_vmid})")
+        source_identity = _pve_guest_identity(raw)
 
         ostype = raw.get('ostype', 'l26')
         memory_mb = int(raw.get('memory', 1024))
@@ -1234,7 +1236,7 @@ def _run_pve_to_xcpng(task):
             # SSH into PVE, stream disk -> PegaProx -> HTTP PUT to XCP-ng
             try:
                 pve_user = getattr(src_mgr.config, 'ssh_user', '') or 'root'
-                pve_pass = getattr(src_mgr.config, 'pass_', '')
+                pve_pass = ssh_password_for(src_mgr.config)
                 pve_key = getattr(src_mgr.config, 'ssh_key', '')
                 pve_port = int(getattr(src_mgr.config, 'ssh_port', 22))
 
@@ -1292,9 +1294,11 @@ def _run_pve_to_xcpng(task):
                 body = _StreamBody(stdout_stream, total,
                                    lambda n: task.update_progress(disk_key, n, total))
 
-                resp = _req.put(import_url, data=body, verify=ssl_verify,
-                                headers={'Content-Type': 'application/octet-stream'},
-                                timeout=7200)
+                # an upload into the pool: the guard of an automatic group asks first and
+                # once its connection is up (#625)
+                resp = ha_transport.http('PUT', import_url, data=body, verify=ssl_verify,
+                                         headers={'Content-Type': 'application/octet-stream'},
+                                         timeout=7200)
                 copied = body._read
 
                 # read stderr in case dd had warnings
@@ -1494,9 +1498,19 @@ def _run_pve_to_xcpng(task):
         # cleanup source
         if task.remove_source:
             try:
-                _pve_node_exec(src_mgr, task.source_node,
-                               f"qm destroy {task.source_vmid} --purge", timeout=120)
-                task.log("Source VM destroyed on Proxmox")
+                # NS Oct 2026 (#1079) - hours can pass since planning, and a VMID freed in
+                # the meantime may already belong to somebody else's new guest. Destroy only
+                # the guest that was copied.
+                now = src_mgr.get_vm_config(task.source_node, int(task.source_vmid), 'qemu')
+                now_cfg = now.get('config', {}) if now.get('success') else None
+                now_raw = now_cfg.get('raw', now_cfg) if now_cfg is not None else None
+                if now_raw is None or _pve_guest_identity(now_raw) != source_identity:
+                    task.log(f"Source VM {task.source_vmid} is no longer the guest that was "
+                             f"copied - left in place, remove it by hand if needed")
+                else:
+                    _pve_node_exec(src_mgr, task.source_node,
+                                   f"qm destroy {task.source_vmid} --purge", timeout=120)
+                    task.log("Source VM destroyed on Proxmox")
             except Exception as e:
                 task.log(f"Source cleanup failed: {e}")
 
@@ -1520,6 +1534,15 @@ def _run_pve_to_xcpng(task):
 # ============================================================
 # helpers
 # ============================================================
+
+def _pve_guest_identity(raw):
+    """The config keys that tell a guest apart from a later one under the same VMID.
+
+    PVE generates smbios1 (uuid), vmgenid and meta (ctime) for every new guest, so a guest
+    created after the copy started differs in all three; name catches the rest."""
+    raw = raw if isinstance(raw, dict) else {}
+    return {k: raw.get(k) for k in ('smbios1', 'vmgenid', 'meta', 'name') if raw.get(k)}
+
 
 def _next_pve_vmid(pve_mgr):
     """Ask the target cluster for the next free VMID.
@@ -1577,9 +1600,13 @@ def _connect_ssh(host, user, password, key_path=None, port=22):
             persist_host_keys(client)
             try: client.get_transport().set_keepalive(30)  # #546: keep the channel alive through long disk transfers
             except Exception: pass
-            return client
+            return ha_transport.guard_client(client, host)
         except Exception as e:
             logger.debug(f"[SSH] key auth failed for {user}@{host}: {e}")
+
+    # '' from ssh_password_for (a token cluster, SSH off): offer sshd nothing at all
+    if not password:
+        raise Exception(f"no SSH password to offer {user}@{host} and no key that worked")
 
     # keyboard-interactive via Transport (some hosts require this)
     try:
@@ -1595,7 +1622,7 @@ def _connect_ssh(host, user, password, key_path=None, port=22):
             client._transport = transport
             try: transport.set_keepalive(30)  # #546: keep the channel alive through long disk transfers
             except Exception: pass
-            return client
+            return ha_transport.guard_client(client, host)
         transport.close()
     except Exception as e:
         logger.debug(f"[SSH] keyboard-interactive failed for {user}@{host}: {e}")
@@ -1612,7 +1639,7 @@ def _connect_ssh(host, user, password, key_path=None, port=22):
     persist_host_keys(client2)
     try: client2.get_transport().set_keepalive(30)  # #546: keep the channel alive through long disk transfers
     except Exception: pass
-    return client2
+    return ha_transport.guard_client(client2, host)
 
 
 def _ssh_cleanup(ssh, path):
@@ -1851,8 +1878,12 @@ def _run_esxi_to_pve(task):
         esxi_host = src_mgr.host
         esxi_user = getattr(src_mgr.config, 'ssh_user', 'root')
         esxi_pass = getattr(src_mgr.config, 'pass_', '')
+        # goes into the sshfs and scp command lines on the PVE node
+        if not validate_ssh_user(esxi_user):
+            task.set_phase('failed', 'The SSH user of the ESXi source is not a valid user name')
+            return
         pve_user = getattr(tgt_mgr.config, 'ssh_user', '') or 'root'
-        pve_pass = getattr(tgt_mgr.config, 'pass_', '')
+        pve_pass = ssh_password_for(tgt_mgr.config)
         pve_key = getattr(tgt_mgr.config, 'ssh_key', '')
         pve_port = int(getattr(tgt_mgr.config, 'ssh_port', 22))
 
@@ -2024,8 +2055,11 @@ def _run_esxi_to_pve(task):
                     p_out.channel.recv_exit_status()
                     dev_path = p_out.read().decode().strip()
 
-                    # qemu-img convert vmdk -> raw directly to storage
-                    conv_cmd = f"qemu-img convert -f vmdk -O raw '{tmp_path}' '{dev_path}'"
+                    # qemu-img convert -> raw directly to storage. The file is the -flat
+                    # extent, raw data: read as raw. NS Oct 2026 (#1106) - with -f vmdk a
+                    # descriptor dropped on the datastore under that name was parsed as
+                    # root here and its extent paths followed
+                    conv_cmd = f"qemu-img convert -f raw -O raw '{tmp_path}' '{dev_path}'"
                     task.log(f"  Converting VMDK to raw...")
                     _, conv_out, conv_err = ssh_pve.exec_command(conv_cmd, timeout=7200)
                     conv_exit = conv_out.channel.recv_exit_status()
@@ -2071,7 +2105,7 @@ def _run_esxi_to_pve(task):
                 # convert from SSHFS mount directly to storage volume
                 # NS Jul 2026 (CodeAnt RCE) — shlex.quote both paths (defense-in-depth on top of
                 # the component validation above) instead of the naive single-quoting.
-                conv_cmd = f"qemu-img convert -p -f vmdk -O raw {_q_local(sshfs_vmdk)} {_q_local(dev_path)}"
+                conv_cmd = f"qemu-img convert -p -f raw -O raw {_q_local(sshfs_vmdk)} {_q_local(dev_path)}"  # #1106
                 task.log(f"  Converting via SSHFS → {vol_id}")
                 _, conv_out, conv_err = ssh_pve.exec_command(conv_cmd, timeout=7200)
                 conv_exit = conv_out.channel.recv_exit_status()
@@ -2168,7 +2202,6 @@ def _run_esxi_to_xcpng(task):
     Uses PegaProx server as relay since ESXi can't do qemu-img and XCP-ng
     can't mount ESXi datastores directly.
     """
-    import requests as _req
     import subprocess
 
     try:
@@ -2240,6 +2273,9 @@ def _run_esxi_to_xcpng(task):
         esxi_host = src_mgr.host
         esxi_user = getattr(src_mgr.config, 'ssh_user', 'root')
         esxi_pass = getattr(src_mgr.config, 'pass_', '')
+        if not validate_ssh_user(esxi_user):
+            task.set_phase('failed', 'The SSH user of the ESXi source is not a valid user name')
+            return
         created_vdis = []
 
         for idx, disk in enumerate(disks):
@@ -2262,6 +2298,13 @@ def _run_esxi_to_xcpng(task):
                 return
             datastore_name = ds_match.group(1)
             vmdk_rel_path = ds_match.group(2)
+            # NS Oct 2026 - same component check as the ESXi-to-PVE branch, before the VDI
+            # exists: no '..' or other non-name part reaches the scp path
+            from pegaprox.utils.sanitization import validate_esxi_path_component
+            _pcs = [datastore_name] + [c for c in vmdk_rel_path.split('/') if c]
+            if not all(validate_esxi_path_component(c) for c in _pcs):
+                task.set_phase('failed', f'Unsafe ESXi path component in VMDK path: {vmdk!r}')
+                return
             flat_path = vmdk_rel_path
             if flat_path.endswith('.vmdk') and '-flat.vmdk' not in flat_path:
                 flat_path = flat_path.replace('.vmdk', '-flat.vmdk')
@@ -2309,7 +2352,7 @@ def _run_esxi_to_xcpng(task):
                 scp_cmd = [
                     'sshpass', '-e',
                     'scp', '-o', f'StrictHostKeyChecking={_hkc}', '-o', f'UserKnownHostsFile={_kh}', '-o', 'HashKnownHosts=no',
-                    f'{esxi_user}@{esxi_host}:{_q_remote_path}',
+                    '--', f'{esxi_user}@{esxi_host}:{_q_remote_path}',
                     tmp_vmdk
                 ]
                 proc = subprocess.run(scp_cmd, capture_output=True, timeout=7200,
@@ -2318,10 +2361,11 @@ def _run_esxi_to_xcpng(task):
                     task.set_phase('failed', f'SCP failed: {proc.stderr.decode()[:200]}')
                     return
 
-                # convert VMDK -> raw
+                # the -flat extent is raw already; read it as raw so qemu-img on this
+                # host never treats a datastore file as a descriptor (#1106)
                 task.log(f"  Converting VMDK to raw...")
                 conv = subprocess.run(
-                    ['qemu-img', 'convert', '-f', 'vmdk', '-O', 'raw', tmp_vmdk, tmp_raw],
+                    ['qemu-img', 'convert', '-f', 'raw', '-O', 'raw', tmp_vmdk, tmp_raw],
                     capture_output=True, timeout=7200
                 )
                 os.remove(tmp_vmdk)  # free space
@@ -2337,9 +2381,9 @@ def _run_esxi_to_xcpng(task):
                 with open(tmp_raw, 'rb') as f:
                     body = _StreamBody(f, cap,
                                        lambda n: task.update_progress(disk_key, n, cap))
-                    resp = _req.put(import_url, data=body, verify=ssl_verify,
-                                    headers={'Content-Type': 'application/octet-stream'},
-                                    timeout=7200)
+                    resp = ha_transport.http('PUT', import_url, data=body, verify=ssl_verify,
+                                             headers={'Content-Type': 'application/octet-stream'},
+                                             timeout=7200)
                 os.remove(tmp_raw)
                 try:
                     os.rmdir(task.scratch)      # only when the last disk is done

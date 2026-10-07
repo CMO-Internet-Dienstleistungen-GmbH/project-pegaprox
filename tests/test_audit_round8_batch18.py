@@ -49,7 +49,7 @@ def _plain_operator(seed, name='ops'):
 
 # ── the sharpest one: rewriting the cluster's host redirects its stored credentials ──
 def test_scoped_caller_cannot_repoint_the_cluster_host(api, seed):
-    # host/user/ssl_verification/fallback_hosts are all in ALLOWED_CONFIG_FIELDS, and the manager
+    # host/ssl_verification/fallback_hosts are all in ALLOWED_CONFIG_FIELDS, and the manager
     # presents the STORED root password to config.host on the next auth — so this is credential
     # exfiltration, not just a config edit.
     u = _pool_scoped_tenant_admin(seed)

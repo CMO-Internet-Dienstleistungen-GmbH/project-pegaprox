@@ -72,12 +72,20 @@ def sanitize_bool(value, default: bool = False) -> bool:
     return default
 
 
+# MK Sep 2026 - every anchored validator below ends in \Z, not $. In Python `$` also
+# matches immediately BEFORE a trailing newline, so `re.match(r'^[a-z]+$', 'abc\n')` is a
+# match and every one of these accepted a value with a newline glued to the end. Two of
+# them gate values that reach a root shell on a PVE node unquoted, where a newline is a
+# command terminator, and one gates a path segment we hand to the PVE API. Nothing
+# legitimate here ever ends in a newline. \Z means the end of the string and only that.
+
+
 def validate_email(email: str) -> bool:
     """Validate email format"""
     if not email or not isinstance(email, str):
         return False
     # Simple regex - not perfect but catches most issues
-    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\Z'
     return bool(re.match(pattern, email))
 
 
@@ -86,9 +94,44 @@ def validate_hostname(hostname: str) -> bool:
     if not hostname or not isinstance(hostname, str):
         return False
     # Allow IP addresses and hostnames
-    ip_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
-    hostname_pattern = r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$'
+    ip_pattern = r'^(\d{1,3}\.){3}\d{1,3}\Z'
+    hostname_pattern = r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\Z'
     return bool(re.match(ip_pattern, hostname) or re.match(hostname_pattern, hostname))
+
+
+# NS Oct 2026 - an SSH login name goes onto the ssh/sshpass/scp command line and into
+# shell strings run on the nodes. Starting with '-' it is an OpenSSH option there
+# (-oProxyCommand=... runs a command on this host), so only what a POSIX login name
+# can be: letters, digits, '_', '.', '-', not starting with '-' or '.'.
+_SSH_USER_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,63}\Z')
+
+
+def validate_ssh_user(value) -> bool:
+    """True if `value` can be used as the remote login name of an SSH connection.
+    Empty is rejected; callers that mean "the default user" decide that first."""
+    if not value or not isinstance(value, str):
+        return False
+    return bool(_SSH_USER_RE.match(value))
+
+
+# a little wider than validate_hostname: '_' turns up in internal names
+_HOST_NAME_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_.\-]{0,252}\Z')
+
+
+def validate_host_address(value) -> bool:
+    """True for a host name, an IPv4 or an IPv6 address (bracketed or not) and nothing
+    else: no scheme, user, port, path, whitespace or leading '-'."""
+    import ipaddress
+    if not value or not isinstance(value, str):
+        return False
+    if _HOST_NAME_RE.match(value):
+        return True
+    bare = value[1:-1] if value.startswith('[') and value.endswith(']') else value
+    try:
+        ipaddress.ip_address(bare)
+        return True
+    except ValueError:
+        return False
 
 
 def validate_storage_name(storage) -> bool:
@@ -103,7 +146,7 @@ def validate_storage_name(storage) -> bool:
     if not storage or not isinstance(storage, str):
         return False
     # Must start with alphanumeric, 1-100 chars total, set: [A-Za-z0-9._-]
-    pattern = r'^[a-zA-Z0-9][a-zA-Z0-9_\-\.]{0,99}$'
+    pattern = r'^[a-zA-Z0-9][a-zA-Z0-9_\-\.]{0,99}\Z'
     return bool(re.match(pattern, storage))
 
 
@@ -114,7 +157,7 @@ def validate_storage_name(storage) -> bool:
 # low-priv storage.upload holder. A PVE ISO/vztmpl filename is a single path
 # component of [A-Za-z0-9._+-] (e.g. debian-12.iso, ubuntu_22.04-1_amd64.tar.zst) —
 # reject anything else (no '/', no spaces, no shell metachars) and fail closed.
-_CONTENT_FILENAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._+\-]{0,254}$')
+_CONTENT_FILENAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._+\-]{0,254}\Z')
 
 def validate_content_filename(value) -> bool:
     """True if `value` is a safe single ISO/template filename for the content-sync
@@ -130,7 +173,7 @@ def validate_content_filename(value) -> bool:
 # set in these; a single component never contains '/'. Anything with shell
 # metacharacters (; | & $ ` < > newlines quotes backslash) or a slash is an
 # injection attempt against the V2P shell pipeline — reject it hard, fail closed.
-_ESXI_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9 ._()+\-]{0,127}$')
+_ESXI_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9 ._()+\-]{0,127}\Z')
 
 def validate_esxi_path_component(value) -> bool:
     """True if `value` is a safe single ESXi datastore / directory name.
@@ -145,6 +188,17 @@ def validate_esxi_path_component(value) -> bool:
     return bool(_ESXI_NAME_RE.match(value))
 
 
+# NS Oct 2026 (#1090) - virtio_iso_path is loop-mounted by root on the PVE node. Any node
+# path was taken, so a disk image or another file could be mounted in the ISO's place.
+_NODE_ISO_PATH_RE = re.compile(r'/[A-Za-z0-9 ._()+\-/]{0,4090}\.iso\Z', re.IGNORECASE)
+
+def validate_node_iso_path(value) -> bool:
+    """True for an absolute path to an .iso file: no '..' part, no control characters."""
+    if not isinstance(value, str) or not _NODE_ISO_PATH_RE.match(value):
+        return False
+    return '..' not in value.split('/')
+
+
 # MK Sep 2026 (audit CRIT) — a snapshot name goes straight into the PVE API path
 # (.../{vmid}/snapshot/{snapname}), and the authz gate in front of those routes only ever
 # validates the vmid. So a name carrying dot-segments walked out of the guest the caller owns
@@ -153,7 +207,7 @@ def validate_esxi_path_component(value) -> bool:
 # copy of this check when the same bug was found there; the dashboard twins never got it, so
 # it lives here now and the sinks in manager.py enforce it for every caller.
 # PVE's own snapshot-name rule is [A-Za-z][A-Za-z0-9_-]*, so nothing legitimate is refused.
-_SNAPSHOT_NAME_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_\-]{0,62}$')
+_SNAPSHOT_NAME_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_\-]{0,62}\Z')
 
 
 def validate_snapshot_name(value) -> bool:
@@ -173,7 +227,7 @@ def validate_snapshot_name(value) -> bool:
 # time because the router will not pass a slash. Proxmox publishes the grammar itself
 # (pve-sdn-vnet-id is [a-zA-Z][a-zA-Z0-9]*[a-zA-Z0-9]); dash and underscore are allowed here
 # too so an id someone already created is not suddenly refused. A dot never is.
-_SDN_ID_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_\-]{0,62}$')
+_SDN_ID_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_\-]{0,62}\Z')
 
 
 def validate_sdn_id(value) -> bool:
@@ -289,6 +343,53 @@ _SECRET_PARAM_HINTS = ('token', 'key', 'secret', 'password', 'passwd', 'pwd',
                        'sig', 'signature', 'credential', 'auth')
 
 
+# Extra hints that only make sense for a MAPPING key, not for a URL query parameter.
+# `target-endpoint` is PVE's remote-migration field and carries a full-rights API token
+# inside its value; it matches none of the hints above, which is why folding the old
+# per-key redaction in core/manager.py into the shared rule needed this line. Keeping them
+# separate leaves redact_url()'s behaviour exactly as it was.
+_SECRET_KEY_EXTRA_HINTS = ('endpoint', 'apitoken', 'bindpw', 'passphrase', 'privatekey')
+
+
+def redact_secrets(mapping, _depth=0):
+    """Return a copy of a mapping with credential-bearing values replaced.
+
+    For the case where a handler wants to log a request body or a backend config
+    whole. The storage-create route did exactly that at DEBUG level, and for a PBS
+    or CIFS target that payload carries `password` verbatim — `--debug` is an
+    ordinary thing to be running. core/manager.py had already been bitten by this
+    once (a cleartext PVEAPIToken in a migration payload) and fixed it with a dict
+    comprehension for the single key it knew about, which is why the storage route
+    went on leaking: the fix was correct and reached one line.
+
+    Key names are matched case-insensitively as substrings against
+    _SECRET_PARAM_HINTS — the same list redact_url() applies to query parameters,
+    so adding a hint covers every caller — plus _SECRET_KEY_EXTRA_HINTS for the
+    field names that only ever appear as mapping keys. It over-matches slightly
+    (PVE's `keyboard` contains `key`), which is the right direction for a log
+    line. An empty or absent value is left alone so "not set" does not start
+    reading as "set". A matching key is redacted whatever it holds, including a
+    whole sub-mapping — `credentials: {...}` has already told you what is in
+    there, and walking in to publish it a leaf at a time because the leaf names
+    do not match would be the wrong way round. Sub-mappings under a NON-matching
+    key are walked; other values pass through, so this is not a deep sanitiser —
+    it is what you call instead of interpolating a dict into a format string. NS
+    """
+    if not isinstance(mapping, dict):
+        return mapping
+    if _depth > 4:
+        return '***TRUNCATED***'
+    out = {}
+    for k, v in mapping.items():
+        if any(h in str(k).lower() for h in _SECRET_PARAM_HINTS + _SECRET_KEY_EXTRA_HINTS):
+            out[k] = '***REDACTED***' if v not in (None, '') else v
+        elif isinstance(v, dict):
+            out[k] = redact_secrets(v, _depth + 1)
+        else:
+            out[k] = v
+    return out
+
+
 def redact_url(value):
     """Make a URL safe to write into a log line.
 
@@ -317,10 +418,19 @@ def redact_url(value):
         out += host
         path, sep, query = rest.partition('?')
         segments = [s for s in path.split('/') if s]
-        if segments:
-            out += '/' + segments[0]
-            if len(segments) > 1:
-                out += '/[REDACTED]'
+        if len(segments) > 1:
+            # The first segment of a multi-segment path is structural - 'services' on a
+            # Slack hook, 'api' on a Discord one - so keeping it says which endpoint
+            # failed without giving anything away.
+            out += '/' + segments[0] + '/[REDACTED]'
+        elif segments:
+            # MK Sep 2026 (follow-up) - a LONE segment is not structure, it is the whole
+            # path, and for an ntfy topic that path is the credential: anyone holding
+            # https://ntfy.sh/<topic> can publish to it and read it. The first version
+            # kept segments[0] unconditionally and printed such a URL verbatim, which is
+            # exactly the leak this function exists to stop. Nothing is learned from a
+            # single segment anyway - the host already says which service it was.
+            out += '/[REDACTED]'
         if sep:
             parts = []
             for pair in query.split('&'):
@@ -335,6 +445,28 @@ def redact_url(value):
     return re.sub(
         r'(https?)://(?:([^/@\s]+)@)?([A-Za-z0-9_.\-:\[\]]+)([^\s\'"<>]*)',
         _one, text)
+
+
+def redact_request_line(line):
+    """An access-log line with credential-looking query values blanked.
+
+    redact_url() wants a scheme and so never matches `POST /x?token=... HTTP/1.1`.
+    Some callers can only send a credential in the query string (an auto-installer
+    ISO too old for a header token), and the request line is logged at INFO."""
+    if not isinstance(line, str) or '?' not in line:
+        return line
+
+    def _query(m):
+        parts = []
+        for pair in m.group(1).split('&'):
+            name, eq, _val = pair.partition('=')
+            if eq and any(h in name.lower() for h in _SECRET_PARAM_HINTS):
+                parts.append(f'{name}=[REDACTED]')
+            else:
+                parts.append(pair)
+        return '?' + '&'.join(parts)
+
+    return re.sub(r'\?([^\s"#]*)', _query, line)
 
 
 class LogInjectionFilter(logging.Filter):
@@ -365,9 +497,73 @@ class LogInjectionFilter(logging.Filter):
 
 
 def install_log_injection_filter(logger=None):
-    """Attach the filter to a logger's handlers (root by default). Idempotent."""
+    """Attach the filter to a logger's handlers (root by default). Idempotent.
+
+    Covers only the handlers that exist WHEN IT RUNS - see
+    install_log_record_sanitizer() for why that was not enough.
+    """
     target = logger if logger is not None else logging.getLogger()
     for handler in target.handlers:
         if not any(isinstance(f, LogInjectionFilter) for f in handler.filters):
             handler.addFilter(LogInjectionFilter())
     return target
+
+
+_RECORD_FACTORY_INSTALLED = False
+
+
+def install_log_record_sanitizer():
+    """Neutralise control characters when the record is BUILT, not when it is handled.
+
+    MK Sep 2026 (follow-up) - the handler filter above was meant to be "at the sink
+    instead of at seventy-five call sites", and it missed a sink. A logging Filter lives
+    on a HANDLER, and install_log_injection_filter() walks the handlers that exist at the
+    moment it runs. core/manager.py and core/xcpng.py give every cluster its own logger
+    with its own file and console handler, added when that cluster is constructed - long
+    after startup. Those handlers carry no filter, and a cluster logger emits through its
+    own handlers BEFORE propagating to root, so the per-cluster log file got the raw line
+    while the main log got the clean one. Measured, not assumed: a VM rename containing
+    CR/LF produced a forged, correctly-timestamped line in the cluster file.
+
+    The record factory runs once per record, before any handler or propagation, so it
+    covers every logger in the process including ones added later. Chains whatever
+    factory is already installed rather than replacing it, and is idempotent.
+
+    Same deliberate scope as the filter: `msg` and `args` only. A traceback arrives via
+    exc_info and is rendered by the formatter, so it keeps its newlines.
+    """
+    global _RECORD_FACTORY_INSTALLED
+    if _RECORD_FACTORY_INSTALLED:
+        return
+    previous = logging.getLogRecordFactory()
+
+    def _sanitising_factory(*args, **kwargs):
+        record = previous(*args, **kwargs)
+        if isinstance(record.msg, str):
+            record.msg = sanitize_log_message(record.msg)
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {k: (sanitize_log_message(v) if isinstance(v, str) else v)
+                               for k, v in record.args.items()}
+            elif isinstance(record.args, tuple):
+                record.args = tuple(sanitize_log_message(a) if isinstance(a, str) else a
+                                    for a in record.args)
+
+        # MK Sep 2026 (follow-up) - sanitising msg and args covers str values and nothing
+        # else, and the most common thing we log is not a str: `logging.error("...: %s", e)`
+        # passes the EXCEPTION, and str(e) carries whatever a remote server put in its error
+        # text. Measured: that forged a line straight through both this factory and the
+        # handler filter. Rendering is the one place where msg and args become text
+        # regardless of their types, so clean the rendered result too. It happens after %
+        # formatting, so a %d with an int still formats as an int; exc_info is appended by
+        # the formatter afterwards, so tracebacks keep their newlines.
+        _render = record.getMessage
+
+        def _clean_render(_r=_render):
+            return sanitize_log_message(_r())
+
+        record.getMessage = _clean_render
+        return record
+
+    logging.setLogRecordFactory(_sanitising_factory)
+    _RECORD_FACTORY_INSTALLED = True

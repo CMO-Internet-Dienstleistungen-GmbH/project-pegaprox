@@ -137,3 +137,27 @@ def test_tenant_and_permissions_from_a_custom_mapping_still_apply():
     assert out['role'] == CUSTOM_ROLE
     assert out['tenant'] == 'lab-waw'
     assert 'vm.create' in out['permissions']
+
+
+# #962 - Graph lists some groups with "displayName": null (and an id can come back null on
+# odd tenants). dict.get(k, '') only covers a missing key, so the .lower() on None made the
+# whole callback answer 500 and the user never got in.
+
+def test_a_group_whose_name_is_null_does_not_break_the_login():
+    cfg = _cfg(admin_group_id=ADMINS)
+    groups = [{'id': ADMINS, 'name': None}, {'id': LAB, 'name': 'lab'}]
+    assert oidc_map_groups_to_role(cfg, groups)['role'] == ROLE_ADMIN
+
+
+def test_a_group_whose_id_is_null_still_maps_by_the_others():
+    cfg = _cfg(group_mappings=[{'group_id': LAB, 'role': CUSTOM_ROLE}])
+    groups = [{'id': None, 'name': None}, {'id': LAB, 'name': None}]
+    assert oidc_map_groups_to_role(cfg, groups)['role'] == CUSTOM_ROLE
+
+
+def test_null_entries_do_not_match_a_mapping_by_accident():
+    """A group with nothing in it must not add an empty identifier a mapping could meet."""
+    cfg = _cfg(default_role=ROLE_VIEWER,
+               group_mappings=[{'group_id': LAB, 'role': ROLE_USER}])
+    out = oidc_map_groups_to_role(cfg, [{'id': None, 'name': None}, {}])
+    assert out['role'] == ROLE_VIEWER

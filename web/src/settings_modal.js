@@ -20,6 +20,8 @@
             vmware:        { order: 150, title: 'ESXi',       icon: '📡' },
             xapi:          { order: 160, title: 'XCP-ng',               icon: '🔶' },
             plugins:       { order: 170, title: 'Plugins',              icon: '🧩' },
+            autoinstall:   { order: 175, title: 'Automated Installs',   icon: '💿' },
+            metrics:       { order: 180, title: 'Telemetry',            icon: '📈' },
             admin:         { order: 999, title: 'Administration',       icon: '⚙️' },
         };
 
@@ -105,6 +107,16 @@
                                                     <div className="flex-1 min-w-0">
                                                         <div className="font-medium leading-tight">{p.description || p.permission}</div>
                                                         <div className="text-[10px] text-gray-500 font-mono truncate" title={p.permission}>{p.permission}</div>
+                                                        {/* MK Sep 2026 (#818) - a permission whose reach is wider than its
+                                                            name suggests says so here, where somebody is about to tick it.
+                                                            metrics.view and the two autoinstall ones carry one; the server
+                                                            sends '' for the rest, so nothing else grows a line. */}
+                                                        {p.warning && (
+                                                            <div className="mt-1 flex items-start gap-1 text-[10px] leading-snug text-yellow-400/90">
+                                                                <Icons.AlertTriangle className="w-3 h-3 flex-shrink-0 mt-px" />
+                                                                <span>{p.warning}</span>
+                                                            </div>
+                                                        )}
                                                     </div>
                                                 </label>
                                             ))}
@@ -565,6 +577,2118 @@
             );
         }
 
+
+        // LW Sep 2026 - Automated installations. PegaProx serves answer files to the
+        // Proxmox auto-installer and lists the machines that fetched one. The server
+        // hands the token out once, so the reveal box carries the finished prepare-iso
+        // command rather than the bare token.
+        const AUTOINSTALL_TEMPLATE = [
+            '[global]',
+            'keyboard = "de"',
+            'country = "de"',
+            'fqdn = "pve01.example.com"',
+            'mailto = "root@example.com"',
+            'timezone = "Europe/Berlin"',
+            '# the hash button above the editor writes this line (or: mkpasswd -m sha-512)',
+            'root-password-hashed = "$6$...replace me..."',
+            '',
+            '[network]',
+            'source = "from-dhcp"',
+            '',
+            '[disk-setup]',
+            'filesystem = "ext4"',
+            'disk-list = ["sda"]',
+            ''
+        ].join('\n');
+
+        // What the installer itself accepts. These mirror the checks in
+        // pegaprox/api/auto_install.py (keep them in step - the patterns below are the
+        // same regexes); the server repeats all of it, this only saves a round trip.
+        const AUTOINSTALL_KEYBOARDS = [
+            ['de', 'German'], ['de-ch', 'Swiss-German'], ['dk', 'Danish'], ['en-gb', 'United Kingdom'],
+            ['en-us', 'U.S. English'], ['es', 'Spanish'], ['fi', 'Finnish'], ['fr', 'French'],
+            ['fr-be', 'Belgium-French'], ['fr-ca', 'Canada-French'], ['fr-ch', 'Swiss-French'],
+            ['hu', 'Hungarian'], ['is', 'Icelandic'], ['it', 'Italian'], ['jp', 'Japanese'],
+            ['lt', 'Lithuanian'], ['mk', 'Macedonian'], ['nl', 'Dutch'], ['no', 'Norwegian'],
+            ['pl', 'Polish'], ['pt', 'Portuguese'], ['pt-br', 'Portuguese (Brazil)'], ['se', 'Swedish'],
+            ['si', 'Slovenian'], ['tr', 'Turkish']
+        ];
+        // ISO 3166-1 alpha-2, lowercase like the installer wants it
+        const AUTOINSTALL_COUNTRIES = (
+            'ad ae af ag ai al am ao aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bl bm bn bo bq br bs bt ' +
+            'bv bw by bz ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg eh ' +
+            'er es et fi fj fk fm fo fr ga gb gd ge gf gg gh gi gl gm gn gp gq gr gs gt gu gw gy hk hm hn hr ht ' +
+            'hu id ie il im in io iq ir is it je jm jo jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls ' +
+            'lt lu lv ly ma mc md me mf mg mh mk ml mm mn mo mp mq mr ms mt mu mv mw mx my mz na nc ne nf ng ni ' +
+            'nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro rs ru rw sa sb sc sd se sg ' +
+            'sh si sj sk sl sm sn so sr ss st sv sx sy sz tc td tf tg th tj tk tl tm tn to tr tt tv tw tz ua ug ' +
+            'um us uy uz va vc ve vg vi vn vu wf ws ye yt za zm zw'
+        ).split(' ');
+        // minimum disk count per level, same table as the backend
+        const AUTOINSTALL_RAID_MIN = {
+            zfs: { raid0: 1, raid1: 2, raid10: 4, 'raidz-1': 3, 'raidz-2': 4, 'raidz-3': 5 },
+            btrfs: { raid0: 1, raid1: 2, raid10: 4 }
+        };
+        const AUTOINSTALL_DISK_KEYS = ['ID_SERIAL', 'ID_SERIAL_SHORT', 'ID_WWN', 'ID_MODEL', 'DEVNAME'];
+        // sha-512, sha-256, yescrypt, bcrypt. The charset also keeps ':' and newlines
+        // out, which would break the chpasswd line the installer writes.
+        const AUTOINSTALL_CRYPT_RE = [
+            /^\$6\$(rounds=[0-9]{1,9}\$)?[./0-9A-Za-z]{0,16}\$[./0-9A-Za-z]{86}$/,
+            /^\$5\$(rounds=[0-9]{1,9}\$)?[./0-9A-Za-z]{0,16}\$[./0-9A-Za-z]{43}$/,
+            /^\$y\$[./0-9A-Za-z]+\$[./0-9A-Za-z]{1,86}\$[./0-9A-Za-z]{43}$/,
+            /^\$2[aby]\$[0-9]{2}\$[./0-9A-Za-z]{53}$/
+        ];
+        const AUTOINSTALL_CTRL_RE = /[\x00-\x1f\x7f]/;
+        const AUTOINSTALL_SSH_KEY_RE = /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+={0,3}( [^\x00-\x1f\x7f]*)?$/;
+        const AUTOINSTALL_GLOB_RE = /^[A-Za-z0-9_.:+\-\/*?\[\]!]{1,128}$/;
+        const AUTOINSTALL_DISK_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.:\-\/]{0,63}$/;
+        // disk-list wants the installer's raw names; a by-id path never matches (_is_disk_path)
+        const aiDiskNameOk = (n) => AUTOINSTALL_DISK_NAME_RE.test(n) && !n.startsWith('disk/');
+
+        const aiCryptOk = (v) => AUTOINSTALL_CRYPT_RE.some(re => re.test(v || ''));
+
+        // returns a translation key, '' when fine. domainOnly = the DHCP fallback domain
+        function aiFqdnError(v, domainOnly) {
+            const s = String(v || '');
+            if (s.length > 253) return 'autoInstallErrFqdnLong';
+            const labels = s.split('.');
+            if (!domainOnly && labels.length < 2) return 'autoInstallErrFqdnDomain';
+            if (labels.some(l => !/^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(l))) return 'autoInstallErrFqdnLabel';
+            if (!domainOnly && /^[0-9]+$/.test(labels[0])) return 'autoInstallErrFqdnDigits';
+            return '';
+        }
+
+        const aiIpv4 = (v) => /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/.test(v);
+        // 4, 6 or 0. The URL parser is the cheapest full IPv6 check a browser has.
+        function aiIpFamily(v) {
+            const s = String(v || '');
+            if (aiIpv4(s)) return 4;
+            if (!s.includes(':') || !/^[0-9A-Fa-f:.]+$/.test(s)) return 0;
+            try { new URL(`http://[${s}]/`); return 6; } catch (e) { return 0; }
+        }
+
+        function aiCidrError(v) {
+            const m = String(v || '').match(/^([^/\s]+)\/(\d{1,3})$/);
+            if (!m) return 'autoInstallErrCidr';
+            const fam = aiIpFamily(m[1]);
+            const max = fam === 4 ? 32 : (fam === 6 ? 128 : -1);
+            if (max < 0 || Number(m[2]) > max || (m[2].length > 1 && m[2][0] === '0')) return 'autoInstallErrCidr';
+            return '';
+        }
+
+        // bit string of an address, only used for the gateway-in-subnet hint
+        function aiIpBits(v) {
+            if (aiIpv4(v)) return v.split('.').map(o => Number(o).toString(2).padStart(8, '0')).join('');
+            const h = new URL(`http://[${v}]/`).hostname.slice(1, -1);
+            const [head, tail] = h.split('::');
+            const a = head ? head.split(':') : [];
+            const b = tail ? tail.split(':') : [];
+            const groups = tail === undefined ? a : a.concat(Array(8 - a.length - b.length).fill('0'), b);
+            return groups.map(g => parseInt(g, 16).toString(2).padStart(16, '0')).join('');
+        }
+        const aiSameNet = (cidr, ip) => {
+            try {
+                const [addr, pfx] = cidr.split('/');
+                const n = Number(pfx);
+                return aiIpBits(addr).slice(0, n) === aiIpBits(ip).slice(0, n);
+            } catch (e) { return true; }
+        };
+
+        // the HTML5 type=email pattern, which is what the installer checks against
+        const aiMailOk = (v) => /^[a-zA-Z0-9.!#$%&'*+\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/.test(v || '')
+            && v !== 'mail@example.invalid';
+        // the installer only knows its own zone table plus the literal UTC, so Etc/UTC fails at the rack
+        const aiTimezoneOk = (v) => /^[A-Za-z][A-Za-z0-9_+\-]*(?:\/[A-Za-z0-9_+\-]+){0,2}$/.test(v || '') && !v.startsWith('Etc/');
+
+        // datetime-local speaks browser time, the server stores UTC
+        const utcToLocalInput = (iso) => {
+            if (!iso) return '';
+            const d = new Date(iso);
+            if (isNaN(d.getTime())) return '';
+            const pad = (n) => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        };
+        const localInputToUtc = (v) => {
+            if (!v) return '';
+            const d = new Date(v);
+            return isNaN(d.getTime()) ? v : d.toISOString();
+        };
+
+        function autoInstallPrepareCmd(token, fp) {
+            const answerUrl = `${window.location.origin}/api/auto-install/answer`;
+            return [
+                'proxmox-auto-install-assistant prepare-iso proxmox-ve.iso',
+                '    --fetch-from http',
+                `    --url '${answerUrl}'`,
+                `    --answer-auth-token 'pegaprox:${token}'`
+            ].concat(fp ? [`    --cert-fingerprint '${fp}'`] : []).join(' \\\n');
+        }
+
+        // Drops every root password line in [global] and puts the hash right under the
+        // header. Deliberately line based, a TOML round trip would eat the user's comments.
+        function aiSetRootHash(answer, hash) {
+            const line = `root-password-hashed = "${hash}"`;
+            const out = [];
+            let inGlobal = false, at = -1;
+            for (const raw of String(answer || '').split('\n')) {
+                const s = raw.trim();
+                if (s.startsWith('[')) {
+                    inGlobal = /^\[\s*global\s*\]/.test(s);
+                    out.push(raw);
+                    if (inGlobal && at < 0) at = out.length;
+                    continue;
+                }
+                if (inGlobal && /^root[-_]password([-_]hashed)?\s*=/.test(s)) continue;
+                out.push(raw);
+            }
+            if (at < 0) return `[global]\n${line}\n\n` + out.join('\n');
+            out.splice(at, 0, line);
+            return out.join('\n');
+        }
+
+        // The one-time token plus the finished prepare-iso command. Shared by the
+        // editor's reveal box and the wizard's last page so both print the same thing.
+        // CopyButton has the textarea fallback, so this also copies over plain http.
+        function AutoInstallTokenBox({ t, reveal, onCopied, onDismiss }) {
+            const cmd = autoInstallPrepareCmd(reveal.token, reveal.fp);
+            const copyBtn = (value) => (
+                <span className="shrink-0 inline-flex" onClickCapture={() => onCopied && onCopied()}>
+                    <CopyButton value={value} size="md" title={t('copy')}
+                        className="w-8 h-8 border border-proxmox-border hover:border-gray-500" />
+                </span>
+            );
+            return (
+                <div className="bg-yellow-500/10 border border-yellow-500/40 rounded-xl p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                        <h4 className="font-medium text-yellow-200 flex items-center gap-2">
+                            <Icons.Key className="w-4 h-4" />
+                            {t('autoInstallTokenOnce')}
+                        </h4>
+                        {onDismiss && (
+                            <button onClick={onDismiss} aria-label={t('close')} className="text-gray-400 hover:text-white">
+                                <Icons.X />
+                            </button>
+                        )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                        <code className="flex-1 px-3 py-2 bg-black/40 rounded text-sm text-yellow-200 break-all">{reveal.token}</code>
+                        {copyBtn(reveal.token)}
+                    </div>
+                    <div>
+                        <div className="text-xs text-gray-400 mb-1">{t('autoInstallPrepareIso')}</div>
+                        <div className="flex items-start gap-2">
+                            <pre className="flex-1 px-3 py-2 bg-black/40 rounded text-xs text-gray-200 overflow-x-auto whitespace-pre">{cmd}</pre>
+                            {copyBtn(cmd)}
+                        </div>
+                        <div className="text-[11px] text-gray-500 mt-1">{t('autoInstallOldIsoHint')}</div>
+                    </div>
+                </div>
+            );
+        }
+
+        function AutoInstallPanel({ t, addToast, getAuthHeaders, clusters, heading = true, intent, onIntentConsumed }) {
+            const [profiles, setProfiles] = useState([]);
+            const [canManage, setCanManage] = useState(false);
+            const [runs, setRuns] = useState([]);
+            const [loading, setLoading] = useState(false);
+            const [loadError, setLoadError] = useState('');
+            const [editing, setEditing] = useState(null);
+            const [check, setCheck] = useState(null);      // {valid, errors, warnings}
+            const [reveal, setReveal] = useState(null);    // {token, name, fp}, shown once
+            const [busy, setBusy] = useState(false);
+            const [loaded, setLoaded] = useState(false);
+            const [wizardOpen, setWizardOpen] = useState(false);
+            const [wizardPreset, setWizardPreset] = useState(null);
+            const [hashOpen, setHashOpen] = useState(false);
+            const [hashPw, setHashPw] = useState('');
+            const [hashPw2, setHashPw2] = useState('');
+            const [hashMsg, setHashMsg] = useState(null);  // {ok, text}
+
+            const load = async () => {
+                setLoading(true);
+                try {
+                    const [p, r] = await Promise.all([
+                        fetch(`${API_URL}/auto-install/profiles`, { credentials: 'include', headers: getAuthHeaders() }),
+                        fetch(`${API_URL}/auto-install/runs`, { credentials: 'include', headers: getAuthHeaders() })
+                    ]);
+                    if (p.ok) {
+                        const data = await p.json();
+                        setProfiles(data.profiles || []);
+                        setCanManage(!!data.can_manage);
+                        setLoadError('');
+                    } else {
+                        // a 403 here is not "no profiles yet" - saying so invites
+                        // somebody to create duplicates of what already exists
+                        const e = await p.json().catch(() => ({}));
+                        setLoadError(e.error || t('autoInstallLoadFailed'));
+                    }
+                    if (r.ok) setRuns(await r.json());
+                } catch (e) {
+                    setLoadError(t('autoInstallLoadFailed'));
+                }
+                setLoading(false);
+                setLoaded(true);
+            };
+            useEffect(() => { load(); }, []);
+
+            // poll while something is installing; an install takes minutes
+            useEffect(() => {
+                if (!runs.some(r => r.status === 'installing')) return;
+                const h = setInterval(load, 15000);
+                return () => clearInterval(h);
+            }, [runs]);
+
+            // a shortcut elsewhere asked for the wizard. Wait for the first load, a
+            // view-only reader just lands on the page.
+            useEffect(() => {
+                if (!intent || !loaded) return;
+                if (intent.wizard && canManage) {
+                    setWizardPreset({ target_cluster_id: intent.target_cluster_id || '' });
+                    setWizardOpen(true);
+                }
+                onIntentConsumed?.();
+            }, [intent, loaded, canManage]);
+
+            const openWizard = () => { setWizardPreset(null); setWizardOpen(true); };
+
+            // a typed password must not outlive the form it was typed into
+            const editingKey = editing ? (editing.id || 'new') : '';
+            useEffect(() => {
+                setHashOpen(false); setHashPw(''); setHashPw2(''); setHashMsg(null);
+            }, [editingKey]);
+
+            // wizard -> editor. expires_local, not expires_at: the form reads the local one
+            const openInEditor = (d, res) => {
+                setWizardOpen(false);
+                setReveal(null);
+                setCheck(res ? { valid: !!res.valid, errors: res.errors || [], warnings: res.warnings || [] } : null);
+                setEditing({ id: null, name: d.name || '', description: d.description || '',
+                             answer: (res && res.answer) || AUTOINSTALL_TEMPLATE,
+                             target_cluster_id: d.target_cluster_id || '', callback_url: d.callback_url || '',
+                             max_uses: d.max_uses || 0, expires_local: d.expires_local || '',
+                             enabled: d.enabled !== false });
+            };
+
+            const hashIntoAnswer = async () => {
+                setHashMsg(null);
+                const bytes = new TextEncoder().encode(hashPw).length;
+                if (hashPw.length < 8 || hashPw.length > 64 || bytes < 8 || AUTOINSTALL_CTRL_RE.test(hashPw)) {
+                    setHashMsg({ ok: false, text: t('autoInstallErrPwLength') });
+                    return;
+                }
+                if (hashPw !== hashPw2) {
+                    setHashMsg({ ok: false, text: t('passwordsDoNotMatch') });
+                    return;
+                }
+                setBusy(true);
+                try {
+                    const r = await fetch(`${API_URL}/auto-install/password-hash`, {
+                        method: 'POST', credentials: 'include',
+                        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ password: hashPw })
+                    });
+                    const data = await r.json().catch(() => ({}));
+                    if (r.ok && aiCryptOk(data.hash)) {
+                        setEditing(ed => ed && ({ ...ed, answer: aiSetRootHash(ed.answer, data.hash) }));
+                        setCheck(null);
+                        setHashPw(''); setHashPw2('');
+                        setHashMsg({ ok: true, text: t('autoInstallHashInserted') });
+                    } else {
+                        setHashMsg({ ok: false, text: data.error || t('autoInstallHashFailed') });
+                    }
+                } catch (e) {
+                    setHashMsg({ ok: false, text: t('autoInstallHashFailed') });
+                }
+                setBusy(false);
+            };
+
+            const startNew = () => {
+                setCheck(null);
+                setEditing({ id: null, name: '', description: '', answer: AUTOINSTALL_TEMPLATE,
+                             target_cluster_id: '', callback_url: '', max_uses: 0,
+                             expires_at: '', enabled: true });
+            };
+
+            const openProfile = async (p, readOnly) => {
+                setCheck(null);
+                try {
+                    const r = await fetch(`${API_URL}/auto-install/profiles/${p.id}`,
+                                          { credentials: 'include', headers: getAuthHeaders() });
+                    const data = await r.json().catch(() => ({}));
+                    if (!r.ok) {
+                        addToast?.(data.error || t('autoInstallLoadFailed'), 'error');
+                        return;
+                    }
+                    setEditing({ ...data, readOnly: !!readOnly,
+                                 expires_local: utcToLocalInput(data.expires_at) });
+                } catch (e) {
+                    addToast?.(e.message || t('autoInstallLoadFailed'), 'error');
+                }
+            };
+
+            const validate = async () => {
+                try {
+                    const r = await fetch(`${API_URL}/auto-install/validate`, {
+                        method: 'POST', credentials: 'include',
+                        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ answer: editing.answer })
+                    });
+                    if (r.ok) setCheck(await r.json());
+                } catch (e) { addToast?.(e.message, 'error'); }
+            };
+
+            const save = async () => {
+                setBusy(true);
+                const isNew = !editing.id;
+                const body = {
+                    name: editing.name, description: editing.description,
+                    target_cluster_id: editing.target_cluster_id,
+                    callback_url: editing.callback_url,
+                    max_uses: Number(editing.max_uses) || 0,
+                    expires_at: localInputToUtc(editing.expires_local || ''),
+                    enabled: !!editing.enabled
+                };
+                // a blanked file came back from the server; sending it would write
+                // "********" over the real root password
+                if (!editing.answer_redacted) body.answer = editing.answer;
+                try {
+                    const r = await fetch(
+                        isNew ? `${API_URL}/auto-install/profiles` : `${API_URL}/auto-install/profiles/${editing.id}`,
+                        { method: isNew ? 'POST' : 'PUT', credentials: 'include',
+                          headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                          body: JSON.stringify(body) });
+                    const data = await r.json().catch(() => ({}));
+                    if (r.ok) {
+                        if (data.token) setReveal({ token: data.token, name: data.name, fp: data.fetch_fingerprint || '' });
+                        setEditing(null); setCheck(null); load();
+                        addToast?.(t('autoInstallSaved'), 'success');
+                    } else {
+                        addToast?.(data.error || t('autoInstallSaveFailed'), 'error');
+                    }
+                } catch (e) { addToast?.(e.message || t('autoInstallSaveFailed'), 'error'); }
+                setBusy(false);
+            };
+
+            const rotate = async (p) => {
+                if (!window.confirm(t('autoInstallRotateConfirm'))) return;
+                try {
+                    const r = await fetch(`${API_URL}/auto-install/profiles/${p.id}/token`,
+                                          { method: 'POST', credentials: 'include', headers: getAuthHeaders() });
+                    const data = await r.json().catch(() => ({}));
+                    if (r.ok) { setReveal({ token: data.token, name: p.name, fp: data.fetch_fingerprint || '' }); load(); }
+                    else addToast?.(data.error || t('autoInstallRotateFailed'), 'error');
+                } catch (e) { addToast?.(e.message || t('autoInstallRotateFailed'), 'error'); }
+            };
+
+            const remove = async (p) => {
+                if (!window.confirm(`${t('autoInstallDeleteConfirm')} "${p.name}"?`)) return;
+                try {
+                    const r = await fetch(`${API_URL}/auto-install/profiles/${p.id}`,
+                                          { method: 'DELETE', credentials: 'include', headers: getAuthHeaders() });
+                    if (r.ok) { addToast?.(t('autoInstallDeleted'), 'success'); load(); }
+                    else {
+                        const e = await r.json().catch(() => ({}));
+                        addToast?.(e.error || t('autoInstallDeleteFailed'), 'error');
+                    }
+                } catch (e) { addToast?.(e.message || t('autoInstallDeleteFailed'), 'error'); }
+            };
+
+            const clearRun = async (run) => {
+                try {
+                    const r = await fetch(`${API_URL}/auto-install/runs/${run.id}`,
+                                          { method: 'DELETE', credentials: 'include', headers: getAuthHeaders() });
+                    if (r.ok) load();
+                    else addToast?.(t('autoInstallDeleteFailed'), 'error');
+                } catch (e) { addToast?.(e.message || t('autoInstallDeleteFailed'), 'error'); }
+            };
+
+            const STATUS_STYLE = {
+                installing: 'bg-blue-500/20 text-blue-300 border-blue-500/40',
+                installed: 'bg-green-500/20 text-green-300 border-green-500/30',
+                failed: 'bg-red-500/20 text-red-300 border-red-500/30'
+            };
+            const statusLabel = (s) => ({
+                installing: t('autoInstallStatusInstalling'),
+                installed: t('autoInstallStatusInstalled'),
+                failed: t('autoInstallStatusFailed')
+            }[s] || s);
+
+            const when = (iso) => {
+                if (!iso) return '-';
+                const d = new Date(iso);
+                return isNaN(d.getTime()) ? iso : d.toLocaleString();
+            };
+
+            const readOnly = !!(editing && editing.readOnly);
+
+            return (
+                <div className="space-y-4">
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                        <div>
+                            {heading && (
+                                <h3 className="text-lg font-semibold text-white flex items-center gap-2 mb-1">
+                                    <Icons.Disc className="w-5 h-5" />
+                                    {t('autoInstall')}
+                                </h3>
+                            )}
+                            <p className="text-sm text-gray-400 max-w-3xl">{t('autoInstallIntro')}</p>
+                        </div>
+                        {canManage && (
+                            <div className="flex flex-wrap items-center gap-2">
+                                <button onClick={openWizard}
+                                    className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-proxmox-orange/90 rounded-lg text-sm font-medium transition-colors whitespace-nowrap">
+                                    <Icons.Plus />
+                                    {t('autoInstallGuided')}
+                                </button>
+                                <button onClick={startNew}
+                                    className="flex items-center gap-2 px-4 py-2 bg-proxmox-card border border-proxmox-border rounded-lg text-sm text-gray-300 hover:border-gray-500 whitespace-nowrap">
+                                    <Icons.FileText />
+                                    {t('autoInstallEditor')}
+                                </button>
+                            </div>
+                        )}
+                    </div>
+
+                    {loadError && (
+                        <div className="rounded-lg p-3 text-sm border bg-red-500/10 border-red-500/30 text-red-300 flex items-center gap-2">
+                            <Icons.AlertTriangle className="w-4 h-4" />
+                            {loadError}
+                        </div>
+                    )}
+
+                    {reveal && <AutoInstallTokenBox t={t} reveal={reveal} onDismiss={() => setReveal(null)} />}
+
+                    {editing && (
+                        <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4 space-y-3">
+                            <h4 className="font-medium text-white">
+                                {readOnly ? editing.name : (editing.id ? t('autoInstallEditProfile') : t('autoInstallNewProfile'))}
+                            </h4>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1">{t('name')}</label>
+                                    <input value={editing.name} disabled={readOnly} onChange={e => setEditing({ ...editing, name: e.target.value })}
+                                        className="w-full px-3 py-2 bg-proxmox-card border border-proxmox-border rounded text-sm text-white disabled:opacity-50" />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1">{t('description')}</label>
+                                    <input value={editing.description || ''} disabled={readOnly} onChange={e => setEditing({ ...editing, description: e.target.value })}
+                                        className="w-full px-3 py-2 bg-proxmox-card border border-proxmox-border rounded text-sm text-white disabled:opacity-50" />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1">{t('autoInstallTargetCluster')}</label>
+                                    <select value={editing.target_cluster_id || ''} disabled={readOnly} onChange={e => setEditing({ ...editing, target_cluster_id: e.target.value })}
+                                        className="w-full px-3 py-2 bg-proxmox-card border border-proxmox-border rounded text-sm text-white disabled:opacity-50">
+                                        <option value="">-</option>
+                                        {(clusters || []).map(c => <option key={c.id} value={c.id}>{c.name || c.id}</option>)}
+                                    </select>
+                                </div>
+                                <div className="grid grid-cols-2 gap-3">
+                                    <div>
+                                        <label className="block text-xs text-gray-400 mb-1">{t('autoInstallMaxUses')}</label>
+                                        <input type="number" min="0" value={editing.max_uses || 0} disabled={readOnly}
+                                            onChange={e => setEditing({ ...editing, max_uses: e.target.value })}
+                                            className="w-full px-3 py-2 bg-proxmox-card border border-proxmox-border rounded text-sm text-white disabled:opacity-50" />
+                                        <div className="text-[11px] text-gray-500 mt-1">{t('autoInstallUnlimited')}</div>
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs text-gray-400 mb-1">{t('autoInstallExpires')}</label>
+                                        <input type="datetime-local" value={editing.expires_local || ''} disabled={readOnly}
+                                            onChange={e => setEditing({ ...editing, expires_local: e.target.value })}
+                                            className="w-full px-3 py-2 bg-proxmox-card border border-proxmox-border rounded text-sm text-white disabled:opacity-50" />
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div>
+                                <div className="flex items-center justify-between mb-1">
+                                    <label className="text-xs text-gray-400">{t('autoInstallAnswerFile')}</label>
+                                    {!readOnly && (
+                                        <div className="flex items-center gap-2">
+                                            {!editing.answer_redacted && (
+                                                <button onClick={() => { setHashOpen(!hashOpen); setHashMsg(null); }} aria-expanded={hashOpen}
+                                                    className="text-xs px-2 py-1 bg-proxmox-card border border-proxmox-border rounded hover:border-gray-500 text-gray-300 flex items-center gap-1">
+                                                    <Icons.Lock className="w-3.5 h-3.5" />
+                                                    {t('autoInstallHashPassword')}
+                                                </button>
+                                            )}
+                                            <button onClick={validate} className="text-xs px-2 py-1 bg-proxmox-card border border-proxmox-border rounded hover:border-gray-500 text-gray-300">
+                                                {t('autoInstallValidate')}
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
+                                {hashOpen && !readOnly && !editing.answer_redacted && (
+                                    // the clear password goes to the server once and only the hash comes back into the file
+                                    // a div, not a form: a submitted form that then clears or goes away is what makes
+                                    // browsers offer to save the node's root password as the PegaProx login
+                                    <div className="mb-2 p-3 bg-proxmox-card border border-proxmox-border rounded-lg space-y-2"
+                                        onKeyDown={e => { if (e.key === 'Enter' && !e.defaultPrevented && e.target.tagName === 'INPUT') { e.preventDefault(); if (!busy && hashPw) hashIntoAnswer(); } }}>
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                            <input type="password" autoComplete="new-password" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" value={hashPw} placeholder={t('password')}
+                                                aria-label={t('password')} onChange={e => { setHashPw(e.target.value); setHashMsg(null); }}
+                                                className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded text-sm text-white" />
+                                            <input type="password" autoComplete="new-password" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" value={hashPw2} placeholder={t('confirmPassword')}
+                                                aria-label={t('confirmPassword')} onChange={e => { setHashPw2(e.target.value); setHashMsg(null); }}
+                                                className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded text-sm text-white" />
+                                        </div>
+                                        <div className="flex flex-wrap items-center justify-between gap-2">
+                                            <span className="text-[11px] text-gray-500">{t('autoInstallPwHint')}</span>
+                                            <button type="button" onClick={() => hashIntoAnswer()} disabled={busy || !hashPw}
+                                                className="text-xs px-3 py-1.5 bg-proxmox-orange hover:bg-proxmox-orange/90 rounded disabled:opacity-50 flex items-center gap-1.5">
+                                                {busy && <Icons.RotateCw />}
+                                                {t('autoInstallHashInsert')}
+                                            </button>
+                                        </div>
+                                        {hashMsg && (
+                                            <div className={`text-xs ${hashMsg.ok ? 'text-green-400' : 'text-red-400'}`}>{hashMsg.text}</div>
+                                        )}
+                                    </div>
+                                )}
+                                {editing.answer_redacted && (
+                                    <div className="mb-2 text-xs text-yellow-300 flex items-center gap-1.5">
+                                        <Icons.Lock className="w-3.5 h-3.5" />
+                                        {t('autoInstallRedacted')}
+                                    </div>
+                                )}
+                                <textarea rows={14} spellCheck={false} disabled={readOnly || !!editing.answer_redacted}
+                                    value={editing.answer || ''} onChange={e => { setEditing({ ...editing, answer: e.target.value }); setCheck(null); }}
+                                    className="w-full px-3 py-2 bg-proxmox-card border border-proxmox-border rounded font-mono text-xs text-white disabled:opacity-50" />
+                            </div>
+
+                            {check && (
+                                <div className={`rounded-lg p-3 text-xs border ${check.valid ? 'bg-green-500/10 border-green-500/30 text-green-300' : 'bg-red-500/10 border-red-500/30 text-red-200'}`}>
+                                    <div className="font-medium mb-1">
+                                        {check.valid ? t('autoInstallAnswerOk') : t('autoInstallAnswerBad')}
+                                    </div>
+                                    {(check.errors || []).map((e, i) => <div key={`e${i}`}>• {e}</div>)}
+                                    {(check.warnings || []).map((w, i) => <div key={`w${i}`} className="text-yellow-300">• {w}</div>)}
+                                </div>
+                            )}
+
+                            {!readOnly && (
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1">{t('autoInstallCallbackUrl')}</label>
+                                    <input value={editing.callback_url || ''} placeholder={editing.callback_effective_url || ''}
+                                        onChange={e => setEditing({ ...editing, callback_url: e.target.value })}
+                                        className="w-full px-3 py-2 bg-proxmox-card border border-proxmox-border rounded text-sm text-white" />
+                                    <div className="text-[11px] text-gray-500 mt-1">{t('autoInstallCallbackHint')}</div>
+                                </div>
+                            )}
+
+                            <div className="flex items-center justify-between pt-1">
+                                <label className="flex items-center gap-2 text-sm text-gray-300">
+                                    <input type="checkbox" checked={!!editing.enabled} disabled={readOnly}
+                                        onChange={e => setEditing({ ...editing, enabled: e.target.checked })} />
+                                    {t('enabled')}
+                                </label>
+                                <div className="flex gap-2">
+                                    <button onClick={() => { setEditing(null); setCheck(null); }}
+                                        className="px-4 py-2 bg-proxmox-card border border-proxmox-border rounded-lg text-sm text-gray-300 hover:border-gray-500">
+                                        {readOnly ? t('close') : t('cancel')}
+                                    </button>
+                                    {!readOnly && (
+                                        <button onClick={save} disabled={busy || !editing.name}
+                                            className="px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm font-medium disabled:opacity-50">
+                                            {t('save')}
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    <div className="bg-proxmox-dark border border-proxmox-border rounded-xl overflow-hidden">
+                        <table className="w-full text-sm">
+                            <thead className="bg-proxmox-card/50 text-gray-400 text-xs uppercase">
+                                <tr>
+                                    <th className="text-left px-4 py-2">{t('name')}</th>
+                                    <th className="text-left px-4 py-2">{t('autoInstallTargetCluster')}</th>
+                                    <th className="text-left px-4 py-2">{t('autoInstallToken')}</th>
+                                    <th className="text-left px-4 py-2">{t('autoInstallUses')}</th>
+                                    <th className="text-right px-4 py-2"></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {profiles.length === 0 && !loadError && (canManage && !editing && !loading ? (
+                                    // first visit: offer both ways in instead of an empty table
+                                    <tr><td colSpan="5" className="p-4">
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                            <button onClick={openWizard}
+                                                className="text-left p-4 rounded-xl border border-proxmox-border bg-proxmox-card hover:border-proxmox-orange transition-colors">
+                                                <div className="flex items-center gap-2 text-white font-medium">
+                                                    <Icons.Disc className="w-5 h-5 text-proxmox-orange" />
+                                                    {t('autoInstallChoiceGuided')}
+                                                </div>
+                                                <div className="text-xs text-gray-400 mt-1">{t('autoInstallChoiceGuidedHint')}</div>
+                                            </button>
+                                            <button onClick={startNew}
+                                                className="text-left p-4 rounded-xl border border-proxmox-border bg-proxmox-card hover:border-gray-500 transition-colors">
+                                                <div className="flex items-center gap-2 text-white font-medium">
+                                                    <Icons.FileText />
+                                                    {t('autoInstallChoiceEditor')}
+                                                </div>
+                                                <div className="text-xs text-gray-400 mt-1">{t('autoInstallChoiceEditorHint')}</div>
+                                            </button>
+                                        </div>
+                                        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-500">
+                                            <span className="text-gray-400 font-medium">{t('autoInstallHowItWorks')}:</span>
+                                            <span>1. {t('autoInstallHow1')}</span>
+                                            <span>2. {t('autoInstallHow2')}</span>
+                                            <span>3. {t('autoInstallHow3')}</span>
+                                        </div>
+                                    </td></tr>
+                                ) : (
+                                    <tr><td colSpan="5" className="px-4 py-6 text-center text-gray-500">
+                                        {loading ? t('loading') : t('autoInstallNoProfiles')}
+                                    </td></tr>
+                                ))}
+                                {profiles.map(p => (
+                                    <tr key={p.id} className="border-t border-proxmox-border/50">
+                                        <td className="px-4 py-2">
+                                            <div className="text-white flex items-center gap-2">
+                                                {p.name}
+                                                {!p.enabled && <span className="text-[10px] px-1.5 py-0.5 border border-gray-600 text-gray-400 rounded">{t('disabled')}</span>}
+                                            </div>
+                                            {p.description && <div className="text-xs text-gray-500">{p.description}</div>}
+                                        </td>
+                                        <td className="px-4 py-2 text-gray-300">{p.target_cluster_name || p.target_cluster_id || '-'}</td>
+                                        <td className="px-4 py-2 font-mono text-xs text-gray-400">{p.token_hint}...</td>
+                                        <td className="px-4 py-2 text-gray-300">
+                                            {p.uses}{p.max_uses ? ` / ${p.max_uses}` : ''}
+                                        </td>
+                                        <td className="px-4 py-2">
+                                            <div className="flex items-center justify-end gap-1">
+                                                {canManage ? (
+                                                    <>
+                                                        <button onClick={() => openProfile(p, false)} title={t('edit')}
+                                                            className="p-1.5 text-gray-400 hover:text-white"><Icons.Edit className="w-4 h-4" /></button>
+                                                        <button onClick={() => rotate(p)} title={t('autoInstallRotate')}
+                                                            className="p-1.5 text-gray-400 hover:text-white"><Icons.RefreshCw className="w-4 h-4" /></button>
+                                                        <button onClick={() => remove(p)} title={t('delete')}
+                                                            className="p-1.5 text-gray-400 hover:text-red-400"><Icons.Trash2 className="w-4 h-4" /></button>
+                                                    </>
+                                                ) : (
+                                                    <button onClick={() => openProfile(p, true)} title={t('autoInstallView')}
+                                                        className="p-1.5 text-gray-400 hover:text-white"><Icons.Eye className="w-4 h-4" /></button>
+                                                )}
+                                            </div>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div>
+                        <h4 className="font-medium text-white mb-2 flex items-center gap-2">
+                            <Icons.Activity className="w-4 h-4" />
+                            {t('autoInstallRuns')}
+                        </h4>
+                        <div className="bg-proxmox-dark border border-proxmox-border rounded-xl overflow-hidden">
+                            <table className="w-full text-sm">
+                                <thead className="bg-proxmox-card/50 text-gray-400 text-xs uppercase">
+                                    <tr>
+                                        <th className="text-left px-4 py-2">{t('autoInstallMachine')}</th>
+                                        <th className="text-left px-4 py-2">{t('profile')}</th>
+                                        <th className="text-left px-4 py-2">{t('status')}</th>
+                                        <th className="text-left px-4 py-2">{t('autoInstallStarted')}</th>
+                                        <th className="text-right px-4 py-2"></th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {runs.length === 0 && !loadError && (
+                                        <tr><td colSpan="5" className="px-4 py-6 text-center text-gray-500">
+                                            {t('autoInstallNoRuns')}
+                                        </td></tr>
+                                    )}
+                                    {runs.map(r => (
+                                        <tr key={r.id} className="border-t border-proxmox-border/50">
+                                            <td className="px-4 py-2">
+                                                <div className="text-white">{r.hostname || r.product || r.fingerprint || '-'}</div>
+                                                <div className="text-[11px] text-gray-500 font-mono">
+                                                    {[r.product && r.hostname ? r.product : '', r.fingerprint || r.client_ip].filter(Boolean).join(' · ')}
+                                                </div>
+                                            </td>
+                                            <td className="px-4 py-2 text-gray-300">{r.profile_name || '-'}</td>
+                                            <td className="px-4 py-2">
+                                                <span className={`px-2 py-0.5 text-xs rounded-full border ${STATUS_STYLE[r.status] || 'border-gray-600 text-gray-400'}`}>
+                                                    {statusLabel(r.status)}
+                                                </span>
+                                                {r.message && <div className="text-[11px] text-gray-500 mt-0.5">{r.message}</div>}
+                                            </td>
+                                            <td className="px-4 py-2 text-gray-400 text-xs">{when(r.started_at)}</td>
+                                            <td className="px-4 py-2 text-right">
+                                                {canManage && (
+                                                    <button onClick={() => clearRun(r)} title={t('clear')}
+                                                        className="p-1.5 text-gray-400 hover:text-red-400"><Icons.X /></button>
+                                                )}
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    {wizardOpen && (
+                        <AutoInstallWizard isOpen onClose={() => setWizardOpen(false)} onCreated={load}
+                            onOpenInEditor={openInEditor} clusters={clusters} addToast={addToast}
+                            initialTargetClusterId={wizardPreset?.target_cluster_id} />
+                    )}
+                </div>
+            );
+        }
+
+        // LW Sep 2026 - the guided way to a profile. Six short steps collect the fields,
+        // the server writes the TOML from them (/compose) and Create goes through the
+        // same POST /profiles as the editor. Whatever the wizard does not ask for
+        // (lvm/zfs tuning, filter-match, first-boot...) is one click away in the editor.
+        function AutoInstallWizard({ isOpen, onClose, onCreated, onOpenInEditor, clusters, addToast, initialTargetClusterId }) {
+            const { t, language } = useTranslation();
+            const { getAuthHeaders } = useAuth();
+            const { isCorporate, isCloud } = useLayout();
+
+            const [activeStep, setActiveStep] = useState(0);
+            // the Corporate stepper scrolls sideways with a hidden scrollbar; keep the
+            // current step in view so the last ones never look cut off
+            const stepperRef = useRef(null);
+            useEffect(() => {
+                const cur = stepperRef.current && stepperRef.current.querySelector('.corp-vm-step.active');
+                if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+            }, [activeStep]);
+            const [stepErrors, setStepErrors] = useState({});
+            const [draft, setDraft] = useState(() => {
+                // guess keyboard and country from the browser, the admin mostly sits
+                // in front of the same kind of keyboard the rack has
+                const langs = (navigator.languages && navigator.languages.length) ? navigator.languages : [navigator.language || ''];
+                const kbAlias = { da: 'dk', ja: 'jp', sv: 'se', sl: 'si', nb: 'no', nn: 'no', en: 'en-us' };
+                let keyboard = '', country = '';
+                for (const raw of langs) {
+                    const l = String(raw || '').toLowerCase();
+                    const base = l.split('-')[0];
+                    if (!keyboard) keyboard = [l, kbAlias[base] || base].find(k => AUTOINSTALL_KEYBOARDS.some(x => x[0] === k)) || '';
+                    const m = l.match(/^[a-z]{2,3}(?:-[a-z]{4})?-([a-z]{2})(?:-|$)/);
+                    if (!country && m && AUTOINSTALL_COUNTRIES.includes(m[1])) country = m[1];
+                }
+                let tz = '';
+                try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) {}
+                return {
+                    name: '', description: '', target_cluster_id: initialTargetClusterId || '',
+                    servers: 'one', several: '5', expires_local: '',
+                    country, keyboard: keyboard || 'en-us', timezone: aiTimezoneOk(tz) ? tz : 'UTC',
+                    host_mode: 'fixed', host_touched: false, fqdn: '', dhcp_domain: '', mailto: '',
+                    pw_mode: 'set', root_password_hashed: '', pasted_hash: '', ssh_keys: '',
+                    net_mode: 'dhcp', cidr: '', gateway: '', dns: '', nic_by: 'mac', nic_mac: '', nic_name: '',
+                    filesystem: 'ext4', raid: '', disk_by: 'name', disks: [], filter_key: 'ID_SERIAL', filter_glob: '',
+                    wipe_ack: false, enabled: true, callback_url: ''
+                };
+            });
+            const [dirty, setDirty] = useState(false);
+            // the clear password lives here and nowhere else, and only until Next
+            const [pw, setPw] = useState('');
+            const [pw2, setPw2] = useState('');
+            const [diskInput, setDiskInput] = useState('');
+            const [compose, setCompose] = useState(null);   // server result + the fields it was built from
+            const [composeError, setComposeError] = useState('');
+            const [createError, setCreateError] = useState('');
+            const [busy, setBusy] = useState(false);
+            const [creating, setCreating] = useState(false);
+            const [result, setResult] = useState(null);     // {token, name, fp}
+            const [copied, setCopied] = useState(false);
+            const [showAdvanced, setShowAdvanced] = useState(false);
+            const composeSeq = useRef(0);
+
+            const countryOptions = useMemo(() => {
+                let dn = null;
+                try { dn = new Intl.DisplayNames([language || 'en', 'en'], { type: 'region' }); } catch (e) { dn = null; }
+                return AUTOINSTALL_COUNTRIES.map(c => {
+                    let name = '';
+                    try { name = dn ? dn.of(c.toUpperCase()) : ''; } catch (e) { name = ''; }
+                    return [c, name && name.toLowerCase() !== c ? `${name} (${c})` : c];
+                }).sort((a, b) => a[1].localeCompare(b[1]));
+            }, [language]);
+
+            const steps = [t('general'), t('autoInstallStepSystem'), t('autoInstallStepRoot'), t('network'), t('disks'), t('summary')];
+            const lastStep = steps.length - 1;
+            const multi = draft.servers !== 'one';
+            const zfsLike = draft.filesystem === 'zfs' || draft.filesystem === 'btrfs';
+            const maxUses = (d) => d.servers === 'one' ? 1 : (d.servers === 'unlimited' ? 0 : (parseInt(d.several, 10) || 0));
+            const sshLines = (txt) => String(txt || '').split('\n').map(s => s.trim()).filter(Boolean);
+            const macHex = (v) => String(v || '').trim().replace(/[:\-]/g, '').toLowerCase();
+
+            const set = (patch) => {
+                setDraft(d => ({ ...d, ...patch }));
+                setDirty(true);
+                const hit = Object.keys(patch).filter(k => stepErrors[k]);
+                if (hit.length) setStepErrors(e => { const n = { ...e }; hit.forEach(k => delete n[k]); return n; });
+            };
+            // switching a card makes the old field errors meaningless
+            const pick = (patch) => { set(patch); setStepErrors({}); };
+            const clearErr = (...keys) => {
+                if (keys.some(k => stepErrors[k])) setStepErrors(e => { const n = { ...e }; keys.forEach(k => delete n[k]); return n; });
+            };
+            const pickServers = (v) => pick({ servers: v, ...(draft.host_touched ? {} : { host_mode: v === 'one' ? 'fixed' : 'dhcp' }) });
+
+            // the /compose body. Nothing in here is ever the clear password.
+            const buildFields = (d) => {
+                const g = {
+                    keyboard: d.keyboard, country: d.country, timezone: d.timezone.trim(), mailto: d.mailto.trim(),
+                    fqdn: d.host_mode === 'fixed' ? d.fqdn.trim()
+                        : (d.dhcp_domain.trim() ? { source: 'from-dhcp', domain: d.dhcp_domain.trim() } : { source: 'from-dhcp' }),
+                    root_password_hashed: d.pw_mode === 'paste' ? d.pasted_hash.trim() : d.root_password_hashed
+                };
+                const keys = sshLines(d.ssh_keys);
+                if (keys.length) g.root_ssh_keys = keys;
+                // from-dhcp must carry nothing else, the installer refuses unknown fields there
+                const network = d.net_mode === 'dhcp' ? { source: 'from-dhcp' } : {
+                    source: 'from-answer', cidr: d.cidr.trim(), gateway: d.gateway.trim(), dns: d.dns.trim(),
+                    filter: d.nic_by === 'mac' ? { ID_NET_NAME_MAC: '*' + macHex(d.nic_mac) } : { ID_NET_NAME: d.nic_name.trim() }
+                };
+                const disk = { filesystem: d.filesystem };
+                if (d.filesystem === 'zfs' || d.filesystem === 'btrfs') disk.raid = d.raid;
+                if (d.disk_by === 'name') disk.disk_list = d.disks;
+                else disk.filter = { [d.filter_key]: d.filter_glob.trim() };
+                return { global: g, network, disk };
+            };
+
+            // same idea as CreateVmModal: check on Next only, mark the field, clear on change
+            const validateStep = (step, d = draft) => {
+                const errs = {};
+                const ctrl = (k, v) => { if (!errs[k] && AUTOINSTALL_CTRL_RE.test(v || '')) errs[k] = t('autoInstallErrControl'); };
+                if (step === 0) {
+                    const name = d.name.trim();
+                    if (!name) errs.name = t('required');
+                    else if (name.length > 120) errs.name = t('autoInstallErrTooLong').replace('{n}', '120');
+                    ctrl('name', d.name);
+                    if (d.description.trim().length > 500) errs.description = t('autoInstallErrTooLong').replace('{n}', '500');
+                    ctrl('description', d.description);
+                    if (d.servers === 'several') {
+                        const s = String(d.several).trim();
+                        if (!/^\d+$/.test(s) || Number(s) < 2 || Number(s) > 10000) errs.several = t('autoInstallErrServers');
+                    }
+                    if (d.expires_local) {
+                        const when = new Date(d.expires_local).getTime();
+                        if (isNaN(when) || when <= Date.now()) errs.expires_local = t('autoInstallErrExpiry');
+                    }
+                }
+                if (step === 1) {
+                    if (!AUTOINSTALL_COUNTRIES.includes(d.country)) errs.country = d.country ? t('autoInstallErrCountry') : t('required');
+                    if (!AUTOINSTALL_KEYBOARDS.some(k => k[0] === d.keyboard)) errs.keyboard = t('autoInstallErrKeyboard');
+                    const tz = d.timezone.trim();
+                    if (!tz) errs.timezone = t('required');
+                    else if (!aiTimezoneOk(tz)) errs.timezone = t('autoInstallErrTimezone');
+                    if (d.host_mode === 'fixed') {
+                        const f = d.fqdn.trim();
+                        if (!f) errs.fqdn = t('required');
+                        else if (aiFqdnError(f)) errs.fqdn = t(aiFqdnError(f));
+                    } else if (d.dhcp_domain.trim() && aiFqdnError(d.dhcp_domain.trim(), true)) {
+                        errs.dhcp_domain = t(aiFqdnError(d.dhcp_domain.trim(), true));
+                    }
+                    const mail = d.mailto.trim();
+                    if (!mail) errs.mailto = t('required');
+                    else if (!aiMailOk(mail)) errs.mailto = t('autoInstallErrMail');
+                }
+                if (step === 2) {
+                    if (d.pw_mode === 'paste') {
+                        const h = d.pasted_hash.trim();
+                        if (!h) errs.pasted_hash = t('required');
+                        else if (!aiCryptOk(h)) errs.pasted_hash = t('autoInstallErrHash');
+                    } else if (!(d.root_password_hashed && !pw && !pw2)) {
+                        const bytes = new TextEncoder().encode(pw).length;
+                        if (!pw) errs.pw = t('required');
+                        else if (pw.length < 8 || pw.length > 64 || bytes < 8) errs.pw = t('autoInstallErrPwLength');
+                        else if (AUTOINSTALL_CTRL_RE.test(pw)) errs.pw = t('autoInstallErrControl');
+                        else if (pw !== pw2) errs.pw2 = t('passwordsDoNotMatch');
+                    }
+                    const lines = String(d.ssh_keys || '').split('\n');
+                    const bad = lines.findIndex(l => l.trim() && !AUTOINSTALL_SSH_KEY_RE.test(l.trim()));
+                    if (sshLines(d.ssh_keys).length > 50) errs.ssh_keys = t('autoInstallErrSshCount');
+                    else if (bad >= 0) errs.ssh_keys = t('autoInstallErrSshKey').replace('{n}', String(bad + 1));
+                }
+                if (step === 3 && d.net_mode === 'static') {
+                    const cidr = d.cidr.trim();
+                    const fam = cidr && !aiCidrError(cidr) ? aiIpFamily(cidr.split('/')[0]) : 0;
+                    if (!cidr) errs.cidr = t('required');
+                    else if (!fam) errs.cidr = t('autoInstallErrCidr');
+                    const ipCheck = (k, v) => {
+                        if (!v) errs[k] = t('required');
+                        else if (!aiIpFamily(v)) errs[k] = t('autoInstallErrIp');
+                        else if (fam && aiIpFamily(v) !== fam) errs[k] = t('autoInstallErrFamily');
+                    };
+                    ipCheck('gateway', d.gateway.trim());
+                    ipCheck('dns', d.dns.trim());
+                    if (d.nic_by === 'mac') {
+                        if (!d.nic_mac.trim()) errs.nic_mac = t('required');
+                        else if (!/^[0-9a-f]{12}$/.test(macHex(d.nic_mac))) errs.nic_mac = t('autoInstallErrMac');
+                    } else {
+                        const g = d.nic_name.trim();
+                        if (!g) errs.nic_name = t('required');
+                        else if (!AUTOINSTALL_GLOB_RE.test(g)) errs.nic_name = t('autoInstallErrPattern');
+                    }
+                }
+                if (step === 4) {
+                    const levels = AUTOINSTALL_RAID_MIN[d.filesystem];
+                    if (levels && !levels[d.raid]) errs.raid = t('autoInstallErrRaid');
+                    if (d.disk_by === 'name') {
+                        const list = d.disks;
+                        const min = levels && levels[d.raid] ? levels[d.raid] : 1;
+                        const bad = list.find(x => !aiDiskNameOk(x));
+                        const dup = list.find((x, i) => list.indexOf(x) !== i);
+                        if (!list.length) errs.disks = t('required');
+                        else if (bad) errs.disks = `${bad}: ${t('autoInstallErrDiskName')}`;
+                        else if (dup) errs.disks = t('autoInstallErrDiskDup').replace('{name}', dup);
+                        else if (!levels && list.length !== 1) errs.disks = t('autoInstallErrDiskOne');
+                        else if (levels && list.length < min) errs.disks = t('autoInstallErrDiskFew').replace('{n}', String(min));
+                        else if (d.raid === 'raid10' && list.length % 2) errs.disks = t('autoInstallErrDiskEven');
+                    } else {
+                        const g = d.filter_glob.trim();
+                        if (!AUTOINSTALL_DISK_KEYS.includes(d.filter_key)) errs.filter_key = t('required');
+                        if (!g) errs.filter_glob = t('required');
+                        else if (!AUTOINSTALL_GLOB_RE.test(g)) errs.filter_glob = t('autoInstallErrPattern');
+                        if (levels && !d.wipe_ack) errs.wipe_ack = t('autoInstallErrAck');
+                    }
+                }
+                setStepErrors(errs);
+                return Object.keys(errs).length === 0;
+            };
+
+            // chips: Enter, space or comma adds. /dev/ is dropped, by-id paths are not
+            // what the installer matches on, so those stay an error.
+            const addDisks = (d = draft) => {
+                const names = diskInput.split(/[\s,]+/).map(s => s.replace(/^\/dev\//, '')).filter(Boolean);
+                if (!names.length) return d;
+                const bad = names.find(n => !aiDiskNameOk(n));
+                if (bad) {
+                    setStepErrors(e => ({ ...e, disks: `${bad}: ${t('autoInstallErrDiskName')}` }));
+                    return null;
+                }
+                const next = { ...d, disks: d.disks.concat(names.filter((n, i) => !d.disks.includes(n) && names.indexOf(n) === i)) };
+                setDraft(next);
+                setDirty(true);
+                setDiskInput('');
+                clearErr('disks');
+                return next;
+            };
+
+            const hashPassword = async () => {
+                setBusy(true);
+                try {
+                    const r = await fetch(`${API_URL}/auto-install/password-hash`, {
+                        method: 'POST', credentials: 'include',
+                        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ password: pw })
+                    });
+                    const data = await r.json().catch(() => ({}));
+                    if (r.ok && aiCryptOk(data.hash)) {
+                        setDraft(d => ({ ...d, root_password_hashed: data.hash }));
+                        setPw(''); setPw2('');
+                        return data.hash;
+                    }
+                    setStepErrors({ pw: data.error || t('autoInstallHashFailed') });
+                } catch (e) {
+                    setStepErrors({ pw: t('autoInstallHashFailed') });
+                } finally {
+                    setBusy(false);
+                }
+                return '';
+            };
+
+            const runCompose = async (d) => {
+                const fields = buildFields(d);
+                const seq = ++composeSeq.current;
+                setCompose(null); setComposeError(''); setCreateError('');
+                setBusy(true);
+                try {
+                    const r = await fetch(`${API_URL}/auto-install/compose`, {
+                        method: 'POST', credentials: 'include',
+                        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ fields })
+                    });
+                    const data = await r.json().catch(() => ({}));
+                    if (seq !== composeSeq.current) return;
+                    if (r.ok && typeof data.answer === 'string') setCompose({ ...data, key: JSON.stringify(fields) });
+                    else setComposeError(data.error || t('autoInstallRenderFailed'));
+                } catch (e) {
+                    if (seq === composeSeq.current) setComposeError(t('autoInstallRenderFailed'));
+                } finally {
+                    if (seq === composeSeq.current) setBusy(false);
+                }
+            };
+
+            const goNext = async () => {
+                if (busy || result || activeStep >= lastStep) return;
+                let d = draft;
+                if (activeStep === 4 && diskInput.trim()) {
+                    d = addDisks(d);
+                    if (!d) return;
+                }
+                if (!validateStep(activeStep, d)) return;
+                if (activeStep === 2 && d.pw_mode === 'set' && pw) {
+                    const hash = await hashPassword();
+                    if (!hash) return;
+                    d = { ...d, root_password_hashed: hash };
+                }
+                setActiveStep(activeStep + 1);
+                setStepErrors({});
+                if (activeStep + 1 === lastStep) runCompose(d);
+            };
+            const goTo = (i) => {
+                if (busy || i < 0 || i > activeStep) return;
+                setActiveStep(i);
+                setStepErrors({});
+            };
+
+            // compose field_errors come back keyed like 'global.fqdn'; this is where each one lives
+            const fieldTarget = (key) => ({
+                'global.keyboard': [1, 'keyboard'], 'global.country': [1, 'country'], 'global.timezone': [1, 'timezone'],
+                'global.mailto': [1, 'mailto'], 'global.fqdn': [1, draft.host_mode === 'fixed' ? 'fqdn' : 'dhcp_domain'],
+                'global.root_password_hashed': [2, draft.pw_mode === 'paste' ? 'pasted_hash' : 'pw'],
+                'global.root_ssh_keys': [2, 'ssh_keys'],
+                'network.source': [3, 'net_mode'], 'network.cidr': [3, 'cidr'], 'network.gateway': [3, 'gateway'],
+                'network.dns': [3, 'dns'], 'network.filter': [3, draft.nic_by === 'mac' ? 'nic_mac' : 'nic_name'],
+                'disk.filesystem': [4, 'filesystem'], 'disk.raid': [4, 'raid'], 'disk.disk_list': [4, 'disks'],
+                'disk.filter': [4, 'filter_glob']
+            })[key] || null;
+            const fieldErrors = (compose && compose.field_errors) || {};
+            const badSteps = new Set(Object.keys(fieldErrors).map(k => (fieldTarget(k) || [])[0]).filter(i => i !== undefined));
+            const fixField = (key) => {
+                const tg = fieldTarget(key);
+                if (!tg) return;
+                setActiveStep(tg[0]);
+                setStepErrors({ [tg[1]]: fieldErrors[key] });
+            };
+
+            // anything changed after the render means the file on screen is not what Create would save
+            const stale = !!compose && activeStep === lastStep && compose.key !== JSON.stringify(buildFields(draft));
+            const canCreate = !!compose && compose.valid && !stale && !busy;
+
+            const profileDraft = () => ({
+                name: draft.name.trim(), description: draft.description.trim(),
+                target_cluster_id: draft.target_cluster_id, callback_url: draft.callback_url.trim(),
+                max_uses: maxUses(draft), expires_local: draft.expires_local, enabled: !!draft.enabled
+            });
+
+            const create = async () => {
+                if (!canCreate) return;
+                const cb = draft.callback_url.trim();
+                if (cb && (!/^https?:\/\//.test(cb) || cb.length > 500 || AUTOINSTALL_CTRL_RE.test(cb))) {
+                    setShowAdvanced(true);
+                    setStepErrors({ callback_url: t('autoInstallCallbackBad') });
+                    return;
+                }
+                setBusy(true); setCreating(true); setCreateError('');
+                try {
+                    const r = await fetch(`${API_URL}/auto-install/profiles`, {
+                        method: 'POST', credentials: 'include',
+                        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            name: draft.name.trim(), description: draft.description.trim(), answer: compose.answer,
+                            target_cluster_id: draft.target_cluster_id, callback_url: cb, max_uses: maxUses(draft),
+                            expires_at: localInputToUtc(draft.expires_local), enabled: !!draft.enabled
+                        })
+                    });
+                    const data = await r.json().catch(() => ({}));
+                    if (r.ok) {
+                        // the hash and the rendered file have done their job
+                        setDraft(d => ({ ...d, root_password_hashed: '', pasted_hash: '' }));
+                        setCompose(null);
+                        onCreated && onCreated();
+                        if (data.token) {
+                            setResult({ token: data.token, name: data.name || draft.name.trim(), fp: data.fetch_fingerprint || '' });
+                        } else {
+                            addToast?.(t('autoInstallSaved'), 'success');
+                            onClose();
+                        }
+                    } else {
+                        setCreateError(data.error || t('autoInstallSaveFailed'));
+                    }
+                } catch (e) {
+                    setCreateError(e.message || t('autoInstallSaveFailed'));
+                }
+                setBusy(false); setCreating(false);
+            };
+
+            // X, Cancel, Done and Escape all come through here. The token cannot be
+            // shown again (only rotated, which kills every ISO built so far), so ask.
+            const requestClose = () => {
+                if (creating) return;
+                if (result) {
+                    if (!copied && !window.confirm(t('autoInstallTokenNotCopied'))) return;
+                } else if (dirty && !window.confirm(t('autoInstallDiscard'))) {
+                    return;
+                }
+                onClose();
+            };
+            const closeRef = useRef(requestClose);
+            closeRef.current = requestClose;
+            useEffect(() => {
+                if (!isOpen) return;
+                // capture phase: the dialog stops keydown from bubbling (the dashboard's
+                // single-key shortcuts), so a bubbling listener would never see Escape
+                const onKey = (e) => {
+                    if (e.key !== 'Escape') return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    closeRef.current();
+                };
+                window.addEventListener('keydown', onKey, true);
+                return () => window.removeEventListener('keydown', onKey, true);
+            }, [isOpen]);
+
+            if (!isOpen) return null;
+
+            const labelCls = 'block text-sm text-gray-400 mb-1';
+            const inputCls = (k) => `w-full px-3 py-2 bg-proxmox-dark border rounded-lg text-white ${stepErrors[k] ? 'border-red-500' : 'border-proxmox-border'}`;
+            const aria = (k) => stepErrors[k] ? { 'aria-invalid': true, 'aria-describedby': `aiw-err-${k}` } : {};
+            const errLine = (k) => stepErrors[k] ? <p id={`aiw-err-${k}`} className="text-xs text-red-400 mt-1">{stepErrors[k]}</p> : null;
+            const hint = (text) => <p className="text-xs text-gray-500 mt-1">{text}</p>;
+            const warn = (text, action, onAction) => (
+                <div className="rounded-lg p-3 text-xs border bg-yellow-500/10 border-yellow-500/30 text-yellow-300 flex items-start gap-2">
+                    <Icons.AlertTriangle />
+                    <div className="flex-1">
+                        {text}
+                        {action && <button type="button" onClick={onAction} className="ml-2 font-medium underline hover:text-white">{action}</button>}
+                    </div>
+                </div>
+            );
+            const choice = (on, onPick, title, sub, key) => (
+                <button key={key} type="button" onClick={onPick} aria-pressed={on}
+                    className={`text-left p-3 rounded-lg border transition-colors ${on ? 'border-proxmox-orange bg-proxmox-orange/10' : 'border-proxmox-border bg-proxmox-dark hover:border-gray-500'}`}>
+                    <div className={`text-sm font-medium ${on ? 'text-white' : 'text-gray-300'}`}>{title}</div>
+                    {sub && <div className="text-xs text-gray-500 mt-0.5">{sub}</div>}
+                </button>
+            );
+            const countryLabel = (c) => (countryOptions.find(x => x[0] === c) || [c, c])[1];
+
+            const renderStepContent = () => {
+                switch (activeStep) {
+                    case 0:
+                        return (
+                            <div className="space-y-4">
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <label htmlFor="aiw-name" className={labelCls}>{t('name')}</label>
+                                        <input id="aiw-name" autoFocus value={draft.name} placeholder="rack-a"
+                                            onChange={e => set({ name: e.target.value })} className={inputCls('name')} {...aria('name')} />
+                                        {errLine('name')}
+                                    </div>
+                                    <div>
+                                        <label htmlFor="aiw-cluster" className={labelCls}>{t('autoInstallTargetCluster')}</label>
+                                        <select id="aiw-cluster" value={draft.target_cluster_id}
+                                            onChange={e => set({ target_cluster_id: e.target.value })} className={inputCls('target_cluster_id')}>
+                                            <option value="">-</option>
+                                            {(clusters || []).map(c => <option key={c.id} value={c.id}>{c.display_name || c.name || c.id}</option>)}
+                                            {/* a preset for a cluster that is not in the list yet */}
+                                            {draft.target_cluster_id && !(clusters || []).some(c => c.id === draft.target_cluster_id) && (
+                                                <option value={draft.target_cluster_id}>{draft.target_cluster_id}</option>
+                                            )}
+                                        </select>
+                                    </div>
+                                </div>
+                                <div>
+                                    <label htmlFor="aiw-desc" className={labelCls}>{t('description')}</label>
+                                    <input id="aiw-desc" value={draft.description} onChange={e => set({ description: e.target.value })}
+                                        className={inputCls('description')} {...aria('description')} />
+                                    {errLine('description')}
+                                </div>
+                                <div>
+                                    <div className={labelCls}>{t('autoInstallHowMany')}</div>
+                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                                        {choice(draft.servers === 'one', () => pickServers('one'), t('autoInstallOneServer'), t('autoInstallOneServerHint'))}
+                                        {choice(draft.servers === 'several', () => pickServers('several'), t('autoInstallSeveralServers'), t('autoInstallSeveralHint'))}
+                                        {choice(draft.servers === 'unlimited', () => pickServers('unlimited'), t('autoInstallUnlimitedServers'), t('autoInstallUnlimitedHint'))}
+                                    </div>
+                                    {draft.servers === 'several' && (
+                                        <div className="mt-2 max-w-xs">
+                                            <label htmlFor="aiw-several" className={labelCls}>{t('autoInstallServerCount')}</label>
+                                            <input id="aiw-several" type="number" min="2" max="10000" value={draft.several}
+                                                onChange={e => set({ several: e.target.value })} className={inputCls('several')} {...aria('several')} />
+                                            {errLine('several')}
+                                        </div>
+                                    )}
+                                </div>
+                                <div>
+                                    <label htmlFor="aiw-expires" className={labelCls}>{t('autoInstallExpires')}</label>
+                                    <div className="flex flex-wrap items-center gap-2">
+                                        <input id="aiw-expires" type="datetime-local" value={draft.expires_local}
+                                            onChange={e => set({ expires_local: e.target.value })}
+                                            className={`px-3 py-2 bg-proxmox-dark border rounded-lg text-white ${stepErrors.expires_local ? 'border-red-500' : 'border-proxmox-border'}`}
+                                            {...aria('expires_local')} />
+                                        {[[0, t('none')], [24, `24 ${t('hours')}`], [24 * 7, `7 ${t('days')}`], [24 * 30, `30 ${t('days')}`]].map(([h, label]) => (
+                                            <button key={h} type="button"
+                                                onClick={() => set({ expires_local: h ? utcToLocalInput(new Date(Date.now() + h * 3600000).toISOString()) : '' })}
+                                                className={`px-2.5 py-1 text-xs rounded-full border transition-colors ${!h && !draft.expires_local ? 'border-proxmox-orange text-white' : 'border-proxmox-border text-gray-300 hover:border-gray-500'}`}>
+                                                {label}
+                                            </button>
+                                        ))}
+                                    </div>
+                                    {errLine('expires_local')}
+                                </div>
+                                {draft.servers === 'unlimited' && !draft.expires_local && warn(t('autoInstallNoLimitWarn'))}
+                            </div>
+                        );
+                    case 1:
+                        return (
+                            <div className="space-y-4">
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    <div>
+                                        <label htmlFor="aiw-country" className={labelCls}>{t('autoInstallCountry')}</label>
+                                        <select id="aiw-country" autoFocus value={draft.country}
+                                            onChange={e => set({ country: e.target.value })} className={inputCls('country')} {...aria('country')}>
+                                            <option value="">-</option>
+                                            {countryOptions.map(([code, label]) => <option key={code} value={code}>{label}</option>)}
+                                        </select>
+                                        {errLine('country') || hint(t('autoInstallCountryHint'))}
+                                    </div>
+                                    <div>
+                                        <label htmlFor="aiw-kb" className={labelCls}>{t('autoInstallKeyboard')}</label>
+                                        <select id="aiw-kb" value={draft.keyboard}
+                                            onChange={e => set({ keyboard: e.target.value })} className={inputCls('keyboard')} {...aria('keyboard')}>
+                                            {AUTOINSTALL_KEYBOARDS.map(([code, label]) => <option key={code} value={code}>{label} ({code})</option>)}
+                                        </select>
+                                        {errLine('keyboard')}
+                                    </div>
+                                    <div>
+                                        <label htmlFor="aiw-tz" className={labelCls}>{t('timezone')}</label>
+                                        <input id="aiw-tz" list="aiw-tz-list" value={draft.timezone}
+                                            onChange={e => set({ timezone: e.target.value })} className={inputCls('timezone')} {...aria('timezone')} />
+                                        <datalist id="aiw-tz-list">
+                                            {TIMEZONES.map(z => <option key={z} value={z} />)}
+                                        </datalist>
+                                        {errLine('timezone')}
+                                    </div>
+                                    <div>
+                                        <label htmlFor="aiw-mail" className={labelCls}>{t('autoInstallMailto')}</label>
+                                        <input id="aiw-mail" type="email" value={draft.mailto} placeholder="root@example.com"
+                                            onChange={e => set({ mailto: e.target.value })} className={inputCls('mailto')} {...aria('mailto')} />
+                                        {errLine('mailto')}
+                                    </div>
+                                </div>
+                                <div>
+                                    <div className={labelCls}>{t('autoInstallHostName')}</div>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                        {choice(draft.host_mode === 'fixed', () => pick({ host_mode: 'fixed', host_touched: true }), t('autoInstallHostFixed'), t('autoInstallHostFixedHint'))}
+                                        {choice(draft.host_mode === 'dhcp', () => pick({ host_mode: 'dhcp', host_touched: true }), t('autoInstallHostDhcp'), t('autoInstallHostDhcpHint'))}
+                                    </div>
+                                    <div className="mt-2">
+                                        {draft.host_mode === 'fixed' ? (
+                                            <>
+                                                <label htmlFor="aiw-fqdn" className={labelCls}>{t('autoInstallFqdn')}</label>
+                                                <input id="aiw-fqdn" value={draft.fqdn} placeholder="pve01.example.com"
+                                                    onChange={e => set({ fqdn: e.target.value })} className={inputCls('fqdn')} {...aria('fqdn')} />
+                                                {errLine('fqdn')}
+                                            </>
+                                        ) : (
+                                            <>
+                                                <label htmlFor="aiw-domain" className={labelCls}>{t('autoInstallDhcpDomain')}</label>
+                                                <input id="aiw-domain" value={draft.dhcp_domain} placeholder="example.com"
+                                                    onChange={e => set({ dhcp_domain: e.target.value })} className={inputCls('dhcp_domain')} {...aria('dhcp_domain')} />
+                                                {errLine('dhcp_domain') || hint(t('autoInstallDhcpNameHint'))}
+                                            </>
+                                        )}
+                                    </div>
+                                </div>
+                                {draft.host_mode === 'fixed' && multi &&
+                                    warn(t('autoInstallSameNameWarn'), t('autoInstallUseDhcp'), () => pick({ host_mode: 'dhcp', host_touched: true }))}
+                            </div>
+                        );
+                    case 2:
+                        return (
+                            <div className="space-y-4">
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                    {choice(draft.pw_mode === 'set', () => pick({ pw_mode: 'set' }), t('autoInstallSetPassword'), t('autoInstallPwHint'))}
+                                    {choice(draft.pw_mode === 'paste', () => pick({ pw_mode: 'paste' }), t('autoInstallPasteHash'), t('autoInstallPasteHashHint'))}
+                                </div>
+                                {draft.pw_mode === 'paste' ? (
+                                    <div>
+                                        <label htmlFor="aiw-hash" className={labelCls}>{t('autoInstallHashLabel')}</label>
+                                        <input id="aiw-hash" autoFocus spellCheck={false} value={draft.pasted_hash} placeholder="$6$..."
+                                            onChange={e => set({ pasted_hash: e.target.value })}
+                                            className={`${inputCls('pasted_hash')} font-mono text-xs`} {...aria('pasted_hash')} />
+                                        {errLine('pasted_hash')}
+                                    </div>
+                                ) : draft.root_password_hashed ? (
+                                    // only the hash is kept; coming back never shows the password
+                                    <div>
+                                        <div className="flex items-center gap-2 text-sm text-green-400">
+                                            <Icons.CheckCircle />
+                                            <span>{t('autoInstallPwSet')}</span>
+                                            <span className="text-gray-500">·</span>
+                                            <button type="button" onClick={() => set({ root_password_hashed: '' })}
+                                                className="text-proxmox-orange hover:underline">{t('autoInstallPwChange')}</button>
+                                        </div>
+                                        {errLine('pw')}
+                                    </div>
+                                ) : (
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <div>
+                                            <label htmlFor="aiw-pw" className={labelCls}>{t('password')}</label>
+                                            <input id="aiw-pw" type="password" autoFocus autoComplete="new-password" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" value={pw}
+                                                onChange={e => { setPw(e.target.value); setDirty(true); clearErr('pw', 'pw2'); }}
+                                                className={inputCls('pw')} {...aria('pw')} />
+                                            {errLine('pw')}
+                                        </div>
+                                        <div>
+                                            <label htmlFor="aiw-pw2" className={labelCls}>{t('confirmPassword')}</label>
+                                            <input id="aiw-pw2" type="password" autoComplete="new-password" data-lpignore="true" data-1p-ignore="true" data-bwignore="true" value={pw2}
+                                                onChange={e => { setPw2(e.target.value); clearErr('pw2'); }}
+                                                className={inputCls('pw2')} {...aria('pw2')} />
+                                            {errLine('pw2')}
+                                        </div>
+                                        {/[^\x00-\x7f]/.test(pw) && <div className="md:col-span-2">{warn(t('autoInstallPwNonAscii'))}</div>}
+                                    </div>
+                                )}
+                                <div>
+                                    <label htmlFor="aiw-ssh" className={labelCls}>{t('autoInstallSshKeys')}</label>
+                                    <textarea id="aiw-ssh" rows={3} spellCheck={false} value={draft.ssh_keys}
+                                        placeholder="ssh-ed25519 AAAA... admin@laptop"
+                                        onChange={e => set({ ssh_keys: e.target.value })}
+                                        className={`${inputCls('ssh_keys')} font-mono text-xs`} {...aria('ssh_keys')} />
+                                    {errLine('ssh_keys') || hint(t('autoInstallSshKeysHint'))}
+                                </div>
+                            </div>
+                        );
+                    case 3: {
+                        const cidr = draft.cidr.trim(), gw = draft.gateway.trim();
+                        const fam = cidr && !aiCidrError(cidr) ? aiIpFamily(cidr.split('/')[0]) : 0;
+                        const gwOutside = fam && aiIpFamily(gw) === fam && !aiSameNet(cidr, gw);
+                        return (
+                            <div className="space-y-4">
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                    {choice(draft.net_mode === 'dhcp', () => pick({ net_mode: 'dhcp' }), t('autoInstallNetDhcp'), t('autoInstallNetDhcpHint'))}
+                                    {choice(draft.net_mode === 'static', () => pick({ net_mode: 'static' }), t('autoInstallNetStatic'), t('autoInstallNetStaticHint'))}
+                                </div>
+                                {errLine('net_mode')}
+                                {draft.net_mode === 'static' && (
+                                    <>
+                                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                            <div>
+                                                <label htmlFor="aiw-cidr" className={labelCls}>{t('autoInstallCidr')}</label>
+                                                <input id="aiw-cidr" autoFocus value={draft.cidr} placeholder="192.168.1.10/24"
+                                                    onChange={e => set({ cidr: e.target.value })} className={inputCls('cidr')} {...aria('cidr')} />
+                                                {errLine('cidr')}
+                                            </div>
+                                            <div>
+                                                <label htmlFor="aiw-gw" className={labelCls}>{t('gateway')}</label>
+                                                <input id="aiw-gw" value={draft.gateway} placeholder="192.168.1.1"
+                                                    onChange={e => set({ gateway: e.target.value })} className={inputCls('gateway')} {...aria('gateway')} />
+                                                {errLine('gateway')}
+                                            </div>
+                                            <div>
+                                                <label htmlFor="aiw-dns" className={labelCls}>{t('dnsServer')}</label>
+                                                <input id="aiw-dns" value={draft.dns} placeholder="192.168.1.1"
+                                                    onChange={e => set({ dns: e.target.value })} className={inputCls('dns')} {...aria('dns')} />
+                                                {errLine('dns') || hint(t('autoInstallDnsHint'))}
+                                            </div>
+                                        </div>
+                                        {gwOutside && warn(t('autoInstallGatewayOutside'))}
+                                        <div>
+                                            <div className={labelCls}>{t('autoInstallNic')}</div>
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                                {choice(draft.nic_by === 'mac', () => pick({ nic_by: 'mac' }), t('autoInstallNicByMac'))}
+                                                {choice(draft.nic_by === 'name', () => pick({ nic_by: 'name' }), t('autoInstallNicByName'))}
+                                            </div>
+                                            <div className="mt-2">
+                                                {draft.nic_by === 'mac' ? (
+                                                    <>
+                                                        <input id="aiw-mac" value={draft.nic_mac} placeholder="3c:ec:ef:12:34:56" aria-label={t('autoInstallNicByMac')}
+                                                            onChange={e => set({ nic_mac: e.target.value })}
+                                                            className={`${inputCls('nic_mac')} font-mono`} {...aria('nic_mac')} />
+                                                        {errLine('nic_mac')}
+                                                    </>
+                                                ) : (
+                                                    <>
+                                                        <input id="aiw-nic" value={draft.nic_name} placeholder="enp1s0*" aria-label={t('autoInstallNicByName')}
+                                                            onChange={e => set({ nic_name: e.target.value })}
+                                                            className={`${inputCls('nic_name')} font-mono`} {...aria('nic_name')} />
+                                                        {errLine('nic_name') || hint(t('autoInstallNicNameHint'))}
+                                                    </>
+                                                )}
+                                            </div>
+                                        </div>
+                                        {multi && warn(t('autoInstallSameIpWarn'), t('autoInstallSwitchDhcp'), () => pick({ net_mode: 'dhcp' }))}
+                                    </>
+                                )}
+                            </div>
+                        );
+                    }
+                    case 4: {
+                        const levels = AUTOINSTALL_RAID_MIN[draft.filesystem];
+                        const need = levels && levels[draft.raid];
+                        return (
+                            <div className="space-y-4">
+                                <div>
+                                    <div className={labelCls}>{t('autoInstallFilesystem')}</div>
+                                    <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+                                        {[['ext4', 'ext4'], ['xfs', 'xfs'], ['zfs', 'ZFS'], ['btrfs', 'Btrfs']].map(([fs, label]) => choice(
+                                            draft.filesystem === fs,
+                                            // keep the raid level when it exists on the other filesystem too
+                                            () => pick({ filesystem: fs, raid: AUTOINSTALL_RAID_MIN[fs] && AUTOINSTALL_RAID_MIN[fs][draft.raid] ? draft.raid : '' }),
+                                            label, null, fs))}
+                                    </div>
+                                    {errLine('filesystem')}
+                                </div>
+                                {levels && (
+                                    <div className="max-w-xs">
+                                        <label htmlFor="aiw-raid" className={labelCls}>{t('autoInstallRaid')}</label>
+                                        <select id="aiw-raid" value={draft.raid} onChange={e => set({ raid: e.target.value })}
+                                            className={inputCls('raid')} {...aria('raid')}>
+                                            <option value="">-</option>
+                                            {Object.keys(levels).map(l => <option key={l} value={l}>{`${l} (≥${levels[l]})`}</option>)}
+                                        </select>
+                                        {errLine('raid') || (need ? hint((draft.raid === 'raid10' ? t('autoInstallRaidNeedsEven') : t('autoInstallRaidNeeds')).replace('{n}', String(need))) : null)}
+                                    </div>
+                                )}
+                                <div>
+                                    <div className={labelCls}>{t('autoInstallTargetDisks')}</div>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                        {choice(draft.disk_by === 'name', () => pick({ disk_by: 'name' }), t('autoInstallDisksByName'), t('autoInstallDisksByNameHint'))}
+                                        {choice(draft.disk_by === 'filter', () => pick({ disk_by: 'filter' }), t('autoInstallDisksByFilter'), t('autoInstallDisksByFilterHint'))}
+                                    </div>
+                                    <div className="mt-2">
+                                        {draft.disk_by === 'name' ? (
+                                            <>
+                                                <div className={`flex flex-wrap items-center gap-2 px-2 py-1.5 bg-proxmox-dark border rounded-lg ${stepErrors.disks ? 'border-red-500' : 'border-proxmox-border'}`}>
+                                                    {draft.disks.map(n => (
+                                                        <span key={n} className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-proxmox-card border border-proxmox-border text-xs text-white font-mono">
+                                                            {n}
+                                                            <button type="button" aria-label={`${t('remove')} ${n}`}
+                                                                onClick={() => set({ disks: draft.disks.filter(x => x !== n) })}
+                                                                className="text-gray-400 hover:text-red-400">&times;</button>
+                                                        </span>
+                                                    ))}
+                                                    <input id="aiw-disk" autoFocus value={diskInput} placeholder={draft.disks.length ? '' : 'sda'}
+                                                        aria-label={t('autoInstallDisksByName')} {...aria('disks')}
+                                                        onChange={e => { setDiskInput(e.target.value); clearErr('disks'); }}
+                                                        onKeyDown={e => {
+                                                            // Enter on an empty input still means Next
+                                                            if (!['Enter', ' ', ','].includes(e.key)) return;
+                                                            if (diskInput.trim()) { e.preventDefault(); addDisks(); }
+                                                            else if (e.key !== 'Enter') e.preventDefault();
+                                                        }}
+                                                        className="flex-1 py-1 bg-transparent text-sm text-white font-mono focus:outline-none" style={{ minWidth: '6rem' }} />
+                                                    <button type="button" onClick={() => addDisks()} disabled={!diskInput.trim()}
+                                                        className="text-xs px-2 py-1 border border-proxmox-border rounded text-gray-300 hover:border-gray-500 disabled:opacity-50">
+                                                        {t('add')}
+                                                    </button>
+                                                </div>
+                                                {errLine('disks')}
+                                            </>
+                                        ) : (
+                                            <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
+                                                <div>
+                                                    <select value={draft.filter_key} aria-label={t('autoInstallFilterKey')}
+                                                        onChange={e => set({ filter_key: e.target.value })} className={inputCls('filter_key')} {...aria('filter_key')}>
+                                                        {AUTOINSTALL_DISK_KEYS.map(k => <option key={k} value={k}>{k}</option>)}
+                                                    </select>
+                                                    {errLine('filter_key')}
+                                                </div>
+                                                <div className="md:col-span-2">
+                                                    <input id="aiw-glob" autoFocus value={draft.filter_glob} placeholder="Samsung_SSD_870*"
+                                                        aria-label={t('autoInstallFilterGlob')}
+                                                        onChange={e => set({ filter_glob: e.target.value })}
+                                                        className={`${inputCls('filter_glob')} font-mono`} {...aria('filter_glob')} />
+                                                    {errLine('filter_glob')}
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                                {zfsLike && draft.disk_by === 'filter' && (
+                                    <div className="rounded-lg p-3 text-sm border bg-red-500/10 border-red-500/30 text-red-300 space-y-2">
+                                        <div className="flex items-start gap-2">
+                                            <Icons.AlertTriangle />
+                                            <span>{t('autoInstallWipeWarn')}</span>
+                                        </div>
+                                        <label className="flex items-center gap-2 cursor-pointer">
+                                            <input type="checkbox" checked={draft.wipe_ack} onChange={e => set({ wipe_ack: e.target.checked })} {...aria('wipe_ack')} />
+                                            <span>{t('autoInstallWipeAck')}</span>
+                                        </label>
+                                        {errLine('wipe_ack')}
+                                    </div>
+                                )}
+                                {hint(t('autoInstallTuneInEditor'))}
+                            </div>
+                        );
+                    }
+                    default:
+                        return renderReview();
+                }
+            };
+
+            const summaryRows = () => {
+                const d = draft;
+                const cl = (clusters || []).find(c => c.id === d.target_cluster_id);
+                const servers = d.servers === 'one' ? t('autoInstallOneServer')
+                    : (d.servers === 'unlimited' ? t('autoInstallUnlimitedServers') : `${t('autoInstallServerCount')}: ${d.several}`);
+                const kb = (AUTOINSTALL_KEYBOARDS.find(k => k[0] === d.keyboard) || [d.keyboard, d.keyboard])[1];
+                const keys = sshLines(d.ssh_keys).length;
+                return [
+                    [0, [d.name.trim(), servers, cl ? (cl.display_name || cl.name || cl.id) : d.target_cluster_id,
+                         d.expires_local ? `${t('autoInstallExpires')} ${new Date(d.expires_local).toLocaleString()}` : '']],
+                    [1, [countryLabel(d.country), kb, d.timezone.trim(),
+                         d.host_mode === 'fixed' ? d.fqdn.trim() : `${t('autoInstallHostDhcp')}${d.dhcp_domain.trim() ? ` (${d.dhcp_domain.trim()})` : ''}`,
+                         d.mailto.trim()]],
+                    [2, [d.pw_mode === 'paste' ? t('autoInstallPasteHash') : t('autoInstallPwSet'),
+                         keys ? t('autoInstallSshKeyCount').replace('{n}', String(keys)) : '']],
+                    [3, d.net_mode === 'dhcp' ? [t('autoInstallNetDhcp')]
+                        : [d.cidr.trim(), `${t('gateway')} ${d.gateway.trim()}`, `${t('dnsServer')} ${d.dns.trim()}`,
+                           d.nic_by === 'mac' ? `MAC ${d.nic_mac.trim()}` : d.nic_name.trim()]],
+                    [4, [({ ext4: 'ext4', xfs: 'xfs', zfs: 'ZFS', btrfs: 'Btrfs' })[d.filesystem] + (zfsLike ? ` ${d.raid}` : ''),
+                         d.disk_by === 'name' ? d.disks.join(', ') : `${d.filter_key} = ${d.filter_glob.trim()}`]]
+                ];
+            };
+
+            const renderReview = () => {
+                const fieldMsgs = Object.values(fieldErrors);
+                return (
+                    <div className="space-y-4">
+                        {busy && !compose && (
+                            <div className="flex items-center gap-2 text-sm text-gray-400">
+                                <Icons.RotateCw />
+                                {t('autoInstallRendering')}
+                            </div>
+                        )}
+                        {composeError && (
+                            <div className="rounded-lg p-3 text-sm border bg-red-500/10 border-red-500/30 text-red-300 flex flex-wrap items-center justify-between gap-2">
+                                <span>{composeError}</span>
+                                <button type="button" onClick={() => runCompose(draft)} disabled={busy} className="text-xs underline hover:text-white">
+                                    {t('autoInstallRenderAgain')}
+                                </button>
+                            </div>
+                        )}
+                        {compose && (
+                            <div className={`rounded-lg p-3 text-xs border ${compose.valid ? 'bg-green-500/10 border-green-500/30 text-green-300' : 'bg-red-500/10 border-red-500/30 text-red-200'}`}>
+                                <div className="font-medium mb-1">
+                                    {compose.valid ? t('autoInstallAnswerOk') : t('autoInstallAnswerBad')}
+                                </div>
+                                {Object.keys(fieldErrors).map(k => (
+                                    <div key={`f${k}`} className="flex flex-wrap items-center gap-2">
+                                        <span>• {fieldErrors[k]}</span>
+                                        {fieldTarget(k) && (
+                                            <button type="button" onClick={() => fixField(k)} className="font-medium underline hover:text-white">
+                                                {t('autoInstallFix')}
+                                            </button>
+                                        )}
+                                    </div>
+                                ))}
+                                {(compose.errors || []).filter(e => !fieldMsgs.includes(e)).map((e, i) => <div key={`e${i}`}>• {e}</div>)}
+                                {(compose.warnings || []).map((w, i) => <div key={`w${i}`} className="text-yellow-300">• {w}</div>)}
+                            </div>
+                        )}
+                        {stale && (
+                            <div className="rounded-lg p-3 text-xs border bg-yellow-500/10 border-yellow-500/30 text-yellow-300 flex flex-wrap items-center justify-between gap-2">
+                                <span>{t('autoInstallRenderStale')}</span>
+                                <button type="button" onClick={() => runCompose(draft)} className="font-medium underline hover:text-white">
+                                    {t('autoInstallRenderAgain')}
+                                </button>
+                            </div>
+                        )}
+
+                        <dl className="border border-proxmox-border rounded-lg">
+                            {summaryRows().map(([i, parts]) => (
+                                <div key={i} className={`flex items-start gap-3 px-3 py-2 text-sm ${i ? 'border-t border-proxmox-border' : ''}`}>
+                                    <dt className={`w-28 shrink-0 ${badSteps.has(i) ? 'text-red-400' : 'text-gray-400'}`}>{steps[i]}</dt>
+                                    <dd className="flex-1 min-w-0 text-white break-all">{parts.filter(Boolean).join(' · ')}</dd>
+                                    <button type="button" onClick={() => goTo(i)} disabled={busy}
+                                        className="text-xs text-proxmox-orange hover:underline disabled:opacity-50">{t('edit')}</button>
+                                </div>
+                            ))}
+                        </dl>
+
+                        {compose && compose.answer && (
+                            <div>
+                                <div className="text-xs text-gray-400 mb-1">{t('autoInstallAnswerFile')}</div>
+                                <pre className="max-h-64 overflow-auto px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-xs text-gray-200 font-mono">{compose.answer}</pre>
+                            </div>
+                        )}
+
+                        <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                            <input type="checkbox" checked={!!draft.enabled} onChange={e => set({ enabled: e.target.checked })} />
+                            {t('enabled')}
+                        </label>
+
+                        <div>
+                            <button type="button" onClick={() => setShowAdvanced(!showAdvanced)} aria-expanded={showAdvanced}
+                                className="flex items-center gap-1 text-xs text-gray-400 hover:text-white">
+                                <Icons.ChevronRight className={`w-3.5 h-3.5 transition-transform ${showAdvanced ? 'rotate-90' : ''}`} />
+                                {t('advanced')}
+                            </button>
+                            {showAdvanced && (
+                                <div className="mt-2">
+                                    <label htmlFor="aiw-cb" className={labelCls}>{t('autoInstallCallbackUrl')}</label>
+                                    <input id="aiw-cb" value={draft.callback_url} placeholder="https://"
+                                        onChange={e => set({ callback_url: e.target.value })} className={inputCls('callback_url')} {...aria('callback_url')} />
+                                    {errLine('callback_url') || hint(t('autoInstallCallbackHint'))}
+                                </div>
+                            )}
+                        </div>
+
+                        <p className="flex items-center gap-2 text-xs text-gray-500">
+                            <Icons.Info />
+                            {t('autoInstallIsoMin')}
+                        </p>
+
+                        {createError && (
+                            <div className="rounded-lg p-3 text-sm border bg-red-500/10 border-red-500/30 text-red-300 flex items-center gap-2">
+                                <Icons.AlertTriangle />
+                                {createError}
+                            </div>
+                        )}
+                    </div>
+                );
+            };
+
+            const renderResult = () => (
+                <div className="space-y-4">
+                    <div className="flex items-center gap-2 text-sm text-green-400 font-medium">
+                        <Icons.CheckCircle />
+                        <span>{t('autoInstallCreated')}: <span className="text-white">{result.name}</span></span>
+                    </div>
+                    <AutoInstallTokenBox t={t} reveal={result} onCopied={() => setCopied(true)} />
+                    <div>
+                        <h4 className="text-sm font-medium text-white mb-2">{t('autoInstallNextSteps')}</h4>
+                        <ol className="space-y-2 text-sm text-gray-300">
+                            {[t('autoInstallNextStep1'), t('autoInstallNextStep2'), t('autoInstallNextStep3')].map((s, i) => (
+                                <li key={i} className="flex items-start gap-2">
+                                    <span className="w-5 h-5 shrink-0 rounded-full bg-proxmox-orange/20 text-proxmox-orange text-xs flex items-center justify-center">{i + 1}</span>
+                                    <span>{s}</span>
+                                </li>
+                            ))}
+                        </ol>
+                    </div>
+                </div>
+            );
+
+            // Enter in a field means Next. Deliberately not a <form>: the root step holds a
+            // password pair, and a submitted form that disappears makes browsers offer to
+            // save it as the PegaProx login. Textareas (SSH keys) keep their newlines.
+            const body = result ? renderResult() : (
+                <div onKeyDown={e => {
+                    // a field that handled Enter itself (the disk chips) called preventDefault,
+                    // which is also what stops a real form from submitting
+                    if (e.key === 'Enter' && !e.defaultPrevented && e.target.tagName === 'INPUT'
+                            && e.target.type !== 'checkbox' && e.target.type !== 'radio') {
+                        e.preventDefault();
+                        goNext();
+                    }
+                }}>
+                    {renderStepContent()}
+                </div>
+            );
+            const stepMeta = result ? result.name : `${t('step')} ${activeStep + 1} / ${steps.length}`;
+            // clicks and keys stay inside: React bubbles through portals, and the
+            // dashboard has single-letter shortcuts on document
+            const contain = { onClick: e => e.stopPropagation(), onKeyDown: e => e.stopPropagation() };
+
+            if (isCorporate) {
+                return ReactDOM.createPortal(
+                    <div className="corp-vm-modal-overlay" style={{ zIndex: 70 }} {...contain}>
+                        <div className="corp-vm-modal" style={{ maxWidth: '820px' }} role="dialog" aria-modal="true" aria-labelledby="aiw-title">
+                            <div className="corp-vm-modal-header">
+                                <div className="corp-vm-modal-header-left">
+                                    <span className="corp-vm-type-pill">PVE</span>
+                                    <div className="corp-vm-modal-title-block">
+                                        <h2 id="aiw-title" className="corp-vm-modal-title">{t('autoInstallGuided')}</h2>
+                                        <div className="corp-vm-modal-meta">
+                                            <span>{t('autoInstall')}</span>
+                                            <span className="corp-meta-sep">·</span>
+                                            <span>{stepMeta}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div className="corp-vm-modal-actions">
+                                    <button onClick={requestClose} disabled={creating} className="corp-vm-btn corp-vm-btn-ghost">
+                                        {t('close')}
+                                    </button>
+                                </div>
+                            </div>
+
+                            {!result && (
+                                <div className="corp-vm-stepper" ref={stepperRef}>
+                                    {steps.map((s, i) => {
+                                        const cls = i === activeStep ? 'active' : (i < activeStep ? 'done' : 'todo');
+                                        const bad = badSteps.has(i) && i !== activeStep;
+                                        return (
+                                            <button key={i} type="button" onClick={() => goTo(i)} className={`corp-vm-step ${cls}`}
+                                                disabled={i > activeStep} aria-current={i === activeStep ? 'step' : undefined}>
+                                                <span className="corp-vm-step-num"
+                                                    style={bad ? { background: '#c92100', borderColor: '#c92100', color: '#fff' } : undefined}>
+                                                    {bad ? '!' : (i < activeStep ? '✓' : i + 1)}
+                                                </span>
+                                                <span className="corp-vm-step-label">{s}</span>
+                                                {i < steps.length - 1 && <span className="corp-vm-step-line" />}
+                                            </button>
+                                        );
+                                    })}
+                                </div>
+                            )}
+
+                            <div className="corp-vm-modal-body" style={{ minHeight: '320px' }}>
+                                {body}
+                            </div>
+
+                            <div className="corp-vm-modal-footer">
+                                {result ? <span /> : (
+                                    <button onClick={requestClose} disabled={creating} className="corp-vm-btn corp-vm-btn-ghost">
+                                        {t('cancel')}
+                                    </button>
+                                )}
+                                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                                    {result ? (
+                                        <button onClick={requestClose} className="corp-vm-btn corp-vm-btn-primary">{t('done')}</button>
+                                    ) : (
+                                        <>
+                                            <button onClick={() => goTo(activeStep - 1)} disabled={activeStep === 0 || busy}
+                                                className="corp-vm-btn corp-vm-btn-ghost">
+                                                {t('back')}
+                                            </button>
+                                            {activeStep < lastStep ? (
+                                                <button onClick={goNext} disabled={busy} className="corp-vm-btn corp-vm-btn-primary">
+                                                    {busy && <Icons.RotateCw />}
+                                                    {t('next')}
+                                                </button>
+                                            ) : (
+                                                <>
+                                                    <button onClick={() => onOpenInEditor(profileDraft(), compose)} disabled={!compose || !compose.answer || stale || busy}
+                                                        className="corp-vm-btn corp-vm-btn-ghost">
+                                                        {t('autoInstallOpenInEditor')}
+                                                    </button>
+                                                    <button onClick={create} disabled={!canCreate} className="corp-vm-btn corp-vm-btn-create">
+                                                        {creating && <Icons.RotateCw />}
+                                                        {t('autoInstallCreateProfile')}
+                                                    </button>
+                                                </>
+                                            )}
+                                        </>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    </div>,
+                    document.body
+                );
+            }
+
+            return ReactDOM.createPortal(
+                <div className={`fixed inset-0 z-[70] flex items-center justify-center p-4 bg-black/80${isCloud ? ' cloud-mounted' : ''}`} {...contain}>
+                    <div className="w-full max-w-2xl max-h-[90vh] flex flex-col bg-proxmox-card border border-proxmox-border rounded-xl shadow-2xl overflow-hidden"
+                        role="dialog" aria-modal="true" aria-labelledby="aiw-title">
+                        <div className="flex items-center justify-between border-b border-proxmox-border bg-proxmox-dark px-6 py-4">
+                            <div className="flex items-center gap-3 min-w-0">
+                                <div className="p-2 rounded-lg bg-proxmox-orange/10 text-proxmox-orange">
+                                    <Icons.Disc className="w-5 h-5" />
+                                </div>
+                                <div className="min-w-0">
+                                    <h2 id="aiw-title" className="font-semibold text-white">{t('autoInstallGuided')}</h2>
+                                    <div className="text-xs text-gray-500 truncate">{stepMeta}</div>
+                                </div>
+                            </div>
+                            <button onClick={requestClose} disabled={creating} aria-label={t('close')}
+                                className="p-2 hover:bg-proxmox-hover rounded-lg text-gray-400 hover:text-white">
+                                <Icons.X />
+                            </button>
+                        </div>
+
+                        {!result && (
+                            <div className="flex border-b border-proxmox-border bg-proxmox-dark/50 overflow-x-auto">
+                                {steps.map((s, i) => (
+                                    <button key={i} type="button" onClick={() => goTo(i)} disabled={i > activeStep}
+                                        aria-current={i === activeStep ? 'step' : undefined}
+                                        className={`flex-1 px-3 py-3 text-xs font-medium whitespace-nowrap transition-colors disabled:cursor-not-allowed ${
+                                            i === activeStep
+                                                ? 'text-proxmox-orange border-b-2 border-proxmox-orange'
+                                                : (badSteps.has(i) ? 'text-red-400' : (i < activeStep ? 'text-gray-300 hover:text-white' : 'text-gray-500'))
+                                        }`}>
+                                        {i + 1}. {s}
+                                    </button>
+                                ))}
+                            </div>
+                        )}
+
+                        <div className="flex-1 overflow-y-auto p-6 min-h-[300px]">
+                            {body}
+                        </div>
+
+                        <div className="flex items-center justify-between gap-3 px-6 py-4 border-t border-proxmox-border bg-proxmox-dark">
+                            {result ? <span /> : (
+                                <button onClick={requestClose} disabled={creating} className="px-4 py-2 text-gray-300 hover:text-white">
+                                    {t('cancel')}
+                                </button>
+                            )}
+                            <div className="flex flex-wrap justify-end gap-3">
+                                {result ? (
+                                    <button onClick={requestClose}
+                                        className="px-4 py-2 bg-proxmox-orange hover:bg-proxmox-orange/90 rounded-lg text-white">
+                                        {t('done')}
+                                    </button>
+                                ) : (
+                                    <>
+                                        <button onClick={() => goTo(activeStep - 1)} disabled={activeStep === 0 || busy}
+                                            className="px-4 py-2 text-gray-400 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed">
+                                            {t('back')}
+                                        </button>
+                                        {activeStep < lastStep ? (
+                                            <button onClick={goNext} disabled={busy}
+                                                className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange hover:bg-proxmox-orange/90 rounded-lg text-white disabled:opacity-50">
+                                                {busy && <Icons.RotateCw />}
+                                                {t('next')}
+                                            </button>
+                                        ) : (
+                                            <>
+                                                <button onClick={() => onOpenInEditor(profileDraft(), compose)} disabled={!compose || !compose.answer || stale || busy}
+                                                    className="px-4 py-2 border border-proxmox-border rounded-lg text-gray-300 hover:text-white hover:border-gray-500 disabled:opacity-50">
+                                                    {t('autoInstallOpenInEditor')}
+                                                </button>
+                                                <button onClick={create} disabled={!canCreate}
+                                                    className="flex items-center gap-2 px-4 py-2 bg-green-600 rounded-lg text-white hover:bg-green-700 disabled:opacity-50">
+                                                    {creating && <Icons.RotateCw />}
+                                                    {t('autoInstallCreateProfile')}
+                                                </button>
+                                            </>
+                                        )}
+                                    </>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                </div>,
+                document.body
+            );
+        }
+
+        // LW Oct 2026 - Settings > Banners: the broadcast banners signed-in users see at the top of
+        // the page (BroadcastBanners in dashboard.js). An admin limited to a tenant gets the
+        // server's 403 text instead of the list. A standby lists them and leaves every change to
+        // the active instance (#625), so its buttons give way to the note.
+        const BANNER_SEVERITY_KEYS = { info: 'bcastSevInfo', warning: 'bcastSevWarning', critical: 'bcastSevCritical' };
+        const BANNER_SEVERITY_BADGE = {
+            info: 'bg-blue-500/10 text-blue-400 border-blue-500/30',
+            warning: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30',
+            critical: 'bg-red-500/10 text-red-400 border-red-500/30',
+        };
+
+        function BroadcastBannerSettings({ t, addToast, getAuthHeaders }) {
+            const { haStandby } = useAuth();
+            const [data, setData] = useState(null);
+            const [refused, setRefused] = useState('');
+            const [editing, setEditing] = useState(null);
+            const [saving, setSaving] = useState(false);
+
+            const load = useCallback(async () => {
+                try {
+                    const r = await fetch(`${API_URL}/settings/banners`, { credentials: 'include', headers: getAuthHeaders() });
+                    const d = await r.json().catch(() => ({}));
+                    if (r.ok) {
+                        setData(d);
+                        setRefused('');
+                    } else {
+                        setRefused(typeof d.error === 'string' && d.error ? d.error : t('bcastLoadFailed'));
+                    }
+                } catch (_) {
+                    setRefused(t('bcastLoadFailed'));
+                }
+            }, [getAuthHeaders, t]);
+            useEffect(() => { load(); }, [load]);
+
+            const limits = data?.limits || { text: 500, count: 20 };
+            const tenantChoices = Array.isArray(data?.choices?.tenants) ? data.choices.tenants : [];
+            const roleChoices = Array.isArray(data?.choices?.roles) ? data.choices.roles : [];
+            const list = Array.isArray(data?.banners) ? data.banners : [];
+            const tenantName = (id) => (tenantChoices.find(x => x.id === id) || {}).name || id;
+            const roleName = (id) => (roleChoices.find(x => x.id === id) || {}).name || id;
+            const full = list.length >= limits.count;
+
+            const startNew = () => setEditing({ id: null, text: '', severity: 'info', expires: '', expiresWas: '',
+                                                scope: 'everyone', tenants: [], roles: [] });
+            const startEdit = (b) => {
+                const expires = utcToLocalInput(b.expires_at);
+                setEditing({ id: b.id, text: b.text, severity: b.severity, expires, expiresWas: expires,
+                             scope: b.scope, tenants: b.tenants || [], roles: b.roles || [] });
+            };
+            const toggle = (key, id) => setEditing(e => ({ ...e,
+                [key]: e[key].includes(id) ? e[key].filter(x => x !== id) : e[key].concat(id) }));
+
+            const changed = () => window.dispatchEvent(new CustomEvent('pegaprox-banners-changed'));
+
+            const save = async () => {
+                if (!editing || saving) return;
+                const body = { text: editing.text, severity: editing.severity, scope: editing.scope,
+                               tenants: editing.scope === 'tenants' ? editing.tenants : [],
+                               roles: editing.scope === 'roles' ? editing.roles : [] };
+                // an expiry left as it was is not sent: one that has passed would be refused
+                if (!editing.id || editing.expires !== editing.expiresWas) body.expires_at = localInputToUtc(editing.expires);
+                setSaving(true);
+                try {
+                    const r = await fetch(editing.id ? `${API_URL}/settings/banners/${encodeURIComponent(editing.id)}` : `${API_URL}/settings/banners`, {
+                        method: editing.id ? 'PUT' : 'POST', credentials: 'include',
+                        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    const d = await r.json().catch(() => ({}));
+                    if (r.ok) {
+                        addToast(t('bcastSaved'), 'success');
+                        setEditing(null);
+                        load();
+                        changed();
+                    } else {
+                        addToast(typeof d.error === 'string' && d.error ? d.error : t('bcastSaveFailed'), 'error');
+                    }
+                } catch (_) {
+                    addToast(t('bcastSaveFailed'), 'error');
+                }
+                setSaving(false);
+            };
+
+            const remove = async (b) => {
+                if (!window.confirm(t('bcastDeleteAsk'))) return;
+                try {
+                    const r = await fetch(`${API_URL}/settings/banners/${encodeURIComponent(b.id)}`, {
+                        method: 'DELETE', credentials: 'include', headers: getAuthHeaders(),
+                    });
+                    const d = await r.json().catch(() => ({}));
+                    if (r.ok) {
+                        addToast(t('bcastDeleted'), 'success');
+                        if (editing && editing.id === b.id) setEditing(null);
+                        load();
+                        changed();
+                    } else {
+                        addToast(typeof d.error === 'string' && d.error ? d.error : t('bcastSaveFailed'), 'error');
+                    }
+                } catch (_) {
+                    addToast(t('bcastSaveFailed'), 'error');
+                }
+            };
+
+            const scopeText = (b) => b.scope === 'tenants' ? `${t('bcastScopeTenants')}: ${(b.tenants || []).map(tenantName).join(', ')}`
+                : b.scope === 'roles' ? `${t('bcastScopeRoles')}: ${(b.roles || []).map(roleName).join(', ')}`
+                : t('bcastScopeEveryone');
+            const expiryText = (b) => !b.expires_at ? t('bcastNoExpiry')
+                : b.expired ? t('bcastExpired') : t('bcastUntil').replace('{time}', () => fmtDate(b.expires_at));
+            const canSave = editing && editing.text.trim() && !saving
+                && (editing.scope !== 'tenants' || editing.tenants.length > 0)
+                && (editing.scope !== 'roles' || editing.roles.length > 0);
+            const input = 'w-full px-3 py-2 bg-proxmox-darker border border-proxmox-border rounded-lg text-white text-sm';
+
+            const picker = (key, choices) => (
+                <div className="flex flex-wrap gap-2" data-banner-picker={key}>
+                    {choices.map(c => (
+                        <label key={c.id} className="flex items-center gap-2 px-2 py-1 rounded-lg border border-proxmox-border text-sm text-gray-300 cursor-pointer">
+                            <input type="checkbox" checked={editing[key].includes(c.id)} onChange={() => toggle(key, c.id)} className="w-4 h-4" />
+                            <span>{c.name || c.id}</span>
+                        </label>
+                    ))}
+                </div>
+            );
+
+            const form = editing && (
+                <div className="p-4 bg-proxmox-darker border border-proxmox-border rounded-lg space-y-3" data-banner-form={editing.id ? 'edit' : 'new'}>
+                    <div>
+                        <label htmlFor="bcast-text" className="block text-xs text-gray-400 mb-1">{t('bcastText')}</label>
+                        <textarea id="bcast-text" rows={2} maxLength={limits.text} value={editing.text}
+                            onChange={e => setEditing({ ...editing, text: e.target.value })} className={input} />
+                        <div className="flex justify-between gap-3 text-xs text-gray-500 mt-1">
+                            <span>{t('bcastTextHint')}</span>
+                            <span>{editing.text.length}/{limits.text}</span>
+                        </div>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        <div>
+                            <label htmlFor="bcast-severity" className="block text-xs text-gray-400 mb-1">{t('bcastSeverity')}</label>
+                            <select id="bcast-severity" value={editing.severity}
+                                onChange={e => setEditing({ ...editing, severity: e.target.value })} className={input}>
+                                {Object.keys(BANNER_SEVERITY_KEYS).map(s => <option key={s} value={s}>{t(BANNER_SEVERITY_KEYS[s])}</option>)}
+                            </select>
+                        </div>
+                        <div>
+                            <label htmlFor="bcast-expires" className="block text-xs text-gray-400 mb-1">{t('bcastExpires')}</label>
+                            <input id="bcast-expires" type="datetime-local" value={editing.expires}
+                                onChange={e => setEditing({ ...editing, expires: e.target.value })} className={input} />
+                            <div className="text-xs text-gray-500 mt-1">{t('bcastExpiresHint')}</div>
+                        </div>
+                    </div>
+                    <div>
+                        <div className="block text-xs text-gray-400 mb-1">{t('bcastScope')}</div>
+                        <div className="flex flex-wrap gap-4 mb-2">
+                            {[['everyone', 'bcastScopeEveryone'], ['tenants', 'bcastScopeTenants'], ['roles', 'bcastScopeRoles']].map(([s, key]) => (
+                                <label key={s} className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer">
+                                    <input type="radio" name="bcast-scope" value={s} checked={editing.scope === s}
+                                        onChange={() => setEditing({ ...editing, scope: s })} className="w-4 h-4" />
+                                    <span>{t(key)}</span>
+                                </label>
+                            ))}
+                        </div>
+                        {editing.scope === 'tenants' && picker('tenants', tenantChoices)}
+                        {editing.scope === 'roles' && picker('roles', roleChoices)}
+                    </div>
+                    <div className="flex justify-end gap-2">
+                        <button onClick={() => setEditing(null)} className="px-3 py-1.5 text-sm text-gray-300 hover:text-white">
+                            {t('cancel')}
+                        </button>
+                        <button onClick={save} disabled={!canSave}
+                            className="flex items-center gap-2 px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm text-white disabled:opacity-50">
+                            {saving && <Icons.RotateCw className="w-4 h-4 animate-spin" />}
+                            {t('save')}
+                        </button>
+                    </div>
+                </div>
+            );
+
+            return (
+                <div className="space-y-4" data-banner-settings>
+                    <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-4 space-y-3">
+                        <div className="flex items-center justify-between gap-3">
+                            <h4 className="font-medium text-white flex items-center gap-2">
+                                <Icons.MessageSquare />
+                                {t('bcastTitle')}
+                                {data && <span className="text-xs text-gray-500 ml-1">({list.length}/{limits.count})</span>}
+                            </h4>
+                            {data && !haStandby && !editing && (
+                                <button onClick={startNew} disabled={full}
+                                    className="flex items-center gap-1 px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm text-white disabled:opacity-50">
+                                    <Icons.Plus /> {t('bcastAdd')}
+                                </button>
+                            )}
+                        </div>
+                        <p className="text-xs text-gray-500">{t('bcastDesc')}</p>
+                        {refused && <div className="px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/30 text-sm text-red-400" data-banner-refused>{refused}</div>}
+                        {data && haStandby && <HaSettingsOnActive />}
+                        {data && !haStandby && full && !editing && <p className="text-xs text-yellow-400">{t('bcastFull').replace('{n}', limits.count)}</p>}
+                        {!haStandby && form}
+                        {data && list.length === 0 && !editing && <p className="text-sm text-gray-500 text-center py-3">{t('bcastNone')}</p>}
+                        {list.length > 0 && (
+                            <div className="space-y-2">
+                                {list.map(b => (
+                                    <div key={b.id} data-banner-row={b.id}
+                                        className={`flex items-start gap-3 p-3 rounded-lg border border-proxmox-border bg-proxmox-darker ${b.expired ? 'opacity-60' : ''}`}>
+                                        <span className={`px-2 py-0.5 rounded border text-xs whitespace-nowrap ${BANNER_SEVERITY_BADGE[b.severity] || BANNER_SEVERITY_BADGE.info}`}>
+                                            {t(BANNER_SEVERITY_KEYS[b.severity] || 'bcastSevInfo')}
+                                        </span>
+                                        <div className="flex-1 min-w-0">
+                                            <div className="text-sm text-white" style={{ overflowWrap: 'anywhere' }}>{b.text}</div>
+                                            <div className="text-xs text-gray-500 mt-1">{scopeText(b)} · {expiryText(b)}</div>
+                                        </div>
+                                        {!haStandby && (
+                                            <div className="flex items-center gap-1">
+                                                <button onClick={() => startEdit(b)} title={t('edit')} aria-label={t('edit')}
+                                                    className="p-1.5 rounded text-gray-400 hover:text-white hover:bg-proxmox-dark">
+                                                    <Icons.Edit />
+                                                </button>
+                                                <button onClick={() => remove(b)} title={t('delete')} aria-label={t('delete')}
+                                                    className="p-1.5 rounded text-red-400 hover:bg-red-500/10">
+                                                    <Icons.Trash />
+                                                </button>
+                                            </div>
+                                        )}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+        }
+
         // ═══════════════════════════════════════════════
         // PegaProx - Settings Modal
         // PegaProxSettingsModal (Server, SSL, SMTP, RBAC, Audit, Tenants)
@@ -572,7 +2696,8 @@
         // PegaProx Settings Modal with User Management and Audit Log
         function PegaProxSettingsModal({ isOpen, onClose, addToast, onGroupsChanged }) {
             const { t } = useTranslation();
-            const { getAuthHeaders, user: currentUser } = useAuth();
+            // haStandby: the saves below that no standby carries out, forwarding or not (#625)
+            const { getAuthHeaders, user: currentUser, isAdmin, haStandby } = useAuth();
             const { isCorporate } = useLayout(); // LW: Feb 2026 - Corporate styling
             const [activeTab, setActiveTab] = useState('users');
             const [users, setUsers] = useState([]);
@@ -816,6 +2941,13 @@
                 };
                 window.addEventListener('pegaprox-navigate-updates', handleNavigateUpdates);
                 return () => window.removeEventListener('pegaprox-navigate-updates', handleNavigateUpdates);
+            }, []);
+
+            // the standby banner opens us on the HA tab
+            useEffect(() => {
+                const toHa = () => setActiveTab('ha');
+                window.addEventListener('pegaprox-navigate-ha', toHa);
+                return () => window.removeEventListener('pegaprox-navigate-ha', toHa);
             }, []);
             
             // Fetch password policy - NS Jan 2026
@@ -2364,6 +4496,8 @@
                     'vm.cloned': t('vmCloned'),
                     'vm.migrated': t('vmMigrated'),
                     'vm.bulk_migrated': t('vmBulkMigrated'),
+                    'vm.bulk_migrate_cancelled': t('migRunAuditCancelled'),
+                    'vm.bulk_migrate_finished': t('migRunAuditFinished'),
                     'vm.config_changed': t('vmConfigChanged'),
                     'vm.suspended': t('vmSuspended'),
                     'vm.resumed': t('vmResumed'),
@@ -2387,6 +4521,9 @@
                     'node.maintenance_entered': t('nodeMaintenanceEntered'),
                     'node.maintenance_exited': t('nodeMaintenanceExited'),
                     'node.update_started': t('nodeUpdateStarted'),
+                    'node.guests_started': t('auditNodeGuestsStarted'),
+                    'node.guests_stopped': t('auditNodeGuestsStopped'),
+                    'node.guests_migrated': t('auditNodeGuestsMigrated'),
                 };
                 return labels[action] || action;
             };
@@ -2568,6 +4705,32 @@
                                 <Icons.Server className="w-4 h-4" />
                                 <span>{t('server') || 'Server'}</span>
                             </button>
+                            {isAdmin && (
+                            <button
+                                onClick={() => setActiveTab('banners')}
+                                className={`flex items-center gap-2 ${isCorporate ? 'px-3 py-1.5 text-[13px]' : 'px-4 py-2.5 text-sm'} font-medium transition-colors whitespace-nowrap ${
+                                    activeTab === 'banners'
+                                        ? (isCorporate ? 'text-white border-b-2 border-[#49afd9] font-medium' : 'text-proxmox-orange border-b-2 border-proxmox-orange bg-proxmox-dark/50')
+                                        : 'text-gray-400 hover:text-white hover:bg-proxmox-dark/30'
+                                }`}
+                            >
+                                <Icons.MessageSquare className="w-4 h-4" />
+                                <span>{t('bcastTab')}</span>
+                            </button>
+                            )}
+                            {isAdmin && (
+                            <button
+                                onClick={() => setActiveTab('ha')}
+                                className={`flex items-center gap-2 ${isCorporate ? 'px-3 py-1.5 text-[13px]' : 'px-4 py-2.5 text-sm'} font-medium transition-colors whitespace-nowrap ${
+                                    activeTab === 'ha'
+                                        ? (isCorporate ? 'text-white border-b-2 border-[#49afd9] font-medium' : 'text-proxmox-orange border-b-2 border-proxmox-orange bg-proxmox-dark/50')
+                                        : 'text-gray-400 hover:text-white hover:bg-proxmox-dark/30'
+                                }`}
+                            >
+                                <Icons.Layers className="w-4 h-4" />
+                                <span>{t('pgHaTab')}</span>
+                            </button>
+                            )}
                             <button
                                 onClick={() => setActiveTab('syslog')}
                                 className={`flex items-center gap-2 ${isCorporate ? 'px-3 py-1.5 text-[13px]' : 'px-4 py-2.5 text-sm'} font-medium transition-colors whitespace-nowrap ${
@@ -4302,7 +6465,7 @@
                                                         <option key={c.id} value={c.id}>{clusterLabel(c)}</option>
                                                     ))}
                                                 </select>
-                                                {selectedPoolCluster && (
+                                                {selectedPoolCluster && !haStandby && (
                                                     <button
                                                         onClick={() => refreshPoolCache(selectedPoolCluster)}
                                                         className="px-3 py-2 bg-proxmox-border hover:bg-gray-600 rounded-lg text-sm"
@@ -5333,10 +7496,12 @@
                                     
                                     {/* Save Button */}
                                     <div className="flex justify-end gap-3">
+                                        {haStandby ? <HaSettingsOnActive /> : (
                                         <button onClick={saveLdapSettings} disabled={loading} className="px-6 py-2 bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 rounded-lg text-white font-medium flex items-center gap-2">
                                             {loading ? <Icons.Loader className="w-4 h-4 animate-spin" /> : <Icons.Save className="w-4 h-4" />}
                                             Save LDAP Settings
                                         </button>
+                                        )}
                                     </div>
                                 </div>
                             )}
@@ -5646,10 +7811,12 @@
                                     
                                     {/* Save */}
                                     <div className="flex justify-end pt-2">
+                                        {haStandby ? <HaSettingsOnActive /> : (
                                         <button onClick={saveOidcSettings} disabled={loading} className="px-6 py-2 bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 rounded-lg text-white font-medium flex items-center gap-2">
                                             {loading ? <Icons.Loader className="w-4 h-4 animate-spin" /> : <Icons.Save className="w-4 h-4" />}
                                             Save OIDC Settings
                                         </button>
+                                        )}
                                     </div>
                                 </div>
                             )}
@@ -5703,6 +7870,7 @@
                                         </div>
 
                                         <div className="pt-3 flex justify-end border-t border-proxmox-border">
+                                            {haStandby ? <HaSettingsOnActive own /> : (
                                             <button
                                                 onClick={async () => {
                                                     setServerLoading(true);
@@ -5734,6 +7902,7 @@
                                                 {serverLoading && <Icons.Loader className="w-4 h-4 animate-spin" />}
                                                 {t('saveSettings') || t('save') || 'Save'}
                                             </button>
+                                            )}
                                         </div>
                                     </div>
                                 </div>
@@ -6326,7 +8495,7 @@
                                                     </p>
                                                 </div>
 
-                                                {acmeResult?.pending_dns && (
+                                                {acmeResult?.pending_dns && !haStandby && (
                                                     <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg space-y-3">
                                                         <p className="text-sm text-amber-300">{t('acmeDnsInstructions') || 'Create this TXT record, wait for DNS propagation, then continue validation.'}</p>
                                                         <div>
@@ -6362,6 +8531,7 @@
                                                     </div>
                                                 )}
 
+                                                {haStandby ? <HaSettingsOnActive own /> : (
                                                 <button
                                                     onClick={handleAcmeRequest}
                                                     disabled={acmeLoading || !serverSettings.domain || (serverSettings.acme_provider === 'letsencrypt' && !serverSettings.acme_email) || (serverSettings.acme_provider === 'custom' && !serverSettings.acme_directory_url) || ((serverSettings.acme_challenge_type || 'http-01') === 'dns-01' && (serverSettings.acme_dns_provider || 'manual') === 'rfc2136' && (!serverSettings.acme_dns_rfc2136_nameserver || !serverSettings.acme_dns_rfc2136_zone || !serverSettings.acme_dns_rfc2136_key_name || !serverSettings.acme_dns_rfc2136_secret)) || ((serverSettings.acme_challenge_type || 'http-01') === 'dns-01' && (serverSettings.acme_dns_provider || 'manual') === 'cloudflare' && !serverSettings.acme_dns_cloudflare_token)}
@@ -6369,6 +8539,7 @@
                                                 >
                                                     {acmeLoading ? t('acmeRequesting') : ((serverSettings.acme_challenge_type || 'http-01') === 'dns-01' && (serverSettings.acme_dns_provider || 'manual') === 'manual' ? (t('acmeDnsPrepare') || 'Prepare DNS Challenge') : t('acmeRequest'))}
                                                 </button>
+                                                )}
                                             </div>
                                         </div>
                                     </div>
@@ -6505,6 +8676,7 @@
                                                 
                                                 {/* Save SMTP Button */}
                                                 <div className="pt-3 flex justify-end">
+                                                    {haStandby ? <HaSettingsOnActive /> : (
                                                     <button
                                                         onClick={handleSaveSMTPSettings}
                                                         disabled={smtpLoading}
@@ -6513,6 +8685,7 @@
                                                         {smtpLoading && <Icons.Loader className="w-4 h-4 animate-spin" />}
                                                         {t('saveSmtpSettings') || 'Save SMTP Settings'}
                                                     </button>
+                                                    )}
                                                 </div>
                                             </div>
                                         )}
@@ -6523,6 +8696,7 @@
                                                 <p className="text-xs text-gray-500 mr-auto my-auto">
                                                     {t('enableSmtpHint') || 'Enable SMTP to configure email settings'}
                                                 </p>
+                                                {haStandby ? <HaSettingsOnActive /> : (
                                                 <button
                                                     onClick={handleSaveSMTPSettings}
                                                     disabled={smtpLoading}
@@ -6531,6 +8705,7 @@
                                                     {smtpLoading && <Icons.Loader className="w-4 h-4 animate-spin" />}
                                                     {t('save') || 'Save'}
                                                 </button>
+                                                )}
                                             </div>
                                         )}
                                     </div>
@@ -6622,7 +8797,9 @@
                                                 <Icons.Package className="w-4 h-4" />
                                                 {t('plugins') || 'Plugins'}
                                             </h4>
-                                            <button onClick={async () => {
+                                            {/* a process loads its own plugins: a standby does not switch, rescan
+                                                or delete them, forwarding or not (#625) */}
+                                            {!haStandby && <button onClick={async () => {
                                                 try {
                                                     await fetch(`${API_URL}/plugins/rescan`, { method: 'POST', credentials: 'include', headers: getAuthHeaders() });
                                                     fetchPlugins();
@@ -6631,7 +8808,7 @@
                                             }} className="text-xs text-gray-400 hover:text-white flex items-center gap-1">
                                                 <Icons.RefreshCw className="w-3 h-3" />
                                                 Rescan
-                                            </button>
+                                            </button>}
                                         </div>
                                         <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3">
                                             <p className="text-xs text-yellow-400">
@@ -6652,9 +8829,49 @@
                                                             {plugin.author && <p className="text-xs text-gray-500">{t('pluginAuthor') || 'by'} {plugin.author}</p>}
                                                             {plugin.description && <p className="text-xs text-gray-400 mt-0.5">{plugin.description}</p>}
                                                             {plugin.error && <p className="text-xs text-red-400 mt-0.5">{plugin.error}</p>}
+                                                            {/* MK Sep 2026 (#642) - which clusters this plugin belongs to.
+                                                                Nothing ticked = every cluster, which is where plugins start and
+                                                                what the reporter's standalone nodes were seeing. */}
+                                                            {clusters.length > 1 && (
+                                                                <div className="mt-1.5 flex items-center gap-2 flex-wrap">
+                                                                    <span className="text-xs text-gray-500">
+                                                                        {t('showOnClusters') || 'Show on'}:
+                                                                    </span>
+                                                                    {(plugin.clusters || []).length === 0 && (
+                                                                        <span className="text-xs text-gray-400">
+                                                                            {t('allClusters') || 'All clusters'}
+                                                                        </span>
+                                                                    )}
+                                                                    {clusters.map(c => {
+                                                                        const on = (plugin.clusters || []).indexOf(c.id) >= 0;
+                                                                        return (
+                                                                            <button key={c.id} type="button"
+                                                                                onClick={async () => {
+                                                                                    const cur = plugin.clusters || [];
+                                                                                    const next = on ? cur.filter(x => x !== c.id) : cur.concat([c.id]);
+                                                                                    try {
+                                                                                        const r = await fetch(`${API_URL}/plugins/${plugin.id}/clusters`, {
+                                                                                            method: 'PUT', credentials: 'include',
+                                                                                            headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+                                                                                            body: JSON.stringify({ clusters: next })
+                                                                                        });
+                                                                                        if (r && r.ok) fetchPlugins();
+                                                                                        else addToast((await r.json().catch(() => ({}))).error || 'Failed', 'error');
+                                                                                    } catch (e) { addToast('Error', 'error'); }
+                                                                                }}
+                                                                                className={`text-xs px-1.5 py-0.5 rounded border transition-colors ${
+                                                                                    on ? 'border-proxmox-orange text-proxmox-orange'
+                                                                                       : 'border-proxmox-border text-gray-500 hover:text-gray-300'}`}>
+                                                                                {c.name || c.id}
+                                                                            </button>
+                                                                        );
+                                                                    })}
+                                                                </div>
+                                                            )}
                                                         </div>
                                                         <div className="flex items-center gap-2">
-                                                            <div className={`toggle-switch ${plugin.enabled ? 'active' : ''}`} onClick={() => togglePlugin(plugin.id, plugin.enabled)} />
+                                                            <div className={`toggle-switch ${plugin.enabled ? 'active' : ''} ${haStandby ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                                                onClick={haStandby ? undefined : () => togglePlugin(plugin.id, plugin.enabled)} />
                                                             <button onClick={async () => {
                                                                 try {
                                                                     const r = await fetch(`${API_URL}/plugins/${plugin.id}/config`, { credentials: 'include', headers: getAuthHeaders() });
@@ -6671,7 +8888,7 @@
                                                             }} className="text-gray-400/50 hover:text-proxmox-orange transition-colors" title="Edit config.json">
                                                                 <Icons.Edit className="w-4 h-4" />
                                                             </button>
-                                                            <button onClick={async () => {
+                                                            {!haStandby && <button onClick={async () => {
                                                                 if (!confirm(`Delete plugin "${plugin.name}"? This removes all plugin files.`)) return;
                                                                 try {
                                                                     const r = await fetch(`${API_URL}/plugins/${plugin.id}`, { method: 'DELETE', credentials: 'include', headers: getAuthHeaders() });
@@ -6680,7 +8897,7 @@
                                                                 } catch (e) { addToast('Error', 'error'); }
                                                             }} className="text-red-400/50 hover:text-red-400 transition-colors" title="Delete plugin">
                                                                 <Icons.Trash2 className="w-4 h-4" />
-                                                            </button>
+                                                            </button>}
                                                         </div>
                                                     </div>
                                                 ))}
@@ -6753,6 +8970,7 @@
 
                                     {/* Save Button */}
                                     <div className="flex justify-end gap-3">
+                                        {haStandby ? <HaSettingsOnActive own /> : (
                                         <button
                                             onClick={handleSaveServerSettings}
                                             disabled={serverLoading}
@@ -6761,6 +8979,7 @@
                                             {serverLoading ? <Icons.RotateCw /> : <Icons.Save />}
                                             {t('saveSettings')}
                                         </button>
+                                        )}
                                     </div>
 
                                     {/* Restart Server Section */}
@@ -7050,6 +9269,15 @@
                                 </div>
                             )}
 
+                            {activeTab === 'banners' && isAdmin && (
+                                <BroadcastBannerSettings t={t} addToast={addToast} getAuthHeaders={getAuthHeaders} />
+                            )}
+
+                            {/* LW Sep 2026 (#625) - warm standby for PegaProx itself */}
+                            {activeTab === 'ha' && isAdmin && (
+                                <HaPanel t={t} addToast={addToast} getAuthHeaders={getAuthHeaders} />
+                            )}
+
                             {/* MK May 2026 — SIEM Forwarder Tab */}
                             {activeTab === 'siem' && (
                                 <SIEMTab addToast={addToast} t={t} getAuthHeaders={getAuthHeaders} />
@@ -7139,7 +9367,7 @@
                                                             </div>
                                                         )}
                                                     </div>
-                                                ) : (
+                                                ) : !haStandby && (
                                                     <button
                                                         onClick={performUpdate}
                                                         disabled={updateLoading || updateProgress}
@@ -7225,7 +9453,9 @@
                                         </div>
                                     )}
                                     
-                                    {/* Rollback Section - NS Jan 2026 */}
+                                    {/* Rollback Section - NS Jan 2026. Not on a standby: its route refuses
+                                        there, the listing (an empty POST) as well (#625) */}
+                                    {!haStandby && (
                                     <div className="bg-proxmox-dark border border-proxmox-border rounded-xl p-6">
                                         <div className="flex items-center justify-between">
                                             <div>
@@ -7247,7 +9477,8 @@
                                             </button>
                                         </div>
                                     </div>
-                                    
+                                    )}
+
                                     {/* Update Instructions */}
                                     {updateInfo?.instructions && (
                                         <div className="bg-blue-500/10 border border-blue-500/30 rounded-xl p-6">
@@ -7767,5 +9998,3216 @@
                         </div>
                     )}
                 </>
+            );
+        }
+
+        // ═══════════════════════════════════════════════
+        // PegaProx - High Availability (#625)
+        // HaPanel (settings tab), HaRestartOverlay, haRelTime
+        // v2: the live view switch and the restart a changed cluster setup needs
+        // v3: groups of up to four - the members table, Remove, more standbys from the active
+        // v4: confirmed standbys and member keys, a second step to remove one that is not
+        //     confirmed, whether a removed member was told, the note on a removed instance
+        // v5: the switch that has a standby carry out what is done on it through the active
+        // v6: the switch that has a standby serve users as an active instance; the active is
+        //     the leader, the one that runs the automation
+        // v7: the words for the three kinds, the leader, a member that serves users and a plain
+        //     standby; read-only only where it is
+        // v8: who is active is set on the leader, per member, up to three with the leader.
+        //     The switch of v6 is gone; a member shows what the leader made it
+        // v9: the config version in the head card, and the copies of what a sync replaced
+        //     here: listed, downloaded after the password, dismissed for good
+        // v10: stage 2 - automatic failover (switch, checklist, lease), the witness and the
+        //     time zone of the group's schedules: HaAutoCard, HaWitnessCard, HaZoneCard below
+        // ═══════════════════════════════════════════════
+
+        // "3 minutes ago" in the UI language. Intl speaks all nine, so no keys for it.
+        // A server clock a little ahead of the browser must not read "in 5 seconds".
+        function haRelTime(iso, language) {
+            if (!iso) return '';
+            const ts = new Date(iso).getTime();
+            if (isNaN(ts)) return '';
+            const sec = Math.min(0, Math.round((ts - Date.now()) / 1000));
+            const abs = Math.abs(sec);
+            const [n, unit] = abs < 60 ? [sec, 'second']
+                : abs < 3600 ? [Math.round(sec / 60), 'minute']
+                : abs < 86400 ? [Math.round(sec / 3600), 'hour']
+                : [Math.round(sec / 86400), 'day'];
+            try {
+                return new Intl.RelativeTimeFormat(language || undefined, { numeric: 'auto' }).format(n, unit);
+            } catch (_) {
+                return fmtDate(iso);
+            }
+        }
+
+        const HA_ROLE_STYLE = {
+            standalone: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
+            active: 'bg-green-500/20 text-green-300 border-green-500/30',
+            serving: 'bg-blue-500/20 text-blue-300 border-blue-500/30',
+            pending: 'bg-blue-500/10 text-blue-300 border-blue-500/30 border-dashed',
+            standby: 'bg-yellow-500/20 text-yellow-300 border-yellow-500/40',
+        };
+
+        // the active is the leader, it runs the automation. A standby that serves users is
+        // an active instance to them and shows as one, every other standby as a standby.
+        // pending: the leader made it active, and it has not said yet that it serves
+        function HaRoleBadge({ role, serving = false, pending = false, t }) {
+            const shown = role === 'standby' && serving ? (pending ? 'pending' : 'serving') : role;
+            const label = { standalone: t('pgHaRoleStandalone'), active: t('pgHaRoleLeader'), serving: t('pgHaRoleActive'),
+                            pending: t('pgHaRoleActivePending'), standby: t('pgHaRoleStandby') }[shown] || role || '-';
+            return (
+                <span data-ha-badge={shown || undefined} title={shown === 'pending' ? t('pgHaRoleActivePendingHint') : undefined}
+                    className={`px-2 py-0.5 rounded-full border text-xs font-medium ${HA_ROLE_STYLE[shown] || HA_ROLE_STYLE.standalone}`}>
+                    {label}
+                </span>
+            );
+        }
+
+        // Covers the page while the process restarts into its new role, then reloads.
+        // The old process keeps answering for a second or two after the request, so a
+        // plain "it answers" is not enough: wait until it was gone and came back, or it
+        // answers in the new role after a while. After 120 s reload regardless.
+        function HaRestartOverlay({ t, expectRole }) {
+            useEffect(() => {
+                const started = Date.now();
+                let seenDown = false, stop = false, timer = null;
+                const tick = async () => {
+                    let up = false, role = null;
+                    try {
+                        const r = await fetch(`${API_URL}/auth/check?t=${Date.now()}`, { credentials: 'include', cache: 'no-store' });
+                        if (r.status >= 502) {
+                            seenDown = true;  // a reverse proxy in front answers for the dead backend
+                        } else {
+                            up = true;
+                            const d = await r.json().catch(() => ({}));
+                            role = d.ha_role || (d.ha && d.ha.role) || null;
+                        }
+                    } catch (_) {
+                        seenDown = true;
+                    }
+                    if (stop) return;
+                    const elapsed = Date.now() - started;
+                    if (elapsed >= 120000 || (up && seenDown) || (up && elapsed >= 10000 && role === expectRole)) {
+                        window.location.reload();
+                        return;
+                    }
+                    timer = setTimeout(tick, 2000);
+                };
+                timer = setTimeout(tick, 2000);
+                return () => { stop = true; clearTimeout(timer); };
+            }, []);
+            return ReactDOM.createPortal(
+                <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 p-4" role="alertdialog" aria-live="assertive">
+                    <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-6 max-w-md w-full text-center space-y-3">
+                        <div className="flex justify-center py-2 text-proxmox-orange" style={{ transform: 'scale(1.75)' }}>
+                            <span className="inline-flex animate-spin"><Icons.RefreshCw /></span>
+                        </div>
+                        <div className="text-lg font-semibold text-white">{t('pgHaRestarting')}</div>
+                        <div className="text-sm text-gray-400">{t('pgHaRestartingHint')}</div>
+                    </div>
+                </div>,
+                document.body
+            );
+        }
+
+        function HaPanel({ t, addToast, getAuthHeaders }) {
+            const { language } = useTranslation();
+            const { refreshHa, user, logout } = useAuth();
+            const [status, setStatus] = useState(null);
+            const [loadError, setLoadError] = useState('');
+            const [busy, setBusy] = useState('');
+            const [ownUrl, setOwnUrl] = useState('');
+            const [code, setCode] = useState(null);          // {code, expires_at}, shown once
+            const [now, setNow] = useState(Date.now());
+            const [joinCode, setJoinCode] = useState('');
+            const [joinUrl, setJoinUrl] = useState('');
+            const [joinConfirm, setJoinConfirm] = useState(false);
+            const [joinError, setJoinError] = useState('');
+            const [interval, setIntervalValue] = useState('');
+            const [confirmAction, setConfirmAction] = useState(null);   // 'promote' | 'unpair' | 'remove'
+            const [removing, setRemoving] = useState(null);             // the member a 'remove' is about
+            const [typed, setTyped] = useState('');
+            const [restarting, setRestarting] = useState(null);         // role we restart into
+            const [passwords, setPasswords] = useState({ code: '', join: '', confirm: '', copy: '' });
+            const [reauth, setReauth] = useState(null);                 // {form, code, error} of a refused re-auth
+            const [unconfirmed, setUnconfirmed] = useState(false);      // the remove was refused as HA_REMOVE_UNCONFIRMED
+            const [shutDown, setShutDown] = useState(false);            // the admin ticked "shut down for good"
+            const [promoteSync, setPromoteSync] = useState(false);      // the promote was refused as HA_PROMOTE_SYNC
+            const [forcePromote, setForcePromote] = useState(false);    // the admin ticked "promote without it"
+            const [lastRemoval, setLastRemoval] = useState(null);       // {name, told} of the last removal
+            const [copyAction, setCopyAction] = useState(null);         // {what: 'download' | 'dismiss', name}
+            const [copyError, setCopyError] = useState(null);           // {text, code} for the open copy box
+            const [notShipped, setNotShipped] = useState(false);        // the server refused automatic failover as not in this release
+            const [memberEdit, setMemberEdit] = useState(null);         // {what, id, value} of the member form open on the leader
+
+            // Every status request gets a number. One that left before a code was made cannot
+            // know about it, so only a later answer may say the code is gone.
+            const loadSeq = useRef(0);
+            // likewise a copy: an answer to a request sent before it was dismissed still lists it
+            const copiesSeq = useRef(0);
+            const load = async () => {
+                const seq = ++loadSeq.current;
+                try {
+                    const r = await fetch(`${API_URL}/ha/status`, { credentials: 'include', headers: getAuthHeaders() });
+                    if (!r.ok) {
+                        setLoadError(await PegaProxApiErrors.message(r, t('pgHaLoadFailed')));
+                        return;
+                    }
+                    const data = await r.json();
+                    // a code the server no longer reports open was spent (a member that was
+                    // already listed re-paired with it, the count stays) or replaced from another
+                    // tab. An expired one stays, the box says so itself.
+                    setCode(c => c && seq > c.seq && data.pairing_open_until !== c.expires_at
+                        && c.expires_at * 1000 > Date.now() ? null : c);
+                    if (seq <= copiesSeq.current) setStatus(s => ({ ...data, orphans: s?.orphans ?? data.orphans }));
+                    else setStatus(data);
+                    setLoadError('');
+                    // prefill once, never over something typed
+                    setOwnUrl(v => v || data.suggested_url || '');
+                    setJoinUrl(v => v || data.suggested_url || '');
+                    setIntervalValue(v => v === '' ? String(data.interval || 30) : v);
+                } catch (e) {
+                    setLoadError(t('pgHaLoadFailed'));
+                }
+            };
+            useEffect(() => { load(); }, []);
+
+            // last contact and sync move on their own; the active also learns here that
+            // a standby took its code
+            useEffect(() => {
+                if (restarting) return;
+                const h = setInterval(load, 10000);
+                return () => clearInterval(h);
+            }, [restarting]);
+
+            useEffect(() => {
+                if (!code) return;
+                const h = setInterval(() => setNow(Date.now()), 1000);
+                return () => clearInterval(h);
+            }, [code]);
+
+            const role = status?.role || 'standalone';
+            // a standby that serves users is an active instance to them and gets its own words:
+            // consoles open here, a promote makes it the leader
+            const serving = role === 'standby' && status?.serving === true;
+            // up to four instances: the active and the standbys that follow it. members is
+            // everyone but this instance, so the count adds one for it
+            const members = Array.isArray(status?.members) ? status.members : [];
+            const maxMembers = status?.max_members || 4;
+            const standbyCount = status?.standby_count || 0;
+            const groupFull = standbyCount >= maxMembers - 1;
+            // who is active is set on the leader, per member: the leader and up to two members
+            // (the limit counts the leader). Every member gets the list with serve in it.
+            const activeLimit = status?.active_limit || 3;
+            const actives = typeof status?.actives === 'number' ? status.actives
+                : 1 + members.filter(m => m.serve === true).length;
+            const activesFull = actives >= activeLimit;
+            const memberName = (m) => m.url || (m.instance_id || '').slice(0, 8);
+            // the code on screen is spent once someone pairs with it: this instance turns active,
+            // or its group grows. A removal hides it as well, and the open-code note shows instead.
+            useEffect(() => { setCode(null); }, [role, standbyCount]);
+
+            // LW Oct 2026 - what this instance held and a sync replaced is kept as a copy, in
+            // every role, until an admin dismisses it. The banner counts the copies too and is
+            // only polled on a standby: once the count here differs from it (a dismiss, a poll,
+            // another admin), it is read again.
+            const { ha: haBanner } = useAuth();
+            const copies = status?.orphans && typeof status.orphans === 'object' ? status.orphans : null;
+            // an item is shown, and can be acted on, only with a name to address it by
+            const copyItems = Array.isArray(copies?.items)
+                ? copies.items.filter(c => c && typeof c === 'object' && typeof c.name === 'string' && c.name) : [];
+            const copyCount = copies ? (Number(copies.count) || 0) : 0;
+            useEffect(() => {
+                if (!status) return;
+                const shown = typeof haBanner?.orphans === 'number' ? haBanner.orphans : 0;
+                if (shown !== copyCount) refreshHa?.();
+            }, [!!status, copyCount]);
+
+            // POST/PUT to /api/ha/*; the error text comes from the server as is, the
+            // code tells a refused re-auth apart from everything else
+            const send = async (method, path, body, fallback) => {
+                const r = await fetch(`${API_URL}/ha/${path}`, {
+                    method, credentials: 'include',
+                    headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body || {})
+                });
+                if (!r.ok) {
+                    const code = (await r.clone().json().catch(() => null))?.code || '';
+                    haLeaseRefused(r.status, code);
+                    return { ok: false, code, error: await PegaProxApiErrors.message(r, fallback || t('pgHaActionFailed')) };
+                }
+                return { ok: true, data: await r.json().catch(() => ({})) };
+            };
+
+            // Pairing, joining, promoting and unpairing hand the deployment over or take
+            // it over, so the server asks for the account's own password once more. SSO
+            // accounts have none here; for them it checks how fresh the sign-in is.
+            const sso = ['oidc', 'entra'].includes(user?.auth_source);
+            const setPassword = (form, value) => setPasswords(p => ({ ...p, [form]: value }));
+            const needsPassword = (form) => !sso && !passwords[form];
+            const withPassword = (form, body) => sso ? body : { ...body, user_password: passwords[form] };
+            // a refused re-auth stays next to its field, and the field is emptied for the next try
+            const reauthRefused = (form, res) => {
+                if (res.code !== 'HA_REAUTH' && res.code !== 'HA_REAUTH_RECENT') return false;
+                setReauth({ form, code: res.code, error: res.error });
+                setPassword(form, '');
+                return true;
+            };
+
+            const run = async (name, fn) => {
+                setBusy(name);
+                try { await fn(); }
+                catch (e) { addToast?.(e.message || t('pgHaActionFailed'), 'error'); }
+                setBusy('');
+            };
+
+            const createCode = () => run('code', async () => {
+                setReauth(null);
+                const url = ownUrl.trim();
+                if (!url.startsWith('https://')) { addToast?.(t('pgHaUrlHttps'), 'error'); return; }
+                const res = await send('POST', 'pairing-code', withPassword('code', { url }));
+                if (!res.ok) { if (!reauthRefused('code', res)) addToast?.(res.error, 'error'); return; }
+                setPassword('code', '');
+                setCode({ code: res.data.code, expires_at: res.data.expires_at, seq: loadSeq.current });
+                setNow(Date.now());
+                load();
+            });
+
+            const join = () => run('join', async () => {
+                setJoinError('');
+                setReauth(null);
+                const url = joinUrl.trim();
+                if (!url.startsWith('https://')) { setJoinError(t('pgHaUrlHttps')); return; }
+                const res = await send('POST', 'join', withPassword('join', { code: joinCode.trim(), own_url: url, confirm: true }));
+                if (!res.ok) { if (!reauthRefused('join', res)) setJoinError(res.error); return; }
+                setJoinCode('');
+                setPassword('join', '');
+                if (res.data.restarting) setRestarting('standby');
+                else load();
+            });
+
+            const syncNow = () => run('sync', async () => {
+                const res = await send('POST', 'sync-now', {}, t('pgHaSyncFailed'));
+                if (!res.ok) { addToast?.(res.error, 'error'); return; }
+                if (res.data.status) setStatus(s => ({ ...(s || {}), ...res.data.status }));
+                const result = res.data.result;
+                if (result === 'applied') addToast?.(t('pgHaSyncApplied'), 'success');
+                else if (result === 'unchanged') addToast?.(t('pgHaSyncUnchanged'), 'info');
+                else addToast?.((res.data.status?.sync?.last_error) || t('pgHaSyncFailed'), 'error');
+                refreshHa?.();
+            });
+
+            const saveInterval = () => run('interval', async () => {
+                const n = Number(interval);
+                if (!Number.isInteger(n) || n < 5 || n > 3600) { addToast?.(t('pgHaIntervalRange'), 'error'); return; }
+                const res = await send('PUT', 'settings', { interval: n });
+                if (!res.ok) { addToast?.(res.error, 'error'); return; }
+                setIntervalValue(String(res.data.interval || n));
+                addToast?.(t('pgHaIntervalSaved'), 'success');
+                load();
+            });
+
+            // Live view is this instance's own setting, never synced. A standby restarts to
+            // connect or disconnect; elsewhere it is only stored for when it becomes one.
+            const liveView = status?.live_view !== false;
+            const setLiveView = (on) => run('live', async () => {
+                const res = await send('PUT', 'settings', { live_view: on });
+                if (!res.ok) { addToast?.(res.error, 'error'); return; }
+                if (res.data.restarting) { setRestarting('standby'); return; }
+                addToast?.(t('pgHaLiveViewSaved'), 'success');
+                load();
+            });
+
+            // Forwarding is this instance's own setting too, and takes effect at once: on, a
+            // standby carries out what its users do through the active; off, it only shows.
+            // status.forwarding says whether it does so right now (the active may be away).
+            const forwardWrites = status?.forward_writes !== false;
+            const setForwardWrites = (on) => run('forward', async () => {
+                const res = await send('PUT', 'settings', { forward_writes: on });
+                if (!res.ok) { addToast?.(res.error, 'error'); return; }
+                if (res.data.restarting) { setRestarting('standby'); return; }
+                addToast?.(t(on ? 'pgHaForwardOn' : 'pgHaForwardOff'), 'success');
+                load();
+                // the banner and every button follow the new value
+                refreshHa?.();
+            });
+
+            // The leader makes a member active (or a standby again); the member follows at its
+            // next sync, with its live view and forwarding on, and says so in serving_seen.
+            // Past the limit the server refuses (HA_ACTIVE_LIMIT), its words go to the toast.
+            const setMemberServe = (m, on) => run('serve', async () => {
+                const res = await send('PUT', `members/${encodeURIComponent(m.instance_id)}/serve`, { serve: on });
+                if (!res.ok) { addToast?.(res.error, 'error'); load(); return; }
+                const serve = res.data.serve === true;
+                setStatus(s => ({
+                    ...(s || {}),
+                    ...(typeof res.data.actives === 'number' ? { actives: res.data.actives } : {}),
+                    members: (s?.members || []).map(x => x.instance_id === m.instance_id ? { ...x, serve } : x),
+                }));
+                addToast?.(t(serve ? 'pgHaMemberServeOn' : 'pgHaMemberServeOff').replace('{name}', () => memberName(m)), 'success');
+                load();
+            });
+
+            // a live view switched since this standby started waits for a restart, this does
+            // it now. A changed cluster connection is rebuilt in place without one, and a
+            // waiting one is rebuilt at once; either way the answer says which it was.
+            const applyNow = () => run('apply', async () => {
+                const res = await send('POST', 'apply-config', {});
+                if (!res.ok) { addToast?.(res.error, 'error'); return; }
+                if (res.data.restarting) { setRestarting('standby'); return; }
+                addToast?.(t(res.data.reloaded ? 'pgHaReloaded' : 'pgHaNothingToApply'), res.data.reloaded ? 'success' : 'info');
+                load();
+            });
+
+            // A copy holds account rows, so handing one out wants the password again, as the
+            // config backup does. Dismissing deletes it for good and asks first. One box at a
+            // time, under the copy it is about.
+            const openCopy = (what, name = null) => {
+                setCopyAction(what ? { what, name } : null);
+                setCopyError(null);
+                setPassword('copy', '');
+                setReauth(null);
+            };
+            const saveCopy = (name) => run('copy', async () => {
+                setReauth(null);
+                setCopyError(null);
+                let r;
+                try {
+                    r = await fetch(`${API_URL}/ha/orphans/${encodeURIComponent(name)}/download`, {
+                        method: 'POST', credentials: 'include',
+                        headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                        body: JSON.stringify(withPassword('copy', {}))
+                    });
+                } finally {
+                    // the password was for this one request, whatever came back (or nothing)
+                    setPassword('copy', '');
+                }
+                if (!r.ok) {
+                    const code = (await r.clone().json().catch(() => null))?.code || '';
+                    const res = { code, error: await PegaProxApiErrors.message(r, t('haCopiesDownloadFailed')) };
+                    if (r.status === 404) {
+                        // dismissed in the meantime, from another tab or by another admin
+                        openCopy(null);
+                        addToast?.(res.error, 'error');
+                        load();
+                        return;
+                    }
+                    setCopyAction({ what: 'download', name });
+                    if (reauthRefused('copy', res)) return;
+                    // 409: it does not open on this instance, and the server says why
+                    setCopyError({ text: res.error, code });
+                    load();
+                    return;
+                }
+                // saved under the name the server gives it, never opened in the page
+                const blob = await r.blob();
+                const named = /filename="?([^";]+)"?/.exec(r.headers.get('Content-Disposition') || '');
+                const href = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = href;
+                a.download = named ? named[1] : `pegaprox-ha-${name}.json.gz`;
+                a.style.display = 'none';
+                document.body.appendChild(a);
+                a.click();
+                setTimeout(() => { URL.revokeObjectURL(href); a.remove(); }, 200);
+                openCopy(null);
+                addToast?.(t('haCopiesDownloaded'), 'success');
+            });
+            // an SSO account has no password to type: it goes out at once, and the box only
+            // opens when the server refuses
+            const askCopy = (name) => sso ? saveCopy(name) : openCopy('download', name);
+            const dismissCopy = (name) => run('copy', async () => {
+                setCopyError(null);
+                const res = await send('POST', `orphans/${encodeURIComponent(name)}/dismiss`, { confirm: true }, t('haCopiesDismissFailed'));
+                if (!res.ok) {
+                    // a sync is looking at the copies: nothing went, the box stays for the next try
+                    if (res.code === 'HA_SYNC_RUNNING') { setCopyError({ text: t('haCopiesSyncRunning'), code: res.code }); return; }
+                    setCopyError({ text: res.error, code: res.code });
+                    load();
+                    return;
+                }
+                openCopy(null);
+                // the answer carries the list as it is now; a poll already on its way does not
+                // bring the row back
+                copiesSeq.current = loadSeq.current;
+                if (res.data.orphans && typeof res.data.orphans === 'object') {
+                    setStatus(s => ({ ...(s || {}), orphans: res.data.orphans }));
+                }
+                addToast?.(t('haCopiesDismissed'), 'success');
+                load();
+            });
+            // a box whose copy is no longer listed (dismissed elsewhere, gone at the last
+            // poll) closes, and the password typed into it goes with it
+            const copyNames = copyItems.map(c => c.name).join('\n');
+            useEffect(() => {
+                if (copyAction && !copyItems.some(c => c.name === copyAction.name)) openCopy(null);
+            }, [copyAction, copyNames]);
+
+            const WORD = { promote: 'PROMOTE', unpair: 'UNPAIR', remove: 'REMOVE' };
+            // null closes the box; either way nothing typed survives into the next one.
+            // A remove names the member it is about.
+            const openConfirm = (what, member = null) => {
+                setConfirmAction(what);
+                setRemoving(member);
+                setTyped('');
+                setPassword('confirm', '');
+                setReauth(null);
+                setUnconfirmed(false);
+                setShutDown(false);
+                setPromoteSync(false);
+                setForcePromote(false);
+                setLastRemoval(null);
+            };
+            const confirmed = () => run(confirmAction, async () => {
+                const what = confirmAction;
+                const target = removing;
+                setReauth(null);
+                const path = what === 'remove' ? `members/${encodeURIComponent(target.instance_id)}/remove` : what;
+                // shut_down only goes out as the second step, after the server asked for it and
+                // the admin ticked the box
+                const shutDownNow = what === 'remove' && unconfirmed && shutDown;
+                // force likewise: only after the server said the pull before promoting failed
+                const forceNow = what === 'promote' && promoteSync && forcePromote;
+                const body = { confirm: WORD[what], ...(shutDownNow ? { shut_down: true } : {}), ...(forceNow ? { force: true } : {}) };
+                const res = await send('POST', path, withPassword('confirm', body));
+                if (!res.ok) {
+                    if (reauthRefused('confirm', res)) return;
+                    // never seen as a standby under this epoch: it may still run as an active that
+                    // nobody can tell any more. Ask once more instead of reporting an error.
+                    if (what === 'remove' && res.code === 'HA_REMOVE_UNCONFIRMED') {
+                        setUnconfirmed(true);
+                        return;
+                    }
+                    // the active answers but the last configuration could not be fetched first
+                    if (what === 'promote' && res.code === 'HA_PROMOTE_SYNC') {
+                        setPromoteSync(true);
+                        return;
+                    }
+                    addToast?.(res.error, 'error');
+                    return;
+                }
+                openConfirm(null);
+                if (res.data.restarting) {
+                    setRestarting(what === 'promote' ? 'active' : 'standalone');
+                } else if (what === 'remove') {
+                    // the row goes at once; the next status brings the count and the pairing card along
+                    if (Array.isArray(res.data.members)) setStatus(s => ({ ...(s || {}), members: res.data.members }));
+                    // told is true only when the member answered and let go of the group
+                    const told = typeof res.data.told === 'boolean' ? res.data.told : null;
+                    setLastRemoval({ name: target.url || target.instance_id.slice(0, 8), told });
+                    addToast?.(t('pgHaMemberRemoved'), told === false ? 'info' : 'success');
+                    load();
+                } else {
+                    addToast?.(t('pgHaUnpaired'), 'success');
+                    load();
+                }
+            });
+
+            const when = (iso) => iso ? <span title={fmtDate(iso)}>{haRelTime(iso, language)}</span> : <span className="text-gray-500">{t('pgHaNever')}</span>;
+            const countdown = (() => {
+                if (!code) return '';
+                const left = Math.max(0, Math.floor(code.expires_at - now / 1000));
+                return `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
+            })();
+            const codeExpired = code && code.expires_at * 1000 <= now;
+
+            const card = 'bg-proxmox-dark border border-proxmox-border rounded-xl p-4 space-y-3';
+            const field = 'px-3 py-2 bg-proxmox-card border border-proxmox-border rounded text-sm text-white disabled:opacity-50';
+            const input = `w-full ${field}`;
+            const btn = 'flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
+            const btnGhost = `${btn} bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white hover:border-gray-500`;
+            const row = (label, value) => (
+                <div className="flex items-start justify-between gap-4 text-sm">
+                    <span className="text-gray-400 whitespace-nowrap">{label}</span>
+                    <span className="text-gray-200 text-right min-w-0 break-all">{value}</span>
+                </div>
+            );
+
+            const sync = status?.sync || {};
+            const skipped = Object.entries(sync.skipped_columns || {}).filter(([, cols]) => cols && cols.length);
+            // an unreadable state file: the server refuses promote and the interval (409),
+            // so the panel offers neither and says why in the red note
+            const broken = !!status?.broken;
+
+            const passwordInput = (form, id) => !sso && (
+                <div>
+                    <label className="block text-xs text-gray-400 mb-1" htmlFor={id}>{t('pgHaPassword')}</label>
+                    <input id={id} type="password" autoComplete="current-password" data-lpignore="true" data-1p-ignore="true" data-bwignore="true"
+                        value={passwords[form]} onChange={e => setPassword(form, e.target.value)}
+                        aria-invalid={reauth?.form === form ? 'true' : undefined}
+                        aria-describedby={reauth?.form === form ? `${id}-error` : undefined} className={input} />
+                </div>
+            );
+            const reauthNote = (form, id) => reauth?.form === form && (
+                <div id={`${id}-error`} data-ha-reauth={reauth.code}
+                    className="rounded-lg p-2 text-sm border bg-red-500/10 border-red-500/30 text-red-300 space-y-2">
+                    <div className="break-all">{reauth.error}</div>
+                    {reauth.code === 'HA_REAUTH_RECENT' && (
+                        <button onClick={() => logout()} className={btnGhost}>
+                            <Icons.LogOut />
+                            {t('pgHaSignInAgain')}
+                        </button>
+                    )}
+                </div>
+            );
+
+            // Everyone else in the group, as this instance knows them: on the active its
+            // standbys, each with Remove; on a standby the active and the other standbys, with
+            // the one it pulls from marked as its source. The leader also sets who is active.
+            const cell = 'py-2 pr-4';
+            const canRemove = role === 'active';
+            const canSetActive = role === 'active';
+            // the leader is always active; a member is what the leader made it, and "pending"
+            // until it said it serves. One never reached yet shows what it was made too.
+            const memberRole = (m) => m.role_seen === 'active' ? 'active' : m.serve === true ? 'standby' : m.role_seen;
+            // LW Oct 2026 (#625) - stage 2: auto is null on a release without automatic failover and
+            // missing on a server from before it. Once there, auto.members says what the voter
+            // config holds about each member and the witness, and the table gets those columns.
+            const auto = status?.auto && typeof status.auto === 'object' ? status.auto : null;
+            const autoRows = auto && Array.isArray(auto.members)
+                ? auto.members.filter(r => r && typeof r === 'object' && typeof r.instance_id === 'string') : null;
+            const autoOf = (m) => (autoRows || []).find(r => r.instance_id === m.instance_id && r.kind !== 'witness') || null;
+            const witnessRow = (autoRows || []).find(r => r.kind === 'witness') || null;
+            // how a text names an instance: this one, the witness by its address, a member as the table does
+            const nameOf = (id) => id && id === status?.instance_id ? t('haAutoThisInstance')
+                : id && id === auto?.witness?.instance_id ? (auto.witness.url || t('haAutoTheWitness'))
+                : memberName(members.find(m => m.instance_id === id) || { instance_id: String(id || '') });
+            // The leader sets the site, vote, may lead and agent VM of each member and makes one
+            // leader, in a form under the table (HaMemberForm, HaAgentVmForm). Held while a switch is
+            // pending, while the lead is handed on (writes pause then) and in an automatic group
+            // without the lease; a member reads.
+            const locked = auto?.mode === 'auto_pending' ? t('haAutoLockedPending')
+                : auto?.transfer ? t('haAutoLockedTransfer')
+                : auto?.mode === 'auto' && auto.holds_lease !== true ? t('haAutoNoLeader') : '';
+            const memberCtl = role === 'active' && autoRows && !broken ? {
+                open: (what, row) => setMemberEdit(e => e && e.what === what && e.id === row.instance_id ? null : {
+                    what, id: row.instance_id,
+                    value: what === 'voter' ? row.voter !== true : what === 'may_lead' ? row.may_lead !== true : null,
+                }),
+                form: memberEdit,
+                locked,
+                voteLocked: locked || (notShipped ? t('haAutoNotShipped') : ''),
+                leadLocked: locked,
+                // the clusters with node HA of the Proxmox kind: an agent VM is named per cluster
+                clusters: (Array.isArray(status?.split_safety?.clusters) ? status.split_safety.clusters : [])
+                    .filter(c => c && typeof c === 'object' && typeof c.id === 'string' && c.id && c.kind !== 'other'),
+            } : null;
+            // a form whose member is no longer the leader's to set closes, and what was typed goes with it
+            useEffect(() => { if (!memberCtl || locked) setMemberEdit(null); }, [!!memberCtl, !!locked]);
+            // A group that elects its leader promotes nobody by hand (Make leader instead), and a member
+            // whose way out is Force leader neither promotes nor unpairs by hand (way_out says why).
+            const wayOut = typeof auto?.way_out === 'string' ? auto.way_out : '';
+            const forceOnly = !!wayOut && auto?.force_leader?.offered === true;
+            const promoteOffered = !(auto && auto.mode && auto.mode !== 'manual') && !forceOnly;
+            useEffect(() => {
+                if ((confirmAction === 'promote' && !promoteOffered) || (confirmAction === 'unpair' && forceOnly)) openConfirm(null);
+            }, [promoteOffered, forceOnly]);
+            // the banners of an automatic group come with /auth/check: read again once the mode changed
+            useEffect(() => {
+                if (status && (haBanner?.automatic === true) !== (auto?.mode === 'auto')) refreshHa?.();
+            }, [auto?.mode]);
+            const memberForm = (target) => memberCtl && memberEdit && memberEdit.id === target.instance_id && (
+                memberEdit.what === 'vmid' ? (
+                    <HaAgentVmForm key={`vmid:${memberEdit.id}`} t={t} target={target} name={nameOf(target.instance_id)}
+                        clusters={memberCtl.clusters} getAuthHeaders={getAuthHeaders} onClose={() => setMemberEdit(null)}
+                        onSaved={load} addToast={addToast} />
+                ) : (
+                    <HaMemberForm key={`${memberEdit.what}:${memberEdit.id}`} t={t} what={memberEdit.what} target={target}
+                        name={nameOf(target.instance_id)} value={memberEdit.value}
+                        phrase={typeof auto?.make_leader?.phrase === 'string' && auto.make_leader.phrase ? auto.make_leader.phrase : 'LEADER'}
+                        getAuthHeaders={getAuthHeaders} onClose={() => setMemberEdit(null)} onDone={() => { setMemberEdit(null); load(); }}
+                        onRefused={load} onRestart={setRestarting} addToast={addToast} />
+                )
+            );
+            // the member whose form is open: it goes under the table, not into a row of it, where it
+            // took the width of the whole table and its scroller cut the text off
+            const editRow = memberCtl && memberEdit ? (autoRows || []).find(r => r.instance_id === memberEdit.id) || null : null;
+            const membersCard = (
+                <div className={card} data-ha-members={members.length}>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                        <h4 className="font-medium text-white flex items-center gap-2">
+                            <Icons.Users />
+                            {t('pgHaMembers')}
+                        </h4>
+                        <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                            {canSetActive && (
+                                <span className={`text-xs ${activesFull ? 'text-yellow-300' : 'text-gray-400'}`} data-ha-actives={actives}>
+                                    {t('pgHaActiveCount').replace('{n}', actives).replace('{max}', () => activeLimit)}
+                                </span>
+                            )}
+                            <span className="text-xs text-gray-400" data-ha-count>
+                                {t('pgHaMemberCount').replace('{n}', members.length + 1).replace('{max}', () => maxMembers)}
+                            </span>
+                        </div>
+                    </div>
+                    {members.length > 0 ? (
+                        <div className="overflow-x-auto">
+                            <table className="w-full text-sm">
+                                <thead>
+                                    <tr className="text-left text-xs text-gray-500 border-b border-proxmox-border">
+                                        <th className={`${cell} font-medium`}>{t('pgHaInstanceId')}</th>
+                                        <th className={`${cell} font-medium`}>{t('pgHaPeerUrl')}</th>
+                                        <th className={`${cell} font-medium`}>{t('pgHaPeerSeen')}</th>
+                                        <th className={`${cell} font-medium`}>{t('pgHaEpoch')}</th>
+                                        <th className={`${cell} font-medium`}>{t('pgHaKey')}</th>
+                                        <th className={`${cell} font-medium whitespace-nowrap`}>{t('pgHaLastContact')}</th>
+                                        <th className={`${cell} font-medium whitespace-nowrap`}>{t('pgHaLastError')}</th>
+                                        {canSetActive && <th className={`${cell} font-medium`} title={t('pgHaActiveHint')}>{t('pgHaRoleActive')}</th>}
+                                        {canRemove && <th className="py-2" />}
+                                        {autoRows && <HaAutoMemberHead t={t} cell={cell} ctl={memberCtl} />}
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-proxmox-border">
+                                    {members.map(m => (
+                                        <tr key={m.instance_id} data-ha-member={m.instance_id} data-ha-source={m.is_source ? '' : undefined}
+                                            data-ha-confirmed={typeof m.confirmed_standby === 'boolean' ? String(m.confirmed_standby) : undefined}>
+                                            <td className={`${cell} whitespace-nowrap`}>
+                                                <span className="font-mono text-xs text-gray-200" title={m.instance_id}>{(m.instance_id || '').slice(0, 8)}</span>
+                                                {m.is_source && (
+                                                    <span title={t('pgHaSourceHint')}
+                                                        className="ml-2 px-1.5 py-0.5 rounded-full border text-[11px] bg-blue-500/20 text-blue-300 border-blue-500/30">
+                                                        {t('pgHaSource')}
+                                                    </span>
+                                                )}
+                                            </td>
+                                            <td className={`${cell} font-mono text-xs text-gray-200 whitespace-nowrap`}>{m.url || '-'}</td>
+                                            <td className={`${cell} whitespace-nowrap`}>
+                                                {memberRole(m)
+                                                    ? <HaRoleBadge role={memberRole(m)} serving={m.serve === true} pending={m.serving_seen !== true} t={t} />
+                                                    : '-'}
+                                                {/* confirmed: a standby under the current epoch. Only the active warns
+                                                    about the others, since a removal there needs the second step */}
+                                                {m.confirmed_standby === true && (
+                                                    <span title={t('pgHaConfirmedHint')} className="ml-2 text-[11px] text-green-300">{t('pgHaConfirmed')}</span>
+                                                )}
+                                                {m.confirmed_standby === false && canRemove && (
+                                                    <span title={t('pgHaUnconfirmedHint')}
+                                                        className="ml-2 px-1.5 py-0.5 rounded-full border text-[11px] bg-yellow-500/20 text-yellow-300 border-yellow-500/40">
+                                                        {t('pgHaUnconfirmed')}
+                                                    </span>
+                                                )}
+                                            </td>
+                                            <td className={`${cell} text-gray-200`}>{m.epoch_seen ?? '-'}</td>
+                                            <td className={`${cell} whitespace-nowrap`} data-ha-key={m.key_fingerprint ? 'key' : m.key_fingerprint === '' ? 'secret' : undefined}>
+                                                {m.key_fingerprint
+                                                    ? <span className="font-mono text-xs text-gray-200" title={m.key_fingerprint}>{m.key_fingerprint}</span>
+                                                    : m.key_fingerprint === ''
+                                                        ? <span className="text-xs text-yellow-300" title={t('pgHaOldSecretHint')}>{t('pgHaOldSecret')}</span>
+                                                        : <span className="text-gray-500">-</span>}
+                                            </td>
+                                            <td className={`${cell} text-gray-200 whitespace-nowrap`}>{when(m.last_contact)}</td>
+                                            <td className={`${cell} text-xs max-w-xs`}>
+                                                {m.last_error
+                                                    ? <span className="text-red-300 break-all">{m.last_error}</span>
+                                                    : <span className="text-gray-500">-</span>}
+                                            </td>
+                                            {canSetActive && (
+                                                <td className={cell}>
+                                                    {/* a standby can only be made active while there is room; off always works */}
+                                                    <button type="button" role="switch" aria-checked={m.serve === true}
+                                                        aria-label={t('pgHaServeMember').replace('{name}', () => memberName(m))}
+                                                        title={activesFull && m.serve !== true ? t('pgHaActiveLimit').replace('{max}', () => activeLimit) : undefined}
+                                                        onClick={() => setMemberServe(m, m.serve !== true)}
+                                                        disabled={!!busy || broken || (activesFull && m.serve !== true)}
+                                                        data-ha-serve={m.serve === true ? 'on' : 'off'}
+                                                        className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${m.serve === true ? 'active' : ''}`} />
+                                                </td>
+                                            )}
+                                            {canRemove && (
+                                                <td className="py-2 text-right">
+                                                    <button onClick={() => openConfirm('remove', m)} disabled={!!busy} className={`${btnGhost} ml-auto`}>
+                                                        <Icons.UserX />
+                                                        {t('pgHaRemove')}
+                                                    </button>
+                                                </td>
+                                            )}
+                                            {autoRows && <HaAutoMemberCells t={t} cell={cell} row={autoOf(m)} ctl={memberCtl} nameOf={nameOf} />}
+                                        </tr>
+                                    ))}
+                                    {/* the witness votes and holds nothing: no epoch, no sync, nothing to switch here */}
+                                    {witnessRow && (
+                                        <tr data-ha-member-witness={witnessRow.instance_id}>
+                                            <td className={`${cell} whitespace-nowrap`}>
+                                                <span className="font-mono text-xs text-gray-200" title={witnessRow.instance_id}>{witnessRow.instance_id.slice(0, 8)}</span>
+                                            </td>
+                                            <td className={`${cell} font-mono text-xs text-gray-200 whitespace-nowrap`}>{witnessRow.url || auto.witness?.url || '-'}</td>
+                                            <td className={`${cell} whitespace-nowrap`}>
+                                                <span data-ha-badge="witness" className={`px-2 py-0.5 rounded-full border text-xs font-medium ${HA_ROLE_STYLE.standalone}`}>
+                                                    {t('haAutoKindWitness')}
+                                                </span>
+                                            </td>
+                                            <td className={`${cell} text-gray-500`}>-</td>
+                                            <td className={`${cell} whitespace-nowrap`}>
+                                                {auto.witness?.key_fingerprint
+                                                    ? <span className="font-mono text-xs text-gray-200" title={auto.witness.key_fingerprint}>{auto.witness.key_fingerprint}</span>
+                                                    : <span className="text-gray-500">-</span>}
+                                            </td>
+                                            <td className={`${cell} text-gray-500`}>-</td>
+                                            <td className={`${cell} text-gray-500`}>-</td>
+                                            {canSetActive && <td className={cell} />}
+                                            {canRemove && <td className="py-2" />}
+                                            <HaAutoMemberCells t={t} cell={cell} row={witnessRow} ctl={memberCtl} nameOf={nameOf} />
+                                        </tr>
+                                    )}
+                                </tbody>
+                            </table>
+                        </div>
+                    ) : (
+                        <p className="text-sm text-gray-400">{t('pgHaNoMembers')}</p>
+                    )}
+                    {editRow && (
+                        <div data-ha-member-form-row={editRow.instance_id}>{memberForm(editRow)}</div>
+                    )}
+                    {canSetActive && members.length > 0 && (
+                        <div className="space-y-1">
+                            <p className="text-xs text-gray-500">{t('pgHaActiveHint')}</p>
+                            {activesFull && (
+                                <p className="text-xs text-yellow-300" data-ha-active-limit>
+                                    {t('pgHaActiveLimit').replace('{max}', () => activeLimit)}
+                                </p>
+                            )}
+                        </div>
+                    )}
+                </div>
+            );
+
+            const intervalCard = (
+                <div className={card}>
+                    <label className="block text-sm font-medium text-white" htmlFor="pgha-interval">{t('pgHaInterval')}</label>
+                    <div className="flex items-center gap-2">
+                        <input id="pgha-interval" type="number" min="5" max="3600" value={interval} disabled={broken}
+                            onChange={e => setIntervalValue(e.target.value)} className={`w-32 ${field}`} />
+                        <button onClick={saveInterval} disabled={!!busy || broken} className={btnGhost}>{t('save')}</button>
+                    </div>
+                    <p className="text-xs text-gray-500">{t('pgHaIntervalHint')}</p>
+                </div>
+            );
+
+            // the running managers only differ from the switch until the restart that follows
+            const standby = role === 'standby';
+            const pending = sync.restart_pending || null;
+            const liveMismatch = standby && typeof status?.managers_running === 'boolean'
+                && status.managers_running !== liveView;
+            // a changed cluster connection is rebuilt in place, a few seconds after the sync
+            // that brought it; what the last rebuild could not build stays disconnected here
+            const reloadPending = standby && sync.reload_pending ? sync.reload_pending : null;
+            const lastReload = standby && sync.last_reload && typeof sync.last_reload === 'object' ? sync.last_reload : null;
+            const reloadFailed = Array.isArray(lastReload?.failed)
+                ? lastReload.failed.map(f => typeof f === 'string' ? f : (f?.name || f?.key || f?.id || '')).filter(Boolean)
+                : [];
+
+            const liveViewCard = (
+                <div className={card} data-ha-live-view={liveView ? 'on' : 'off'}>
+                    <div className="flex items-start justify-between gap-4">
+                        <div className="min-w-0">
+                            <label className="block text-sm font-medium text-white" htmlFor="pgha-live-view">{t('pgHaLiveView')}</label>
+                            <p className="text-xs text-gray-500 mt-1">{t('pgHaLiveViewHint')}</p>
+                        </div>
+                        <button id="pgha-live-view" type="button" role="switch" aria-checked={liveView}
+                            onClick={() => setLiveView(!liveView)} disabled={!!busy || broken}
+                            className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${liveView ? 'active' : ''}`} />
+                    </div>
+                    {standby && (
+                        <>
+                            {row(t('pgHaManagers'), status.managers_running
+                                ? <span className="text-green-300">{t(serving ? 'pgHaManagersServing' : 'pgHaManagersRunning')}</span>
+                                : <span className="text-gray-400">{t('pgHaManagersOff')}</span>)}
+                            {lastReload && row(t('pgHaLastReload'), (
+                                <span data-ha-last-reload>
+                                    {when(lastReload.at)}
+                                    {lastReload.reason && <span className="block text-xs text-gray-500">{lastReload.reason}</span>}
+                                </span>
+                            ))}
+                            {reloadPending && (
+                                <div className="space-y-2" data-ha-reload-pending>
+                                    <p className="text-xs text-yellow-300">
+                                        {t('pgHaReloadPending')}
+                                        {reloadPending.reason && <span className="block text-gray-400 break-all">{reloadPending.reason}</span>}
+                                    </p>
+                                    <button onClick={applyNow} disabled={!!busy} className={btnGhost}>
+                                        <Icons.RefreshCw />
+                                        {t('pgHaApplyNow')}
+                                    </button>
+                                </div>
+                            )}
+                            {reloadFailed.length > 0 && (
+                                <div className="rounded-lg p-2 text-xs border bg-red-500/10 border-red-500/30 text-red-300 space-y-1" data-ha-reload-failed>
+                                    <div>{t('pgHaReloadFailed')}</div>
+                                    <ul className="font-mono break-all">
+                                        {reloadFailed.map(f => <li key={f}>{f}</li>)}
+                                    </ul>
+                                </div>
+                            )}
+                            <p className="text-xs text-yellow-300">{t('pgHaLiveViewRestart')}</p>
+                        </>
+                    )}
+                </div>
+            );
+
+            // next to the live view in every role; a standby also says when it is on but has
+            // no active to hand things to. A serving member keeps its consoles then, only the
+            // changes wait
+            const forwardPaused = standby && forwardWrites && status?.forwarding === false;
+            const forwardCard = (
+                <div className={card} data-ha-forward={forwardWrites ? 'on' : 'off'}>
+                    <div className="flex items-start justify-between gap-4">
+                        <div className="min-w-0">
+                            <label className="block text-sm font-medium text-white" htmlFor="pgha-forward">{t('pgHaForwardWrites')}</label>
+                            <p className="text-xs text-gray-500 mt-1">{t('pgHaForwardWritesHint')}</p>
+                        </div>
+                        <button id="pgha-forward" type="button" role="switch" aria-checked={forwardWrites}
+                            onClick={() => setForwardWrites(!forwardWrites)} disabled={!!busy || broken}
+                            className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${forwardWrites ? 'active' : ''}`} />
+                    </div>
+                    {forwardPaused && (
+                        <p className="text-xs text-yellow-300" data-ha-forward-paused={serving ? 'serving' : 'standby'}>
+                            {t(serving ? 'pgHaForwardPausedServing' : 'pgHaForwardPaused')}
+                        </p>
+                    )}
+                </div>
+            );
+
+            // On a member, below the two it needs: whether the leader made it active. Read only,
+            // the leader sets it. Made active without either of the two, it serves nobody, and says so.
+            const assigned = status?.serve_assigned === true;
+            const assignedIdle = assigned && (!liveView || !forwardWrites);
+            const assignedCard = !status?.removed && (
+                <div className={`${card} md:col-span-2`} data-ha-assigned={assigned ? 'on' : 'off'}>
+                    <h4 className="font-medium text-white flex items-center gap-2">
+                        <Icons.Users />
+                        {t('pgHaAssignedTitle')}
+                    </h4>
+                    <p className="text-sm text-gray-300">{t(assigned ? 'pgHaAssignedOn' : 'pgHaAssignedOff')}</p>
+                    {assignedIdle && (
+                        <p className="text-xs text-yellow-300" data-ha-serve-idle>{t('pgHaAssignedNeeds')}</p>
+                    )}
+                    <p className="text-xs text-gray-500 flex items-start gap-2">
+                        <span className="flex-shrink-0"><Icons.Lock className="w-4 h-4" /></span>
+                        <span>{t('pgHaAssignedHint')}</span>
+                    </p>
+                </div>
+            );
+
+            const restartNote = standby && (pending || liveMismatch) && (
+                <div className="rounded-xl p-4 space-y-2 border bg-yellow-500/10 border-yellow-500/40" data-ha-restart-pending>
+                    <div className="flex items-start gap-2 text-sm text-yellow-200">
+                        <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                        <span>{t('pgHaRestartPending')}</span>
+                    </div>
+                    {pending && (pending.reason || pending.since) && (
+                        <div className="text-xs text-gray-400 break-all">
+                            {pending.reason}{pending.reason && pending.since ? ' · ' : ''}{pending.since && when(pending.since)}
+                        </div>
+                    )}
+                    <button onClick={applyNow} disabled={!!busy} className={`${btn} bg-yellow-600 hover:bg-yellow-700 text-white`}>
+                        <Icons.RefreshCw />
+                        {t('pgHaApplyNow')}
+                    </button>
+                </div>
+            );
+
+            // a poll can report the file unreadable while the promote box is open, or the member
+            // gone (or this instance no longer active) while its remove box is
+            const removeStale = confirmAction === 'remove'
+                && (role !== 'active' || !members.some(m => m.instance_id === removing?.instance_id));
+            // the server refused the remove as unconfirmed: the same box asks once more
+            const needShutDown = confirmAction === 'remove' && unconfirmed;
+            const needForce = confirmAction === 'promote' && promoteSync;
+            const typedBox = confirmAction && !(confirmAction === 'promote' && broken) && !removeStale && (
+                <div className="rounded-xl p-4 space-y-3 border bg-red-500/10 border-red-500/30" data-ha-confirm={confirmAction}>
+                    <p className="text-sm text-red-300">
+                        {confirmAction === 'promote' ? (serving ? t('pgHaPromoteLeaderDesc') : `${t('pgHaPromoteDesc')} ${t('pgHaPromoteSyncFirst')}`)
+                            : confirmAction === 'remove' ? t('pgHaRemoveDesc').replace('{name}', () => removing.url || removing.instance_id.slice(0, 8))
+                            : role === 'standby' ? t('pgHaUnpairStandbyDesc') : t('pgHaUnpairActiveDesc')}
+                    </p>
+                    {needForce && (
+                        <div className="rounded-lg p-3 space-y-2 border bg-yellow-500/10 border-yellow-500/40" data-ha-promote-sync>
+                            <div className="flex items-start gap-2 text-sm text-yellow-200">
+                                <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                                <span>{t(serving ? 'pgHaPromoteLeaderSyncFailed' : 'pgHaPromoteSyncFailed')}</span>
+                            </div>
+                            <label className="flex items-start gap-2 text-sm text-gray-200 cursor-pointer">
+                                <input type="checkbox" checked={forcePromote} onChange={e => setForcePromote(e.target.checked)} className="mt-0.5" />
+                                <span>{t('pgHaPromoteForce')}</span>
+                            </label>
+                        </div>
+                    )}
+                    {needShutDown && (
+                        <div className="rounded-lg p-3 space-y-2 border bg-yellow-500/10 border-yellow-500/40" data-ha-unconfirmed>
+                            <div className="flex items-start gap-2 text-sm text-yellow-200">
+                                <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                                <span>{t('pgHaRemoveUnconfirmed')}</span>
+                            </div>
+                            <label className="flex items-start gap-2 text-sm text-gray-200 cursor-pointer">
+                                <input type="checkbox" checked={shutDown} onChange={e => setShutDown(e.target.checked)} className="mt-0.5" />
+                                <span>{t('pgHaShutDownConfirm')}</span>
+                            </label>
+                        </div>
+                    )}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-w-xl">
+                        <div>
+                            <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-typed">
+                                {t('pgHaTypeToConfirm').replace('{word}', WORD[confirmAction])}
+                            </label>
+                            <input id="pgha-typed" value={typed} onChange={e => setTyped(e.target.value)} autoComplete="off"
+                                spellCheck={false} className={`${input} font-mono`} placeholder={WORD[confirmAction]} />
+                        </div>
+                        {passwordInput('confirm', 'pgha-confirm-password')}
+                    </div>
+                    {reauthNote('confirm', 'pgha-confirm-password')}
+                    <div className="flex flex-wrap items-center gap-2">
+                        <button onClick={confirmed} disabled={typed !== WORD[confirmAction] || needsPassword('confirm') || (needShutDown && !shutDown) || (needForce && !forcePromote) || !!busy}
+                            className={`${btn} bg-red-600 hover:bg-red-700 text-white`}>
+                            {confirmAction === 'promote' ? t(serving ? 'pgHaPromoteLeader' : 'pgHaPromote')
+                                : confirmAction === 'remove' ? (needShutDown ? t('pgHaRemoveAnyway') : t('pgHaRemove'))
+                                : t('pgHaUnpair')}
+                        </button>
+                        <button onClick={() => openConfirm(null)} className={btnGhost}>{t('cancel')}</button>
+                    </div>
+                </div>
+            );
+
+            // What the last removal reached, until the next action. The toast is gone after a few
+            // seconds, and a member that was not told has to be unpaired by hand over there.
+            const removalNote = lastRemoval && (
+                <div data-ha-removal={lastRemoval.told === true ? 'told' : lastRemoval.told === false ? 'not-reached' : 'unknown'}
+                    className={`rounded-xl p-4 border flex items-start gap-2 text-sm ${lastRemoval.told === false
+                        ? 'bg-yellow-500/10 border-yellow-500/40 text-yellow-200'
+                        : 'bg-green-500/10 border-green-500/30 text-green-300'}`}>
+                    <span className="mt-0.5 flex-shrink-0">{lastRemoval.told === false ? <Icons.AlertTriangle /> : <Icons.Check />}</span>
+                    <span className="flex-1 min-w-0" style={{ overflowWrap: 'anywhere' }}>
+                        {lastRemoval.told === true ? t('pgHaRemovedTold').replace('{name}', () => lastRemoval.name)
+                            : lastRemoval.told === false ? t('pgHaRemovedNotReached').replace('{name}', () => lastRemoval.name)
+                            : t('pgHaMemberRemoved')}
+                    </span>
+                    <button onClick={() => setLastRemoval(null)} title={t('close')} aria-label={t('close')}
+                        className="flex-shrink-0 text-gray-400 hover:text-white">
+                        <Icons.X />
+                    </button>
+                </div>
+            );
+
+            // This instance learned that the active took it out of the group. It acts on nothing
+            // and receives nothing until an admin unpairs it here.
+            const removedHere = status?.removed;
+            const removedNote = removedHere && role !== 'standalone' && (
+                <div className="rounded-xl p-4 space-y-2 border bg-red-500/10 border-red-500/30" data-ha-removed>
+                    <div className="flex items-start gap-2 text-sm text-red-300">
+                        <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                        <span>{t('pgHaRemovedHere')}</span>
+                    </div>
+                    <div className="text-xs text-gray-400">
+                        <span title={removedHere.by || ''}>
+                            {t('pgHaRemovedBy').replace('{by}', () => (removedHere.by || '-').slice(0, 8)).replace('{epoch}', () => removedHere.epoch ?? '-')}
+                        </span>
+                        {removedHere.at && <> · {when(removedHere.at)}</>}
+                    </div>
+                    <p className="text-sm text-gray-300">{t('pgHaRemovedHereNext')}</p>
+                </div>
+            );
+
+            // What a copy holds: per table the rows only here and the ones only in what replaced
+            // them, the files a sync replaced, and how many journal lines say who wrote them.
+            const copyContent = (c) => {
+                const diff = c.differences && typeof c.differences === 'object' ? c.differences : {};
+                const tables = Object.entries(diff).filter(([name, d]) => name !== 'files' && d && typeof d === 'object'
+                    && (d.only_here > 0 || d.only_there > 0));
+                const files = Array.isArray(diff.files) ? diff.files.filter(f => typeof f === 'string') : [];
+                if (!tables.length && !files.length && !(c.journal_rows > 0)) return '-';
+                return (
+                    <ul className="space-y-0.5">
+                        {tables.map(([name, d]) => (
+                            <li key={name} data-ha-copy-table={name}>
+                                <span className="font-mono text-xs">{name}</span>
+                                {': '}
+                                {[d.only_here > 0 && t('haCopiesOnlyHere').replace('{n}', d.only_here),
+                                  d.only_there > 0 && t('haCopiesOnlyThere').replace('{n}', d.only_there)].filter(Boolean).join(', ')}
+                            </li>
+                        ))}
+                        {files.length > 0 && (
+                            <li data-ha-copy-files>{t('haCopiesFiles')} <span className="font-mono text-xs">{files.join(', ')}</span></li>
+                        )}
+                        {c.journal_rows > 0 && <li data-ha-copy-journal>{t('haCopiesJournal').replace('{n}', c.journal_rows)}</li>}
+                    </ul>
+                );
+            };
+            const copyRow = (label, value) => (
+                <div className="flex flex-wrap gap-x-4 text-sm">
+                    <span className="text-gray-400 w-28 flex-shrink-0">{label}</span>
+                    <span className="text-gray-200 flex-1 min-w-0" style={{ overflowWrap: 'anywhere' }}>{value}</span>
+                </div>
+            );
+            const copyErrorBox = copyError && (
+                <div data-ha-copy-error={copyError.code || 'error'} style={{ overflowWrap: 'anywhere' }}
+                    className={`rounded-lg p-2 text-sm border ${copyError.code === 'HA_SYNC_RUNNING'
+                        ? 'bg-yellow-500/10 border-yellow-500/40 text-yellow-200'
+                        : 'bg-red-500/10 border-red-500/30 text-red-300'}`}>
+                    {copyError.text}
+                </div>
+            );
+            const copyBox = (c, sealed) => !copyAction || copyAction.name !== c.name ? null : copyAction.what === 'download' ? (
+                <div className="rounded-lg p-3 space-y-3 border bg-proxmox-dark border-proxmox-border" data-ha-copy-box="download">
+                    <p className="text-sm text-gray-300">{t('haCopiesDownloadDesc')}</p>
+                    {!sso && <div className="max-w-sm">{passwordInput('copy', 'pgha-copy-password')}</div>}
+                    {reauthNote('copy', 'pgha-copy-password')}
+                    {copyErrorBox}
+                    <div className="flex flex-wrap items-center gap-2">
+                        <button onClick={() => saveCopy(c.name)} disabled={needsPassword('copy') || !!busy || sealed}
+                            className={`${btn} bg-proxmox-orange hover:bg-proxmox-orange/90 text-white`}>
+                            <Icons.Download />
+                            {t('haCopiesDownload')}
+                        </button>
+                        <button onClick={() => openCopy(null)} className={btnGhost}>{t('cancel')}</button>
+                    </div>
+                </div>
+            ) : (
+                <div className="rounded-lg p-3 space-y-3 border bg-red-500/10 border-red-500/30" data-ha-copy-box="dismiss">
+                    <p className="text-sm text-red-300">{t('haCopiesDismissDesc')}</p>
+                    {copyErrorBox}
+                    <div className="flex flex-wrap items-center gap-2">
+                        <button onClick={() => dismissCopy(c.name)} disabled={!!busy}
+                            className={`${btn} bg-red-600 hover:bg-red-700 text-white`}>
+                            <Icons.Trash />
+                            {t('haCopiesDismissConfirm')}
+                        </button>
+                        <button onClick={() => openCopy(null)} className={btnGhost}>{t('cancel')}</button>
+                    </div>
+                </div>
+            );
+            // A copy sealed under a key this instance does not hold does not open here, so
+            // it cannot be handed out either; the fingerprints tell which instance opens it.
+            const copiesCard = copyCount > 0 && (
+                <div className={card} data-ha-copies={copyCount}>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                        <h4 className="font-medium text-white flex items-center gap-2">
+                            <Icons.Archive />
+                            {t('haCopiesTitle')}
+                        </h4>
+                        <span className="text-xs text-gray-400" data-ha-copies-total>
+                            {t('haCopiesTotal').replace('{n}', copyCount).replace('{size}', formatBytes(Number(copies.bytes) || 0))}
+                        </span>
+                    </div>
+                    <p className="text-sm text-gray-400 max-w-3xl">{t('haCopiesIntro')}</p>
+                    {copies.over_limit === true && (
+                        <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 flex items-start gap-2" data-ha-copies-over>
+                            <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                            <span>{t('haCopiesOverLimit')}</span>
+                        </div>
+                    )}
+                    <div className="space-y-3">
+                        {copyItems.map(c => {
+                            const sealed = !!c.seal && c.seal.opens === false;
+                            const oldKey = !sealed && c.key && c.key.current === false;
+                            return (
+                                <div key={c.name} data-ha-copy={c.name} data-ha-copy-opens={sealed ? 'no' : 'yes'}
+                                    className="bg-proxmox-card border border-proxmox-border rounded-lg p-3 space-y-2">
+                                    <div className="flex flex-wrap items-start justify-between gap-3">
+                                        <div className="min-w-0">
+                                            <div className="text-sm text-white flex flex-wrap items-center gap-2">
+                                                <span title={fmtDate(c.captured_at)} data-ha-copy-kept>
+                                                    {t('haCopiesKept').replace('{time}', haRelTime(c.captured_at, language) || '-')}
+                                                </span>
+                                                <span className="text-xs text-gray-400" data-ha-copy-size>{formatBytes(Number(c.bytes) || 0)}</span>
+                                            </div>
+                                            <div className="font-mono text-[11px] text-gray-500 break-all">{c.name}</div>
+                                        </div>
+                                        <div className="flex flex-wrap items-center gap-2">
+                                            <button onClick={() => askCopy(c.name)} disabled={!!busy || sealed} className={btnGhost}>
+                                                <Icons.Download />
+                                                {t('haCopiesDownload')}
+                                            </button>
+                                            <button onClick={() => openCopy('dismiss', c.name)} disabled={!!busy} className={btnGhost}>
+                                                <Icons.Trash />
+                                                {t('haCopiesDismiss')}
+                                            </button>
+                                        </div>
+                                    </div>
+                                    <div className="space-y-1">
+                                        {copyRow(t('haCopiesReason'), <span data-ha-copy-reason>{typeof c.reason === 'string' && c.reason ? c.reason : '-'}</span>)}
+                                        {copyRow(t('haCopiesContent'), copyContent(c))}
+                                        {c.repeats > 0 && copyRow(t('haCopiesRepeated'), (
+                                            <span title={c.last_at ? fmtDate(c.last_at) : undefined} data-ha-copy-repeats={c.repeats}>
+                                                {(c.last_at ? t('haCopiesRepeatedLast') : t('haCopiesRepeatedCount'))
+                                                    .replace('{n}', c.repeats).replace('{time}', haRelTime(c.last_at, language))}
+                                            </span>
+                                        ))}
+                                    </div>
+                                    {sealed && (
+                                        <div className="rounded-lg p-2 text-xs border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 flex items-start gap-2" data-ha-copy-sealed>
+                                            <span className="flex-shrink-0"><Icons.Lock className="w-4 h-4" /></span>
+                                            <span style={{ overflowWrap: 'anywhere' }}>
+                                                {t('haCopiesNoOpen').replace('{fp}', () => c.seal.fp || '-')}
+                                                {copies.seal?.fp && ` ${t('haCopiesOwnSeal').replace('{fp}', () => copies.seal.fp)}`}
+                                            </span>
+                                        </div>
+                                    )}
+                                    {oldKey && (
+                                        <p className="text-xs text-gray-400" style={{ overflowWrap: 'anywhere' }} data-ha-copy-key={c.key.backup ? 'backup' : 'gone'}>
+                                            {c.key.backup ? t('haCopiesValuesBackup').replace('{file}', () => c.key.backup) : t('haCopiesValuesLost')}
+                                        </p>
+                                    )}
+                                    {/* a poll can find it sealed while its box is open */}
+                                    {copyBox(c, sealed)}
+                                </div>
+                            );
+                        })}
+                    </div>
+                    {copyCount > copyItems.length && (
+                        <p className="text-xs text-gray-500" data-ha-copies-more>
+                            {t('haCopiesNewest').replace('{shown}', copyItems.length).replace('{n}', copyCount)}
+                        </p>
+                    )}
+                </div>
+            );
+
+            // A standalone's first code makes it the active. The active hands out one code per
+            // further standby until the group is full; the server refuses a fourth standby too.
+            const adding = role === 'active';
+            const pairingCard = (
+                <div className={card} data-ha-pairing={adding && groupFull ? 'full' : 'open'}>
+                    <h4 className="font-medium text-white flex items-center gap-2">
+                        {adding ? <Icons.UserPlus /> : <Icons.Key />}
+                        {adding ? t('pgHaAddStandbyTitle') : t('pgHaMakeActiveTitle')}
+                    </h4>
+                    {adding && groupFull ? (
+                        <p className="text-sm text-yellow-300">{t('pgHaGroupFull').replace('{max}', () => maxMembers)}</p>
+                    ) : (
+                        <>
+                            <p className="text-sm text-gray-400">{adding ? t('pgHaAddStandbyDesc') : t('pgHaMakeActiveDesc')}</p>
+                            <div>
+                                <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-own-url">{t('pgHaOwnUrl')}</label>
+                                <input id="pgha-own-url" value={ownUrl} onChange={e => setOwnUrl(e.target.value)}
+                                    placeholder="https://pegaprox-a.example:5000" className={`${input} font-mono`} />
+                                <div className="text-[11px] text-gray-500 mt-1">{t('pgHaOwnUrlHint')}</div>
+                            </div>
+                            {passwordInput('code', 'pgha-code-password')}
+                            {reauthNote('code', 'pgha-code-password')}
+                            {status?.pairing_open_until && !code && (
+                                <p className="text-xs text-yellow-300">
+                                    {t('pgHaCodeOpen').replace('{time}', fmtDate(status.pairing_open_until))}
+                                </p>
+                            )}
+                            <button onClick={createCode} disabled={needsPassword('code') || !!busy}
+                                className={`${btn} bg-proxmox-orange hover:bg-proxmox-orange/90 text-white`}>
+                                <Icons.Key />
+                                {t('pgHaCreateCode')}
+                            </button>
+                            {code && (
+                                <div className="bg-yellow-500/10 border border-yellow-500/40 rounded-xl p-3 space-y-2" data-ha-code>
+                                    <div className="text-xs font-medium text-yellow-200">{t('pgHaCodeOnce')}</div>
+                                    {codeExpired ? (
+                                        <p className="text-sm text-red-300">{t('pgHaCodeExpired')}</p>
+                                    ) : (
+                                        <>
+                                            <div className="flex items-start gap-2">
+                                                <code className="flex-1 px-3 py-2 bg-black/40 rounded text-xs text-yellow-200 break-all font-mono select-all">{code.code}</code>
+                                                <span className="shrink-0 inline-flex">
+                                                    <CopyButton value={code.code} size="md" title={t('copy')}
+                                                        className="w-8 h-8 border border-proxmox-border hover:border-gray-500" />
+                                                </span>
+                                            </div>
+                                            <div className="flex items-center gap-2 text-xs text-gray-400">
+                                                <Icons.Clock />
+                                                <span>{t('pgHaCodeExpiresIn').replace('{time}', countdown)}</span>
+                                            </div>
+                                            <p className="text-xs text-gray-400">{t('pgHaCodeNext')}</p>
+                                        </>
+                                    )}
+                                </div>
+                            )}
+                        </>
+                    )}
+                </div>
+            );
+
+            // Automatic failover, the witness and the zone of the schedules: switched and set on the
+            // leader, read on a member. Each card only shows what its server reports: none of them
+            // on a server from before stage 2, and on a member nothing it has no data for.
+            const groupCards = (leader) => {
+                // auto is null while this release does not offer automatic failover: no switch
+                // and no witness form that could only be refused
+                const reported = status.auto != null;
+                const zoned = typeof status.timezone === 'string';
+                const shared = { t, status, auto, members, memberName, leader, getAuthHeaders, load, addToast, broken };
+                const witness = reported && (leader || auto?.witness) && (
+                    <HaWitnessCard {...shared} notShipped={notShipped} onNotShipped={() => setNotShipped(true)} />
+                );
+                const zone = zoned && <HaZoneCard {...shared} />;
+                // the split panel and who leads come with automatic failover as well: null on this release
+                const split = reported && status.split_safety && typeof status.split_safety === 'object' ? status.split_safety : null;
+                return (
+                    <>
+                        {reported && (leader || auto) && (
+                            <HaAutoCard {...shared} notShipped={notShipped} onNotShipped={() => setNotShipped(true)} />
+                        )}
+                        {reported && auto && (
+                            <HaLeadCard t={t} status={status} auto={auto} leader={leader} nameOf={nameOf} getAuthHeaders={getAuthHeaders}
+                                load={load} addToast={addToast} broken={broken} onRestart={setRestarting} />
+                        )}
+                        {split && (
+                            <HaSplitCard t={t} status={status} split={split} auto={auto} nameOf={nameOf} ctl={memberCtl}
+                                selfForm={memberForm({ instance_id: status.instance_id, site: typeof auto?.site === 'string' ? auto.site : (status.site || ''),
+                                                       agent_vmid: auto?.agent_vmid })} />
+                        )}
+                        {(witness || zone) && (
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                {witness}
+                                {zone}
+                            </div>
+                        )}
+                    </>
+                );
+            };
+
+            if (!status) {
+                return (
+                    <div className="space-y-4">
+                        {loadError ? (
+                            <div className="rounded-lg p-3 text-sm border bg-red-500/10 border-red-500/30 text-red-300 flex items-center gap-2">
+                                <Icons.AlertTriangle />
+                                {loadError}
+                            </div>
+                        ) : (
+                            <div className="text-sm text-gray-400 flex items-center gap-2">
+                                <span className="inline-flex animate-spin"><Icons.RefreshCw /></span>
+                                {t('loading')}
+                            </div>
+                        )}
+                    </div>
+                );
+            }
+
+            // what this instance is in its group: the leader, a member that serves users, or a
+            // plain standby. A removed one waits for nothing, the note below says what it is
+            const roleDesc = role === 'active' ? t('pgHaRoleDescLeader')
+                : serving ? t('pgHaRoleDescActive')
+                : role === 'standby' && !status.removed ? t('pgHaRoleDescStandby') : '';
+
+            // The version of the configuration the group shares, as this instance holds it: a
+            // member in step shows what its leader shows. by is the instance that stepped it,
+            // at when; a fresh member has none until its first sync.
+            const cv = role !== 'standalone' && status.config_version && Array.isArray(status.config_version.cv)
+                ? status.config_version : null;
+            const cvText = cv && (cv.cv[0] > 0 || cv.cv[1] > 0) ? `${cv.cv[0]}.${cv.cv[1]}` : '';
+            const cvBy = typeof cv?.by !== 'string' || !cv.by ? '' : cv.by === status.instance_id ? t('haCvThisInstance')
+                : memberName(members.find(m => m.instance_id === cv.by) || { instance_id: cv.by });
+
+            return (
+                <div className="space-y-4" data-ha-role={role}>
+                    {restarting && <HaRestartOverlay t={t} expectRole={restarting} />}
+
+                    <div className={card}>
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                            <h3 className="text-lg font-semibold text-white flex items-center gap-2">
+                                <Icons.Layers />
+                                {t('pgHaTab')}
+                            </h3>
+                            <HaRoleBadge role={role} serving={status.serving === true} t={t} />
+                        </div>
+                        <p className="text-sm text-gray-400 max-w-3xl">{t('pgHaIntro')}</p>
+                        {role !== 'standalone' && (
+                            <p className="text-xs text-gray-400 max-w-3xl flex items-start gap-2" data-ha-automation={serving ? 'serving' : role}>
+                                <span className="flex-shrink-0"><Icons.Zap /></span>
+                                <span>{roleDesc ? `${roleDesc} ${t('pgHaAutomationLeader')}` : t('pgHaAutomationLeader')}</span>
+                            </p>
+                        )}
+                        <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-gray-400">
+                            <span>{t('pgHaEpoch')}: <span className="text-gray-200">{status.epoch}</span></span>
+                            <span>{t('pgHaInstanceId')}: <span className="font-mono text-gray-200" title={status.instance_id}>{(status.instance_id || '').slice(0, 8)}</span></span>
+                            {cv && (
+                                <span data-ha-cv={cvText || (cv.joined ? 'joined' : 'none')} title={t('haCvHint')}>
+                                    {t('haCvLabel')}:{' '}
+                                    {cvText ? (
+                                        <>
+                                            <span className="font-mono text-gray-200">{cvText}</span>
+                                            {cvBy && <> · {t('haCvBy').replace('{who}', () => cvBy)}</>}
+                                            {cv.at && <> · {when(cv.at)}</>}
+                                        </>
+                                    ) : <span className="text-gray-500">{t(cv.joined ? 'haCvJoined' : 'haCvNone')}</span>}
+                                </span>
+                            )}
+                        </div>
+                        {broken && (
+                            <div className="rounded-lg p-3 text-sm border bg-red-500/10 border-red-500/30 text-red-300 space-y-1" data-ha-broken>
+                                <div>{t('pgHaBroken')} <span className="font-mono text-xs">{status.broken}</span></div>
+                                <div className="text-xs">{t('pgHaBrokenLocked')}</div>
+                            </div>
+                        )}
+                        {loadError && <div className="text-xs text-red-400">{loadError}</div>}
+                    </div>
+
+                    {removedNote}
+                    {removalNote}
+                    {copiesCard}
+
+                    {role === 'standalone' && (
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            {pairingCard}
+
+                            <div className={card}>
+                                <h4 className="font-medium text-white flex items-center gap-2">
+                                    <Icons.Link />
+                                    {t('pgHaJoinTitle')}
+                                </h4>
+                                <p className="text-sm text-gray-400">{t('pgHaJoinDesc')}</p>
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-join-code">{t('pgHaCode')}</label>
+                                    <textarea id="pgha-join-code" value={joinCode} onChange={e => setJoinCode(e.target.value)} rows={3}
+                                        spellCheck={false} autoComplete="off" placeholder="pgxha1_..."
+                                        className={`${input} font-mono text-xs break-all`} />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-join-url">{t('pgHaOwnUrl')}</label>
+                                    <input id="pgha-join-url" value={joinUrl} onChange={e => setJoinUrl(e.target.value)}
+                                        placeholder="https://pegaprox-b.example:5000" className={`${input} font-mono`} />
+                                </div>
+                                <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 flex items-start gap-2">
+                                    <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                                    <span>{t('pgHaJoinWarning')}</span>
+                                </div>
+                                <label className="flex items-start gap-2 text-sm text-gray-300 cursor-pointer">
+                                    <input type="checkbox" checked={joinConfirm} onChange={e => setJoinConfirm(e.target.checked)} className="mt-0.5" />
+                                    <span>{t('pgHaJoinConfirm')}</span>
+                                </label>
+                                {passwordInput('join', 'pgha-join-password')}
+                                {reauthNote('join', 'pgha-join-password')}
+                                {joinError && (
+                                    <div className="rounded-lg p-2 text-sm border bg-red-500/10 border-red-500/30 text-red-300 break-all">{joinError}</div>
+                                )}
+                                <button onClick={join} disabled={!joinConfirm || !joinCode.trim() || needsPassword('join') || !!busy}
+                                    className={`${btn} bg-yellow-600 hover:bg-yellow-700 text-white`}>
+                                    <Icons.Link />
+                                    {busy === 'join' ? t('pgHaJoining') : t('pgHaJoin')}
+                                </button>
+                            </div>
+                            {liveViewCard}
+                            {forwardCard}
+                        </div>
+                    )}
+
+                    {role === 'active' && (
+                        <>
+                            {membersCard}
+                            {confirmAction === 'remove' && typedBox}
+                            {groupCards(true)}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                {pairingCard}
+                                {intervalCard}
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                {liveViewCard}
+                                {forwardCard}
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                                <button onClick={() => openConfirm('unpair')} disabled={!!busy} className={btnGhost}>
+                                    <Icons.Unlink />
+                                    {t('pgHaUnpair')}
+                                </button>
+                            </div>
+                            {confirmAction !== 'remove' && typedBox}
+                        </>
+                    )}
+
+                    {role === 'standby' && (
+                        <>
+                            {restartNote}
+                            {membersCard}
+                            {groupCards(false)}
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div className={card}>
+                                    <h4 className="font-medium text-white flex items-center gap-2">
+                                        <Icons.RefreshCw />
+                                        {t('pgHaSync')}
+                                    </h4>
+                                    <div className="space-y-1.5">
+                                        {row(t('pgHaLastSync'), when(sync.last_ok_at))}
+                                        {row(t('pgHaLastAttempt'), when(sync.last_attempt_at))}
+                                        {sync.rows != null && row(t('pgHaSyncContent'),
+                                            t('pgHaRowsTables').replace('{rows}', () => sync.rows).replace('{tables}', () => sync.tables ?? 0))}
+                                    </div>
+                                    {sync.last_error && (
+                                        <div className="rounded-lg p-2 text-xs border bg-red-500/10 border-red-500/30 text-red-300 break-all">
+                                            {t('pgHaLastError')}: {sync.last_error}
+                                        </div>
+                                    )}
+                                    {skipped.length > 0 && (
+                                        <div className="rounded-lg p-2 text-xs border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 space-y-1">
+                                            <div>{t('pgHaSkippedColumns')}</div>
+                                            <ul className="font-mono">
+                                                {skipped.map(([table, cols]) => <li key={table}>{table}: {cols.join(', ')}</li>)}
+                                            </ul>
+                                        </div>
+                                    )}
+                                </div>
+                                {intervalCard}
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                {liveViewCard}
+                                {forwardCard}
+                                {assignedCard}
+                            </div>
+                            {wayOut && (
+                                <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 flex items-start gap-2"
+                                    data-ha-way-out={forceOnly ? 'force' : 'ask'}>
+                                    <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                                    <span style={{ overflowWrap: 'anywhere' }}>{wayOut}</span>
+                                </div>
+                            )}
+                            <div className="flex flex-wrap gap-2">
+                                <button onClick={syncNow} disabled={!!busy}
+                                    className={`${btn} bg-proxmox-orange hover:bg-proxmox-orange/90 text-white`}>
+                                    <span className={`inline-flex ${busy === 'sync' ? 'animate-spin' : ''}`}><Icons.RefreshCw /></span>
+                                    {t('pgHaSyncNow')}
+                                </button>
+                                {!broken && !status?.removed && (promoteOffered ? (
+                                    <button onClick={() => openConfirm('promote')} disabled={!!busy}
+                                        className={`${btn} bg-yellow-600 hover:bg-yellow-700 text-white`}>
+                                        <Icons.Zap />
+                                        {t(serving ? 'pgHaPromoteLeader' : 'pgHaPromote')}
+                                    </button>
+                                ) : null)}
+                                {!forceOnly && (
+                                    <button onClick={() => openConfirm('unpair')} disabled={!!busy} className={btnGhost}>
+                                        <Icons.Unlink />
+                                        {t('pgHaUnpair')}
+                                    </button>
+                                )}
+                            </div>
+                            {typedBox}
+                        </>
+                    )}
+                </div>
+            );
+        }
+
+        // ═══════════════════════════════════════════════
+        // LW Oct 2026 (#625) - stage 2 of the group, for HaPanel: automatic failover, its witness
+        // and the time zone the schedules run in. The leader switches and sets them, a member
+        // reads what its leader says. status.auto is null on a release that does not offer
+        // automatic failover yet; the switch and the witness code are refused there with 409
+        // HA_AUTO_NOT_SHIPPED, which is a note and no error.
+        // ═══════════════════════════════════════════════
+
+        // the precondition each finding code of the server belongs to, in the order of the list
+        const HA_AUTO_CHECKS = [
+            ['votes', ['TOO_FEW_VOTERS', 'EVEN_VOTERS']],
+            ['release', ['OLD_RELEASE', 'RELEASE_MISMATCH', 'DOWNGRADED', 'KEY_MISMATCH', 'NOT_IN_CONFIG']],
+            ['answer', ['VOTER_DOWN', 'MEMBER_MANUAL', 'MEMBER_AUTO', 'ACTIVE_WITHOUT_LEASE', 'QUARANTINED',
+                        'STATE_NOT_WRITTEN', 'NO_DIR_SYNC']],
+            ['witness', ['WITNESS_SAME_SITE']],
+            ['clock', ['CLOCK_SKEW']],
+            ['zone', ['ZONE_UNREADABLE', 'NO_GROUP_ZONE', 'TZ_MISMATCH']],
+            ['sites', ['NO_SITE_LABELS', 'ALL_ONE_SITE', 'SITE_HOLDS_MAJORITY', 'TWO_SITES_NO_THIRD_VOTE',
+                       'CANDIDATES_ONE_SITE', 'NO_CANDIDATE']],
+            ['clusters', ['CLUSTER_ONE_SITE', 'RECOVERY_NOT_READY', 'TWO_NODE_NO_FENCE', 'NO_CLAIM', 'FOREIGN_CLAIM']],
+        ];
+        const HA_AUTO_CHECK_LABEL = {
+            votes: 'haAutoCheckVotes', release: 'haAutoCheckRelease', answer: 'haAutoCheckAnswer',
+            witness: 'haAutoCheckWitness', clock: 'haAutoCheckClock', zone: 'haAutoCheckZone', sites: 'haAutoCheckSites',
+            clusters: 'haAutoCheckClusters', other: 'haAutoCheckOther',
+        };
+        const HA_LEVEL_TONE = { block: 'text-red-400', warn: 'text-yellow-400', info: 'text-blue-400', ok: 'text-green-400' };
+        const HA_AUTO_MODES = { manual: 'haAutoModeManual', auto_pending: 'haAutoModePending', auto: 'haAutoModeAuto' };
+        const HA_AUTO_MODE_STYLE = {
+            manual: 'bg-gray-500/20 text-gray-300 border-gray-500/30',
+            auto_pending: 'bg-blue-500/10 text-blue-300 border-blue-500/30 border-dashed',
+            auto: 'bg-green-500/20 text-green-300 border-green-500/30',
+        };
+        // what the mode route takes for the lease (ha_vote.LEASE_MIN/MAX/DEFAULT), and the clock
+        // skew automatic failover allows (ha_vote.SKEW_LIMIT)
+        const HA_LEASE = { min: 15, max: 120, def: 20 };
+        const HA_SKEW_LIMIT = 5;
+        // a witness that was removed and did not hear it lets go on its own host with this
+        const HA_WITNESS_LEAVE = 'pegaprox-witness leave --force';
+        const HA_GROUP_CARD = 'bg-proxmox-dark border border-proxmox-border rounded-xl p-4 space-y-3';
+        const HA_GROUP_FIELD = 'px-3 py-2 bg-proxmox-card border border-proxmox-border rounded text-sm text-white disabled:opacity-50';
+        const HA_GROUP_BTN = 'flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
+        const HA_GROUP_GHOST = 'flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white hover:border-gray-500';
+
+        // The findings grouped by precondition. One about the witness belongs to it whatever its
+        // code, and the witness item is there only in a group that has one; the cluster item only
+        // where node HA runs on a cluster, or a finding names one. A code nobody knows here yet
+        // still shows, under "other". block keeps the switch off, warn wants a tick, info is
+        // something to know.
+        function haAutoChecklist(findings, witnessId, clustered = false) {
+            const list = (Array.isArray(findings) ? findings : []).filter(f => f && typeof f === 'object' && typeof f.code === 'string');
+            const clusterCodes = HA_AUTO_CHECKS.find(([key]) => key === 'clusters')[1];
+            const shown = (key) => (key !== 'witness' || witnessId)
+                && (key !== 'clusters' || clustered || list.some(f => clusterCodes.includes(f.code)));
+            const items = HA_AUTO_CHECKS.filter(([key]) => shown(key)).map(([key]) => ({ key, findings: [] }));
+            const other = { key: 'other', findings: [] };
+            list.forEach(f => {
+                const key = witnessId && f.member === witnessId ? 'witness'
+                    : (HA_AUTO_CHECKS.find(([, codes]) => codes.includes(f.code)) || ['other'])[0];
+                (items.find(i => i.key === key) || other).findings.push(f);
+            });
+            if (other.findings.length) items.push(other);
+            return items.map(i => {
+                const gates = i.findings.map(haAutoGate);
+                return { ...i, level: gates.includes('block') ? 'block' : gates.includes('warn') ? 'warn' : gates.includes('info') ? 'info' : 'ok' };
+            });
+        }
+
+        // what a finding does to the switch: a block about one cluster stops nothing but that
+        // cluster, so it wants a tick like a warning (switch_auto_on)
+        function haAutoGate(f) {
+            return f.level === 'block' && f.cluster ? 'warn' : f.level;
+        }
+
+        // how long a failover takes at a lease of `lease` seconds (design 9): the election timer
+        // of the others, the vote and the takeover wait, from the crash to the new leader acting
+        function haFailoverSeconds(lease) {
+            const take = 1.1 * (lease + 2) + Math.max(2, 0.05 * lease) + 5;
+            return [Math.round(1.1 * lease + 1 + take), Math.round(1.1 * lease + lease / 4 + 1 + take)];
+        }
+
+        function haSkewText(skew) {
+            return `${skew > 0 ? '+' : ''}${skew.toFixed(1)} s`;
+        }
+
+        // POST/PUT to /api/ha/*: the server's words and code on a refusal, and its body, which
+        // carries the findings of a refused switch
+        async function haGroupSend(getAuthHeaders, method, path, body, fallback) {
+            let r;
+            try {
+                r = await fetch(`${API_URL}/ha/${path}`, {
+                    method, credentials: 'include',
+                    headers: { ...getAuthHeaders(), 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body || {})
+                });
+            } catch (_) {
+                return { ok: false, code: '', error: fallback, data: null };
+            }
+            const data = await r.json().catch(() => null);
+            if (!r.ok) {
+                const said = typeof data?.error === 'string' ? data.error.trim() : '';
+                haLeaseRefused(r.status, data?.code);
+                return { ok: false, code: data?.code || '', error: said || fallback, data };
+            }
+            return { ok: true, code: '', error: '', data: data || {} };
+        }
+
+        // no leader right now, or the lead is handed on (503 HA_NO_LEASE / HA_TRANSFER): the banner
+        // says so as well, read again at once (contexts.js)
+        function haLeaseRefused(status, code) {
+            if (status === 503 && (code === 'HA_NO_LEASE' || code === 'HA_TRANSFER')) {
+                window.dispatchEvent(new CustomEvent('pegaprox-ha-lease'));
+            }
+        }
+
+        // the account password these actions want, and the server's word on it next to the field.
+        // An SSO account types none: the server goes by how fresh its sign-in is.
+        function HaGroupPassword({ t, id, sso, value, onChange, refused, logout }) {
+            const reauth = refused && (refused.code === 'HA_REAUTH' || refused.code === 'HA_REAUTH_RECENT') ? refused : null;
+            return (
+                <>
+                    {!sso && (
+                        <div>
+                            <label className="block text-xs text-gray-400 mb-1" htmlFor={id}>{t('pgHaPassword')}</label>
+                            <input id={id} type="password" autoComplete="current-password" data-lpignore="true" data-1p-ignore="true" data-bwignore="true"
+                                value={value} onChange={e => onChange(e.target.value)} aria-invalid={reauth ? 'true' : undefined}
+                                className={`w-full ${HA_GROUP_FIELD}`} />
+                        </div>
+                    )}
+                    {reauth && (
+                        <div data-ha-reauth={reauth.code} className="rounded-lg p-2 text-sm border bg-red-500/10 border-red-500/30 text-red-300 space-y-2">
+                            <div className="break-all">{reauth.error}</div>
+                            {reauth.code === 'HA_REAUTH_RECENT' && (
+                                <button type="button" onClick={() => logout()} className={HA_GROUP_GHOST}>
+                                    <Icons.LogOut />
+                                    {t('pgHaSignInAgain')}
+                                </button>
+                            )}
+                        </div>
+                    )}
+                </>
+            );
+        }
+
+        // the columns the voter config adds to the members table, and the cells of one row. On the
+        // leader (ctl) vote and may lead are a switch each, the site is edited and a data member
+        // with a vote can be made leader; a member reads the same in one column.
+        function HaAutoMemberHead({ t, cell, ctl = null }) {
+            return (
+                <>
+                    <th className={`${cell} font-medium`}>{t('haAutoColSite')}</th>
+                    <th className={`${cell} font-medium`}>{t('haAutoColVote')}</th>
+                    {ctl && <th className={`${cell} font-medium whitespace-nowrap`} title={t('haAutoMayLeadHint')}>{t('haAutoColMayLead')}</th>}
+                    <th className={`${cell} font-medium`}>{t('haAutoColSkew')}</th>
+                    <th className={`${cell} font-medium`} title={t('haAutoReachHint')}>{t('haAutoColReach')}</th>
+                    <th className={`${cell} font-medium`}>{t('haAutoColState')}</th>
+                    {ctl && <th className="py-2" />}
+                </>
+            );
+        }
+
+        function HaAutoMemberCells({ t, cell, row, ctl = null, nameOf = (id) => String(id || '').slice(0, 8) }) {
+            const none = <span className="text-gray-500">-</span>;
+            if (!row) {
+                // a member the voter config does not name: it neither votes nor counts
+                return (
+                    <>
+                        <td className={cell}>{none}</td>
+                        <td className={cell}>{none}</td>
+                        {ctl && <td className={cell}>{none}</td>}
+                        <td className={cell}>{none}</td>
+                        <td className={cell}>{none}</td>
+                        <td className={`${cell} text-xs text-yellow-300 whitespace-nowrap`} data-ha-auto-state="none">{t('haAutoNotInConfig')}</td>
+                        {ctl && <td className="py-2" />}
+                    </>
+                );
+            }
+            const yesNo = (v) => v === true ? t('yes') : v === false ? t('no') : none;
+            const skew = typeof row.skew === 'number' && isFinite(row.skew) ? row.skew : null;
+            const reach = row.reach && typeof row.reach === 'object' ? Object.values(row.reach) : null;
+            const reached = reach ? reach.filter(v => v === true).length : 0;
+            // the witness says when it acked a renewal last, a data member when it answered
+            const heard = typeof row.seen_ago === 'number' ? row.seen_ago : typeof row.last_heard === 'number' ? row.last_heard : null;
+            const states = [
+                row.quarantined === true && ['quarantined', 'bg-red-500/20 text-red-300 border-red-500/30', t('haAutoQuarantined')],
+                row.holds === true && ['holds', 'bg-green-500/20 text-green-300 border-green-500/30', t('haAutoHolds')],
+                row.mode === 'auto_pending' && ['pending', 'bg-blue-500/10 text-blue-300 border-blue-500/30', t('haAutoHoldsPending')],
+            ].filter(Boolean);
+            const data = row.kind !== 'witness';
+            const name = nameOf(row.instance_id);
+            // what the leader saw it answer, and what the nodes of a two-node cluster could not reach
+            const cv = Array.isArray(row.cv) && row.cv.length >= 2 ? row.cv : null;
+            const behind = typeof row.behind === 'number' ? row.behind : null;
+            const promised = typeof row.promised_to === 'string' && row.promised_to ? row.promised_to : null;
+            const unreached = (Array.isArray(row.unreached_from) ? row.unreached_from : []).filter(u => u && typeof u === 'object' && u.node);
+            const open = ctl?.form && ctl.form.id === row.instance_id ? ctl.form.what : '';
+            const toggle = (what, on, label, locked) => (
+                <button type="button" role="switch" aria-checked={on} aria-label={label.replace('{name}', () => name)}
+                    title={locked || undefined} onClick={() => ctl.open(what, row)} disabled={!!locked}
+                    data-ha-auto-toggle={what} data-ha-auto-open={open === what ? '' : undefined}
+                    className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${on ? 'active' : ''}`} />
+            );
+            return (
+                <>
+                    <td className={`${cell} text-gray-200 whitespace-nowrap`} data-ha-auto-site>
+                        {typeof row.site === 'string' && row.site ? row.site : none}
+                        {ctl && (
+                            <button type="button" onClick={() => ctl.open('site', row)} disabled={!!ctl.locked}
+                                title={ctl.locked || t('haAutoSiteEdit')} aria-label={t('haAutoSiteOf').replace('{name}', () => name)}
+                                className="ml-2 text-gray-400 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed" style={{ verticalAlign: 'middle' }}>
+                                <Icons.Edit />
+                            </button>
+                        )}
+                    </td>
+                    {ctl && data ? (
+                        <>
+                            <td className={cell} data-ha-auto-vote={row.voter === true ? 'yes' : 'no'}>
+                                {toggle('voter', row.voter === true, t('haAutoVoteOf'), ctl.voteLocked)}
+                            </td>
+                            <td className={cell} data-ha-auto-may-lead={row.may_lead === true ? 'yes' : 'no'}>
+                                {toggle('may_lead', row.may_lead === true, t('haAutoMayLeadOf'),
+                                        ctl.voteLocked || (row.voter !== true ? t('haAutoMayLeadNeedsVote') : ''))}
+                            </td>
+                        </>
+                    ) : ctl ? (
+                        <>
+                            {/* the witness always votes and never leads */}
+                            <td className={`${cell} text-gray-200 whitespace-nowrap`} data-ha-auto-vote="yes">{yesNo(row.voter)}</td>
+                            <td className={`${cell} text-gray-200 whitespace-nowrap`} data-ha-auto-may-lead="no">{t('no')}</td>
+                        </>
+                    ) : (
+                        <td className={`${cell} text-gray-200 whitespace-nowrap`} data-ha-auto-vote={row.voter === true ? 'yes' : 'no'}
+                            data-ha-auto-may-lead={row.may_lead === true ? 'yes' : 'no'}>
+                            {yesNo(row.voter)}
+                            {row.may_lead === true && <span className="text-gray-400"> · {t('haAutoColMayLead')}</span>}
+                        </td>
+                    )}
+                    <td className={`${cell} whitespace-nowrap`} data-ha-auto-skew>
+                        {skew === null ? none : <span className={Math.abs(skew) > HA_SKEW_LIMIT ? 'text-red-300' : 'text-gray-200'}>{haSkewText(skew)}</span>}
+                    </td>
+                    <td className={`${cell} whitespace-nowrap`} data-ha-auto-reach>
+                        {reach ? (
+                            <span title={t('haAutoReachHint')} className={reached < reach.length ? 'text-yellow-300' : 'text-gray-200'}>
+                                {t('haAutoReachOf').replace('{n}', reached).replace('{total}', reach.length)}
+                            </span>
+                        ) : none}
+                    </td>
+                    <td className={`${cell} text-xs`} data-ha-auto-state={states.map(s => s[0]).join(' ') || (heard === null ? 'unheard' : 'heard')}>
+                        <div className="flex flex-wrap items-center gap-1">
+                            {states.map(([key, tone, label]) => (
+                                <span key={key} className={`px-1.5 py-0.5 rounded-full border text-[11px] whitespace-nowrap ${tone}`}>{label}</span>
+                            ))}
+                            <span className={`whitespace-nowrap ${heard === null ? 'text-yellow-300' : 'text-gray-400'}`}>
+                                {heard === null ? t('haAutoNotHeard') : t('haAutoHeard').replace('{n}', Math.round(heard))}
+                            </span>
+                        </div>
+                        {(promised || cv || unreached.length > 0) && (
+                            <div className="mt-1 space-y-0.5">
+                                {promised && (
+                                    <div className="text-gray-400" data-ha-auto-promised={promised}>
+                                        {(typeof row.promised_left === 'number' ? t('haAutoPromisedFor') : t('haAutoPromisedTo'))
+                                            .replace('{who}', () => nameOf(promised)).replace('{n}', Math.max(0, Math.round(row.promised_left || 0)))}
+                                    </div>
+                                )}
+                                {cv && (
+                                    <div className={behind > 0 ? 'text-yellow-300' : 'text-gray-400'} data-ha-auto-cv={haCvText(cv)}
+                                        data-ha-auto-behind={behind ?? undefined}>
+                                        {t(row.current === true ? 'haAutoCvCurrent' : 'haAutoCv').replace('{cv}', () => haCvText(cv))}
+                                        {behind > 0 && <> · {t('haAutoBehindBy').replace('{n}', behind)}</>}
+                                    </div>
+                                )}
+                                {unreached.length > 0 && (
+                                    <div className="text-yellow-300" style={{ overflowWrap: 'anywhere' }} data-ha-auto-unreached={unreached.length}>
+                                        {t('haAutoUnreached').replace('{list}', () => unreached.map(u => `${u.node} (${u.name || u.cluster})`).join(', '))}
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                    </td>
+                    {ctl && (
+                        <td className="py-2 pl-2 text-right">
+                            <div className="flex flex-col items-end gap-1">
+                                {data && row.voter === true && (row.make_leader === true ? (
+                                    <button type="button" onClick={() => ctl.open('leader', row)} disabled={!!ctl.leadLocked}
+                                        title={ctl.leadLocked || undefined} data-ha-make-leader={row.instance_id}
+                                        className={`${HA_GROUP_GHOST} whitespace-nowrap`}>
+                                        <Icons.Star className="w-4 h-4" />
+                                        {t('haAutoMakeLeader')}
+                                    </button>
+                                ) : typeof row.make_leader_why === 'string' && row.make_leader_why ? (
+                                    // wraps at words, never down to a letter per line in a narrow cell
+                                    <span className="block min-w-[160px] max-w-xs text-left text-xs text-gray-500" style={{ overflowWrap: 'break-word' }}
+                                        data-ha-make-leader-why={row.instance_id}>
+                                        {row.make_leader_why}
+                                    </span>
+                                ) : null)}
+                                {data && (
+                                    <HaAgentVmButton t={t} ctl={ctl} target={row} name={name} />
+                                )}
+                            </div>
+                        </td>
+                    )}
+                </>
+            );
+        }
+
+        // The switch, with what stands in the way as a checklist: a red item keeps it off, an amber
+        // one wants a tick. While the members take the voter config it names whom it waits for.
+        // The lease length and the quarantined voters are the leader's as well; a member reads.
+        function HaAutoCard({ t, status, auto, members, memberName, leader, getAuthHeaders, load, addToast, broken,
+                              notShipped, onNotShipped }) {
+            const { user, logout } = useAuth();
+            const sso = ['oidc', 'entra'].includes(user?.auth_source);
+            const [form, setForm] = useState(null);           // 'on' | 'off' | 'lease' | 'readmit' while its box is open
+            const [target, setTarget] = useState(null);       // the member a re-admit is about
+            const [lease, setLease] = useState('');
+            const [password, setPassword] = useState('');
+            const [ticked, setTicked] = useState([]);         // the amber items the admin ticked
+            const [answered, setAnswered] = useState(null);   // the findings a refused switch came back with
+            const [refused, setRefused] = useState(null);     // {code, error} of the last refusal
+            const [busy, setBusy] = useState(false);
+            const [offWaits, setOffWaits] = useState(false);  // switched off, and its majority is not there yet
+
+            const mode = HA_AUTO_MODES[auto?.mode] ? auto.mode : 'manual';
+            const on = mode !== 'manual';
+            const witnessId = typeof auto?.witness?.instance_id === 'string' ? auto.witness.instance_id : null;
+            const nameOf = (id) => id === status.instance_id ? t('haAutoThisInstance') : id === witnessId ? t('haAutoTheWitness')
+                : memberName(members.find(m => m.instance_id === id) || { instance_id: String(id || '') });
+            // where a sentence starts with it, the witness goes by its address
+            const labelOf = (id) => id === witnessId && auto.witness.url ? auto.witness.url : nameOf(id);
+            const findings = answered || (Array.isArray(auto?.findings) ? auto.findings : null);
+            const clustered = Array.isArray(status.split_safety?.clusters) && status.split_safety.clusters.length > 0;
+            const checks = leader && findings ? haAutoChecklist(findings, witnessId, clustered) : null;
+            const blocked = mode === 'manual' && !!checks && checks.some(c => c.level === 'block');
+            const amber = mode === 'manual' && checks ? checks.filter(c => c.level === 'warn') : [];
+            const accept = [...new Set(amber.filter(c => ticked.includes(c.key))
+                .flatMap(c => c.findings.filter(f => haAutoGate(f) === 'warn').map(f => f.code)))];
+            const leaseNow = Number.isInteger(auto?.lease_s) ? auto.lease_s : HA_LEASE.def;
+            const leaseText = String(lease).trim();
+            const leaseOk = /^\d+$/.test(leaseText) && Number(leaseText) >= HA_LEASE.min && Number(leaseText) <= HA_LEASE.max;
+            const leaseShown = leaseOk ? Number(leaseText) : leaseNow;
+            const [lo, hi] = haFailoverSeconds(leaseShown);
+            const quarantined = (Array.isArray(auto?.members) ? auto.members : [])
+                .filter(r => r && r.quarantined === true && typeof r.instance_id === 'string');
+            const holder = auto?.holds_lease === true ? status.instance_id : typeof auto?.holder === 'string' ? auto.holder : null;
+            const waiting = Array.isArray(auto?.switch_waiting) ? auto.switch_waiting.filter(id => typeof id === 'string') : null;
+            const pending = auto?.pending && typeof auto.pending === 'object' ? auto.pending : null;
+            // the rest of the status line, each part only where the server sends it: the last
+            // change of the leader, what the leader holds that no majority holds yet, a hand-over
+            // (writes pause meanwhile) or a planned restart, and on a member its promise, how far
+            // it is behind its leader and its last election that found no leader
+            const part = (key) => auto?.[key] && typeof auto[key] === 'object' && !Array.isArray(auto[key]) ? auto[key] : null;
+            const change = part('leader_change') && typeof auto.leader_change.at === 'string' ? auto.leader_change : null;
+            const unconfirmed = part('unconfirmed');
+            const transfer = part('transfer');
+            const planned = part('planned_restart');
+            const promise = auto?.holds_lease !== true ? part('promise') : null;
+            const campaign = part('last_campaign');
+            const behind = auto?.holds_lease !== true && typeof auto?.behind === 'number' ? auto.behind : null;
+            const seconds = (v) => Math.max(0, Math.round(Number(v) || 0));
+
+            // the note of a switch off that waits for its majority goes once the group is manual
+            useEffect(() => { if (mode === 'manual') setOffWaits(false); }, [mode]);
+
+            // null closes the box; nothing typed survives into the next one
+            const open = (what, member = null) => {
+                setForm(what);
+                setTarget(member);
+                setPassword('');
+                setRefused(null);
+                setLease(String(leaseNow));
+                if (!what) { setAnswered(null); setTicked([]); }
+            };
+
+            const submit = async () => {
+                const what = form;
+                const body = what === 'readmit' ? {}
+                    : what === 'off' ? { mode: 'manual' }
+                    : what === 'lease' ? { mode: 'auto', lease_s: Number(leaseText) }
+                    : { mode: 'auto', lease_s: Number(leaseText), accept };
+                const path = what === 'readmit' ? `members/${encodeURIComponent(target)}/readmit` : 'mode';
+                setBusy(true);
+                setRefused(null);
+                let res;
+                try {
+                    res = await haGroupSend(getAuthHeaders, what === 'readmit' ? 'POST' : 'PUT', path,
+                                            sso ? body : { ...body, user_password: password }, t('pgHaActionFailed'));
+                } finally {
+                    setBusy(false);
+                    // the password was for this one request, whatever came back
+                    setPassword('');
+                }
+                if (!res.ok) {
+                    if (res.code === 'HA_AUTO_NOT_SHIPPED') { open(null); onNotShipped(); return; }
+                    // what stands in the way right now, as the server just found it
+                    if (Array.isArray(res.data?.findings)) setAnswered(res.data.findings);
+                    setRefused({ code: res.code, error: res.error });
+                    return;
+                }
+                open(null);
+                if (what === 'off') {
+                    setOffWaits(res.data.result === 'off' && res.data.mode === 'auto');
+                    addToast?.(t(res.data.result === 'cancelled' ? 'haAutoTakenBack' : 'haAutoSwitchedOff'), 'success');
+                } else if (what === 'lease') {
+                    addToast?.(t(res.data.changed === false ? 'haAutoLeaseUnchanged' : 'haAutoLeaseSaved'), 'success');
+                } else if (what === 'readmit') {
+                    addToast?.(t('haAutoReadmitted'), 'success');
+                } else {
+                    addToast?.(t('haAutoSwitchStarted'), 'success');
+                }
+                load();
+            };
+
+            const reauth = refused && (refused.code === 'HA_REAUTH' || refused.code === 'HA_REAUTH_RECENT');
+            const ready = !busy && !broken && (sso || !!password)
+                && (form === 'off' || form === 'readmit' || leaseOk)
+                && (form !== 'on' || (!blocked && amber.every(c => ticked.includes(c.key))));
+            // in manual mode every precondition, met or not; once automatic only what to look at
+            const shownChecks = checks ? (mode === 'manual' ? checks : checks.filter(c => c.findings.length > 0)) : null;
+            const formText = form === 'readmit' ? t('haAutoReadmitDesc').replace('{name}', () => labelOf(target))
+                : t({ on: 'haAutoOnDesc', off: mode === 'auto_pending' ? 'haAutoTakeBackDesc' : 'haAutoOffDesc', lease: 'haAutoLeaseDesc' }[form] || 'haAutoOnDesc');
+            const formButton = { on: 'haAutoSwitchOn', off: mode === 'auto_pending' ? 'haAutoTakeBack' : 'haAutoSwitchOff',
+                                 lease: 'save', readmit: 'haAutoReadmit' }[form];
+
+            return (
+                <div className={HA_GROUP_CARD} data-ha-auto={auto ? mode : 'unknown'}>
+                    <div className="flex items-start justify-between gap-4">
+                        <div className="min-w-0">
+                            <h4 className="font-medium text-white flex flex-wrap items-center gap-2">
+                                <Icons.Shield />
+                                {leader ? <label htmlFor="pgha-auto">{t('haAutoTitle')}</label> : <span>{t('haAutoTitle')}</span>}
+                                {auto && (
+                                    <span data-ha-auto-mode={mode} className={`px-2 py-0.5 rounded-full border text-xs font-medium ${HA_AUTO_MODE_STYLE[mode]}`}>
+                                        {t(HA_AUTO_MODES[mode])}
+                                    </span>
+                                )}
+                            </h4>
+                            <p className="text-xs text-gray-500 mt-1">{t('haAutoHint')}</p>
+                        </div>
+                        {leader && (
+                            <button id="pgha-auto" type="button" role="switch" aria-checked={on}
+                                onClick={() => open(form === 'on' || form === 'off' ? null : on ? 'off' : 'on')}
+                                disabled={busy || broken || (!on && (notShipped || blocked))}
+                                className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${on ? 'active' : ''}`} />
+                        )}
+                    </div>
+                    {notShipped && !on && (
+                        <div className="rounded-lg p-3 text-sm border bg-blue-500/10 border-blue-500/30 text-blue-200 flex items-start gap-2" data-ha-auto-not-shipped>
+                            <span className="mt-0.5 flex-shrink-0"><Icons.Info /></span>
+                            <span>{t('haAutoNotShipped')}</span>
+                        </div>
+                    )}
+                    {auto && (
+                        <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-xs text-gray-400" data-ha-auto-status>
+                            {mode === 'auto' && (
+                                <span data-ha-auto-leader={holder ? (holder === status.instance_id ? 'self' : 'other') : 'none'}>
+                                    {holder
+                                        ? t('haAutoLeader').replace('{who}', () => nameOf(holder)).replace('{epoch}', () => auto.epoch ?? '-')
+                                        : <span className="text-yellow-300">{t('haAutoNoLeader')}</span>}
+                                    {holder && typeof auto.lease_left === 'number' && <> · {t('haAutoLeaseLeft').replace('{n}', Math.round(auto.lease_left))}</>}
+                                    {holder && typeof auto.renewed_ago === 'number' && (
+                                        <> · <span data-ha-auto-renewed={seconds(auto.renewed_ago)}>{t('haAutoRenewed').replace('{n}', seconds(auto.renewed_ago))}</span></>
+                                    )}
+                                </span>
+                            )}
+                            {auto.voters > 0 && (
+                                <span data-ha-auto-majority>{t('haAutoMajority').replace('{m}', () => auto.majority).replace('{n}', () => auto.voters)}</span>
+                            )}
+                            {on && (
+                                <span data-ha-auto-lease={leaseNow}>
+                                    {t('haAutoLeaseIs').replace('{n}', leaseNow)}
+                                    {leader && mode === 'auto' && !form && (
+                                        <button type="button" onClick={() => open('lease')} disabled={busy || broken}
+                                            className="ml-2 text-proxmox-orange hover:text-orange-400 disabled:opacity-50">
+                                            {t('haAutoChange')}
+                                        </button>
+                                    )}
+                                </span>
+                            )}
+                            {typeof auto.acting_in === 'number' && (
+                                <span className="text-yellow-300" data-ha-auto-taking-over>
+                                    {t('haAutoTakingOver').replace('{n}', Math.ceil(auto.acting_in))}
+                                </span>
+                            )}
+                            {transfer && (
+                                <span className="text-yellow-300" data-ha-auto-transfer={transfer.phase || ''}>
+                                    {t('haAutoTransfer').replace('{who}', () => transfer.to_url || nameOf(transfer.to))
+                                        .replace('{n}', Math.ceil(Number(transfer.left) || 0))}
+                                </span>
+                            )}
+                            {planned && (
+                                <span className="text-blue-300" data-ha-auto-planned>
+                                    {t('haAutoPlanned').replace('{who}', () => planned.by_url || nameOf(planned.by))
+                                        .replace('{n}', Math.ceil(Number(planned.hold_left) || 0))}
+                                </span>
+                            )}
+                            {promise && (
+                                <span data-ha-auto-promise={promise.to || ''}>
+                                    {t('haAutoPromise').replace('{who}', () => promise.to_url || nameOf(promise.to)).replace('{n}', seconds(promise.left))}
+                                </span>
+                            )}
+                            {behind !== null && (
+                                <span className={behind > 0 ? 'text-yellow-300' : undefined} data-ha-auto-behind={behind}>
+                                    {behind > 0 ? t('haAutoBehind').replace('{n}', behind) : t('haAutoInStep')}
+                                </span>
+                            )}
+                            {unconfirmed && (
+                                <span className="text-yellow-300" data-ha-auto-unconfirmed={typeof unconfirmed.count === 'number' ? unconfirmed.count : 'epoch'}>
+                                    {typeof unconfirmed.count === 'number' ? t('haAutoUnconfirmed').replace('{n}', unconfirmed.count)
+                                        : t('haAutoUnconfirmedEpoch').replace('{cv}', () => haCvText(unconfirmed.cv))}
+                                </span>
+                            )}
+                            {auto.change_pending === true && (
+                                <span className="text-blue-300" data-ha-auto-change-pending>{t('haAutoChangePending')}</span>
+                            )}
+                            {change && (
+                                <span data-ha-auto-last-change={change.epoch ?? ''} title={fmtDate(change.at)}>
+                                    {t(change.from_url || change.from ? 'haAutoLastChange' : 'haAutoLastChangeTo')
+                                        .replace('{time}', () => fmtTime(change.at))
+                                        .replace('{from}', () => change.from_url || nameOf(change.from))
+                                        .replace('{to}', () => change.to_url || nameOf(change.to))}
+                                </span>
+                            )}
+                            {campaign && (
+                                <span className="text-yellow-300" data-ha-auto-campaign={campaign.unreachable === true ? 'no-majority' : 'refused'}>
+                                    {t('haAutoCampaign').replace('{n}', seconds(campaign.ago)).replace('{reached}', () => campaign.reached ?? '-')
+                                        .replace('{m}', () => campaign.majority ?? '-')}
+                                </span>
+                            )}
+                        </div>
+                    )}
+                    {mode === 'auto_pending' && (
+                        <div className="rounded-lg p-3 text-sm border bg-blue-500/10 border-blue-500/30 text-blue-200 space-y-1"
+                            data-ha-auto-pending={waiting ? waiting.length : 'member'}>
+                            <div style={{ overflowWrap: 'anywhere' }}>
+                                {waiting ? (waiting.length ? t('haAutoWaitingFor').replace('{names}', () => waiting.map(nameOf).join(', '))
+                                                           : t('haAutoWaitingNone'))
+                                    : pending?.own ? t('haAutoPendingOwn')
+                                    : pending && (pending.by_url || pending.by) ? t('haAutoPendingBy').replace('{who}', () => pending.by_url || String(pending.by).slice(0, 8))
+                                    : t('haAutoPendingGroup')}
+                            </div>
+                            {typeof pending?.since === 'string' && pending.since && (
+                                <div className="text-xs text-gray-400">{t('haAutoPendingSince').replace('{time}', () => fmtDate(pending.since))}</div>
+                            )}
+                        </div>
+                    )}
+                    {offWaits && mode === 'auto' && (
+                        <p className="text-xs text-yellow-300" data-ha-auto-off-waiting>{t('haAutoOffWaiting')}</p>
+                    )}
+                    {shownChecks && (
+                        <div className="space-y-2" data-ha-auto-checks={blocked ? 'block' : amber.length ? 'warn' : 'ok'}>
+                            <div className="text-xs font-medium text-gray-400">{t(mode === 'manual' ? 'haAutoChecksTitle' : 'haAutoLookAt')}</div>
+                            {shownChecks.length === 0 && <p className="text-xs text-gray-500" data-ha-auto-nothing>{t('haAutoNothing')}</p>}
+                            <ul className="space-y-2">
+                                {shownChecks.map(c => (
+                                    <li key={c.key} data-ha-auto-check={c.key} data-ha-auto-level={c.level} className="flex items-start gap-2 text-sm">
+                                        <span className={`mt-0.5 flex-shrink-0 ${HA_LEVEL_TONE[c.level] || HA_LEVEL_TONE.ok}`}>
+                                            {c.level === 'block' ? <Icons.XCircle /> : c.level === 'warn' ? <Icons.AlertTriangle />
+                                                : c.level === 'info' ? <Icons.Info /> : <Icons.CheckCircle />}
+                                        </span>
+                                        <div className="min-w-0 flex-1 space-y-1">
+                                            <div className={c.level === 'block' ? 'text-red-300' : c.level === 'warn' ? 'text-yellow-200' : 'text-gray-300'}>
+                                                {t(HA_AUTO_CHECK_LABEL[c.key])}
+                                            </div>
+                                            {/* the server's own sentence, with the member and the numbers in it */}
+                                            {c.findings.map((f, i) => (
+                                                <p key={i} data-ha-auto-finding={f.code} className="text-xs text-gray-400" style={{ overflowWrap: 'anywhere' }}>
+                                                    {typeof f.text === 'string' && f.text ? f.text : f.code}
+                                                </p>
+                                            ))}
+                                            {c.level === 'warn' && mode === 'manual' && (
+                                                <label className="flex items-start gap-2 text-xs text-gray-200 cursor-pointer">
+                                                    <input type="checkbox" checked={ticked.includes(c.key)} disabled={busy} className="mt-0.5"
+                                                        onChange={e => { const v = e.target.checked; setTicked(k => v ? [...k, c.key] : k.filter(x => x !== c.key)); }} />
+                                                    <span>{t('haAutoUnderstand')}</span>
+                                                </label>
+                                            )}
+                                        </div>
+                                    </li>
+                                ))}
+                            </ul>
+                            {blocked && <p className="text-xs text-red-300" data-ha-auto-blocked>{t('haAutoBlocked')}</p>}
+                        </div>
+                    )}
+                    {leader && mode === 'auto' && quarantined.length > 0 && (
+                        <div className="space-y-2" data-ha-auto-quarantined={quarantined.length}>
+                            {quarantined.map(r => (
+                                <div key={r.instance_id} data-ha-auto-quarantine={r.instance_id}
+                                    className="flex flex-wrap items-center justify-between gap-2 rounded-lg p-2 border bg-red-500/10 border-red-500/30">
+                                    <span className="text-sm text-red-300" style={{ overflowWrap: 'anywhere' }}>{labelOf(r.instance_id)}: {t('haAutoQuarantined')}</span>
+                                    <button type="button" onClick={() => open('readmit', r.instance_id)} disabled={busy || broken || !!form} className={HA_GROUP_GHOST}>
+                                        <Icons.RotateCcw />
+                                        {t('haAutoReadmit')}
+                                    </button>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                    {form && leader && (
+                        <div data-ha-auto-form={form}
+                            className={`rounded-lg p-3 space-y-3 border ${form === 'off' ? 'bg-red-500/10 border-red-500/30' : 'bg-proxmox-card border-proxmox-border'}`}>
+                            <p className={`text-sm ${form === 'off' ? 'text-red-300' : 'text-gray-300'}`} style={{ overflowWrap: 'anywhere' }}>{formText}</p>
+                            {(form === 'on' || form === 'lease') && (
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-lease">{t('haAutoLeaseLabel')}</label>
+                                    <input id="pgha-lease" type="number" min={HA_LEASE.min} max={HA_LEASE.max} step="1" value={lease}
+                                        onChange={e => setLease(e.target.value)} aria-invalid={leaseOk ? undefined : 'true'} className={`w-32 ${HA_GROUP_FIELD}`} />
+                                    <p className="text-xs text-gray-500 mt-1" data-ha-auto-lease-note>
+                                        {t('haAutoLeaseNote').replace('{lo}', lo).replace('{hi}', hi).replace('{l}', leaseShown)}
+                                    </p>
+                                    {!leaseOk && <p className="text-xs text-red-300" data-ha-auto-lease-range>{t('haAutoLeaseRange')}</p>}
+                                </div>
+                            )}
+                            {form === 'on' && amber.some(c => !ticked.includes(c.key)) && (
+                                <p className="text-xs text-yellow-300" data-ha-auto-needs-ticks>{t('haAutoConfirm')}</p>
+                            )}
+                            <div className="max-w-sm">
+                                <HaGroupPassword t={t} id="pgha-auto-password" sso={sso} value={password} onChange={setPassword} refused={refused} logout={logout} />
+                            </div>
+                            {refused && !reauth && (
+                                <div role="alert" data-ha-auto-refused={refused.code || 'error'} style={{ overflowWrap: 'anywhere' }}
+                                    className="rounded-lg p-2 text-sm border bg-red-500/10 border-red-500/30 text-red-300">
+                                    {refused.code === 'HA_AUTO_REFUSED' ? t('haAutoRefused') : refused.code === 'HA_AUTO_CONFIRM' ? t('haAutoConfirm') : refused.error}
+                                </div>
+                            )}
+                            <div className="flex flex-wrap items-center gap-2">
+                                <button type="button" onClick={submit} disabled={!ready}
+                                    className={`${HA_GROUP_BTN} text-white ${form === 'off' ? 'bg-red-600 hover:bg-red-700' : 'bg-proxmox-orange hover:bg-proxmox-orange/90'}`}>
+                                    {t(formButton)}
+                                </button>
+                                <button type="button" onClick={() => open(null)} className={HA_GROUP_GHOST}>{t('cancel')}</button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // The third vote: added with a one-time code that the witness host takes, removed with the
+        // word and the password. A member sees the witness of its group, and nothing to change.
+        function HaWitnessCard({ t, status, auto, leader, getAuthHeaders, load, addToast, broken, notShipped, onNotShipped }) {
+            const { user, logout } = useAuth();
+            const sso = ['oidc', 'entra'].includes(user?.auth_source);
+            const witness = auto?.witness && typeof auto.witness === 'object' && typeof auto.witness.instance_id === 'string' ? auto.witness : null;
+            const [url, setUrl] = useState('');
+            const [site, setSite] = useState('');
+            const [password, setPassword] = useState('');
+            const [code, setCode] = useState(null);           // {code, expires_at, install, commands}, shown once
+            const [now, setNow] = useState(Date.now());
+            const [removing, setRemoving] = useState(false);
+            const [typed, setTyped] = useState('');
+            const [refused, setRefused] = useState(null);     // {code, error} of the last refusal
+            const [busy, setBusy] = useState(false);
+            const [gone, setGone] = useState(null);           // {told} of the last removal
+
+            // prefilled once, never over something typed
+            useEffect(() => { setUrl(v => v || status.suggested_url || ''); }, [status.suggested_url]);
+            const expired = !!code && code.expires_at * 1000 <= now;
+            // the code is spent once the witness shows up in the status
+            useEffect(() => {
+                if (!witness || !code) return;
+                setCode(null);
+                addToast?.(t('haWitnessJoined'), 'success');
+            }, [!!witness]);
+            // and until then the status is read every few seconds instead of every ten
+            useEffect(() => {
+                if (!code || witness || expired) return;
+                const tick = setInterval(() => setNow(Date.now()), 1000);
+                const poll = setInterval(load, 3000);
+                return () => { clearInterval(tick); clearInterval(poll); };
+            }, [code, !!witness, expired]);
+
+            const createCode = async () => {
+                const target = url.trim();
+                setRefused(null);
+                setGone(null);
+                if (!target.startsWith('https://')) { setRefused({ code: '', error: t('haWitnessUrlHttps') }); return; }
+                const body = { url: target, site: site.trim() };
+                setBusy(true);
+                let res;
+                try {
+                    res = await haGroupSend(getAuthHeaders, 'POST', 'witness/pairing-code', sso ? body : { ...body, user_password: password },
+                                            t('pgHaActionFailed'));
+                } finally {
+                    setBusy(false);
+                    setPassword('');
+                }
+                if (!res.ok) {
+                    if (res.code === 'HA_AUTO_NOT_SHIPPED') { onNotShipped(); return; }
+                    setRefused({ code: res.code, error: res.error });
+                    return;
+                }
+                // install: one line per way (linux, offline, docker, manual); commands is what an
+                // older server sends instead
+                setCode({ code: res.data.code, expires_at: res.data.expires_at,
+                          install: res.data.install && typeof res.data.install === 'object' ? res.data.install : null,
+                          commands: res.data.commands && typeof res.data.commands === 'object' ? res.data.commands : {} });
+                setNow(Date.now());
+                load();
+            };
+
+            const remove = async () => {
+                setRefused(null);
+                const body = { confirm: 'REMOVE' };
+                setBusy(true);
+                let res;
+                try {
+                    res = await haGroupSend(getAuthHeaders, 'POST', 'witness/remove', sso ? body : { ...body, user_password: password },
+                                            t('pgHaActionFailed'));
+                } finally {
+                    setBusy(false);
+                    setPassword('');
+                }
+                if (!res.ok) {
+                    setRefused({ code: res.code, error: res.error });
+                    return;
+                }
+                setRemoving(false);
+                setTyped('');
+                setGone({ told: res.data.told === true });
+                addToast?.(t('haWitnessRemoved'), res.data.told === true ? 'success' : 'info');
+                load();
+            };
+
+            const reauth = refused && (refused.code === 'HA_REAUTH' || refused.code === 'HA_REAUTH_RECENT');
+            const refusal = refused && !reauth && (
+                <div role="alert" data-ha-witness-refused={refused.code || 'error'} style={{ overflowWrap: 'anywhere' }}
+                    className="rounded-lg p-2 text-sm border bg-red-500/10 border-red-500/30 text-red-300">
+                    {refused.error}
+                </div>
+            );
+            const left = code ? Math.max(0, Math.floor(code.expires_at - now / 1000)) : 0;
+            const commands = code ? code.commands : {};
+            const install = code ? code.install : null;
+            // how the witness is kept up to date: its last update, and WITNESS_OUTDATED with the
+            // command that updates it by hand
+            const update = witness && witness.update && typeof witness.update === 'object' ? witness.update : null;
+            const outdated = witness && Array.isArray(auto?.findings)
+                ? auto.findings.find(f => f && f.code === 'WITNESS_OUTDATED') || null : null;
+            const behind = !!witness && (witness.outdated === true || !!outdated);
+            const updateCommand = (outdated && typeof outdated.command === 'string' && outdated.command)
+                || (witness && typeof witness.update_command === 'string' && witness.update_command) || '';
+            // a failed fetch is tried again with the leader's next word; only code it went back
+            // from (back) or a witness that does not update itself wants the hand
+            const failed = update?.state === 'failed';
+            const wentBack = failed && update.back === true;
+            const byHand = witness?.auto_update !== true || wentBack;
+            const updateSays = witness?.auto_update !== true ? ''
+                : wentBack ? t('haWitnessUpdateWentBack') : failed ? t('haWitnessUpdateRetries') : t('haWitnessUpdatesItself');
+            // newer code than this instance's (the leader went back): WITNESS_AHEAD, and the
+            // command that takes the leader's release by hand
+            const aheadFinding = witness && Array.isArray(auto?.findings)
+                ? auto.findings.find(f => f && f.code === 'WITNESS_AHEAD') || null : null;
+            const ahead = !!witness && (witness.ahead === true || !!aheadFinding);
+            const toLeaderCommand = (aheadFinding && typeof aheadFinding.command === 'string' && aheadFinding.command)
+                || (witness && typeof witness.to_leader_command === 'string' && witness.to_leader_command) || '';
+            // 'installed' is for the way into an update: once the witness runs that release
+            // (an older witness never says more), it is up to date
+            const updateState = update && update.state === 'installed' && typeof witness?.release === 'string'
+                && witness.release !== '' && update.release === witness.release ? 'current' : update?.state;
+            const updateText = update && {
+                failed: t('haWitnessUpdateFailed').replace('{error}', () => String(update.error || '-')),
+                installed: t('haWitnessUpdateInstalled'),
+                current: t('haWitnessUpdateCurrent'),
+            }[updateState];
+            const row = (label, value) => (
+                <div className="flex items-start justify-between gap-4 text-sm">
+                    <span className="text-gray-400 whitespace-nowrap">{label}</span>
+                    <span className="text-gray-200 text-right min-w-0 break-all">{value}</span>
+                </div>
+            );
+            // what to run on the witness host, as the server spells it out, each with a copy button;
+            // spaces kept as they are (sha256sum reads '<digest>  install.sh'), also when selected
+            const command = (kind, label, value) => typeof value === 'string' && value !== '' && (
+                <div className="space-y-1" data-ha-witness-command={kind}>
+                    {label && <div className="text-xs text-gray-400">{label}</div>}
+                    <div className="flex items-start gap-2">
+                        <code className="flex-1 min-w-0 px-3 py-2 bg-black/40 rounded text-xs text-gray-200 break-all whitespace-pre-wrap font-mono select-all">{value}</code>
+                        <span className="shrink-0 inline-flex">
+                            <CopyButton value={value} size="md" title={t('copy')} className="w-8 h-8 border border-proxmox-border hover:border-gray-500" />
+                        </span>
+                    </div>
+                </div>
+            );
+            // one way to install the witness, and under a line that names the witness host by
+            // a placeholder, what to put there
+            const way = (kind, label) => {
+                const value = install && typeof install[kind] === 'string' ? install[kind] : '';
+                if (!value) return null;
+                const marked = Array.isArray(install.placeholder_in) && install.placeholder_in.includes(kind)
+                    && typeof install.placeholder === 'string' && install.placeholder !== '';
+                return (
+                    <div className="space-y-1" data-ha-witness-way={kind}>
+                        {command(kind, label, value)}
+                        {marked && (
+                            <p className="text-[11px] text-gray-500" data-ha-witness-placeholder>
+                                {t('haWitnessPlaceholder').replace('{placeholder}', () => install.placeholder)}
+                            </p>
+                        )}
+                    </div>
+                );
+            };
+
+            return (
+                <div className={HA_GROUP_CARD} data-ha-witness={witness ? 'paired' : code && !expired ? 'waiting' : 'none'}>
+                    <h4 className="font-medium text-white flex items-center gap-2">
+                        <Icons.Scale />
+                        {t(witness || !leader ? 'haWitnessTitle' : 'haWitnessAddTitle')}
+                    </h4>
+                    <p className="text-sm text-gray-400">{t('haWitnessIntro')}</p>
+                    {witness ? (
+                        <>
+                            <div className="space-y-1.5">
+                                {row(t('pgHaPeerUrl'), <span className="font-mono text-xs" data-ha-witness-url>{witness.url || '-'}</span>)}
+                                {row(t('haAutoColSite'), <span data-ha-witness-site>{witness.site || '-'}</span>)}
+                                {witness.key_fingerprint && row(t('pgHaKey'), <span className="font-mono text-xs">{witness.key_fingerprint}</span>)}
+                                {row(t('haWitnessHeard'), typeof witness.last_heard === 'number'
+                                    ? <span data-ha-witness-heard={Math.round(witness.last_heard)}>{t('haWitnessHeardAgo').replace('{n}', Math.round(witness.last_heard))}</span>
+                                    : <span className="text-yellow-300" data-ha-witness-heard="never">{t('haAutoNotHeard')}</span>)}
+                                {typeof witness.skew === 'number' && row(t('haAutoColSkew'), (
+                                    <span className={Math.abs(witness.skew) > HA_SKEW_LIMIT ? 'text-red-300' : undefined} data-ha-witness-skew>{haSkewText(witness.skew)}</span>
+                                ))}
+                                {typeof witness.release === 'string' && witness.release !== '' && row(t('haWitnessRelease'), (
+                                    <span className="font-mono text-xs" data-ha-witness-release>{witness.release}</span>
+                                ))}
+                                {updateText && row(t('haWitnessLastUpdate'), (
+                                    <span className={updateState === 'failed' ? 'text-red-300' : undefined} data-ha-witness-update={updateState}
+                                        style={{ wordBreak: 'normal', overflowWrap: 'anywhere' }}>{updateText}</span>
+                                ))}
+                            </div>
+                            {behind && (
+                                <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 space-y-2" data-ha-witness-outdated>
+                                    <div className="flex items-start gap-2">
+                                        <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                                        <span>
+                                            {t('haWitnessOutdated').replace('{release}', () => witness.release || '?')}
+                                            {updateSays && <span data-ha-witness-says={wentBack ? 'back' : failed ? 'retries' : 'itself'}>{` ${updateSays}`}</span>}
+                                        </span>
+                                    </div>
+                                    {byHand && command('update', t('haWitnessUpdateByHand'), updateCommand)}
+                                </div>
+                            )}
+                            {ahead && (
+                                <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 space-y-2" data-ha-witness-ahead>
+                                    <div className="flex items-start gap-2">
+                                        <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                                        <span>{t('haWitnessAhead').replace('{release}', () => witness.release || '?')}</span>
+                                    </div>
+                                    {command('to-leader', t('haWitnessToLeader'), toLeaderCommand)}
+                                </div>
+                            )}
+                            {witness.write_failed === true && (
+                                <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 flex items-start gap-2" data-ha-witness-unwritten>
+                                    <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                                    <span>{t('haWitnessUnwritten')}</span>
+                                </div>
+                            )}
+                            {leader && !removing && (
+                                <button type="button" onClick={() => { setRemoving(true); setTyped(''); setPassword(''); setRefused(null); }}
+                                    disabled={busy || broken} className={HA_GROUP_GHOST}>
+                                    <Icons.UserX />
+                                    {t('haWitnessRemove')}
+                                </button>
+                            )}
+                            {leader && removing && (
+                                <div className="rounded-lg p-3 space-y-3 border bg-red-500/10 border-red-500/30" data-ha-witness-remove>
+                                    <p className="text-sm text-red-300">{t('haWitnessRemoveDesc')}</p>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                        <div>
+                                            <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-witness-typed">
+                                                {t('pgHaTypeToConfirm').replace('{word}', 'REMOVE')}
+                                            </label>
+                                            <input id="pgha-witness-typed" value={typed} onChange={e => setTyped(e.target.value)} autoComplete="off"
+                                                spellCheck={false} placeholder="REMOVE" className={`w-full ${HA_GROUP_FIELD} font-mono`} />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <HaGroupPassword t={t} id="pgha-witness-password" sso={sso} value={password} onChange={setPassword} refused={refused} logout={logout} />
+                                        </div>
+                                    </div>
+                                    {refusal}
+                                    <div className="flex flex-wrap items-center gap-2">
+                                        <button type="button" onClick={remove} disabled={typed !== 'REMOVE' || (!sso && !password) || busy || broken}
+                                            className={`${HA_GROUP_BTN} bg-red-600 hover:bg-red-700 text-white`}>
+                                            <Icons.UserX />
+                                            {t('haWitnessRemove')}
+                                        </button>
+                                        <button type="button" onClick={() => { setRemoving(false); setRefused(null); setPassword(''); }} className={HA_GROUP_GHOST}>
+                                            {t('cancel')}
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+                        </>
+                    ) : (
+                        <>
+                            {gone && (
+                                <div data-ha-witness-gone={gone.told ? 'told' : 'not-reached'}
+                                    className={`rounded-lg p-3 text-sm border space-y-2 ${gone.told
+                                        ? 'bg-green-500/10 border-green-500/30 text-green-300'
+                                        : 'bg-yellow-500/10 border-yellow-500/40 text-yellow-200'}`}>
+                                    <p>{t(gone.told ? 'haWitnessRemovedTold' : 'haWitnessRemovedNotReached')}</p>
+                                    {!gone.told && command('leave', '', HA_WITNESS_LEAVE)}
+                                </div>
+                            )}
+                            {notShipped ? (
+                                <div className="rounded-lg p-3 text-sm border bg-blue-500/10 border-blue-500/30 text-blue-200 flex items-start gap-2" data-ha-witness-not-shipped>
+                                    <span className="mt-0.5 flex-shrink-0"><Icons.Info /></span>
+                                    <span>{t('haWitnessNotShipped')}</span>
+                                </div>
+                            ) : leader && (
+                                <>
+                                    <div>
+                                        <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-witness-url">{t('haWitnessUrl')}</label>
+                                        <input id="pgha-witness-url" value={url} onChange={e => setUrl(e.target.value)} spellCheck={false}
+                                            placeholder="https://pegaprox-a.example:5000" className={`w-full ${HA_GROUP_FIELD} font-mono`} />
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-witness-site">{t('haWitnessSite')}</label>
+                                        <input id="pgha-witness-site" value={site} maxLength={64} onChange={e => setSite(e.target.value)}
+                                            className={`w-full ${HA_GROUP_FIELD}`} />
+                                        <div className="text-[11px] text-gray-500 mt-1">{t('haWitnessSiteHint')}</div>
+                                    </div>
+                                    <HaGroupPassword t={t} id="pgha-witness-password" sso={sso} value={password} onChange={setPassword} refused={refused} logout={logout} />
+                                    {refusal}
+                                    <button type="button" onClick={createCode} disabled={busy || broken || !url.trim() || (!sso && !password)}
+                                        className={`${HA_GROUP_BTN} bg-proxmox-orange hover:bg-proxmox-orange/90 text-white`}>
+                                        <Icons.Key />
+                                        {t('haWitnessCreate')}
+                                    </button>
+                                    {code && (
+                                        <div className="bg-yellow-500/10 border border-yellow-500/40 rounded-xl p-3 space-y-2" data-ha-witness-code>
+                                            <div className="text-xs font-medium text-yellow-200">{t('haWitnessCodeOnce')}</div>
+                                            {expired ? (
+                                                <p className="text-sm text-red-300" data-ha-witness-expired>{t('pgHaCodeExpired')}</p>
+                                            ) : (
+                                                <>
+                                                    {command('code', '', code.code)}
+                                                    <div className="flex items-center gap-2 text-xs text-gray-400">
+                                                        <Icons.Clock />
+                                                        <span>{t('pgHaCodeExpiresIn').replace('{time}', () => `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`)}</span>
+                                                    </div>
+                                                    {install ? (
+                                                        <div className="space-y-3" data-ha-witness-install>
+                                                            <p className="text-xs text-gray-400">{t('haWitnessRunOneWay')}</p>
+                                                            {!(typeof install.linux === 'string' && install.linux) && (
+                                                                <div className="rounded-lg p-2 text-xs border bg-blue-500/10 border-blue-500/30 text-blue-200 flex items-start gap-2" data-ha-witness-no-installer>
+                                                                    <span className="mt-0.5 flex-shrink-0"><Icons.Info /></span>
+                                                                    <span>{t('haWitnessNoInstaller')}</span>
+                                                                </div>
+                                                            )}
+                                                            {way('linux', t('haWitnessWayLinux'))}
+                                                            {way('offline', t('haWitnessWayOffline'))}
+                                                            {way('docker', t('haWitnessWayDocker'))}
+                                                            {!(typeof install.docker === 'string' && install.docker) && typeof install.docker_note === 'string' && install.docker_note && (
+                                                                <div className="rounded-lg p-2 text-xs border bg-blue-500/10 border-blue-500/30 text-blue-200 flex items-start gap-2" data-ha-witness-no-docker>
+                                                                    <span className="mt-0.5 flex-shrink-0"><Icons.Info /></span>
+                                                                    <span>{t('haWitnessNoDockerImage').replace('{version}', () => String(install.version || '?'))}</span>
+                                                                </div>
+                                                            )}
+                                                            {way('manual', t('haWitnessWayManual'))}
+                                                            <p className="text-xs text-gray-400 flex items-start gap-2" data-ha-witness-firewall>
+                                                                <span className="mt-0.5 flex-shrink-0"><Icons.Shield /></span>
+                                                                <span>{t('haWitnessFirewall').replace('{port}', () => String(Number.isInteger(install.port) ? install.port : 5005))}</span>
+                                                            </p>
+                                                        </div>
+                                                    ) : (
+                                                        <>
+                                                            <p className="text-xs text-gray-400">{t('haWitnessRunOne')}</p>
+                                                            {command('package', t('haWitnessPackage'), commands.package)}
+                                                            {command('docker', t('haWitnessDocker'), commands.docker)}
+                                                        </>
+                                                    )}
+                                                    <p className="text-xs text-gray-400 flex items-center gap-2" data-ha-witness-waiting>
+                                                        <span className="inline-flex animate-spin"><Icons.RefreshCw /></span>
+                                                        {t('haWitnessWaiting')}
+                                                    </p>
+                                                </>
+                                            )}
+                                        </div>
+                                    )}
+                                </>
+                            )}
+                        </>
+                    )}
+                </div>
+            );
+        }
+
+        // The zone the schedules of the group fire in, whichever member leads. Set on the leader,
+        // no password: it decides when a schedule fires, not which instance acts.
+        function HaZoneCard({ t, status, auto, members, memberName, leader, getAuthHeaders, load, addToast, broken }) {
+            const zone = typeof status.timezone === 'string' ? status.timezone : '';
+            const local = typeof status.timezone_local === 'string' ? status.timezone_local : '';
+            const unreadable = typeof status.timezone_unreadable === 'string' ? status.timezone_unreadable : '';
+            const [value, setValue] = useState('');
+            const [error, setError] = useState('');
+            const [busy, setBusy] = useState(false);
+            useEffect(() => { setValue(v => v || zone || local); }, [zone, local]);
+            // members in another zone than the group's: their schedules still go by the group's
+            const others = zone && Array.isArray(auto?.members)
+                ? auto.members.filter(r => r && r.kind !== 'witness' && typeof r.zone === 'string' && r.zone && r.zone !== zone) : [];
+            const nameOf = (r) => memberName(members.find(m => m.instance_id === r.instance_id) || { instance_id: String(r.instance_id || '') });
+            const choices = [...new Set([zone, local, ...TIMEZONES].filter(Boolean))];
+            const wanted = value.trim();
+
+            const save = async () => {
+                setBusy(true);
+                setError('');
+                let res;
+                try {
+                    res = await haGroupSend(getAuthHeaders, 'PUT', 'timezone', { timezone: wanted }, t('pgHaActionFailed'));
+                } finally {
+                    setBusy(false);
+                }
+                if (!res.ok) { setError(res.error); return; }
+                addToast?.(t(res.data.changed === false ? 'haZoneUnchanged' : 'haZoneSaved'), 'success');
+                load();
+            };
+
+            const row = (label, value) => (
+                <div className="flex items-start justify-between gap-4 text-sm">
+                    <span className="text-gray-400 whitespace-nowrap">{label}</span>
+                    <span className="text-gray-200 text-right min-w-0 break-all">{value}</span>
+                </div>
+            );
+            return (
+                <div className={HA_GROUP_CARD} data-ha-zone={zone || 'none'}>
+                    <h4 className="font-medium text-white flex items-center gap-2">
+                        <Icons.Globe />
+                        {t('haZoneTitle')}
+                    </h4>
+                    <p className="text-sm text-gray-400">{t('haZoneIntro')}</p>
+                    <div className="space-y-1.5">
+                        {row(t('haZoneGroup'), zone ? <span className="font-mono" data-ha-zone-group={zone}>{zone}</span>
+                            : <span className="text-gray-400" data-ha-zone-group="">{t('haZoneEach')}</span>)}
+                        {row(t('haZoneLocal'), local ? <span className="font-mono" data-ha-zone-local={local}>{local}</span>
+                            : <span className="text-yellow-300" data-ha-zone-local="">{t('haZoneLocalUnknown')}</span>)}
+                    </div>
+                    {unreadable && (
+                        <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 flex items-start gap-2" data-ha-zone-unreadable>
+                            <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                            <span style={{ overflowWrap: 'anywhere' }}>{t('haZoneUnreadable').replace('{zone}', () => unreadable)}</span>
+                        </div>
+                    )}
+                    {!unreadable && zone && local && zone !== local && (
+                        <div className="rounded-lg p-3 text-sm border bg-blue-500/10 border-blue-500/30 text-blue-200 flex items-start gap-2" data-ha-zone-differs>
+                            <span className="mt-0.5 flex-shrink-0"><Icons.Info /></span>
+                            <span style={{ overflowWrap: 'anywhere' }}>{t('haZoneDiffers').replace('{local}', () => local).replace('{zone}', () => zone)}</span>
+                        </div>
+                    )}
+                    {!zone && !unreadable && <p className="text-xs text-gray-400" data-ha-zone-none>{t('haZoneNone')}</p>}
+                    {others.length > 0 && (
+                        <p className="text-xs text-gray-400" style={{ overflowWrap: 'anywhere' }} data-ha-zone-members={others.length}>
+                            {t('haZoneMembers').replace('{list}', () => others.map(r => `${nameOf(r)} (${r.zone})`).join(', '))}
+                        </p>
+                    )}
+                    {leader ? (
+                        <div className="space-y-2">
+                            <label className="block text-xs text-gray-400" htmlFor="pgha-zone">{t('haZoneSet')}</label>
+                            <div className="flex flex-wrap items-center gap-2">
+                                <input id="pgha-zone" list="pgha-zone-list" value={value} onChange={e => { setValue(e.target.value); setError(''); }}
+                                    spellCheck={false} autoComplete="off" placeholder="Europe/Vienna" className={`w-64 font-mono ${HA_GROUP_FIELD}`} />
+                                <datalist id="pgha-zone-list">
+                                    {choices.map(z => <option key={z} value={z} />)}
+                                </datalist>
+                                <button type="button" onClick={save} disabled={busy || broken || !wanted || wanted === zone} className={HA_GROUP_GHOST}>
+                                    {t('save')}
+                                </button>
+                            </div>
+                            <p className="text-xs text-gray-500">{t('haZoneSetHint')}</p>
+                            {error && (
+                                <p role="alert" className="text-sm text-red-300" style={{ overflowWrap: 'anywhere' }} data-ha-zone-error>{error}</p>
+                            )}
+                        </div>
+                    ) : (
+                        <p className="text-xs text-gray-500 flex items-start gap-2">
+                            <span className="flex-shrink-0"><Icons.Lock className="w-4 h-4" /></span>
+                            <span>{t('haZoneOnLeader')}</span>
+                        </p>
+                    )}
+                </div>
+            );
+        }
+
+        // ═══════════════════════════════════════════════
+        // LW Oct 2026 (#625) - whether the group survives a split, and who leads it: the
+        // split-safety panel (votes per site, the clusters with node HA, the findings the switch
+        // goes by), the settings of one member on the leader, Make leader and, on a member whose
+        // group lost its majority for good, Force leader. Each part renders from what the status
+        // carries, and all of it only once this release offers automatic failover.
+        // ═══════════════════════════════════════════════
+
+        const HA_SPLIT_LEVEL = {
+            ok: ['haAutoSplitOk', 'bg-green-500/20 text-green-300 border-green-500/30'],
+            info: ['haAutoSplitInfo', 'bg-blue-500/20 text-blue-300 border-blue-500/30'],
+            warn: ['haAutoSplitWarn', 'bg-yellow-500/20 text-yellow-300 border-yellow-500/40'],
+            block: ['haAutoSplitBlock', 'bg-red-500/20 text-red-300 border-red-500/30'],
+        };
+        const HA_LEVEL_ORDER = ['block', 'warn', 'info'];
+        // another instance's claim on a cluster, as the cluster's HA settings call it
+        const HA_CLAIM_FOREIGN = ['higher', 'same', 'foreign'];
+
+        function haCvText(cv) {
+            return Array.isArray(cv) && cv.length >= 2 ? `${cv[0]}.${cv[1]}` : '-';
+        }
+
+        // One member action of the leader, under the row it is about (for the leader itself in the
+        // split panel). The site needs no password, it decides nothing; vote and may lead want it,
+        // in automatic mode they are a change of the voter config; Make leader wants the word too.
+        // self: Make leader on a member, for itself. A refusal stays in the form.
+        function HaMemberForm({ t, what, target, name, value = null, phrase = 'LEADER', self = false, getAuthHeaders,
+                                onClose, onDone, onRefused, onRestart, addToast }) {
+            const { user, logout } = useAuth();
+            const sso = ['oidc', 'entra'].includes(user?.auth_source);
+            const before = typeof target.site === 'string' ? target.site : '';
+            const [site, setSite] = useState(before);
+            const [typed, setTyped] = useState('');
+            const [password, setPassword] = useState('');
+            const [refused, setRefused] = useState(null);     // {code, error} of the last refusal
+            const [busy, setBusy] = useState(false);
+            const leader = what === 'leader';
+            const id = target.instance_id;
+            const ready = !busy && (what === 'site' ? site.trim() !== before
+                : (sso || !!password) && (!leader || typed === phrase));
+
+            const submit = async () => {
+                const path = what === 'site' ? `members/${encodeURIComponent(id)}/site`
+                    : leader ? 'make-leader' : `members/${encodeURIComponent(id)}/vote`;
+                const body = what === 'site' ? { site: site.trim() }
+                    : leader ? (self ? { confirm: phrase } : { target: id, confirm: phrase })
+                    : { [what]: value };
+                setBusy(true);
+                setRefused(null);
+                let res;
+                try {
+                    res = await haGroupSend(getAuthHeaders, leader ? 'POST' : 'PUT', path,
+                                            what === 'site' || sso ? body : { ...body, user_password: password }, t('pgHaActionFailed'));
+                } finally {
+                    setBusy(false);
+                    // the password was for this one request, whatever came back
+                    setPassword('');
+                }
+                if (!res.ok) {
+                    setRefused({ code: res.code, error: res.error });
+                    onRefused?.();
+                    return;
+                }
+                if (leader) {
+                    // handed: the old leader restarts as a standby, and the member as the leader
+                    if (res.data.result === 'handed' || res.data.result === 'elected') { onRestart(self ? 'active' : 'standby'); return; }
+                    addToast?.(t('haAutoMakeLeaderCatching'), 'info');
+                } else if (what === 'site') {
+                    addToast?.(t('haAutoSiteSaved'), 'success');
+                } else {
+                    addToast?.(t(res.data.automatic ? 'haAutoVoteSavedAuto' : 'haAutoVoteSaved'), 'success');
+                }
+                onDone();
+            };
+
+            const reauth = refused && (refused.code === 'HA_REAUTH' || refused.code === 'HA_REAUTH_RECENT');
+            const text = what === 'site' ? t('haAutoSiteDesc')
+                : leader ? t(self ? 'haAutoMakeSelfDesc' : 'haAutoMakeLeaderDesc').replace('{name}', () => name)
+                : `${t({ voter: value ? 'haAutoVoteOnDesc' : 'haAutoVoteOffDesc',
+                         may_lead: value ? 'haAutoMayLeadOnDesc' : 'haAutoMayLeadOffDesc' }[what]).replace('{name}', () => name)} ${t('haAutoVoteWhen')}`;
+            return (
+                <div data-ha-member-form={what} data-ha-member-form-for={id}
+                    className={`rounded-lg p-3 space-y-3 border text-left ${leader ? 'bg-red-500/10 border-red-500/30' : 'bg-proxmox-card border-proxmox-border'}`}>
+                    <p className={`text-sm ${leader ? 'text-red-300' : 'text-gray-300'}`} style={{ overflowWrap: 'anywhere' }}>{text}</p>
+                    {what === 'site' ? (
+                        <div className="max-w-sm">
+                            <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-member-site">{t('haAutoSiteOf').replace('{name}', () => name)}</label>
+                            <input id="pgha-member-site" value={site} maxLength={64} onChange={e => { setSite(e.target.value); setRefused(null); }}
+                                spellCheck={false} autoComplete="off" className={`w-full ${HA_GROUP_FIELD}`} />
+                            <div className="text-[11px] text-gray-500 mt-1">{t('haWitnessSiteHint')}</div>
+                        </div>
+                    ) : (
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-w-xl">
+                            {leader && (
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-member-typed">
+                                        {t('pgHaTypeToConfirm').replace('{word}', () => phrase)}
+                                    </label>
+                                    <input id="pgha-member-typed" value={typed} onChange={e => setTyped(e.target.value)} autoComplete="off"
+                                        spellCheck={false} placeholder={phrase} className={`w-full ${HA_GROUP_FIELD} font-mono`} />
+                                </div>
+                            )}
+                            <div className="space-y-2">
+                                <HaGroupPassword t={t} id="pgha-member-password" sso={sso} value={password} onChange={setPassword} refused={refused} logout={logout} />
+                            </div>
+                        </div>
+                    )}
+                    {refused && !reauth && (
+                        <div role="alert" data-ha-member-refused={refused.code || 'error'} style={{ overflowWrap: 'anywhere' }}
+                            className="rounded-lg p-2 text-sm border bg-red-500/10 border-red-500/30 text-red-300">
+                            {refused.error}
+                        </div>
+                    )}
+                    <div className="flex flex-wrap items-center gap-2">
+                        <button type="button" onClick={submit} disabled={!ready}
+                            className={`${HA_GROUP_BTN} text-white ${leader ? 'bg-red-600 hover:bg-red-700' : 'bg-proxmox-orange hover:bg-proxmox-orange/90'}`}>
+                            {leader && <Icons.Star className="w-4 h-4" />}
+                            {t(leader ? (self ? 'haAutoMakeSelf' : 'haAutoMakeLeader') : 'save')}
+                        </button>
+                        <button type="button" onClick={onClose} className={HA_GROUP_GHOST}>{t('cancel')}</button>
+                    </div>
+                </div>
+            );
+        }
+
+        // Agent VM id on the leader, for a member or the leader itself: the button that opens its form,
+        // and what is named so far, cluster by cluster.
+        function HaAgentVmButton({ t, ctl, target, name }) {
+            const held = Object.entries(target.agent_vmid && typeof target.agent_vmid === 'object' ? target.agent_vmid : {})
+                .filter(([, vmid]) => typeof vmid === 'number');
+            const clusterName = (cid) => (ctl.clusters.find(c => c.id === cid) || {}).name || cid;
+            return (
+                <span className="inline-flex flex-wrap items-center justify-end gap-2">
+                    <button type="button" onClick={() => ctl.open('vmid', target)} disabled={!!ctl.locked}
+                        title={ctl.locked || undefined} aria-label={t('haAutoVmidOf').replace('{name}', () => name)}
+                        data-ha-agent-vmid={target.instance_id} className={`${HA_GROUP_GHOST} whitespace-nowrap`}>
+                        <Icons.Monitor />
+                        {t('haAutoVmidOpen')}
+                    </button>
+                    {held.length > 0 && (
+                        <span className="text-xs text-gray-400" style={{ overflowWrap: 'break-word' }} data-ha-agent-vmid-set={held.length}>
+                            {held.map(([cid, vmid]) => `${clusterName(cid)}: ${vmid}`).join(', ')}
+                        </span>
+                    )}
+                </span>
+            );
+        }
+
+        // The VM a member runs as, one row per cluster with node HA (and any other it is still named
+        // on): Force leader switches autostart off on it when it cuts that member out. It names a VM
+        // and acts on none, so no password. Each row is saved on its own; a refusal stays in the form.
+        function HaAgentVmForm({ t, target, name, clusters, getAuthHeaders, onClose, onSaved, addToast }) {
+            const held = target.agent_vmid && typeof target.agent_vmid === 'object' ? target.agent_vmid : {};
+            const rows = [...clusters.map(c => ({ id: c.id, name: typeof c.name === 'string' && c.name ? c.name : c.id })),
+                          ...Object.keys(held).filter(cid => !clusters.some(c => c.id === cid)).map(cid => ({ id: cid, name: cid }))];
+            const [saved, setSaved] = useState(() => ({ ...held }));      // what the leader holds, as far as this form knows
+            const [typed, setTyped] = useState(() => Object.fromEntries(rows.map(r => [r.id, typeof held[r.id] === 'number' ? String(held[r.id]) : ''])));
+            const [refused, setRefused] = useState(null);                  // {code, error} of the last refusal
+            const [busy, setBusy] = useState('');                          // the cluster whose request is out
+            const id = target.instance_id;
+            const valid = (v) => /^\d{3,9}$/.test(v) && Number(v) >= 100;
+
+            const send = async (cid, vmid) => {
+                setBusy(cid);
+                setRefused(null);
+                let res;
+                try {
+                    res = await haGroupSend(getAuthHeaders, 'PUT', `members/${encodeURIComponent(id)}/agent-vmid`,
+                                            { cluster_id: cid, vmid }, t('pgHaActionFailed'));
+                } finally {
+                    setBusy('');
+                }
+                if (!res.ok) {
+                    setRefused({ code: res.code, error: res.error });
+                    return;
+                }
+                setSaved(s => {
+                    const next = { ...s };
+                    if (vmid === null) delete next[cid];
+                    else next[cid] = vmid;
+                    return next;
+                });
+                if (vmid === null) setTyped(v => ({ ...v, [cid]: '' }));
+                addToast?.(t(vmid === null ? 'haAutoVmidCleared' : 'haAutoVmidSaved'), 'success');
+                onSaved?.();
+            };
+
+            return (
+                <div data-ha-member-form="vmid" data-ha-member-form-for={id}
+                    className="rounded-lg p-3 space-y-3 border text-left bg-proxmox-card border-proxmox-border">
+                    <p className="text-sm text-gray-300" style={{ overflowWrap: 'anywhere' }}>{t('haAutoVmidDesc').replace('{name}', () => name)}</p>
+                    {rows.length === 0 ? (
+                        <p className="text-xs text-yellow-300" data-ha-agent-vmid-none>{t('haAutoVmidNoClusters')}</p>
+                    ) : (
+                        <div className="space-y-2">
+                            {rows.map(r => {
+                                const value = (typed[r.id] || '').trim();
+                                const now = typeof saved[r.id] === 'number' ? saved[r.id] : null;
+                                const bad = !!value && !valid(value);
+                                return (
+                                    <div key={r.id} data-ha-agent-vmid-row={r.id} className="flex flex-wrap items-center gap-2">
+                                        <label htmlFor={`pgha-vmid-${r.id}`} className="w-44 text-sm text-gray-200 truncate" title={r.id}>{r.name}</label>
+                                        <input id={`pgha-vmid-${r.id}`} value={typed[r.id] || ''} inputMode="numeric" maxLength={9} autoComplete="off"
+                                            placeholder={t('haAutoVmidPlaceholder')} aria-invalid={bad ? 'true' : undefined} disabled={!!busy}
+                                            onChange={e => { const v = e.target.value; setTyped(k => ({ ...k, [r.id]: v })); setRefused(null); }}
+                                            className={`w-32 ${HA_GROUP_FIELD} font-mono`} />
+                                        <button type="button" onClick={() => send(r.id, Number(value))}
+                                            disabled={!!busy || bad || !value || Number(value) === now}
+                                            className={`${HA_GROUP_BTN} bg-proxmox-orange hover:bg-proxmox-orange/90 text-white`}>
+                                            {t('save')}
+                                        </button>
+                                        {now !== null && (
+                                            <button type="button" onClick={() => send(r.id, null)} disabled={!!busy} className={HA_GROUP_GHOST}>
+                                                {t('remove')}
+                                            </button>
+                                        )}
+                                        {bad && <span className="text-xs text-yellow-300" data-ha-agent-vmid-bad>{t('haAutoVmidBad')}</span>}
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+                    {refused && (
+                        <div role="alert" data-ha-member-refused={refused.code || 'error'} style={{ overflowWrap: 'anywhere' }}
+                            className="rounded-lg p-2 text-sm border bg-red-500/10 border-red-500/30 text-red-300">
+                            {refused.error}
+                        </div>
+                    )}
+                    <div className="flex flex-wrap items-center gap-2">
+                        <button type="button" onClick={onClose} className={HA_GROUP_GHOST}>{t('close')}</button>
+                    </div>
+                </div>
+            );
+        }
+
+        // Whether the group still elects a leader once it loses a site, or the link between two: the
+        // votes per site and who leads on its own there, the clusters with node HA as a leader at
+        // any site finds them, and the findings (the very list the switch goes by). The site and
+        // may lead of this instance are set here on the leader, the members' in their rows.
+        function HaSplitCard({ t, status, split, auto, nameOf, ctl, selfForm }) {
+            const level = HA_SPLIT_LEVEL[split.level] ? split.level : 'ok';
+            const ids = (list) => (Array.isArray(list) ? list : []).filter(v => typeof v === 'string' && v);
+            const names = (list) => ids(list).map(nameOf).join(', ');
+            const sites = (Array.isArray(split.sites) ? split.sites : []).filter(s => s && typeof s === 'object' && typeof s.site === 'string');
+            const unlabeled = ids(split.unlabeled);
+            const clusters = (Array.isArray(split.clusters) ? split.clusters : []).filter(c => c && typeof c === 'object' && typeof c.id === 'string');
+            // the worst first, in the order the server found them
+            const findings = (Array.isArray(split.findings) ? split.findings : [])
+                .filter(f => f && typeof f === 'object' && typeof f.code === 'string')
+                .map((f, i) => ({ f, i, rank: HA_LEVEL_ORDER.includes(f.level) ? HA_LEVEL_ORDER.indexOf(f.level) : HA_LEVEL_ORDER.length }))
+                .sort((a, b) => a.rank - b.rank || a.i - b.i).map(x => x.f);
+            const self = { instance_id: status.instance_id, site: typeof auto?.site === 'string' ? auto.site : (status.site || ''),
+                           may_lead: auto?.may_lead !== false, agent_vmid: auto?.agent_vmid };
+            // what a cluster without the claim leaves open, in the words of the server, once
+            const residual = (clusters.map(c => c.claim).find(c => c && c.enabled === false && typeof c.residual === 'string' && c.residual) || {}).residual || '';
+            const num = (v) => typeof v === 'number' && isFinite(v) ? v : 0;
+            const th = 'py-2 pr-4 font-medium';
+            const td = 'py-2 pr-4';
+
+            const nodesCell = (c) => {
+                if (c.kind === 'other') return <span className="text-gray-400" data-ha-split-ready="other">{t('haAutoSplitOtherKind')}</span>;
+                const nodes = ids(c.nodes);
+                const notReady = ids(c.not_ready);
+                const verified = ids(c.fence_verified);
+                return (
+                    <div className="space-y-1">
+                        {c.ready === true ? <span className="text-green-300" data-ha-split-ready="yes">{t('haAutoSplitReady')}</span>
+                            : c.ready === false ? (
+                                <span className="text-yellow-300" data-ha-split-ready="no">
+                                    {t('haAutoSplitNotReady').replace('{list}', () => notReady.join(', ') || '-')}
+                                </span>
+                            ) : <span className="text-gray-400" data-ha-split-ready="unknown">{t('haAutoSplitNoNodes')}</span>}
+                        {nodes.length > 0 && (
+                            <details data-ha-split-nodes={nodes.length}>
+                                <summary className="cursor-pointer text-gray-400">{t('haAutoSplitNodes').replace('{n}', nodes.length)}</summary>
+                                <ul className="mt-1 space-y-0.5">
+                                    {nodes.map(n => {
+                                        const v = c.agents && typeof c.agents[n] === 'number' ? c.agents[n] : 0;
+                                        const fence = c.fence && typeof c.fence[n] === 'string' ? c.fence[n] : '';
+                                        return (
+                                            <li key={n} data-ha-split-node={n} className={notReady.includes(n) ? 'text-yellow-300' : 'text-gray-300'}>
+                                                <span className="font-mono">{n}</span>
+                                                {': '}
+                                                {v ? t('haAutoSplitAgent').replace('{v}', v) : t('haAutoSplitNoAgent')}
+                                                {' · '}
+                                                {fence ? t(verified.includes(n) ? 'haAutoSplitFenceVerified' : 'haAutoSplitFence').replace('{type}', () => fence)
+                                                    : t('haAutoSplitNoFence')}
+                                            </li>
+                                        );
+                                    })}
+                                </ul>
+                            </details>
+                        )}
+                    </div>
+                );
+            };
+
+            const claimCell = (c) => {
+                const claim = c.claim && typeof c.claim === 'object' ? c.claim : null;
+                if (!claim) return <span className="text-gray-500">-</span>;
+                const state = claim.enabled === true ? String(claim.state || 'unknown') : 'off';
+                const who = typeof claim.instance === 'string' && claim.instance ? nameOf(claim.instance) : '-';
+                const [key, tone] = state === 'off' ? ['haAutoClaimOff', 'text-gray-400']
+                    : state === 'ours' ? ['haAutoClaimOurs', 'text-green-300']
+                    : HA_CLAIM_FOREIGN.includes(state) ? ['haAutoClaimForeign', 'text-red-300']
+                    : state === 'unreadable' ? ['haAutoClaimUnreadable', 'text-red-300']
+                    : state === 'unreachable' ? ['haAutoClaimNoSsh', 'text-yellow-300']
+                    : state === 'unknown' ? ['haAutoClaimNotRead', 'text-gray-400'] : ['haAutoClaimNotWritten', 'text-yellow-300'];
+                return (
+                    <span className={tone} data-ha-split-claim={state} style={{ overflowWrap: 'anywhere' }}>
+                        {t(key).replace('{who}', () => who).replace('{epoch}', () => claim.epoch ?? '-')}
+                    </span>
+                );
+            };
+
+            return (
+                <div className={HA_GROUP_CARD} data-ha-split={level}>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                        <h4 className="font-medium text-white flex flex-wrap items-center gap-2">
+                            <Icons.Network />
+                            {t('haAutoSplitTitle')}
+                            <span data-ha-split-level={level} className={`px-2 py-0.5 rounded-full border text-xs font-medium ${HA_SPLIT_LEVEL[level][1]}`}>
+                                {t(HA_SPLIT_LEVEL[level][0])}
+                            </span>
+                        </h4>
+                        <span className="text-xs text-gray-400" data-ha-split-votes={num(split.voters)}>
+                            {t('haAutoSplitVotes').replace('{n}', num(split.voters)).replace('{m}', () => num(split.majority))
+                                .replace('{k}', num(split.tolerates))}
+                        </span>
+                    </div>
+                    <p className="text-sm text-gray-400 max-w-3xl">{t('haAutoSplitIntro')}</p>
+                    <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-sm" data-ha-split-self>
+                        <span className="text-gray-400">{t('haAutoSplitSelf')}</span>
+                        <span className="text-gray-200 flex items-center gap-1">
+                            {t('haAutoColSite')}: <span data-ha-split-self-site={self.site}>{self.site || '-'}</span>
+                            {ctl && (
+                                <button type="button" onClick={() => ctl.open('site', self)} disabled={!!ctl.locked}
+                                    title={ctl.locked || t('haAutoSiteEdit')} aria-label={t('haAutoSiteOf').replace('{name}', () => nameOf(self.instance_id))}
+                                    className="ml-1 text-gray-400 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed">
+                                    <Icons.Edit />
+                                </button>
+                            )}
+                        </span>
+                        {ctl ? (
+                            <span className="text-gray-200 flex items-center gap-2" data-ha-split-self-may-lead={self.may_lead ? 'yes' : 'no'}>
+                                <button type="button" role="switch" aria-checked={self.may_lead}
+                                    aria-label={t('haAutoMayLeadOf').replace('{name}', () => nameOf(self.instance_id))}
+                                    title={ctl.voteLocked || undefined} onClick={() => ctl.open('may_lead', self)} disabled={!!ctl.voteLocked}
+                                    className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${self.may_lead ? 'active' : ''}`} />
+                                {t('haAutoColMayLead')}
+                            </span>
+                        ) : (
+                            <span className="text-gray-200" data-ha-split-self-may-lead={self.may_lead ? 'yes' : 'no'}>
+                                {t('haAutoColMayLead')}: {t(self.may_lead ? 'yes' : 'no')}
+                            </span>
+                        )}
+                        {ctl && <HaAgentVmButton t={t} ctl={ctl} target={self} name={nameOf(self.instance_id)} />}
+                    </div>
+                    {selfForm}
+                    {sites.length > 0 && (
+                        <div className="overflow-x-auto">
+                            <table className="w-full text-sm">
+                                <thead>
+                                    <tr className="text-left text-xs text-gray-500 border-b border-proxmox-border">
+                                        <th className={th}>{t('haAutoColSite')}</th>
+                                        <th className={th}>{t('haAutoSplitMembers')}</th>
+                                        <th className={th}>{t('haAutoSplitVotesCol')}</th>
+                                        <th className={th}>{t('haAutoSplitLeads')}</th>
+                                        <th className="py-2 font-medium">{t('haAutoSplitIfLost')}</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-proxmox-border">
+                                    {sites.map(s => (
+                                        <tr key={s.site} data-ha-split-site={s.site}>
+                                            <td className={`${td} text-gray-200 whitespace-nowrap`}>{s.site}</td>
+                                            <td className={`${td} text-gray-300`} style={{ overflowWrap: 'anywhere' }}>{names(s.members) || '-'}</td>
+                                            <td className={`${td} text-gray-200 whitespace-nowrap`} data-ha-split-site-votes={num(s.votes)}>
+                                                {num(s.votes)}{s.witness === true ? ` (${t('haAutoSplitWithWitness')})` : ''}
+                                            </td>
+                                            <td className={`${td} text-gray-300`} style={{ overflowWrap: 'anywhere' }}>{names(s.candidates) || '-'}</td>
+                                            <td className="py-2 whitespace-nowrap" data-ha-split-survives={s.survives_loss === true ? 'yes' : 'no'}>
+                                                {s.survives_loss === true
+                                                    ? <span className="text-green-300">{t('haAutoSplitSurvives')}</span>
+                                                    : <span className="text-red-300">{t('haAutoSplitStops')}</span>}
+                                            </td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+                    {unlabeled.length > 0 && (
+                        <p className="text-xs text-yellow-300" style={{ overflowWrap: 'anywhere' }} data-ha-split-unlabeled={unlabeled.length}>
+                            {t('haAutoSplitUnlabeled').replace('{list}', () => names(unlabeled))}
+                        </p>
+                    )}
+                    <div className="space-y-2">
+                        <div className="text-xs font-medium text-gray-400">{t('haAutoSplitFindings')}</div>
+                        {findings.length === 0 ? (
+                            <p className="text-xs text-gray-500" data-ha-split-nothing>{t('haAutoSplitNothing')}</p>
+                        ) : (
+                            <ul className="space-y-1.5">
+                                {findings.map((f, i) => (
+                                    <li key={`${f.code}:${i}`} data-ha-split-finding={f.code} data-ha-split-finding-level={f.level}
+                                        className="flex items-start gap-2 text-sm">
+                                        <span className={`mt-0.5 flex-shrink-0 ${HA_LEVEL_TONE[f.level] || HA_LEVEL_TONE.info}`}>
+                                            {f.level === 'block' ? <Icons.XCircle /> : f.level === 'warn' ? <Icons.AlertTriangle /> : <Icons.Info />}
+                                        </span>
+                                        <span className={f.level === 'block' ? 'text-red-300' : f.level === 'warn' ? 'text-yellow-200' : 'text-gray-300'}
+                                            style={{ overflowWrap: 'anywhere' }}>
+                                            {typeof f.text === 'string' && f.text ? f.text : f.code}
+                                        </span>
+                                    </li>
+                                ))}
+                            </ul>
+                        )}
+                    </div>
+                    {clusters.length > 0 && (
+                        <div className="space-y-2" data-ha-split-clusters={clusters.length}>
+                            <div className="text-xs font-medium text-gray-400">{t('haAutoSplitClusters')}</div>
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-sm">
+                                    <thead>
+                                        <tr className="text-left text-xs text-gray-500 border-b border-proxmox-border">
+                                            <th className={th}>{t('haAutoSplitCluster')}</th>
+                                            <th className={th}>{t('haAutoSplitRecovery')}</th>
+                                            <th className={th}>{t('haAutoSplitTwoNodes')}</th>
+                                            <th className={th}>{t('haAutoSplitClaim')}</th>
+                                            <th className="py-2 font-medium">{t('haAutoSplitReachedFrom')}</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-proxmox-border">
+                                        {clusters.map(c => (
+                                            <tr key={c.id} data-ha-split-cluster={c.id} style={{ verticalAlign: 'top' }}>
+                                                <td className={`${td} text-gray-200 whitespace-nowrap`}>{typeof c.name === 'string' && c.name ? c.name : c.id}</td>
+                                                <td className={`${td} text-xs`}>{nodesCell(c)}</td>
+                                                <td className={`${td} text-xs whitespace-nowrap`}
+                                                    data-ha-split-two-node={c.kind === 'other' ? 'other' : c.two_node === true ? (c.unsafe_two_node === true ? 'unsafe' : 'yes') : 'no'}>
+                                                    {c.kind === 'other' ? <span className="text-gray-500">-</span>
+                                                        : c.two_node === true
+                                                            ? <span className="text-yellow-300">{t(c.unsafe_two_node === true ? 'haAutoSplitTwoNodeUnsafe' : 'haAutoSplitTwoNode')}</span>
+                                                            : <span className="text-gray-300">{t('no')}</span>}
+                                                </td>
+                                                <td className={`${td} text-xs`}>{claimCell(c)}</td>
+                                                <td className="py-2 text-xs text-gray-300" data-ha-split-reach={ids(c.reach_sites).join(',')}>
+                                                    {ids(c.reach_sites).join(', ') || <span className="text-gray-500">-</span>}
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                            {residual && <p className="text-xs text-gray-500" style={{ overflowWrap: 'anywhere' }} data-ha-split-residual>{residual}</p>}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // Who leads, from here. On an instance Force leader made the active: what it did, and the
+        // VMs whose autostart is still to go off. On a member of an automatic group that may lead:
+        // Make leader for itself. Where the group lost its majority for good, and only where the
+        // server offers it: the danger zone with Force leader. Nothing where none of it applies.
+        function HaLeadCard({ t, status, auto, leader, nameOf, getAuthHeaders, load, addToast, broken, onRestart }) {
+            const { user, logout } = useAuth();
+            const sso = ['oidc', 'entra'].includes(user?.auth_source);
+            const [asking, setAsking] = useState(false);      // the Make leader form of this instance is open
+            const [forcing, setForcing] = useState(false);    // the Force leader form is open
+            const [ticked, setTicked] = useState([]);         // the cut-out members the admin ticked
+            const [reason, setReason] = useState('');
+            const [typed, setTyped] = useState('');
+            const [password, setPassword] = useState('');
+            const [refused, setRefused] = useState(null);     // {code, error} of the last refusal
+            const [busy, setBusy] = useState(false);
+
+            const forced = auto?.forced && typeof auto.forced === 'object' ? auto.forced : null;
+            const force = !broken && auto?.force_leader && typeof auto.force_leader === 'object' && auto.force_leader.offered === true
+                ? auto.force_leader : null;
+            const self = !broken && !leader && auto?.mode === 'auto' && auto?.make_leader?.self === true;
+            const phrase = typeof force?.phrase === 'string' && force.phrase ? force.phrase : 'FORCE LEADER';
+            const cut = (Array.isArray(force?.cut_out) ? force.cut_out : []).filter(c => c && typeof c === 'object' && typeof c.instance_id === 'string');
+            const cutIds = cut.map(c => c.instance_id).join(',');
+
+            const openForce = (on) => {
+                setForcing(on);
+                setTicked([]);
+                setReason('');
+                setTyped('');
+                setPassword('');
+                setRefused(null);
+            };
+            // a poll that no longer offers it closes the form, with everything typed into it; a
+            // member that answers again is no longer listed, nor ticked
+            useEffect(() => { if (!force) openForce(false); }, [!!force]);
+            useEffect(() => { setTicked(k => k.filter(id => cut.some(c => c.instance_id === id))); }, [cutIds]);
+            useEffect(() => { if (!self) setAsking(false); }, [self]);
+            if (!forced && !force && !self) return null;
+
+            const submit = async () => {
+                const body = { confirm: phrase, cut_out: cut.map(c => c.instance_id), reason: reason.trim() };
+                setBusy(true);
+                setRefused(null);
+                let res;
+                try {
+                    res = await haGroupSend(getAuthHeaders, 'POST', 'force-leader', sso ? body : { ...body, user_password: password },
+                                            t('pgHaActionFailed'));
+                } finally {
+                    setBusy(false);
+                    setPassword('');
+                }
+                if (!res.ok) { setRefused({ code: res.code, error: res.error }); return; }
+                if (res.data.restarting) { onRestart('active'); return; }
+                openForce(false);
+                load();
+            };
+
+            const reauth = refused && (refused.code === 'HA_REAUTH' || refused.code === 'HA_REAUTH_RECENT');
+            const ready = !busy && cut.every(c => ticked.includes(c.instance_id)) && !!reason.trim() && typed === phrase && (sso || !!password);
+            const campaign = force?.last_campaign && typeof force.last_campaign === 'object' ? force.last_campaign : null;
+            const caseText = force?.case === 'auto'
+                ? t('haAutoForceCaseAuto').replace('{n}', Math.round(Number(force.quiet) || 0))
+                    .replace('{reached}', () => campaign?.reached ?? '-').replace('{m}', () => campaign?.majority ?? '-')
+                : t(force?.case === 'pending' ? 'haAutoForceCasePending' : 'haAutoForceCaseUnknown');
+            const cutName = (c) => `${c.url || c.instance_id.slice(0, 8)}${c.kind === 'witness' ? ` (${t('haAutoKindWitness')})` : ''}`;
+            const cutOut = (Array.isArray(forced?.cut_out) ? forced.cut_out : []).filter(v => typeof v === 'string');
+            const onboot = Object.entries(forced?.onboot_left && typeof forced.onboot_left === 'object' ? forced.onboot_left : {})
+                .filter(([, vmids]) => Array.isArray(vmids) && vmids.length);
+
+            return (
+                <div className={HA_GROUP_CARD} data-ha-lead={force ? 'force' : self ? 'self' : 'forced'}>
+                    <h4 className="font-medium text-white flex items-center gap-2">
+                        <Icons.Star className="w-4 h-4" />
+                        {t('haAutoLeadTitle')}
+                    </h4>
+                    {forced && (
+                        <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 space-y-1" data-ha-forced={forced.epoch ?? ''}>
+                            <div className="flex items-start gap-2">
+                                <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                                <span style={{ overflowWrap: 'anywhere' }}>
+                                    {t('haAutoForcedTitle').replace('{epoch}', () => forced.epoch ?? '-').replace('{by}', () => forced.by || '-')}
+                                    {forced.at && <span className="text-gray-400"> · {fmtDate(forced.at)}</span>}
+                                </span>
+                            </div>
+                            {typeof forced.reason === 'string' && forced.reason && (
+                                <div className="text-gray-300" style={{ overflowWrap: 'anywhere' }} data-ha-forced-reason>
+                                    {t('haAutoForcedReason').replace('{reason}', () => forced.reason)}
+                                </div>
+                            )}
+                            {cutOut.length > 0 && (
+                                <div className="text-gray-300" style={{ overflowWrap: 'anywhere' }} data-ha-forced-cut={cutOut.length}>
+                                    {t('haAutoForcedCut').replace('{list}', () => cutOut.map(nameOf).join(', '))}
+                                </div>
+                            )}
+                            {onboot.length > 0 && (
+                                <div style={{ overflowWrap: 'anywhere' }} data-ha-forced-onboot={onboot.length}>
+                                    {t('haAutoForcedOnboot').replace('{list}', () => onboot.map(([cid, vmids]) => `${cid}: ${vmids.join(', ')}`).join('; '))}
+                                </div>
+                            )}
+                            <div className="text-xs text-gray-400">{t('haAutoForcedBack')}</div>
+                        </div>
+                    )}
+                    {self && (
+                        <div className="space-y-2" data-ha-make-self>
+                            <p className="text-sm text-gray-400">{t('haAutoMakeSelfHint')}</p>
+                            {asking ? (
+                                <HaMemberForm t={t} what="leader" self target={{ instance_id: status.instance_id }} name={t('haAutoThisInstance')}
+                                    phrase={typeof auto.make_leader.phrase === 'string' && auto.make_leader.phrase ? auto.make_leader.phrase : 'LEADER'}
+                                    getAuthHeaders={getAuthHeaders} onClose={() => setAsking(false)} onDone={() => { setAsking(false); load(); }}
+                                    onRefused={load} onRestart={onRestart} addToast={addToast} />
+                            ) : (
+                                <button type="button" onClick={() => setAsking(true)} className={HA_GROUP_GHOST}>
+                                    <Icons.Star className="w-4 h-4" />
+                                    {t('haAutoMakeSelf')}
+                                </button>
+                            )}
+                        </div>
+                    )}
+                    {force && (
+                        <div className="rounded-xl p-4 space-y-3 border bg-red-500/10 border-red-500/30" data-ha-force={force.case || ''}>
+                            <h4 className="font-medium text-red-300 flex items-center gap-2">
+                                <Icons.AlertTriangle />
+                                {t('haAutoForceTitle')}
+                            </h4>
+                            <p className="text-sm text-red-300">{t('haAutoForceIntro')}</p>
+                            <p className="text-sm text-gray-300" style={{ overflowWrap: 'anywhere' }} data-ha-force-case={force.case || ''}>{caseText}</p>
+                            {!forcing ? (
+                                <button type="button" onClick={() => openForce(true)} className={`${HA_GROUP_BTN} bg-red-600 hover:bg-red-700 text-white`}>
+                                    <Icons.Zap />
+                                    {t('haAutoForceOpen')}
+                                </button>
+                            ) : (
+                                <div className="space-y-3" data-ha-force-form>
+                                    {typeof force.warning === 'string' && force.warning && (
+                                        <div className="rounded-lg p-3 text-sm border bg-yellow-500/10 border-yellow-500/40 text-yellow-200 flex items-start gap-2" data-ha-force-warning>
+                                            <span className="mt-0.5 flex-shrink-0"><Icons.AlertTriangle /></span>
+                                            <span style={{ overflowWrap: 'anywhere' }}>{force.warning}</span>
+                                        </div>
+                                    )}
+                                    {cut.length > 0 && (
+                                        <div className="space-y-1.5" data-ha-force-cut={cut.length}>
+                                            <div className="text-xs font-medium text-gray-400">{t('haAutoForceCutTitle')}</div>
+                                            {cut.map(c => (
+                                                <label key={c.instance_id} className="flex items-start gap-2 text-sm text-gray-200 cursor-pointer" data-ha-force-member={c.instance_id}>
+                                                    <input type="checkbox" className="mt-0.5" checked={ticked.includes(c.instance_id)} disabled={busy}
+                                                        onChange={e => { const v = e.target.checked; setTicked(k => v ? [...k, c.instance_id] : k.filter(x => x !== c.instance_id)); }} />
+                                                    <span style={{ overflowWrap: 'anywhere' }}>{t('haAutoForceTick').replace('{name}', () => cutName(c))}</span>
+                                                </label>
+                                            ))}
+                                        </div>
+                                    )}
+                                    <div className="max-w-xl">
+                                        <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-force-reason">{t('haAutoForceReason')}</label>
+                                        <input id="pgha-force-reason" value={reason} maxLength={500} onChange={e => setReason(e.target.value)}
+                                            autoComplete="off" className={`w-full ${HA_GROUP_FIELD}`} />
+                                    </div>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 max-w-xl">
+                                        <div>
+                                            <label className="block text-xs text-gray-400 mb-1" htmlFor="pgha-force-typed">
+                                                {t('pgHaTypeToConfirm').replace('{word}', () => phrase)}
+                                            </label>
+                                            <input id="pgha-force-typed" value={typed} onChange={e => setTyped(e.target.value)} autoComplete="off"
+                                                spellCheck={false} placeholder={phrase} className={`w-full ${HA_GROUP_FIELD} font-mono`} />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <HaGroupPassword t={t} id="pgha-force-password" sso={sso} value={password} onChange={setPassword} refused={refused} logout={logout} />
+                                        </div>
+                                    </div>
+                                    {refused && !reauth && (
+                                        <div role="alert" data-ha-force-refused={refused.code || 'error'} style={{ overflowWrap: 'anywhere' }}
+                                            className="rounded-lg p-2 text-sm border bg-red-500/10 border-red-500/30 text-red-300">
+                                            {refused.error}
+                                        </div>
+                                    )}
+                                    <div className="flex flex-wrap items-center gap-2">
+                                        <button type="button" onClick={submit} disabled={!ready} className={`${HA_GROUP_BTN} bg-red-600 hover:bg-red-700 text-white`}>
+                                            <Icons.Zap />
+                                            {t('haAutoForceGo')}
+                                        </button>
+                                        <button type="button" onClick={() => openForce(false)} className={HA_GROUP_GHOST}>{t('cancel')}</button>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </div>
             );
         }

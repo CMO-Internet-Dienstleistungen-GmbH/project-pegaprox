@@ -14,6 +14,7 @@ import threading
 from datetime import datetime
 
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 
 logger = logging.getLogger('pegaprox.xcrepl')
 
@@ -109,7 +110,8 @@ def _xcrepl_loop():
     while _xcrepl_running:
         try:
             db = get_db()
-            jobs = db.query('SELECT * FROM cross_cluster_replications WHERE enabled = 1')
+            # a standby starts no job; they are the active instance's to run
+            jobs = db.query('SELECT * FROM cross_cluster_replications WHERE enabled = 1') if ha.is_active() else []
 
             if jobs:
                 now = time.time()
@@ -142,10 +144,15 @@ def _xcrepl_loop():
                         is_local = job.get('source_cluster') == job.get('target_cluster')
                         handler = _execute_local_replication if is_local else _execute_replication
                         logger.info(f"[XCREPL] Scheduling {'local' if is_local else 'cross-cluster'} job {job['id']} (VM {job['vmid']})")
+                        # an automatic leader that lost its lease starts no job (#625)
+                        if not ha.confirm_step(f"replication job {job['id']}"):
+                            _release_job(job['id'])
+                            break
                         try:
-                            # run in own thread so one slow job doesn't block others
+                            # run in own thread so one slow job doesn't block others; its
+                            # many SSH and API steps ask for the lease at their exit
                             threading.Thread(
-                                target=_tracked_run,
+                                target=ha.as_job(_tracked_run, f"replication job {job['id']}"),
                                 args=(handler, job),
                                 daemon=True
                             ).start()

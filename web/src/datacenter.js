@@ -4,6 +4,321 @@
         // ═══════════════════════════════════════════════
         // Datacenter Tab Component (embedded in main view)
 
+        // LW Oct 2026 - the resource mappings of a cluster: directories (PVE 8.4+) to add, change
+        // and remove, the PCI and USB mappings to look at. A directory mapping is what the virtiofs
+        // share of a VM names, one absolute path per node; the server holds the same rules.
+        const DM_ID_RE = /^[A-Za-z][A-Za-z0-9_-]{1,63}$/;
+        // a guest given one of these can change the node itself
+        const DM_SYSTEM_DIRS = ['/bin', '/boot', '/dev', '/etc', '/lib', '/lib64', '/proc', '/root', '/run', '/sbin', '/sys', '/usr'];
+
+        function dmPathOk(path) {
+            const p = String(path || '');
+            return p.startsWith('/') && p.replace(/\/+/g, '') !== '' && p.length <= 4096
+                && !/[;,=()\u0000-\u001f\u007f]/.test(p) && p === p.trimEnd() && !p.split('/').includes('..');
+        }
+
+        function dmSystemDir(path) {
+            const p = String(path || '').replace(/\/+$/, '');
+            return ['/var', '/var/lib'].includes(p) || DM_SYSTEM_DIRS.some(d => p === d || p.startsWith(d + '/'));
+        }
+
+        // '' when the form is fine, else the key of what is wrong with it
+        function dmProblem(form, isNew) {
+            if (isNew && !DM_ID_RE.test(form.id)) return 'dmBadId';
+            if (!form.entries.length) return 'dmNoEntries';
+            if (form.entries.some(e => !e.node)) return 'dmNoNode';
+            if (new Set(form.entries.map(e => e.node)).size !== form.entries.length) return 'dmNodeTwice';
+            if (form.entries.some(e => !dmPathOk(e.path))) return 'dmBadPath';
+            return '';
+        }
+
+        // the nodes a PCI or USB mapping has a device on, from PVE's "node=..,path=.." entries
+        const rmNodesOf = (row) => [...new Set((row.map || []).map(x => (String(x).match(/(?:^|,)node=([^,]+)/) || [])[1]).filter(Boolean))].sort();
+
+        function DirMappingDialog({ mapping, nodes, onSave, onClose, t }) {
+            const [form, setForm] = useState(() => ({
+                id: mapping ? mapping.id : '',
+                description: mapping ? (mapping.description || '') : '',
+                entries: mapping ? mapping.entries.map(e => ({ node: e.node, path: e.path })) : [{ node: nodes[0] || '', path: '' }],
+            }));
+            const [busy, setBusy] = useState(false);
+            const problem = dmProblem(form, !mapping);
+            const setEntry = (i, key, value) => setForm(prev => ({ ...prev, entries: prev.entries.map((e, j) => j === i ? { ...e, [key]: value } : e) }));
+            const addEntry = () => setForm(prev => ({
+                ...prev, entries: [...prev.entries, { node: nodes.find(n => !prev.entries.some(e => e.node === n)) || '', path: prev.entries[prev.entries.length - 1]?.path || '' }],
+            }));
+            const save = async () => {
+                if (problem || busy) return;
+                setBusy(true);
+                if (!(await onSave(form, mapping))) setBusy(false);
+            };
+            const input = 'w-full bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white';
+            return (
+                <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60" data-dm-dialog={mapping ? 'edit' : 'add'}>
+                    <div className="w-full max-w-2xl bg-proxmox-card border border-proxmox-border rounded-xl p-6 max-h-[90vh] overflow-y-auto">
+                        <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+                            <span className="text-proxmox-orange"><Icons.FolderOpen /></span>
+                            {mapping ? t('dmEdit') : t('dmAdd')}
+                        </h3>
+                        <div className="space-y-4">
+                            <div className="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1">{t('dmId')}</label>
+                                    <input value={form.id} disabled={!!mapping} maxLength={64} data-dm-id
+                                        onChange={e => setForm(prev => ({ ...prev, id: e.target.value.trim() }))}
+                                        className={`${input} font-mono disabled:opacity-50`} />
+                                </div>
+                                <div>
+                                    <label className="block text-xs text-gray-400 mb-1">{t('dmDescription')}</label>
+                                    <input value={form.description} maxLength={4096} data-dm-description
+                                        onChange={e => setForm(prev => ({ ...prev, description: e.target.value }))} className={input} />
+                                </div>
+                            </div>
+                            <p className="text-xs text-gray-500">{t('dmIdHint')}</p>
+                            <div>
+                                <label className="block text-xs text-gray-400 mb-1">{t('dmPaths')}</label>
+                                <div className="space-y-2">
+                                    {form.entries.map((e, i) => (
+                                        <div key={i} data-dm-entry-row={i}>
+                                            <div className="flex items-center gap-2">
+                                                <select value={e.node} onChange={ev => setEntry(i, 'node', ev.target.value)} data-dm-node={i}
+                                                    className="w-44 shrink-0 bg-proxmox-dark border border-proxmox-border rounded px-3 py-2 text-white">
+                                                    <option value="">-- {t('dmNode')} --</option>
+                                                    {e.node && !nodes.includes(e.node) && <option value={e.node}>{e.node}</option>}
+                                                    {nodes.map(n => <option key={n} value={n}>{n}</option>)}
+                                                </select>
+                                                <input value={e.path} placeholder="/mnt/share" onChange={ev => setEntry(i, 'path', ev.target.value)} data-dm-path={i}
+                                                    className={`${input} font-mono`} />
+                                                <button type="button" onClick={() => setForm(prev => ({ ...prev, entries: prev.entries.filter((_, j) => j !== i) }))}
+                                                    data-dm-remove-entry={i} title={t('remove')} className="shrink-0 text-xs px-2 py-2 text-red-400 hover:bg-red-500/20 rounded">
+                                                    <Icons.Trash className="w-3.5 h-3.5" />
+                                                </button>
+                                            </div>
+                                            {dmSystemDir(e.path) && (
+                                                <p className="text-xs text-yellow-400 mt-1 flex items-start gap-1" data-dm-warning="system">
+                                                    <span className="shrink-0 mt-0.5"><Icons.AlertTriangle /></span>
+                                                    <span>{t('dmWarnSystem')}</span>
+                                                </p>
+                                            )}
+                                        </div>
+                                    ))}
+                                </div>
+                                <button type="button" onClick={addEntry} data-dm-add-entry disabled={nodes.length > 0 && form.entries.length >= nodes.length}
+                                    className="mt-2 text-xs px-3 py-1.5 bg-proxmox-orange/20 text-proxmox-orange rounded hover:bg-proxmox-orange/30 flex items-center gap-1 disabled:opacity-50">
+                                    <Icons.Plus className="w-3 h-3" />
+                                    {t('dmAddNode')}
+                                </button>
+                                <p className="text-xs text-gray-500 mt-2">{t('dmPathHint')}</p>
+                            </div>
+                            {problem && <p className="text-xs text-red-400" data-dm-problem={problem}>{t(problem)}</p>}
+                            <div className="flex gap-2 justify-end pt-4">
+                                <button onClick={onClose} className="px-4 py-2 bg-proxmox-dark hover:bg-proxmox-hover rounded">{t('cancel')}</button>
+                                <button onClick={save} disabled={!!problem || busy} data-dm-save
+                                    className="px-4 py-2 bg-proxmox-orange hover:bg-orange-600 text-white rounded disabled:opacity-50">
+                                    {busy ? t('saving') : (mapping ? t('save') : t('add'))}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        function ResourceMappingsSection({ clusterId, addToast }) {
+            const { t } = useTranslation();
+            const { getAuthHeaders, haReadOnly } = useAuth();
+            const { isCorporate } = useLayout();
+            const empty = { loading: false, error: '', supported: true, mappings: [], nodes: [], digest: '' };
+            const [dirs, setDirs] = useState({ ...empty, loading: true });
+            const [devices, setDevices] = useState({ pci: null, usb: null });
+            const [dialog, setDialog] = useState(null);   // { mapping } - null mapping for a new one
+            const api = (path, opts = {}) => fetch(`${API_URL}/clusters/${clusterId}/datacenter/mapping/${path}`,
+                { ...opts, credentials: 'include', headers: { ...(opts.headers || {}), ...getAuthHeaders() } });
+
+            const loadDirs = async () => {
+                setDirs(prev => ({ ...prev, loading: true, error: '' }));
+                try {
+                    const r = await api('dir');
+                    const d = await r.json().catch(() => ({}));
+                    setDirs(r.ok
+                        ? { ...empty, supported: d.supported !== false, mappings: d.mappings || [], nodes: d.nodes || [], digest: d.digest || '' }
+                        : { ...empty, error: d.error || t('operationFailed') });
+                } catch (e) {
+                    setDirs({ ...empty, error: t('connectionError') });
+                }
+            };
+            const loadDevices = async (kind) => {
+                let rows = [];
+                try {
+                    const r = await api(kind);
+                    const d = r.ok ? await r.json() : [];
+                    rows = Array.isArray(d) ? d : [];
+                } catch (e) { /* the list stays empty */ }
+                setDevices(prev => ({ ...prev, [kind]: rows }));
+            };
+            useEffect(() => {
+                setDirs({ ...empty, loading: true });
+                setDevices({ pci: null, usb: null });
+                loadDirs();
+                loadDevices('pci');
+                loadDevices('usb');
+            }, [clusterId]);
+
+            const save = async (form, mapping) => {
+                const body = { description: form.description, map: form.entries.map(e => ({ node: e.node, path: e.path })) };
+                if (mapping) {
+                    if (dirs.digest) body.digest = dirs.digest;
+                } else {
+                    body.id = form.id;
+                }
+                try {
+                    const r = await api(mapping ? `dir/${encodeURIComponent(mapping.id)}` : 'dir', {
+                        method: mapping ? 'PUT' : 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+                    });
+                    const d = await r.json().catch(() => ({}));
+                    if (r.ok) {
+                        addToast(t('dmSaved'), 'success');
+                        setDialog(null);
+                        loadDirs();
+                        return true;
+                    }
+                    addToast(d.error || t('dmSaveFailed'), 'error');
+                } catch (e) {
+                    addToast(t('connectionError'), 'error');
+                }
+                return false;
+            };
+
+            const remove = async (mapping) => {
+                if (!confirm(t('dmDeleteConfirm').replace(/\{id\}/g, () => mapping.id))) return;
+                try {
+                    const r = await api(`dir/${encodeURIComponent(mapping.id)}`, { method: 'DELETE' });
+                    const d = await r.json().catch(() => ({}));
+                    if (r.ok) {
+                        addToast(t('dmDeleted'), 'success');
+                        loadDirs();
+                    } else {
+                        addToast(d.error || t('dmDeleteFailed'), 'error');
+                    }
+                } catch (e) {
+                    addToast(t('connectionError'), 'error');
+                }
+            };
+
+            const panel = (key, icon, title, extra, children) => isCorporate ? (
+                <div style={{ background: 'var(--corp-header-bg)', border: '1px solid var(--corp-border)', borderRadius: 4 }} data-rm-panel={key}>
+                    <div className="flex justify-between items-center gap-2 px-3 py-2" style={{ borderBottom: '1px solid var(--corp-border)' }}>
+                        <span className="text-xs font-semibold" style={{ color: 'var(--corp-text)' }}>{title}</span>
+                        {extra}
+                    </div>
+                    {children}
+                </div>
+            ) : (
+                <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden" data-rm-panel={key}>
+                    <div className="p-4 border-b border-proxmox-border flex justify-between items-center gap-4">
+                        <h3 className="font-semibold flex items-center gap-2">{icon}{title}</h3>
+                        {extra}
+                    </div>
+                    {children}
+                </div>
+            );
+            const pad = isCorporate ? 'px-3 py-2' : 'px-4 py-3';
+            const spinner = (
+                <div className="flex justify-center p-4"><div className="animate-spin rounded-full h-5 w-5 border-b-2 border-proxmox-orange"></div></div>
+            );
+
+            const dirBody = dirs.loading ? spinner
+                : dirs.error ? <div className={`${pad} text-sm text-red-400`} data-dm-error>{dirs.error}</div>
+                : !dirs.supported ? <div className={`${pad} text-sm text-yellow-400`} data-dm-unsupported>{t('vfsUnsupported')}</div>
+                : !dirs.mappings.length ? <div className={`${pad} text-sm text-gray-500`} data-dm-none>{t('dmNone')}</div>
+                : (
+                    <div className="divide-y divide-proxmox-border">
+                        {dirs.mappings.map(m => {
+                            const missing = dirs.nodes.filter(n => !m.nodes.includes(n));
+                            return (
+                                <div key={m.id} className={pad} data-dm-row={m.id}>
+                                    <div className="flex items-center justify-between gap-4">
+                                        <div className="min-w-0 truncate">
+                                            <span className="font-mono text-white">{m.id}</span>
+                                            {m.description && <span className="text-sm text-gray-400 ml-2">{m.description}</span>}
+                                        </div>
+                                        {!haReadOnly && (
+                                            <div className="flex items-center gap-1 shrink-0">
+                                                <button onClick={() => setDialog({ mapping: m })} data-dm-edit={m.id} title={t('edit')}
+                                                    className="text-xs px-2 py-1 text-gray-400 hover:text-white hover:bg-proxmox-hover rounded">
+                                                    <Icons.Edit />
+                                                </button>
+                                                <button onClick={() => remove(m)} data-dm-delete={m.id} title={t('remove')}
+                                                    className="text-xs px-2 py-1 text-red-400 hover:bg-red-500/20 rounded">
+                                                    <Icons.Trash className="w-3.5 h-3.5" />
+                                                </button>
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div className="mt-1 space-y-1">
+                                        {m.entries.map(e => (
+                                            <div key={e.node} className="text-xs text-gray-400" data-dm-entry={e.node}>
+                                                {e.node}: <span className="font-mono text-gray-300 break-all">{e.path}</span>
+                                            </div>
+                                        ))}
+                                    </div>
+                                    {missing.length > 0 && (
+                                        <div className="text-xs text-yellow-400 mt-1" data-dm-missing>
+                                            {t('dmMissingNodes').replace(/\{nodes\}/g, () => missing.slice(0, 10).join(', ') + (missing.length > 10 ? ` +${missing.length - 10}` : ''))}
+                                        </div>
+                                    )}
+                                </div>
+                            );
+                        })}
+                    </div>
+                );
+
+            const deviceBody = (kind) => {
+                const rows = devices[kind];
+                if (rows === null) return spinner;
+                if (!rows.length) return <div className={`${pad} text-sm text-gray-500`} data-rm-none={kind}>{t(kind === 'pci' ? 'ptNoPciMappings' : 'ptNoUsbMappings')}</div>;
+                return (
+                    <div className="divide-y divide-proxmox-border">
+                        {rows.map(row => (
+                            <div key={row.id} className={`${pad} flex items-center justify-between gap-4`} data-rm-row={`${kind}:${row.id}`}>
+                                <div className="min-w-0 truncate">
+                                    <span className="font-mono text-white">{row.id}</span>
+                                    {row.description && <span className="text-sm text-gray-400 ml-2">{row.description}</span>}
+                                </div>
+                                <span className="text-xs text-gray-400 shrink-0">{t('ptMappingNodes')}: {rmNodesOf(row).join(', ') || '-'}</span>
+                            </div>
+                        ))}
+                    </div>
+                );
+            };
+
+            const addButton = !haReadOnly && dirs.supported && !dirs.error && !dirs.loading && (
+                <button onClick={() => setDialog({ mapping: null })} data-dm-add
+                    className={isCorporate ? 'corp-action-btn' : 'text-xs px-3 py-1.5 bg-proxmox-orange/20 text-proxmox-orange rounded hover:bg-proxmox-orange/30 flex items-center gap-1'}>
+                    <Icons.Plus className="w-3 h-3" />
+                    {!isCorporate && t('dmAdd')}
+                </button>
+            );
+
+            return (
+                <div className={isCorporate ? 'space-y-2' : 'space-y-4'} data-rm-section>
+                    <p className="text-sm text-gray-400">{t('rmIntro')}</p>
+                    {panel('dir', <Icons.FolderOpen />, t('dmTitle'), addButton, (
+                        <>
+                            <p className={`${pad} text-xs text-gray-500 border-b border-proxmox-border`}>{t('dmIntro')}</p>
+                            {dirBody}
+                        </>
+                    ))}
+                    {panel('pci', <Icons.Cpu />, t('rmPci'), null, deviceBody('pci'))}
+                    {panel('usb', <Icons.Plug />, t('rmUsb'), null, deviceBody('usb'))}
+                    <p className="text-xs text-gray-500">{t('rmDevicesHint')}</p>
+                    {dialog && !haReadOnly && (
+                        <DirMappingDialog mapping={dialog.mapping} nodes={dirs.nodes} onSave={save} onClose={() => setDialog(null)} t={t} />
+                    )}
+                </div>
+            );
+        }
+
         // Datacenter Tab Component
         function DatacenterTab({ clusterId, addToast }) {
             const { t } = useTranslation();
@@ -320,6 +635,7 @@
                 { id: 'cluster', labelKey: 'cluster', icon: Icons.Server, descKey: 'cluster' },
                 { id: 'options', labelKey: 'options', icon: Icons.Settings, descKey: 'options' },
                 { id: 'storage', labelKey: 'storage', icon: Icons.HardDrive, descKey: 'storage' },
+                { id: 'mappings', labelKey: 'rmTitle', icon: Icons.Link, descKey: 'mappings' },
                 { id: 'sdn', labelKey: 'sdn', icon: Icons.Network, descKey: 'sdn' },
                 { id: 'backup', labelKey: 'backup', icon: Icons.Clock, descKey: 'backup' },
                 { id: 'replication', labelKey: 'replication', icon: Icons.RefreshCw, descKey: 'replication' },
@@ -8009,6 +8325,11 @@
                                     </>
                                 )}
                             </div>
+                        )}
+
+                        {/* LW Oct 2026 - directory, PCI and USB resource mappings */}
+                        {activeSection === 'mappings' && (
+                            <ResourceMappingsSection clusterId={clusterId} addToast={addToast} />
                         )}
 
                         {/* Metric Server Sub-Tab */}

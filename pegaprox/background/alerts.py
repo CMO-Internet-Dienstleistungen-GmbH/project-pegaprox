@@ -22,9 +22,11 @@ from pegaprox.globals import (
     _notification_handlers,
 )
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 from pegaprox.api.helpers import load_server_settings, save_server_settings
 from pegaprox.utils.email import send_email
 from pegaprox.utils.concurrent import run_concurrent  # H5: parallel backup-store scan
+from pegaprox.background.alert_events import EVENT_METRICS, active_mutes, mute_for
 
 def load_alerts_config():
     """Load alerts configuration from SQLite database.
@@ -123,6 +125,77 @@ def _record_eval(alert_id, **fields):
     _last_eval[alert_id] = snap
 
 
+def _selected_channels(rule):
+    # NS Apr 2026 (#213) - honour the per-rule channel selection.
+    # `channels` (new, list) takes precedence; fall back to legacy `action`.
+    sel = rule.get('channels')
+    if isinstance(sel, list):
+        return [str(s) for s in sel]
+    legacy = (rule.get('action') or 'log').lower()
+    if legacy == 'email':
+        return ['email']
+    if legacy == 'all':
+        # old "fire everything" - keep broadcast (None = all webhooks)
+        return ['email', '__all_webhooks__']
+    return []  # 'log' or anything unknown
+
+
+def _metric_object(target_type, target_id):
+    """The object a mute names for a metric rule's target; a cluster has none."""
+    if target_type in ('node', 'vm') and target_id not in (None, ''):
+        return f"{target_type}:{target_id}"
+    return ''
+
+
+def dispatch_alert(rule, alert_data, subject, body, html_body, recipients):
+    """Send one alert to everything the rule picked: email, the notification handlers
+    (push and the inbox) and the webhook channels. The metric loop and the event rules
+    (alert_events.py) both go through here, so no source reaches one exit and not the
+    others (#815).
+
+    Returns (selected, sent_anywhere, email_status, webhook_status). MK Oct 2026
+    """
+    alert_id = rule.get('id', '')
+    selected = _selected_channels(rule)
+    want_email = 'email' in selected
+    webhook_ids = [s for s in selected if s not in ('email', 'log', '__all_webhooks__')]
+    fire_all_webhooks = '__all_webhooks__' in selected
+
+    sent_anywhere = False
+    email_status = 'not selected'
+    if want_email and not recipients:
+        email_status = 'no recipients configured'
+        logging.warning(f"[AlertCheck]   alert {alert_id} wants email but no alert_email_recipients set")
+    elif want_email and recipients:
+        success, error = send_email(recipients, subject, body, html_body)
+        if success:
+            sent_anywhere = True
+            email_status = f'ok → {len(recipients)} recipient(s)'
+            logging.info(f"[AlertCheck]   alert {alert_id} email → ok ({len(recipients)})")
+        elif error:
+            email_status = f'failed: {error}'
+            logging.warning(f"[AlertCheck]   alert {alert_id} email → FAILED: {error}")
+
+    for handler in list(_notification_handlers):
+        try:
+            handler(alert_data)
+        except Exception as he:
+            logging.debug(f"Notification handler error: {he}")
+
+    webhook_status = 'no webhook channels selected'
+    if webhook_ids or fire_all_webhooks:
+        try:
+            from pegaprox.utils.webhooks import send_to_channels
+            send_to_channels(alert_data, channel_ids=None if fire_all_webhooks else webhook_ids)
+            sent_anywhere = True
+            webhook_status = f'dispatched to {webhook_ids or "all webhooks"}'
+            logging.info(f"[AlertCheck]   alert {alert_id} webhooks → {webhook_status}")
+        except Exception as he:
+            webhook_status = f'dispatch error: {he}'
+            logging.warning(f"[AlertCheck]   alert {alert_id} webhooks → FAILED: {he}")
+    return selected, sent_anywhere, email_status, webhook_status
+
+
 def check_and_send_alerts():
     """Check all alert conditions and send notifications.
 
@@ -143,6 +216,7 @@ def check_and_send_alerts():
     # Webhook-only setups (ntfy, slack) were silently skipped because of this.
     current_time = time.time()
     alerts_list = config.get('alerts', [])
+    mutes = active_mutes()
     logging.info(f"[AlertCheck] tick: {len(alerts_list)} alert(s), {len(cluster_managers)} cluster(s) loaded, recipients={len(recipients)}")
 
     for alert in alerts_list:
@@ -157,6 +231,15 @@ def check_and_send_alerts():
         operator = alert.get('operator', '>')  # >, <, =
         target_type = alert.get('target_type', 'cluster')  # cluster, node, vm
         target_id = alert.get('target_id', '')  # node name or vmid
+
+        # Rolling-update reboots are event-driven.  They are evaluated by the
+        # update worker when the reboot is issued, never by this metric poll.
+        if metric == 'rolling_update':
+            _record_eval(alert_id, reason='event-driven rolling-update alarm',
+                         cluster_id=cluster_id, metric=metric, target_type=target_type)
+            continue
+        if metric in EVENT_METRICS:
+            continue  # alert_events.check_event_alerts, it records its own evaluation
 
         # Check cooldown
         # NS May 2026: include alert_id so a warning rule and a critical rule
@@ -413,6 +496,14 @@ def check_and_send_alerts():
                          cluster_id=cluster_id, metric=metric, current_value=round(current_value, 1),
                          threshold=threshold, operator=operator, triggered=False)
 
+        _mute = mute_for(mutes, cluster_id, alert_id, '', _metric_object(target_type, target_id)) \
+            if triggered else None
+        if _mute:
+            _record_eval(alert_id, reason=f"muted until {_mute['until']}", cluster_id=cluster_id,
+                         metric=metric, current_value=round(current_value, 1), threshold=threshold,
+                         operator=operator, triggered=True, sent=False)
+            triggered = False
+
         if triggered:
             # Send alert
             alert_name = alert.get('name', f'{metric} Alert')
@@ -445,40 +536,6 @@ This is an automated alert from PegaProx.
 <p style="color: #666; font-size: 12px; margin-top: 20px;">This is an automated alert from PegaProx.</p>
 """
             
-            # NS Apr 2026 (#213) — honour the per-rule channel selection.
-            # `channels` (new, list) takes precedence; fall back to legacy `action`.
-            sel = alert.get('channels')
-            if isinstance(sel, list):
-                selected = [str(s) for s in sel]
-            else:
-                legacy = (alert.get('action') or 'log').lower()
-                if legacy == 'email':
-                    selected = ['email']
-                elif legacy == 'all':
-                    # old "fire everything" — keep broadcast (None = all webhooks)
-                    selected = ['email', '__all_webhooks__']
-                else:  # 'log' or anything unknown
-                    selected = []
-
-            want_email = 'email' in selected
-            webhook_ids = [s for s in selected if s not in ('email', 'log', '__all_webhooks__')]
-            fire_all_webhooks = '__all_webhooks__' in selected
-
-            sent_anywhere = False
-            email_status = 'not selected'
-            if want_email and not recipients:
-                email_status = 'no recipients configured'
-                logging.warning(f"[AlertCheck]   alert {alert_id} wants email but no alert_email_recipients set")
-            elif want_email and recipients:
-                success, error = send_email(recipients, subject, body, html_body)
-                if success:
-                    sent_anywhere = True
-                    email_status = f'ok → {len(recipients)} recipient(s)'
-                    logging.info(f"[AlertCheck]   alert {alert_id} email → ok ({len(recipients)})")
-                elif error:
-                    email_status = f'failed: {error}'
-                    logging.warning(f"[AlertCheck]   alert {alert_id} email → FAILED: {error}")
-
             # NS #501: a rule may pin an explicit severity; otherwise derive it.
             _rule_sev = alert.get('severity')
             if _rule_sev and _rule_sev != 'auto':
@@ -504,24 +561,8 @@ This is an automated alert from PegaProx.
                 'timestamp': datetime.now().isoformat(),
                 'message': f"{target_type.capitalize()} {target_name}: {metric} is {_val_display} (threshold: {operator} {threshold}{unit})",
             }
-            if _notification_handlers:
-                for handler in _notification_handlers:
-                    try:
-                        handler(alert_data)
-                    except Exception as he:
-                        logging.debug(f"Notification handler error: {he}")
-
-            webhook_status = 'no webhook channels selected'
-            if webhook_ids or fire_all_webhooks:
-                try:
-                    from pegaprox.utils.webhooks import send_to_channels
-                    send_to_channels(alert_data, channel_ids=None if fire_all_webhooks else webhook_ids)
-                    sent_anywhere = True
-                    webhook_status = f'dispatched to {webhook_ids or "all webhooks"}'
-                    logging.info(f"[AlertCheck]   alert {alert_id} webhooks → {webhook_status}")
-                except Exception as he:
-                    webhook_status = f'dispatch error: {he}'
-                    logging.warning(f"[AlertCheck]   alert {alert_id} webhooks → FAILED: {he}")
+            selected, sent_anywhere, email_status, webhook_status = dispatch_alert(
+                alert, alert_data, subject, body, html_body, recipients)
 
             # NS #501: persist this firing as an active incident (for ack + escalation)
             try:
@@ -765,6 +806,83 @@ def _emit_node_status_event(cluster_id, node, new_status, message, severity, rec
         logging.debug(f"[NodeWatch] webhook dispatch failed: {e}")
 
 
+def emit_rolling_update_reboot_event(cluster_id, node):
+    """Publish an informational alert when a rolling update reboots a node.
+
+    The update worker calls this only after it has successfully handed the reboot
+    command to the node.  Keeping the event here sends it through the same
+    notification-handler pipeline as regular alerts, which includes the alerts
+    menu/browser notification inbox, while preserving cluster access scoping.
+    """
+    rules = []
+    try:
+        for rule in load_alerts_config().get('alerts', []):
+            if (rule.get('enabled', True) and rule.get('metric') == 'rolling_update'
+                    and rule.get('cluster_id') == cluster_id):
+                # Cluster-wide alarms apply to every reboot. A node-targeted
+                # alarm applies only to its named node; other targets cannot
+                # describe a node reboot event.
+                if rule.get('target_type', 'cluster') == 'cluster' or (
+                        rule.get('target_type') == 'node' and str(rule.get('target_id')) == str(node)):
+                    rules.append(rule)
+    except Exception as e:
+        logging.debug(f"[RollingUpdate] could not load alarm rules: {e}")
+        return False
+
+    if not rules:
+        return False
+
+    for rule in rules:
+        alert_data = {
+            # NS Sep 2026 - named after the node, not after the rule: a six-node run
+            # otherwise sends six notifications with an identical subject and the node
+            # only in the body. _emit_node_status_event above does the same, and this
+            # is the same kind of thing - a node lifecycle event, not a threshold breach.
+            # The emitted metric is likewise the EVENT (`node_status` has its own), while
+            # the rule that selected it keeps `rolling_update`.
+            'alert_name': f"Node {node} rebooting for rolling update",
+            'metric': 'rolling_update_reboot',
+            'target_type': 'node',
+            'target_name': node,
+            'cluster_id': cluster_id,
+            'severity': rule.get('severity') if rule.get('severity') not in (None, 'auto') else 'info',
+            'current_value': 'rebooting',
+            'timestamp': datetime.now().isoformat(),
+            'message': f"Node {node} is rebooting as part of a rolling update on cluster {cluster_id}",
+        }
+        logging.info("[RollingUpdate] %s", alert_data['message'])
+        # NS Sep 2026 - the metric poll records this rule as skipped on every pass, so
+        # without this the diagnostics endpoint keeps reporting it as never evaluated
+        # even right after it fired, which is the first thing anybody looks at when a
+        # notification does not arrive.
+        _record_eval(rule.get('id', 'rolling_update'), fired=True, reason='rolling-update reboot',
+                     cluster_id=cluster_id, metric='rolling_update_reboot',
+                     target_type='node', target_id=node)
+
+        try:
+            _upsert_active_alert(
+                f"{rule.get('id', 'rolling_update')}:{cluster_id}:node:{node}:rolling_update",
+                rule.get('id', 'rolling_update'), alert_data, 1, 0, 'event', node)
+        except Exception as e:
+            logging.debug(f"[RollingUpdate] active alert persist failed: {e}")
+
+        for handler in list(_notification_handlers):
+            try:
+                handler(alert_data)
+            except Exception as e:
+                logging.debug(f"[RollingUpdate] notification handler failed: {e}")
+
+        selected = rule.get('channels') if isinstance(rule.get('channels'), list) else []
+        webhook_ids = [str(c) for c in selected if c not in ('email', 'log', '__all_webhooks__')]
+        if webhook_ids or '__all_webhooks__' in selected:
+            try:
+                from pegaprox.utils.webhooks import send_to_channels
+                send_to_channels(alert_data, channel_ids=None if '__all_webhooks__' in selected else webhook_ids)
+            except Exception as e:
+                logging.debug(f"[RollingUpdate] webhook dispatch failed: {e}")
+    return True
+
+
 _SESSION_CLEANUP_INTERVAL = 6 * 60 * 60   # every 6 hours
 _last_session_cleanup_at = 0.0
 
@@ -850,31 +968,46 @@ def process_alert_lifecycle():
     cur = db.conn.cursor()
     rows = cur.execute(
         """SELECT id, alert_key, alert_id, cluster_id, severity, message, target_name,
-                  triggered_at, last_fired_at, acked_at, escalation_step
+                  triggered_at, last_fired_at, acked_at, escalation_step,
+                  metric, target_type, target_id, threshold, operator, object_key
            FROM active_alerts WHERE resolved_at IS NULL""").fetchall()
     if not rows:
         return
     rules_by_id = None
+    mutes = None
+    resolved = []
     for r in rows:
         (aid, alert_key, rule_id, cluster_id, severity, message, target_name,
-         triggered_at, last_fired_at, acked_at, esc_step) = r
-        # 1) auto-resolve incidents that stopped re-firing
-        try:
-            lf = datetime.fromisoformat(last_fired_at) if last_fired_at else None
-        except Exception:
-            lf = None
-        if lf and (now - lf).total_seconds() > resolve_grace:
-            cur.execute("UPDATE active_alerts SET resolved_at=?, resolved_by='auto' WHERE id=?",
-                        (now.isoformat(), aid))
-            continue
-        # 2) escalate unacked incidents along their rule's chain
-        if acked_at:
-            continue
+         triggered_at, last_fired_at, acked_at, esc_step,
+         metric, target_type, target_id, threshold, operator, object_key) = tuple(r)
         if rules_by_id is None:
             try:
                 rules_by_id = {a.get('id'): a for a in (load_alerts_config().get('alerts', []) or [])}
             except Exception:
                 rules_by_id = {}
+        # 1) auto-resolve incidents that stopped re-firing. An event incident is the
+        # event rule's to close (alert_events.py): it does not fire again while it holds.
+        try:
+            lf = datetime.fromisoformat(last_fired_at) if last_fired_at else None
+        except Exception:
+            lf = None
+        if metric not in EVENT_METRICS and lf and (now - lf).total_seconds() > resolve_grace:
+            cur.execute("UPDATE active_alerts SET resolved_at=?, resolved_by='auto' WHERE id=?",
+                        (now.isoformat(), aid))
+            rule = rules_by_id.get(rule_id) or {}
+            if rule.get('notify_resolved'):
+                resolved.append((rule, cluster_id, metric, target_type, target_id, target_name,
+                                 threshold, operator))
+            continue
+        # 2) escalate unacked incidents along their rule's chain. A mute stops it like
+        # an ack does, for as long as it holds: muting a firing incident is how it is
+        # silenced from the alert list.
+        if acked_at:
+            continue
+        if mutes is None:
+            mutes = active_mutes()
+        if mute_for(mutes, cluster_id, rule_id or '', object_key or '', _metric_object(target_type, target_id)):
+            continue
         steps = (rules_by_id.get(rule_id) or {}).get('escalation') or []
         if not isinstance(steps, list) or not steps:
             continue
@@ -917,6 +1050,41 @@ def process_alert_lifecycle():
             cur.execute("UPDATE active_alerts SET escalation_step=?, last_escalated_at=? WHERE id=?",
                         (idx + 1, now.isoformat(), aid))
     db.conn.commit()
+    if resolved:
+        _send_metric_resolved(resolved)
+
+
+def _send_metric_resolved(items):
+    """The note a metric rule with notify_resolved gets once its incident went quiet.
+    A mute that holds the rule or its target back holds this back as well."""
+    settings = load_server_settings() or {}
+    recipients = settings.get('alert_email_recipients') or []
+    mutes = active_mutes()
+    for rule, cluster_id, metric, target_type, target_id, target_name, threshold, operator in items:
+        if mute_for(mutes, cluster_id, rule.get('id', ''), '', _metric_object(target_type, target_id)):
+            continue
+        unit = '°C' if metric == 'temperature' else '' if metric == 'hardware_health' else '%'
+        try:
+            limit = f"{float(threshold):g}"
+        except (TypeError, ValueError):
+            limit = str(threshold)
+        what = f"{(target_type or 'cluster').capitalize()} {target_name}"
+        message = f"{what}: {metric} is no longer {operator} {limit}{unit}"
+        name = f"Resolved: {rule.get('name') or metric}"
+        alert_data = {
+            'alert_name': name, 'metric': metric, 'operator': operator, 'threshold': threshold,
+            'current_value': 'resolved', 'target_type': target_type, 'target_name': target_name,
+            'cluster_id': cluster_id, 'severity': 'info', 'timestamp': datetime.now().isoformat(),
+            'message': message, 'event': 'resolved',
+        }
+        body = f"{message}\nCluster: {cluster_id}\nTime: {alert_data['timestamp']}\n"
+        html_body = (f"<h2 style=\"color: #16a34a;\">{html_lib.escape(name)}</h2>"
+                     f"<p>{html_lib.escape(message)}</p>"
+                     f"<p><b>Cluster:</b> {html_lib.escape(str(cluster_id))}</p>")
+        try:
+            dispatch_alert(rule, alert_data, f"[PegaProx] {name}", body, html_body, recipients)
+        except Exception as e:
+            logging.debug(f"[AlertCheck] resolved note for {rule.get('id')} failed: {e}")
 
 
 def alert_check_loop():
@@ -925,22 +1093,31 @@ def alert_check_loop():
     _alert_running = True
 
     while _alert_running:
-        try:
-            check_and_send_alerts()
-        except Exception as e:
-            logging.error(f"Alert check error: {e}")
-        try:
-            process_alert_lifecycle()  # NS #501: auto-resolve + escalation
-        except Exception as e:
-            logging.debug(f"Alert lifecycle error: {e}")
-        try:
-            check_node_status_transitions()
-        except Exception as e:
-            logging.debug(f"Node status watcher error: {e}")
-        try:
-            check_update_available_alert()
-        except Exception as e:
-            logging.debug(f"Update alert check error: {e}")
+        # MK Sep 2026 (#625) - a standby sends nothing, the active instance watches the
+        # same clusters and would otherwise mail every alert twice. The two cleanups
+        # below are about this host's own sessions and audit log, those keep running.
+        if ha.is_active():
+            try:
+                check_and_send_alerts()
+            except Exception as e:
+                logging.error(f"Alert check error: {e}")
+            try:
+                from pegaprox.background.alert_events import check_event_alerts
+                check_event_alerts()  # failed tasks, Ceph, replication, old snapshots
+            except Exception as e:
+                logging.error(f"Event alert check error: {e}")
+            try:
+                process_alert_lifecycle()  # NS #501: auto-resolve + escalation
+            except Exception as e:
+                logging.debug(f"Alert lifecycle error: {e}")
+            try:
+                check_node_status_transitions()
+            except Exception as e:
+                logging.debug(f"Node status watcher error: {e}")
+            try:
+                check_update_available_alert()
+            except Exception as e:
+                logging.debug(f"Update alert check error: {e}")
         try:
             _periodic_session_cleanup()
         except Exception as e:
@@ -959,6 +1136,3 @@ def start_alert_thread():
         _alert_thread = threading.Thread(target=alert_check_loop, daemon=True)
         _alert_thread.start()
         logging.info("Alert monitoring thread started")
-
-
-

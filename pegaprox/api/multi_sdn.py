@@ -39,6 +39,7 @@ from flask import Blueprint, jsonify, request
 
 from pegaprox.globals import cluster_managers
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.concurrent import run_per_node
@@ -1364,6 +1365,9 @@ def _msdn_scan_once():
                 if to_fix:
                     recreated = [cid for cid in to_fix if live[cid].get('status') == 'missing']
                     for cid in to_fix:
+                        # before it applies: not from a leader that lost its lease (#625)
+                        if not ha.confirm_step(f"reconciling vnet {rec.get('name')} on {cid}"):
+                            break
                         try:
                             _reconcile_on_cluster(cid, defn)
                         except Exception as e:
@@ -1425,7 +1429,9 @@ def _msdn_scan_once():
 def _msdn_scanner_loop():
     while _msdn_scanner_running:
         try:
-            _msdn_scan_once()
+            # a standby neither scans nor remediates; vnet status comes over with the sync
+            if ha.is_active():
+                _msdn_scan_once()
         except Exception as e:
             logging.warning(f"[multi_sdn] scanner iteration failed: {e}")
         # break the sleep into 1-sec chunks so shutdown is responsive (drift.py pattern)

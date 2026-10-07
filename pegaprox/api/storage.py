@@ -6,7 +6,7 @@ import json
 import time
 import logging
 from pegaprox.utils.sanitization import sanitize_log_message as _sl  # CWE-117 tainted-log sanitiser
-from pegaprox.utils.sanitization import redact_url
+from pegaprox.utils.sanitization import redact_url, redact_secrets
 import threading
 import uuid
 import hashlib
@@ -19,13 +19,14 @@ from pegaprox.constants import *
 from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db
+from pegaprox.core import ha
 
 from pegaprox.utils.auth import require_auth, load_users
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.rbac import user_can_access_vm
 from pegaprox.core.cache import APIRateLimiter, StorageDataCache
 from pegaprox.api.helpers import get_connected_manager, check_cluster_access, safe_error, parse_pve_error, scope_vm_rows, require_unconfined
-from pegaprox.utils.ssh import get_paramiko, _ssh_track_connection
+from pegaprox.utils.ssh import get_paramiko, _ssh_track_connection, ssh_password_for, ssh_blocked_for
 from pegaprox import globals as _g
 from pegaprox.utils.ssh import read_capped as _read_capped
 
@@ -119,6 +120,12 @@ def get_esxi_hosts(cluster_id):
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # MK Sep 2026 (audit) — the registered ESXi endpoints are infrastructure inventory:
+    # hostnames, storage ids, their connection state. Nothing here is per-object, so a
+    # caller confined to a pool or a single VM has no standing on it.
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -304,6 +311,13 @@ def get_esxi_vms(cluster_id, host_id):
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # MK Sep 2026 (audit) — this enumerates every guest on a foreign ESXi host. They are
+    # not PegaProx-managed VMs, so there is no ACL to consult and scope_vm_rows has
+    # nothing to match on; the honest gate is that a confined caller has no business
+    # reading another platform's inventory at all.
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -477,6 +491,22 @@ def save_storage_clusters():
 load_storage_clusters()
 
 
+def _bounded_worker_int(value, default, lo, hi):
+    """Clamp a value the shared auto-balance worker will later compare against.
+
+    MK Sep 2026 (audit) — max_concurrent and check_interval came straight off the request
+    body and were stored as given. The worker does `len(still_active) >= sc.get(
+    'max_concurrent', 1)` and `time.sleep(...)` on them, so a string or a negative from
+    one storage.config holder raised inside the shared background thread and took
+    auto-balance down for every cluster in the installation, not just theirs.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, n))
+
+
 @bp.route('/api/clusters/<cluster_id>/storage-clusters', methods=['GET'])
 @require_auth(perms=["storage.view"])
 def get_storage_clusters(cluster_id):
@@ -544,8 +574,8 @@ def create_storage_cluster(cluster_id):
             'threshold': threshold,
             'enabled': True,
             'auto_balance': data.get('auto_balance', False),
-            'max_concurrent': data.get('max_concurrent', 1),
-            'check_interval': data.get('check_interval', 3600),  # seconds
+            'max_concurrent': _bounded_worker_int(data.get('max_concurrent', 1), 1, 1, 32),
+            'check_interval': _bounded_worker_int(data.get('check_interval', 3600), 3600, 60, 86400),  # seconds
             'last_auto_run': None,
             'created': datetime.now().isoformat()
         }
@@ -612,9 +642,9 @@ def update_storage_cluster(cluster_id, sc_id):
                 if 'auto_balance' in data:
                     sc['auto_balance'] = data['auto_balance']
                 if 'max_concurrent' in data:
-                    sc['max_concurrent'] = data['max_concurrent']
+                    sc['max_concurrent'] = _bounded_worker_int(data['max_concurrent'], 1, 1, 32)
                 if 'check_interval' in data:
-                    sc['check_interval'] = data['check_interval']
+                    sc['check_interval'] = _bounded_worker_int(data['check_interval'], 3600, 60, 86400)
                 
                 storage_clusters_config[cluster_id]['clusters'][i] = sc
                 save_storage_clusters()
@@ -796,6 +826,15 @@ def get_storage_cluster_status(cluster_id, sc_id):
                 else:
                     all_vms = []
             
+            # NS Oct 2026 - the inventory is the whole cluster's; a caller confined to some of
+            # its guests gets recommendations, names and disks for those only, as on the
+            # other per-VM lists
+            from pegaprox.api.helpers import caller_is_scoped
+            from pegaprox.utils.auth import build_authz_user
+            if caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session),
+                                cluster_id):
+                all_vms = scope_vm_rows(cluster_id, all_vms)
+
             # NS: Process VMs in batches to avoid blocking too long
             # and to spread out API calls over time
             vms_checked = 0
@@ -886,7 +925,7 @@ def get_storage_cluster_status(cluster_id, sc_id):
         
         # Include rate limiter stats for monitoring
         rate_stats = _api_rate_limiter.get_stats(cluster_id)
-        cache_stats = _storage_cache.get_stats()
+        cache_stats = _storage_cache.get_stats(cluster_id)
         
         return jsonify({
             'id': sc_config['id'],
@@ -1031,17 +1070,34 @@ def get_storage_balancing_stats(cluster_id):
     rate_stats = _api_rate_limiter.get_stats(cluster_id)
     
     # Get cache stats
-    cache_stats = _storage_cache.get_stats()
+    cache_stats = _storage_cache.get_stats(cluster_id)
     
     # Get active migrations for this cluster
+    # MK Sep 2026 (audit) — every row here names a VM and one of its disks. The route is
+    # cluster-scoped, so a caller confined to a pool or a VM-ACL was reading which of
+    # somebody else's guests is being moved and off which disk. Same treatment as the
+    # other per-VM lists: unconfined callers keep the lot, confined ones see their own.
+    from pegaprox.api.helpers import caller_is_scoped as _cis
+    from pegaprox.utils.auth import build_authz_user as _bau
+    from pegaprox.utils.rbac import user_can_access_vm as _ucav
+    _caller = _bau(request.session.get('user', ''), request.session)
+    _confined = _cis(_caller, cluster_id)
+
     active_migrations = []
     with _migration_lock:
         for key, migrations in active_auto_migrations.items():
             if key.startswith(cluster_id + ':'):
                 for m in migrations:
+                    _vmid = m.get('vmid')
+                    if _confined:
+                        try:
+                            if not _ucav(_caller, cluster_id, int(_vmid), 'vm.view'):
+                                continue
+                        except (TypeError, ValueError):
+                            continue          # unparseable vmid -> not ours to show
                     active_migrations.append({
                         'storage_cluster': key.split(':')[1],
-                        'vmid': m.get('vmid'),
+                        'vmid': _vmid,
                         'disk': m.get('disk'),
                         'started': m.get('started'),
                         'active': m.get('active', False)
@@ -1084,6 +1140,10 @@ def run_auto_storage_balance():
     while True:
         try:
             time.sleep(60)  # Check every minute
+
+            # a standby moves no disks, the active instance balances
+            if not ha.is_active():
+                continue
             
             # Get a snapshot of config
             with _storage_config_lock:
@@ -1382,7 +1442,10 @@ def run_auto_storage_balance():
                                         'storage': target_storage,
                                         'delete': 1
                                     }
-                                    
+
+                                    # it deletes the source: not from a leader that lost its lease (#625)
+                                    if not ha.confirm_step(f'moving {key} of {vmid} to {target_storage}'):
+                                        break
                                     move_response = manager._create_session().post(move_url, data=move_data, timeout=10)
                                     
                                     if move_response.status_code == 200:
@@ -1445,7 +1508,12 @@ auto_balance_thread.start()
 
 
 @bp.route('/api/clusters/<cluster_id>/datacenter/storage', methods=['POST'])
-@require_auth(perms=['storage.config'])
+# MK Sep 2026 (audit) — adding storage is storage.create, not storage.config. The
+# permission has existed since the RBAC work and was enforced on no route at all, so
+# the distinction our own role templates draw was fiction: 'storage_admin' lists
+# storage.create, the tenant-admin template deliberately does not, and both could add
+# storage anyway. Same shape as node.reboot, which was also defined and never asked for.
+@require_auth(perms=['storage.create'])
 def create_storage(cluster_id):
     """create new storage on proxmox - NS Dec 2025"""
     ok, err = check_cluster_access(cluster_id)
@@ -1469,6 +1537,16 @@ def create_storage(cluster_id):
         
         if not storage_type:
             return jsonify({'error': 'Storage type is required'}), 400
+        # MK Sep 2026 (audit) — the dedicated ESXi route requires cluster.admin because
+        # registering a foreign hypervisor is a cluster-level act. This generic route
+        # reaches the same PVE endpoint with type='esxi' and asked for far less, so it
+        # was the cheaper way to do the same thing. Ask the same question here.
+        if str(storage_type).lower() == 'esxi':
+            from pegaprox.utils.auth import build_authz_user as _bau
+            from pegaprox.utils.rbac import has_permission as _has
+            _caller = _bau(request.session.get('user', ''), request.session)
+            if not _has(_caller, 'cluster.admin'):
+                return jsonify({'error': 'Registering an ESXi target requires cluster.admin'}), 403
         if not storage_id:
             return jsonify({'error': 'Storage ID is required'}), 400
         
@@ -1518,7 +1596,10 @@ def create_storage(cluster_id):
         pve_data['type'] = storage_type
         
         logging.info(f"Creating storage {storage_id} of type {storage_type}")
-        logging.debug(f"Storage data: {pve_data}")
+        # MK Sep 2026 (audit) — pve_data is a verbatim copy of the request body, and for a
+        # pbs/cifs target that includes `password` (pbs even requires it, see required_fields
+        # above). This line wrote it to the log in the clear at DEBUG.
+        logging.debug(f"Storage data: {redact_secrets(pve_data)}")
         
         # NS May 2026 — bumped to 60s. PVE blocks the create call while it
         # verifies remote target (especially PBS — it pulls the cert + auths
@@ -1797,12 +1878,20 @@ def rescan_storage(cluster_id, storage_id):
             return jsonify({'error': 'No online nodes available for rescan'}), 400
         
         results = []
-        paramiko = get_paramiko() if deep_scan else None
+        # MK Oct 2026 (#941) - the deep scan logs in to every node with the stored key; with
+        # SSH switched off it stays out, and the API rescan below still runs
+        ssh_block = ssh_blocked_for(manager) if deep_scan else None
+        paramiko = get_paramiko() if deep_scan and not ssh_block else None
         
         for node in nodes:
             node_result = {'node': node, 'actions': [], 'success': True}
             
             try:
+                if ssh_block:
+                    node_result['actions'].append({
+                        'action': 'deep_scan', 'status': 'skipped', 'code': ssh_block,
+                        'error': 'SSH is not available for this cluster',
+                    })
                 # Deep scan using SSH for more thorough rescan
                 if deep_scan and paramiko:
                     ssh_acquired = False
@@ -1822,15 +1911,16 @@ def rescan_storage(cluster_id, storage_id):
                             ssh_user = manager.config.ssh_user if hasattr(manager.config, 'ssh_user') and manager.config.ssh_user else 'root'
                             ssh_port = getattr(manager.config, 'ssh_port', 22) or 22
                             ssh_key = getattr(manager.config, 'ssh_key', '')
-                            ssh_pass = manager.config.pass_ if hasattr(manager.config, 'pass_') else None
+                            # None rather than '' so paramiko offers no password at all
+                            ssh_pass = ssh_password_for(manager.config) or None
                             
                             # Determine node hostname
                             node_host = host if node == nodes[0] else f"{node}.{host.split('.', 1)[1] if '.' in host else host}"
                             
                             # Try to connect via SSH
-                            from pegaprox.utils.ssh_security import apply_host_key_policy, persist_host_keys
-                            ssh = paramiko.SSHClient()
-                            apply_host_key_policy(ssh, paramiko)
+                            # its commands ask the transport guard of an automatic group (#625)
+                            from pegaprox.utils.ssh_security import secure_ssh_client, persist_host_keys
+                            ssh = secure_ssh_client(paramiko)
 
                             connect_kwargs = {
                                 'hostname': node_host,
@@ -2234,6 +2324,11 @@ def download_template(cluster_id):
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # NS Oct 2026 - a template lands on a storage of the whole cluster, like an ISO upload
+    # (vms.py upload_to_datastore): not for a caller confined to some guests here (#1109)
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -2393,6 +2488,9 @@ def download_from_url(cluster_id, node, storage):
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)   # same as the template download above (#1109)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error:
@@ -2750,6 +2848,12 @@ def iso_sync_status(cluster_id):
 def iso_sync_trigger(cluster_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # MK Sep 2026 (audit) — copying content between every node of the cluster is a
+    # whole-cluster action with no per-object notion. storage.upload plus cluster reach
+    # let a pool-/ACL-scoped caller start it through the #248/#555 fallbacks.
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     mgr = cluster_managers[cluster_id]
@@ -2788,7 +2892,9 @@ def iso_sync_trigger(cluster_id):
         results = mgr.sync_content_to_nodes(source, storage, filename, content_type, targets)
         logging.info(f"[SYNC] {filename}: {sum(1 for r in results if r.get('success'))} ok, {sum(1 for r in results if not r.get('success'))} failed")
 
-    threading.Thread(target=_do_sync, daemon=True, name=f'iso-sync-{filename}').start()
+    # a user job: in an automatic group each copy asks for the lease (#625)
+    threading.Thread(target=ha.as_job(_do_sync, f'ISO sync of {filename}'), daemon=True,
+                     name=f'iso-sync-{filename}').start()
     return jsonify({'success': True, 'message': f'Sync started for {filename}'})
 
 
@@ -2797,6 +2903,9 @@ def iso_sync_trigger(cluster_id):
 def iso_sync_all(cluster_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    _cerr = require_unconfined(cluster_id)   # same as the single-file sync above
+    if _cerr:
+        return _cerr
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     mgr = cluster_managers[cluster_id]
@@ -2820,7 +2929,7 @@ def iso_sync_all(cluster_id):
             synced += sum(1 for r in results if r.get('success'))
         logging.info(f"[SYNC] Sync-all done: {synced} files distributed")
 
-    threading.Thread(target=_do_sync_all, daemon=True, name='iso-sync-all').start()
+    threading.Thread(target=ha.as_job(_do_sync_all, 'ISO sync'), daemon=True, name='iso-sync-all').start()
     return jsonify({'success': True, 'message': 'Full sync started'})
 
 

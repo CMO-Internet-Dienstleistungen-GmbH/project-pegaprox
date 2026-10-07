@@ -165,6 +165,17 @@ def download_static_files():
 
 
 if __name__ == '__main__':
+    # MK Oct 2026 (#625) - the witness of an automatic group: same package, a process of
+    # its own that never starts the app (the Docker image runs it as the command `witness`)
+    if len(sys.argv) > 1 and sys.argv[1] == 'witness':
+        # through witness_boot: the newer of this tree and the updates the witness fetched
+        # from its leader into its state directory (the Docker volume) runs
+        from pegaprox.witness_boot import main as _witness_boot
+        _in_image = os.path.exists('/.dockerenv') or os.path.exists('/run/.containerenv')
+        sys.exit(_witness_boot(sys.argv[2:], base=os.path.dirname(os.path.abspath(__file__)),
+                               install=os.environ.get('PEGAPROX_WITNESS_INSTALL')
+                               or ('docker' if _in_image else 'manual'),
+                               again=[sys.executable, os.path.abspath(__file__), 'witness']))
     if '--requirements' in sys.argv:
         print_system_requirements()
     elif '--download-static' in sys.argv:
@@ -210,6 +221,7 @@ Options:
   --print-key       print the resolved master key (base64) to stdout
   --keystore-status JSON dump of key-source + DB-backend status
   --help, -h        this message
+  witness ...       the witness of an automatic group instead (witness --help)
 
 Env vars:
   PEGAPROX_DB_KEY            master key (urlsafe-base64 or hex)

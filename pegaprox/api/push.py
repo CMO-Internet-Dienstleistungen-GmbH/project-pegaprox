@@ -158,6 +158,21 @@ def _load_vapid():
     return kp
 
 
+def _synced_vapid_public():
+    """The public key as the active stored it, or None. Reads only: no keypair is
+    made, migrated or re-encrypted, and the private half is not even decrypted."""
+    try:
+        c = get_db().conn.cursor()
+        c.execute('SELECT value FROM server_settings WHERE key = ?', (_VAPID_KEY_NAME,))
+        r = c.fetchone()
+        stored = json.loads(r['value']) if r and r['value'] else {}
+    except Exception as e:
+        logging.warning(f"[push] vapid read failed: {e}")
+        return None
+    pub = stored.get('public_b64') if isinstance(stored, dict) else None
+    return pub if isinstance(pub, str) and pub else None
+
+
 def _vapid_jwt(audience: str) -> str:
     """Sign a VAPID JWT for one push-service origin. ES256."""
     kp = _load_vapid()
@@ -408,6 +423,17 @@ def register_alert_handler():
 @bp.route('/api/push/vapid-key', methods=['GET'])
 @require_auth()
 def vapid_key():
+    # MK Sep 2026 (#625) - the keypair is shared configuration in server_settings. A
+    # standby that generated or rewrote one here would hand out its own public key, and
+    # keep that row apart from the active's until the active changed something itself.
+    from pegaprox.core import ha
+    if ha.is_standby():
+        pub = _synced_vapid_public()
+        if not pub:
+            return jsonify({'error': 'Push notifications are not available on a standby until '
+                                     'the active instance has set them up',
+                            'code': 'HA_STANDBY'}), 409
+        return jsonify({'public_key': pub})
     kp = _load_vapid()
     return jsonify({'public_key': kp['public_b64']})
 
