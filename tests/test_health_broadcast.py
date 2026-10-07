@@ -29,6 +29,14 @@ def _isolated(monkeypatch):
     invalidate_cluster_health()
 
 
+def _forget_storage_read():
+    """The storage read under the rollup is shared per cluster for a while (#946); these
+    tests count how often the rollup reaches the manager, so each starts without it."""
+    import pegaprox.api.clusters as clusters_mod
+    from pegaprox.core.cache import StorageDataCache
+    clusters_mod._health_storage_cache = StorageDataCache()
+
+
 def _register(cluster_id='cluster_1', requested=True, **overrides):
     kw = dict(
         get_node_status={'pve1': {'status': 'online'}},
@@ -36,7 +44,7 @@ def _register(cluster_id='cluster_1', requested=True, **overrides):
         get_replication_status=[],
     )
     kw.update(overrides)
-    mgr = make_fake_manager(cluster_id, **kw)
+    mgr = make_fake_manager(cluster_id, cluster_type='xcpng', **kw)
     mgr.is_connected = True
     ppglobals.cluster_managers[cluster_id] = mgr
     if requested:
@@ -44,6 +52,7 @@ def _register(cluster_id='cluster_1', requested=True, **overrides):
         # into the cache. The loop only keeps warm what someone asked for.
         get_cluster_health(cluster_id, mgr)
         mgr.get_storage_list.reset_mock()
+        _forget_storage_read()
     return mgr
 
 

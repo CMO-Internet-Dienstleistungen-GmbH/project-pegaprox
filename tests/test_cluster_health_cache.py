@@ -31,7 +31,7 @@ def _healthy_manager(api, cluster_id='cluster_1', nodes=('pve1', 'pve2', 'pve3')
     node_status = {n: {'status': 'online'} for n in nodes}
     storages = [{'storage': 'local', 'active': 1, 'total': 100, 'used': 10}]
     mgr = api.make_fake_manager(
-        cluster_id,
+        cluster_id, cluster_type='xcpng',
         get_node_status=node_status,
         get_storage_list=storages,
         get_replication_status=[],
@@ -126,7 +126,11 @@ def test_expired_entry_is_recomputed(api, seed):
     get_cluster_health('cluster_1', mgr)
     calls = mgr.get_storage_list.call_count
 
-    # max_age=0 means "nothing cached is good enough"
+    # max_age=0 means "nothing cached is good enough" - and the shared storage read (#946)
+    # is one more cache between the rollup and the manager
+    import pegaprox.api.clusters as clusters_mod
+    from pegaprox.core.cache import StorageDataCache
+    clusters_mod._health_storage_cache = StorageDataCache()
     get_cluster_health('cluster_1', mgr, max_age=0)
     assert mgr.get_storage_list.call_count > calls
 
@@ -152,7 +156,7 @@ def test_offline_node_lowers_the_score(api):
     # offline needs BOTH keys — status alone would still be counted as online.
     # That is upstream's condition, carried over unchanged by the extraction.
     mgr = api.make_fake_manager(
-        'cluster_1',
+        'cluster_1', cluster_type='xcpng',
         get_node_status={'pve1': {'status': 'online'},
                          'pve2': {'status': 'offline', 'offline': True}},
         get_storage_list=[],
@@ -205,7 +209,7 @@ def test_a_request_between_two_refreshes_is_served_from_cache(api, seed):
         return [{'storage': 'local', 'active': 1, 'total': 100, 'used': 10}]
 
     mgr = api.make_fake_manager(
-        'cluster_1',
+        'cluster_1', cluster_type='xcpng',
         get_node_status={'pve1': {'status': 'online'}},
         get_replication_status=[],
     )
