@@ -1,7 +1,6 @@
 #!/bin/bash
 set -e
 
-#DEBHELPER#
 if [ "$1" = "configure" ]; then
 
     if ! id "pegaprox" &>/dev/null; then
@@ -27,3 +26,7 @@ if [ "$1" = "configure" ]; then
     systemctl restart pegaprox.service || true
 
 fi
+
+# The debhelper part enables and starts the unit, so it goes after the user and the
+# state directory exist. Ahead of them every first start failed with 217/USER (#1129).
+#DEBHELPER#

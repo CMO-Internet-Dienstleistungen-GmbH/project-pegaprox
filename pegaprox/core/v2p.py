@@ -2450,10 +2450,7 @@ def _inject_virtio_drivers(pve_mgr, task):
         task.log("[VirtIO] ✗ Could not resolve boot disk path")
         return False
     # Detect storage type so the script knows which exposure path to take
-    rc_st, st_out, _ = _pve_node_exec(pve_mgr, node,
-        f"pvesm status --storage {shlex.quote(task.target_storage)} 2>/dev/null | tail -n +2 | awk '{{print $2}}'",
-        timeout=10)
-    storage_type = (str(st_out or '').strip().splitlines() or [''])[0].strip().lower()
+    storage_type = _pve_storage_type(pve_mgr, node, task.target_storage)
     task.log(f"[VirtIO] Target storage type: {storage_type or 'unknown'} ({vol_path})")
 
     drivers_arg = ' '.join(_VIRTIO_DRIVERS)
@@ -3974,6 +3971,23 @@ def _unmap_v2p_rbd_devices(pve_mgr, node, task):
     task._mapped_rbd_devs = []
 
 
+def _pve_storage_type(pve_mgr, node, storage):
+    """The type column of `pvesm status` for one storage (lvmthin, dir, zfspool, rbd, ...),
+    '' when it cannot be read.
+
+    MK Oct 2026 - pvesm prints plugin and volume group warnings on stdout ahead of its
+    header on some nodes ("unsupported storage of vg ..."), so neither "the line after the
+    header" nor "the second word" is the storage's type. The row is the one that names
+    the storage in its first column."""
+    _rc, out, _ = _pve_node_exec(pve_mgr, node,
+        f"pvesm status --storage {shlex.quote(str(storage))} 2>/dev/null", timeout=10)
+    for line in str(out or '').splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == storage:
+            return parts[1].lower()
+    return ''
+
+
 def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errbuf=None, mapped_rbd=None):
     """Robustly allocate a disk via pvesm alloc.
 
@@ -3993,16 +4007,11 @@ def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errb
     size_kb = max(1024, int(size_bytes / 1024))
     
     # Detect storage type first
-    storage_type = 'unknown'
     try:
-        rc_st, out_st, _ = _pve_node_exec(pve_mgr, node,
-            f"pvesm status --storage {storage} 2>&1 | grep -v '^Name'", timeout=10)
-        st_parts = str(out_st or '').split()
-        if len(st_parts) >= 2:
-            storage_type = st_parts[1].lower()  # lvmthin, dir, zfspool, rbd, etc.
-    except:
-        pass
-    
+        storage_type = _pve_storage_type(pve_mgr, node, storage) or 'unknown'
+    except Exception:
+        storage_type = 'unknown'
+
     # Build filename based on storage type
     if storage_type in ('dir', 'nfs', 'cifs', 'glusterfs', 'pbs'):
         # File-based storage needs extension

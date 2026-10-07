@@ -43,6 +43,23 @@ bp = Blueprint('realtime', __name__)
 sock = Sock()
 
 
+_MAX_SUBSCRIBED_CLUSTERS = 1000
+
+
+def _cluster_id_list(value):
+    """A client's requested cluster list as sent in the body: None, or a list of cluster id
+    strings. Anything else (nested objects, a bare string, numbers) comes back as False so the
+    caller can reject it. The value lands in the registry the broadcaster aggregates with
+    set.update(), so one unhashable entry would stall live updates for every client."""
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) > _MAX_SUBSCRIBED_CLUSTERS:
+        return False
+    if not all(isinstance(c, str) and 0 < len(c) <= 128 for c in value):
+        return False
+    return value
+
+
 def _scope_ws_clusters(allowed, requested):
     """NS Aug 2026 (audit) — clamp a WebSocket client's cluster subscription to what RBAC permits.
     `allowed` is get_user_clusters(user) — None means admin (no restriction). A scoped user that
@@ -163,9 +180,12 @@ def ws_live_updates(ws):
                 elif msg_type == 'pong':
                     pass
                 elif msg_type == 'subscribe':
+                    _req = _cluster_id_list(data.get('clusters'))
+                    if _req is False:
+                        continue  # malformed list, keep the current subscription
                     with ws_clients_lock:
                         if client_id in ws_clients:
-                            ws_clients[client_id]['clusters'] = _scope_ws_clusters(_allowed, data.get('clusters'))
+                            ws_clients[client_id]['clusters'] = _scope_ws_clusters(_allowed, _req)
 
             except Exception as e:
                 err_str = str(e).lower()
@@ -734,10 +754,12 @@ def update_sse_subscription():
     """
     data = request.json or {}
     client_id = data.get('client_id')
-    requested = data.get('clusters')  # list of cluster IDs or None for all
+    requested = _cluster_id_list(data.get('clusters'))  # list of cluster IDs or None for all
 
-    if not client_id:
+    if not client_id or not isinstance(client_id, str):
         return jsonify({'error': 'client_id required'}), 400
+    if requested is False:
+        return jsonify({'error': 'clusters must be a list of cluster ids'}), 400
 
     username = request.session.get('user', 'unknown')
 

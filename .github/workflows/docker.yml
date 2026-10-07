@@ -69,13 +69,15 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
+      # NS Oct 2026 - amd64 and arm64 go out first, under every tag. arm/v7 compiles about
+      # a dozen packages under emulation (50+ minutes) and used to hold the whole release
+      # image back, so it is built after this and added to the tags below.
       - name: Build and push
+        id: main
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: .
-          # NS Oct 2026 - arm/v7 for 32-bit ARM hosts (a Raspberry Pi witness); it compiles
-          # the packages that have no armv7 wheel, which is fine for a tag build
-          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -84,3 +86,34 @@ jobs:
           # openssl/libssl3 (Aikido CVE-2026-45447/7383 et al). Build is
           # tag-triggered, so the full-rebuild cost is fine.
           no-cache: true
+
+      # arm/v7 for 32-bit ARM hosts (a Raspberry Pi witness), pushed by digest only
+      - name: Build and push arm/v7
+        id: armv7
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
+        with:
+          context: .
+          platforms: linux/arm/v7
+          outputs: type=image,name=ghcr.io/pegaprox/pegaprox,push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ steps.meta.outputs.labels }}
+          no-cache: true
+
+      # A tag gets arm/v7 only while it still points at what this run pushed above, so a
+      # slow run cannot take back a latest that a newer release has moved on.
+      - name: Add arm/v7 to the tags
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          BASE: ${{ steps.main.outputs.digest }}
+          ARM: ${{ steps.armv7.outputs.digest }}
+        run: |
+          set -euo pipefail
+          img=ghcr.io/pegaprox/pegaprox
+          for tag in $TAGS; do
+            now=$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -r .digest)
+            if [ "$now" != "$BASE" ]; then
+              echo "$tag now points at $now, not at this run's $BASE - left as it is"
+              continue
+            fi
+            docker buildx imagetools create -t "$tag" "$img@$BASE" "$img@$ARM"
+            echo "$tag: amd64, arm64 and arm/v7"
+          done

@@ -816,11 +816,13 @@ jobs:
       - name: Smoke-Test (VM booten + First-Boot-Install + HTTP-Check)
         run: |
           set -e
+          # NS Oct 2026 (#1129) - this boot runs on the image we ship, so everything it
+          # leaves behind goes out to every user. The seed used to set a password for the
+          # cloud-init default user: every appliance had debian/pegaprox with passwordless
+          # sudo and SSH password logins on. No default user, no password, from now on.
           cat > user-data <<'EOF'
           #cloud-config
-          password: pegaprox
-          chpasswd: { expire: false }
-          ssh_pwauth: true
+          users: []
           EOF
           echo "instance-id: iid-pegaprox" > meta-data
           cloud-localds seed.iso user-data meta-data
@@ -832,6 +834,7 @@ jobs:
               -drive file=seed.iso,format=raw,if=virtio \
               -netdev user,id=n0,hostfwd=tcp::${PVE_PORT}-:${PVE_PORT} \
               -device virtio-net-pci,netdev=n0 \
+              -monitor unix:qemu-mon.sock,server,nowait \
               -display none -daemonize -pidfile qemu.pid
           else
             qemu-system-aarch64 \
@@ -841,6 +844,7 @@ jobs:
               -drive file=seed.iso,format=raw,if=virtio \
               -netdev user,id=n0,hostfwd=tcp::${PVE_PORT}-:${PVE_PORT} \
               -device virtio-net-device,netdev=n0 \
+              -monitor unix:qemu-mon.sock,server,nowait \
               -display none -daemonize -pidfile qemu.pid
           fi
 
@@ -853,9 +857,88 @@ jobs:
             fi
             sleep 10
           done
-          sudo kill "$(cat qemu.pid)" 2>/dev/null || true
+
+          # Shut the guest down, do not kill it. A kill right after the first start left
+          # the freshly generated TLS pair at 0 bytes in the image (#1129).
+          QPID="$(cat qemu.pid)"
+          python3 -c "import socket; s=socket.socket(socket.AF_UNIX); s.connect('qemu-mon.sock'); s.sendall(b'system_powerdown\n')" || true
+          for i in $(seq 1 60); do kill -0 "$QPID" 2>/dev/null || break; sleep 5; done
+          if kill -0 "$QPID" 2>/dev/null; then
+            kill "$QPID" 2>/dev/null || true
+            echo "::error::Die VM hat sich nicht sauber heruntergefahren - das Image wird so nicht ausgeliefert"
+            exit 1
+          fi
           [ "$OK" -eq 1 ] || { echo "::error::PegaProx kam in der VM nicht hoch"; exit 1; }
           echo "VM Smoke-Test erfolgreich."
+
+      - name: Zustand des Testboots aus dem Image entfernen
+        run: |
+          set -e
+          # NS Oct 2026 (#1129) - the smoke boot installed PegaProx and that stays, but
+          # nothing that belongs to one machine may ship: PegaProx's database, its
+          # encryption keys and TLS pair, SSH host keys, the machine id and cloud-init's
+          # record of the test instance were all identical on every appliance.
+          sudo qemu-nbd --connect=/dev/nbd0 pegaprox.qcow2
+          for i in $(seq 1 10); do
+            sudo partprobe /dev/nbd0 2>/dev/null || true
+            sleep 1
+            ls /dev/nbd0p* >/dev/null 2>&1 && break
+          done
+          ROOT=""
+          for PART in $(ls /dev/nbd0p* 2>/dev/null); do
+            sudo mkdir -p /mnt/probe
+            if sudo mount "$PART" /mnt/probe 2>/dev/null; then
+              if [ -f /mnt/probe/etc/os-release ]; then ROOT="$PART"; sudo umount /mnt/probe; break; fi
+              sudo umount /mnt/probe
+            fi
+          done
+          [ -n "$ROOT" ] || { echo "::error::Root-Partition nicht gefunden"; exit 1; }
+          sudo mkdir -p /mnt/img
+          sudo mount "$ROOT" /mnt/img
+          R=/mnt/img
+
+          # PegaProx state: a fresh database, keys and TLS pair on the user's first start
+          sudo find "$R/var/lib/pegaprox" -mindepth 1 -delete
+          # the installer ran in the smoke boot; it must not run again on the user's machine
+          sudo rm -f "$R/usr/local/sbin/install-pegaprox.sh" \
+                     "$R/etc/systemd/system/pegaprox-firstboot.service" \
+                     "$R/etc/systemd/system/multi-user.target.wants/pegaprox-firstboot.service"
+          # SSH host keys: generated on first boot instead (cloud-init does not run there)
+          sudo rm -f "$R"/etc/ssh/ssh_host_*
+          sudo tee "$R/etc/systemd/system/pegaprox-ssh-hostkeys.service" >/dev/null <<'UNIT'
+          [Unit]
+          Description=Generate SSH host keys on first boot (PegaProx appliance)
+          Before=ssh.service
+          ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/ssh-keygen -A
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          sudo sed -i 's/^[[:space:]]*//' "$R/etc/systemd/system/pegaprox-ssh-hostkeys.service"
+          sudo ln -sf /etc/systemd/system/pegaprox-ssh-hostkeys.service \
+            "$R/etc/systemd/system/multi-user.target.wants/pegaprox-ssh-hostkeys.service"
+          # machine id, cloud-init record and the journal of the test boot
+          sudo truncate -s 0 "$R/etc/machine-id"
+          [ -L "$R/var/lib/dbus/machine-id" ] || sudo rm -f "$R/var/lib/dbus/machine-id"
+          sudo sh -c "rm -rf $R/var/lib/cloud/* $R/var/log/cloud-init*.log"
+          sudo find "$R/var/log/journal" -mindepth 1 -delete 2>/dev/null || true
+
+          # refuse to ship if any of it is back
+          FAIL=0
+          if grep -q '^debian:' "$R/etc/passwd"; then echo "::error::cloud-init default user is in the image"; FAIL=1; fi
+          if [ -n "$(sudo ls -A "$R/var/lib/pegaprox")" ]; then echo "::error::/var/lib/pegaprox is not empty"; FAIL=1; fi
+          if ls "$R"/etc/ssh/ssh_host_* >/dev/null 2>&1; then echo "::error::SSH host keys are in the image"; FAIL=1; fi
+          if [ -s "$R/etc/machine-id" ]; then echo "::error::machine-id is set"; FAIL=1; fi
+
+          sudo sync
+          sudo umount /mnt/img
+          sudo qemu-nbd --disconnect /dev/nbd0
+          [ "$FAIL" -eq 0 ] || exit 1
+          echo "Image bereinigt."
 
       - name: Image komprimieren + umbenennen
         run: |
@@ -876,7 +959,10 @@ jobs:
   # ----------------------------------------------------------------------
   publish:
     needs: [prepare, build-lxc, build-vm]
-    if: ${{ always() && needs.build-lxc.result == 'success' && needs.build-vm.result == 'success' }}
+    # NS Oct 2026 - a dispatch without a tag builds dev-YYYYMMDD-HHMMSS, and this job used
+    # to attach that to a release of the same name, creating a public dev release and tag.
+    # Dev builds stop at the artifacts.
+    if: ${{ always() && needs.prepare.outputs.is_release == 'true' && needs.build-lxc.result == 'success' && needs.build-vm.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
