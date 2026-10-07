@@ -160,6 +160,7 @@
     "pegaprox/utils/ssh.py",
     "pegaprox/utils/ssh_pool.py",
     "pegaprox/utils/ssh_security.py",
+    "pegaprox/utils/ssl_errqueue.py",
     "pegaprox/utils/url_security.py",
     "pegaprox/utils/vnc_crypto.py",
     "pegaprox/utils/vnc_grab.py",
