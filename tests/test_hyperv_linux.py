@@ -268,9 +268,11 @@ class TestTheGuestAgentIsNotConfinedBySelinux:
         record = tmp_path / 'semodule.calls'
         _stub(tmp_path, 'semodule',
               f'echo "$@" >> {record}; cat "$2" >> {record}; exit {semodule_exit}\n')
+        # /tmp/ first: tmp_path itself lies under /tmp on Linux, so replacing it after the
+        # config path would rewrite the config path a second time and point it nowhere.
         command = (linux.GUEST_AGENT_SELINUX
-                   .replace('/etc/selinux/config', str(root / 'etc/selinux/config'))
-                   .replace('/tmp/', f'{root}/tmp/'))
+                   .replace('/tmp/', f'{root}/tmp/')
+                   .replace('/etc/selinux/config', str(root / 'etc/selinux/config')))
         done = subprocess.run(['bash', '-c', command], capture_output=True, text=True,
                               env={**os.environ, 'PATH': f'{tmp_path}:{os.environ["PATH"]}'})
         calls = record.read_text() if record.exists() else ''
