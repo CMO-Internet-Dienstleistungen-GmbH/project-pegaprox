@@ -5027,9 +5027,11 @@ const sponsorLinks={1:'https://socialfurr.com',2:'https://www.netwolk.ch',3:'htt
 return/*#__PURE__*/React.createElement("a",{href:"mailto:sponsor@pegaprox.com?subject=Sponsorship%20Inquiry",className:"group",title:t('becomeSponsor')||'Become a sponsor'},/*#__PURE__*/React.createElement("div",{className:"w-12 h-12 rounded-lg bg-proxmox-card border border-dashed border-proxmox-border flex flex-col items-center justify-center hover:border-proxmox-orange/50 transition-all hover:scale-105"},/*#__PURE__*/React.createElement("span",{className:"text-sm"},"\uD83C\uDFAF")));}const content=/*#__PURE__*/React.createElement("div",{className:"w-12 h-12 rounded-lg bg-proxmox-card border border-proxmox-border p-1 flex items-center justify-center hover:border-proxmox-orange/50 transition-all hover:scale-105 overflow-hidden"},/*#__PURE__*/React.createElement("img",{src:imageSrc,alt:`Sponsor ${num}`,className:"w-full h-full object-contain opacity-80 group-hover:opacity-100 transition-opacity",onError:handleImageError}));if(url){return/*#__PURE__*/React.createElement("a",{href:url,target:"_blank",rel:"noopener noreferrer",className:"group"},content);}return/*#__PURE__*/React.createElement("div",{className:"group"},content);}// Notification Toast
 // LW: Simple toast - auto-closes after 3s
 // tried 5s but users complained it was too long
-function Toast({message,type='success',onClose}){useEffect(()=>{const timer=setTimeout(onClose,3000);// 3000ms = 3s
-return()=>clearTimeout(timer);},[onClose]);// NS: ternary hell but it works lol
-return/*#__PURE__*/React.createElement("div",{className:`toast-enter flex items-center gap-3 px-4 py-3 rounded-lg border ${type==='success'?'bg-green-500/10 border-green-500/30 text-green-400':type==='error'?'bg-red-500/10 border-red-500/30 text-red-400':'bg-proxmox-orange/10 border-proxmox-orange/30 text-proxmox-orange'}`},type==='success'?/*#__PURE__*/React.createElement(Icons.Check,null):type==='error'?/*#__PURE__*/React.createElement(Icons.X,null):/*#__PURE__*/React.createElement(Icons.Activity,null),/*#__PURE__*/React.createElement("span",{className:"text-sm font-medium"},message));}// Node Alert Banner - shows critical alerts when nodes go offline
+function Toast({title,message,type='success',onClose}){// An error waits for a person. Three seconds is long enough to notice that
+// something went wrong and far too short to read why — and why is the only
+// part worth showing. Everything else still clears itself.
+useEffect(()=>{if(type==='error')return;const timer=setTimeout(onClose,5000);return()=>clearTimeout(timer);},[onClose,type]);// NS: ternary hell but it works lol
+return/*#__PURE__*/React.createElement("div",{className:`toast-enter flex items-start gap-3 px-4 py-3 rounded-lg border max-w-md ${type==='success'?'bg-green-500/10 border-green-500/30 text-green-400':type==='error'?'bg-red-500/10 border-red-500/30 text-red-400':'bg-proxmox-orange/10 border-proxmox-orange/30 text-proxmox-orange'}`},/*#__PURE__*/React.createElement("span",{className:"shrink-0 mt-0.5"},type==='success'?/*#__PURE__*/React.createElement(Icons.Check,null):type==='error'?/*#__PURE__*/React.createElement(Icons.X,null):/*#__PURE__*/React.createElement(Icons.Activity,null)),/*#__PURE__*/React.createElement("span",{className:"text-sm min-w-0"},title&&/*#__PURE__*/React.createElement("span",{className:"font-medium block"},title),/*#__PURE__*/React.createElement("span",{className:`block break-all${title?' opacity-90':' font-medium'}`},message)),/*#__PURE__*/React.createElement("button",{onClick:onClose,"aria-label":"Dismiss",className:"shrink-0 ml-1 opacity-60 hover:opacity-100 leading-none"},"\xD7"));}// Node Alert Banner - shows critical alerts when nodes go offline
 // fix for #184 - banner was not showing on first load
 // NS: Now filters by cluster_id to only show alerts for current cluster
 function NodeAlertBanner({alerts,onDismiss,currentClusterId}){const{t}=useTranslation();// Filter alerts to only show ones for the current cluster
@@ -8428,11 +8430,28 @@ if(err.name!=='AbortError')console.error('authFetch err:',err);return null;}fina
 // NS: this is a hack for the websocket callback closure issue
 // NS: Reset ref IMMEDIATELY when cluster changes to prevent cross-cluster data leaks
 useEffect(()=>{// First update the ref synchronously
-selectedClusterRef.current=selectedCluster;},[selectedCluster]);useEffect(()=>{expandedSidebarClustersRef.current=expandedSidebarClusters;},[expandedSidebarClusters]);useEffect(()=>{sidebarClusterDataRef.current=sidebarClusterData;},[sidebarClusterData]);useEffect(()=>{selectedVMwareRef.current=selectedVMware;},[selectedVMware]);useEffect(()=>{vmwareSelectedVmRef.current=vmwareSelectedVm;},[vmwareSelectedVm]);useEffect(()=>{vmwareSelectedMigrationRef.current=vmwareSelectedMigration;},[vmwareSelectedMigration]);const addToast=(message,type='success')=>{const id=Date.now()+Math.random();// the same message twice at once says nothing new (authFetch and its caller
+selectedClusterRef.current=selectedCluster;},[selectedCluster]);useEffect(()=>{expandedSidebarClustersRef.current=expandedSidebarClusters;},[expandedSidebarClusters]);useEffect(()=>{sidebarClusterDataRef.current=sidebarClusterData;},[sidebarClusterData]);useEffect(()=>{selectedVMwareRef.current=selectedVMware;},[selectedVMware]);useEffect(()=>{vmwareSelectedVmRef.current=vmwareSelectedVm;},[vmwareSelectedVm]);useEffect(()=>{vmwareSelectedMigrationRef.current=vmwareSelectedMigration;},[vmwareSelectedMigration]);// Two call shapes are in use across this app and only one of them worked.
+//
+//   addToast('Saved', 'success')                      2 arguments
+//   addToast('Error', err.error, 'error')             3 arguments
+//
+// The second is used at forty call sites, and every one of them lost its
+// message: `err.error` arrived in the `type` slot and was dropped, leaving a
+// toast that said "Error" and nothing else. Reported from a migration that
+// would not start, the server's reason was there, in the response, and the
+// operator could not see it.
+//
+// Both shapes are read now rather than one of them being rewritten at forty
+// places, because the next call site will be written in whichever style its
+// neighbours use.
+const addToast=(message,type='success',third)=>{// the three-argument shape: addToast('Error', err.error, 'error')
+let title='';if(third!==undefined){title=message;message=type;type=third||'success';}const id=Date.now()+Math.random();// the same message twice at once says nothing new (authFetch and its caller
 // both report a standby refusal, #625). The newer one replaces the older and
 // gets its own full lifetime, so a retry that fails the same way still shows.
-setToasts(prev=>[...prev.filter(x=>x.message!==message||x.type!==type),{id,message,type}]);// auto remove after 5 seconds
-setTimeout(()=>{setToasts(prev=>prev.filter(t=>t.id!==id));},5000);};const removeToast=id=>{setToasts(prev=>prev.filter(toast=>toast.id!==id));};// the words for a standby refusal (#625), fresh every render for the language.
+setToasts(prev=>[...prev.filter(x=>x.message!==message||x.type!==type),{id,message,type}]);if(title)setToasts(prev=>prev.map(x=>x.id===id?{...x,title}:x));// An error stays until it is dismissed (a day, in practice): it is the one kind
+// somebody has to read and usually act on, and five seconds is not enough for a
+// sentence that names a host, a volume and a reason.
+setTimeout(()=>{setToasts(prev=>prev.filter(t=>t.id!==id));},type==='error'?86400000:5000);};const removeToast=id=>{setToasts(prev=>prev.filter(toast=>toast.id!==id));};// the words for a standby refusal (#625), fresh every render for the language.
 // The active out of reach has its own, and a console refused on a forwarding
 // standby too. Either answer may mean forwarding just changed, so the banner and
 // the buttons are read again. A member that serves users is the active instance
@@ -8925,7 +8944,7 @@ if(item.separator&&(!out.length||out[out.length-1].separator))continue;out.push(
 // A portal to document.body keeps it clear of the corporate z-index/overflow rules.
 // The bulk migrations (#952) sit on top of the stack: from every page of every
 // layout, and clear of the toasts below them
-const toastPortal=ReactDOM.createPortal(React.createElement('div',{style:{position:'fixed',bottom:isCorporate?64:24,right:24,zIndex:99999,display:'flex',flexDirection:'column',gap:8}},React.createElement(BulkMigrateRuns,{key:'bulk-runs',authFetch,openId:bulkRunOpen,onOpen:setBulkRunOpen,tick:bulkRunsTick,canAct:!haReadOnly,onSettled:bulkRunSettled}),toasts.map(toast=>React.createElement(Toast,{key:toast.id,message:toast.message,type:toast.type,onClose:()=>removeToast(toast.id)}))),document.body);// NS 2026-06-05 — Cloud skin (Preview): the whole console layout is its own
+const toastPortal=ReactDOM.createPortal(React.createElement('div',{style:{position:'fixed',bottom:isCorporate?64:24,right:24,zIndex:99999,display:'flex',flexDirection:'column',gap:8}},React.createElement(BulkMigrateRuns,{key:'bulk-runs',authFetch,openId:bulkRunOpen,onOpen:setBulkRunOpen,tick:bulkRunsTick,canAct:!haReadOnly,onSettled:bulkRunSettled}),toasts.map(toast=>React.createElement(Toast,{key:toast.id,title:toast.title,message:toast.message,type:toast.type,onClose:()=>removeToast(toast.id)}))),document.body);// NS 2026-06-05 — Cloud skin (Preview): the whole console layout is its own
 // self-contained shell (cloud.js). Mount it instead of the Modern/Corporate
 // chrome. onExitCloud flips back to Modern so the user is never locked in.
 if(isCloud){// bundle the existing dashboard handlers/modal-openers so the Cloud shell
