@@ -9,6 +9,7 @@ Each scenario runs in a subprocess: install() patches ssl.SSLContext process-wid
 gevent's monkey-patch must not leak into the rest of the suite.
 """
 import os
+import ssl
 import subprocess
 import sys
 import textwrap
@@ -73,7 +74,16 @@ def _run(mode, fix):
     return int(r.stdout.split('BLAMED')[-1].strip())
 
 
+#: The stale entry is left behind by OpenSSL 3.5 and later: measured on 3.5.5, 3.5.7 and
+#: 3.6.4, with CPython 3.12 as with 3.14. OpenSSL 3.0 -- what Ubuntu 24.04 and so the CI
+#: runner ship -- does not leave it, and the reproduction blames nothing there with or
+#: without the fix. The instance runs 3.5, so that is where the guard has to hold.
+_OPENSSL_LEAKS = ssl.OPENSSL_VERSION_INFO >= (3, 5)
+
+
 @pytest.mark.parametrize('mode', ['threads', 'gevent'])
+@pytest.mark.skipif(not _OPENSSL_LEAKS,
+                    reason=f'{ssl.OPENSSL_VERSION} does not leave the stale entry behind')
 def test_without_the_fix_a_healthy_socket_is_blamed(mode):
     """Guards the guard: the reproduction must still show the bug, or the test below
     proves nothing."""
