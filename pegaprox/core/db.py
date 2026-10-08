@@ -1635,6 +1635,14 @@ class PegaProxDB:
         except Exception as e:
             logging.error(f"Error creating xcpng_vmid_map table: {e}")
 
+        # Hyper-V migration source - fork issue #15. The tables are defined in
+        # pegaprox/core/hyperv_db.py so this file does not grow a second schema.
+        try:
+            from pegaprox.core import hyperv_db
+            hyperv_db.ensure_schema(cursor)
+        except Exception as e:
+            logging.error(f"Error creating Hyper-V tables: {e}")
+
         # LW Mar 2026 - resource pools for XCP-ng (DB-backed, XAPI has no equivalent)
         try:
             cursor.execute('''
@@ -4867,7 +4875,12 @@ class PegaProxDB:
                                 # password of the host it builds. Missing here would mean a
                                 # rotation leaves every stored profile unreadable and the
                                 # next ISO fetch answering 500.
-                                ('auto_install_profiles', ('answer_encrypted',))):
+                                ('auto_install_profiles', ('answer_encrypted',)),
+                                # Hyper-V migration sources (fork issue #15). Same reasoning
+                                # as the two above: the credential lives in its own table, and
+                                # a rotation that skips it leaves the host unreachable with no
+                                # error until somebody re-enters the password.
+                                ('hyperv_hosts', ('pass_encrypted',))):
                 try:
                     cursor.execute(f"SELECT id, {', '.join(_cols)} FROM {_tbl}")
                     for _r in cursor.fetchall():

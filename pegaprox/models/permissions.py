@@ -184,6 +184,19 @@ PERMISSIONS = {
     # Automated installations - MK Sep 2026
     'autoinstall.view': 'View automated installation profiles and runs',
     'autoinstall.manage': 'Create, edit and revoke automated installation profiles',
+
+    # Hyper-V migration source - fork issue #15.
+    # Hyper-V is a migration source, not a managed hypervisor, so the set is deliberately
+    # short: read what is there, prepare a VM for migration, migrate it. There is no
+    # create, no delete and no general administration, because the epic does not build
+    # them and a permission that grants nothing is a promise the product does not keep.
+    'hyperv.view': 'View Hyper-V hosts and their status',
+    'hyperv.config': 'Add/edit/remove Hyper-V host connections',
+    'hyperv.vm.view': 'View Hyper-V VMs and their migration-relevant hardware',
+    'hyperv.vm.power': 'Start and orderly shut down Hyper-V VMs before a migration',
+    'hyperv.vm.checkpoint': 'Delete Hyper-V checkpoints to prepare a migration',
+    'hyperv.vm.media': 'Mount and eject ISOs on a Hyper-V VM',
+    'hyperv.vm.migrate': 'Migrate Hyper-V VMs to Proxmox',
 }
 
 # MK Sep 2026 (#818) - permissions whose scope is wider than their name suggests.
@@ -240,6 +253,8 @@ ROLE_PERMISSIONS = {
         'xapi.view', 'xapi.vm.view', 'xapi.vm.power', 'xapi.vm.snapshot',
         'xapi.vm.clone', 'xapi.vm.config', 'xapi.vm.migrate',
         'xapi.host.view', 'xapi.storage.view', 'xapi.network.view', 'xapi.template.view',
+        'hyperv.view', 'hyperv.vm.view', 'hyperv.vm.power', 'hyperv.vm.checkpoint',
+        'hyperv.vm.media', 'hyperv.vm.migrate',
     ],
     ROLE_VIEWER: [
         'vm.view', 'vm.console',
@@ -258,5 +273,6 @@ ROLE_PERMISSIONS = {
         'vmware.view', 'vmware.vm.view', 'vmware.host.view', 'vmware.datastore.view', 'vmware.network.view',
         'xapi.view', 'xapi.vm.view', 'xapi.host.view', 'xapi.storage.view', 'xapi.network.view',
         'xapi.template.view',
+        'hyperv.view', 'hyperv.vm.view',
     ],
 }

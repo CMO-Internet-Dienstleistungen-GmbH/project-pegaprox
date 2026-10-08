@@ -363,6 +363,9 @@ EXITS = {
     ('pegaprox/core/xhm.py', '_run_pve_to_xcpng', 'ssh-exec'): (2, 'client'),
     ('pegaprox/core/xhm.py', '_run_esxi_to_pve', 'ssh-exec'): (14, 'client'),
     ('pegaprox/core/xhm.py', '_ssh_cleanup', 'ssh-exec'): (1, 'client'),
+    # Hyper-V migrations: the node session wraps a client from xhm._connect_ssh, which is guarded
+    ('pegaprox/core/hyperv_xhm.py', '_Node.run', 'ssh-exec'): (1, 'client'),
+    ('pegaprox/core/hyperv_xhm.py', '_Node.run_with_progress', 'ssh-exec'): (1, 'client'),
     ('pegaprox/core/xhm.py', '_run_esxi_to_xcpng', 'subprocess'): (2, 'local'),
     ('pegaprox/core/incremental_repl.py', '_relay_pipe', 'ssh-exec'): (2, 'client'),
     ('pegaprox/core/incremental_repl.py', '_relay_pipe._slurp', 'ssh-exec'): (1, 'client'),
@@ -443,6 +446,8 @@ EXITS = {
     ('pegaprox/api/settings.py', '_get_healed_sponsor', 'http-direct'): (1, 'external'),
     ('pegaprox/background/alerts.py', 'check_update_available_alert', 'http-direct'): (1, 'external'),
     ('pegaprox/background/site_recovery.py', '_fire_webhook', 'http-direct'): (1, 'external'),
+    # which virtio-win release is current, asked of its publisher
+    ('pegaprox/core/hyperv_drivers.py', 'refresh_current_release', 'http-urllib'): (1, 'external'),
     ('pegaprox/utils/webhooks.py', '_post_ntfy', 'http-direct'): (1, 'external'),
     ('pegaprox/utils/webhooks.py', 'send_to_channel', 'http-direct'): (1, 'external'),
     ('plugins/notifications/__init__.py', '_send_ntfy', 'http-direct'): (1, 'external'),
@@ -505,10 +510,12 @@ def test_the_inventory_counts_what_the_report_says():
     # asking systemctl in one helper, the join fingerprint read through tls_fingerprint:
     # 257 calls out of this process, 152 (function, kind) pairs in 138 functions; 46 of
     # them guarded at the exit and 84 execs on a client from a guarded factory. No route
-    # relies on the write gate alone any more
-    assert sum(n for n, _v in EXITS.values()) == 257 and len(EXITS) == 152
-    assert len({(f, q) for f, q, _k in EXITS}) == 138
-    assert by['guard'] == 46 and by['client'] == 84
+    # relies on the write gate alone any more.
+    # Hyper-V patch (#15): three more exits, two of them execs on a guarded client, one the
+    # publisher's release list: 260 calls, 155 pairs in 141 functions, 86 client execs.
+    assert sum(n for n, _v in EXITS.values()) == 260 and len(EXITS) == 155
+    assert len({(f, q) for f, q, _k in EXITS}) == 141
+    assert by['guard'] == 46 and by['client'] == 86
 
 
 @pytest.mark.parametrize('key', sorted(k for k, v in EXITS.items() if v[1] == 'guard'),
@@ -705,6 +712,8 @@ AUTOMATIONS = {
     # the replication and backup reads behind the Prometheus series, API GETs only
     ('pegaprox/api/metrics_exporter.py', '_spawn'): (1, 'read'),
     ('pegaprox/api/groups.py', 'trigger_xclb_balance_now'): (1, 'confirm'),
+    # Hyper-V sources: reading a host and closing a replaced connection
+    ('pegaprox/api/hyperv.py', 'update_hyperv_host'): (1, 'read'),
     ('pegaprox/api/multi_sdn.py', 'start_scanner'): (1, 'confirm'),
     ('pegaprox/api/realtime.py', 'update_sse_subscription'): (1, 'read'),
     ('pegaprox/api/reports.py', '<module>'): (2, 'read'),
@@ -736,6 +745,11 @@ AUTOMATIONS = {
     ('pegaprox/core/ha.py', 'pull_soon'): (1, 'peer'),
     # the lease loop, the etag tick and when_active (the deferred boot gates)
     ('pegaprox/core/ha.py', '_lease_spawn'): (1, 'lease'),
+    ('pegaprox/core/hyperv_cluster.py', 'load_hyperv_sources'): (1, 'read'),
+    ('pegaprox/core/hyperv_drivers.py', 'refresh_in_background'): (1, 'read'),
+    ('pegaprox/core/hyperv_inventory.py', '_spawn'): (1, 'read'),
+    # writes to the target node, so it asks for the lease at each exit like a migration does
+    ('pegaprox/core/hyperv_xhm.py', 'retry_driver_injection'): (1, 'job'),
     ('pegaprox/api/vms.py', 'cross_cluster_migrate_api'): (1, 'job'),
     ('pegaprox/api/vmware.py', 'start_vmware_migration'): (1, 'job'),
     ('pegaprox/api/xhm.py', 'xhm_start'): (1, 'job'),
