@@ -3,9 +3,9 @@
 # Rebuild the CMO integration branch on top of the current upstream release.
 #
 # Takes the latest upstream RELEASE tag, replays the patches listed in
-# patches.yml on top of it, regenerates the build artefacts, runs the test
-# suite, and — only when everything is green — moves the integration branch
-# and publishes an immutable tag.
+# patches.yml on top of it, regenerates the build artefacts, has the fork's CI
+# run the test suite on the result, and — only when everything is green — moves
+# the integration branch and publishes an immutable tag.
 #
 # The branch is rebuilt, never merged into: it is force-pushed by design and
 # the tags (v<release>-cmo.<n>) are the stable references.
@@ -20,12 +20,9 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 CONFIG_FILE="${SYNC_CONFIG:-$REPO_ROOT/patches.yml}"
-# The suite peaks around 450 concurrently open files. macOS hands a process
-# started from a terminal a soft limit of 256 (launchctl limit maxfiles), so
-# the run has to raise its own before pytest, and refuse to judge a tree it
-# cannot test properly.
-FD_LIMIT_WANTED=4096
-FD_LIMIT_REQUIRED=1024
+# How often the CI is asked for the run, and how long it may take to appear.
+CI_POLL_SECONDS=20
+CI_APPEAR_TIMEOUT_SECONDS=600
 DO_PUSH=0
 CHECK_ONLY=0
 SKIP_TESTS=0
@@ -43,7 +40,8 @@ Options:
   --check         Only report whether a sync is needed (no build, no tests).
                   Exit 0 = up to date, 10 = work to do, >1 = error.
   --push          Publish the result: force-push the integration branch and
-                  push the new tag. Without it everything stays local.
+                  push the new tag. Without it the branch and tag stay local;
+                  only the CI branches are pushed, so the suite can run.
   --skip-tests    Build but do not run the test suite. Refuses to combine
                   with --push: an unverified tag is exactly what we avoid.
   --config PATH   Config file (default: patches.yml next to this script's repo
@@ -54,11 +52,12 @@ Options:
 Environment:
   GITHUB_TOKEN    Optional. Only lifts the anonymous GitHub API rate limit;
                   pushing uses whatever credentials git is configured with.
+                  The CI gate uses the gh CLI and its own login.
 
 Exit codes:
   0   done (or already up to date)
   10  --check: a sync is needed
-  1   error — conflict that is not a generated file, red tests, missing tools
+  1   error — conflict that is not a generated file, red CI, missing tools
 EOF
 }
 
@@ -94,7 +93,9 @@ UPSTREAM_URL="$(cfg upstream.url)"
 FORK_REMOTE="$(cfg fork.remote)"
 INTEGRATION_BRANCH="$(cfg fork.integration_branch)"
 TAG_SUFFIX="$(cfg fork.tag_suffix)"
-RUN_PYTEST="$(cfg verify.pytest)"
+CI_WORKFLOW="$(cfg verify.ci.workflow)"
+CI_BRANCH="$(cfg verify.ci.branch)"
+CI_BASE_BRANCH="$(cfg verify.ci.base_branch)"
 
 # ---------------------------------------------------------------- discovery
 
@@ -386,32 +387,54 @@ ok "built $(git -C "$WORKTREE" log -1 --format=%h) on $RELEASE_TAG"
 
 # ------------------------------------------------------------------ verify
 
-if [ "$SKIP_TESTS" -eq 0 ] && { [ "$RUN_PYTEST" = "True" ] || [ "$RUN_PYTEST" = "true" ]; }; then
-    # Without this the same tree passes or fails depending only on which shell
-    # started the run: a terminal gives 256 descriptors, enough for four fifths
-    # of the suite, and the exhaustion then surfaces as a cascade of unrelated
-    # errors ending in EMFILE inside pytest's teardown -- which reads like a
-    # broken tree rather than a missing resource. Refuse rather than report a
-    # red suite we caused ourselves.
-    if [ "$(ulimit -Sn)" -lt "$FD_LIMIT_WANTED" ]; then
-        ulimit -Sn "$FD_LIMIT_WANTED" 2>/dev/null \
-            || ulimit -Sn "$(ulimit -Hn)" 2>/dev/null \
-            || true
-    fi
-    fd_limit="$(ulimit -Sn)"
-    [ "$fd_limit" = unlimited ] || [ "$fd_limit" -ge "$FD_LIMIT_REQUIRED" ] \
-        || die "only $fd_limit open files allowed, need $FD_LIMIT_REQUIRED — raise the hard limit and run again"
+if [ "$SKIP_TESTS" -eq 0 ]; then
+    [ -n "$CI_WORKFLOW" ] && [ -n "$CI_BRANCH" ] && [ -n "$CI_BASE_BRANCH" ] \
+        || die "verify.ci in $CONFIG_FILE needs workflow, branch and base_branch"
+    require_cmd gh
+    FORK_SLUG="$(git -C "$REPO_ROOT" remote get-url "$FORK_REMOTE" \
+                 | sed -E 's#^(git@github\.com:|https://github\.com/)##; s#\.git$##')"
 
-    info "running the test suite (isolated venv, like upstream CI)"
-    (
-        cd "$WORKTREE"
-        python3 -m venv .venv
-        .venv/bin/pip install --quiet --upgrade pip
-        .venv/bin/pip install --quiet -r requirements.txt -r requirements-dev.txt
-        .venv/bin/python -m pytest tests/ -q
-    ) || die "test suite failed on the built tree — nothing published"
-    ok "test suite passed"
+    # The base carries the release, the head the build on top of it. GitHub
+    # tests the merge of the two, and because the build descends from the
+    # release that merge has exactly the built tree -- so the run judges what
+    # gets tagged, not an approximation of it. Base first: a head pushed onto
+    # an old base would start a run on the wrong merge.
+    info "running the test suite in the fork's CI ($CI_WORKFLOW, $CI_BRANCH -> $CI_BASE_BRANCH)"
+    git -C "$REPO_ROOT" push --quiet --force-with-lease="$CI_BASE_BRANCH" \
+        "$FORK_REMOTE" "$RELEASE_SHA:refs/heads/$CI_BASE_BRANCH"
+    git -C "$REPO_ROOT" push --quiet --force-with-lease="$CI_BRANCH" \
+        "$FORK_REMOTE" "$BUILT_SHA:refs/heads/$CI_BRANCH"
+
+    # One standing draft PR between the two branches is what makes upstream's
+    # pull_request trigger fire on every push. It is never merged; the branches
+    # cannot be deleted (ruleset), so they are reused instead of piling up.
+    ci_pr="$(gh pr list -R "$FORK_SLUG" --head "$CI_BRANCH" --base "$CI_BASE_BRANCH" \
+             --state open --json number --jq '.[0].number // empty')"
+    if [ -z "$ci_pr" ]; then
+        gh pr create -R "$FORK_SLUG" --draft --head "$CI_BRANCH" --base "$CI_BASE_BRANCH" \
+            --title "ci: test the rebuilt integration branch" \
+            --body "Standing draft PR used by scripts/sync-upstream-release.sh on cmo/automation: every rebuild is pushed to $CI_BRANCH so the test suite runs on it before a tag is published. Never merge, never close." \
+            >/dev/null || die "could not open the CI pull request $CI_BRANCH -> $CI_BASE_BRANCH"
+    fi
+
+    ci_run=""
+    waited=0
+    while [ -z "$ci_run" ]; do
+        ci_run="$(gh run list -R "$FORK_SLUG" --workflow "$CI_WORKFLOW" --event pull_request \
+                  --commit "$BUILT_SHA" --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+        [ -n "$ci_run" ] && break
+        [ "$waited" -lt "$CI_APPEAR_TIMEOUT_SECONDS" ] \
+            || die "no $CI_WORKFLOW run for $BUILT_SHA after ${CI_APPEAR_TIMEOUT_SECONDS}s — check the CI pull request"
+        sleep "$CI_POLL_SECONDS"
+        waited=$((waited + CI_POLL_SECONDS))
+    done
+    CI_RUN_URL="https://github.com/$FORK_SLUG/actions/runs/$ci_run"
+    ok "CI run started: $CI_RUN_URL"
+    gh run watch -R "$FORK_SLUG" "$ci_run" --exit-status --interval 60 >/dev/null \
+        || die "test suite failed in CI on the built tree — nothing published: $CI_RUN_URL"
+    ok "test suite passed in CI"
 else
+    CI_RUN_URL=""
     warn "test suite skipped"
 fi
 
@@ -472,7 +495,8 @@ $(printf '%s' "$SKIPPED_LIST" | sed '/^$/d; s/^/  - /')"
 fi
 tag_body="$tag_body
 
-Built by scripts/sync-upstream-release.sh; the test suite passed on this tree."
+Built by scripts/sync-upstream-release.sh; the test suite passed on this tree in CI:
+${CI_RUN_URL}"
 
 # Branch first, tag second. The other way round, anything that stops the branch
 # from moving leaves a tag behind with no branch pointing at it -- and the next

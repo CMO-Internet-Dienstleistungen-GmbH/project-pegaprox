@@ -199,6 +199,17 @@ generated_files:
   - path: web/index.html
     rebuild: web/Dev/build.sh
 
-# Gate for publishing: all of these must pass before a tag is pushed.
+# Gate for publishing: the built tree must pass before a tag is pushed.
+#
+# The suite runs in the fork's GitHub Actions, never on the machine running the
+# sync: upstream's tests assume Linux (/proc, dash, a non-root user), and a run
+# on a workstation fails for reasons that have nothing to do with the tree.
+# Upstream's own workflow is reused unchanged through its pull_request trigger:
+# `branch` carries the build, `base_branch` the release tag it was built on, and
+# one standing draft PR between them makes every push to `branch` a CI run on
+# exactly that tree. See docs/adr/0001-test-the-build-in-the-forks-ci.md.
 verify:
-  pytest: true
+  ci:
+    workflow: test.yml
+    branch: cmo/ci
+    base_branch: cmo/ci-base

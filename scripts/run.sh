@@ -21,10 +21,11 @@ Usage: run.sh <command>
 Commands:
   check     Is there a new upstream release we have no tag for?
             Exit 0 = nothing to do, 10 = sync needed.
-  sync      Rebuild the integration branch locally and run the tests.
-            Publishes nothing.
+  sync      Rebuild the integration branch locally and have the fork's CI
+            run the tests on it. Pushes only the CI branches; the
+            integration branch and the tag stay local.
   publish   Same as sync, but force-pushes the integration branch and pushes
-            the new tag once the tests are green.
+            the new tag once CI is green.
   verify    Ask the fork what is actually published: the newest -cmo tag, the
             commit it points at, whether the integration branch matches it,
             and which upstream release it sits on.

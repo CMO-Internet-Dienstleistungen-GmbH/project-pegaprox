@@ -18,10 +18,10 @@ git checkout cmo/automation
 # Is there a new upstream release we have no tag for?
 ./scripts/run.sh check          # exit 0 = nothing to do, 10 = sync needed
 
-# Rebuild locally and run the tests — publishes nothing
+# Rebuild locally and have the fork's CI test it — branch and tag stay local
 ./scripts/run.sh sync
 
-# Same, but push the branch and the new tag once the tests are green
+# Same, but push the branch and the new tag once CI is green
 ./scripts/run.sh publish
 
 # Ask the fork what is actually published right now
@@ -62,12 +62,20 @@ upstream release with a changed patch set (a fix added, reworked, or dropped).
    - squash the applied branch commits under that patch's stable
      `commit_message`; branch commit order never decides the subject.
 4. Regenerate the artefacts once more and commit them if they changed.
-5. Run the test suite in an isolated venv, exactly like the upstream CI does.
+5. Run the test suite in the fork's GitHub Actions — upstream's own
+   `test.yml`, unchanged. The build goes to `cmo/ci`, the release tag to
+   `cmo/ci-base`, and a standing draft PR between the two triggers the
+   workflow on exactly that tree. The script waits for the run and stops on
+   red. The suite never runs on the machine doing the sync: upstream's tests
+   assume Linux and fail on a workstation for reasons unrelated to the tree
+   ([ADR 0001](docs/adr/0001-test-the-build-in-the-forks-ci.md)). Needs the
+   `gh` CLI, logged in with push rights to the fork.
 6. Compare the result against the newest existing tag. Identical tree → nothing
    to publish. Otherwise move `cmo/main` and create the next tag.
 7. With `--push`: force-push the branch, push the tag.
 
-**A tag is only ever created after a green test run.** `--skip-tests` refuses
+**A tag is only ever created after a green CI run**, and the tag message
+links that run. `--skip-tests` refuses
 to run together with `--push`.
 
 ## Where an internal request goes
@@ -266,6 +274,8 @@ source of truth for what the routine is told to do; edit it there and update
 the routine. A slow cron on the routine (weekly) is worth keeping as a safety
 net in case the watcher host is down when a release lands.
 
-**GitHub Actions is deliberately not used here.** Minutes are billed per
-organization and simply stop when the allowance is used up — a watcher that
-quietly dies is worse than no watcher.
+**GitHub Actions is deliberately not used as the watcher.** Minutes are billed
+per organization and simply stop when the allowance is used up — a watcher that
+quietly dies is worse than no watcher. The test gate of a sync does run there
+(see *How a sync works*), but it is started by the sync and fails loudly when
+no run appears, so it cannot die quietly.

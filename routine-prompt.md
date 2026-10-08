@@ -32,9 +32,9 @@ git checkout cmo/automation
 - **Exit 10** — bring every patch branch forward first (see *Making the
   branches apply again*), then run `./scripts/run.sh publish`. It rebuilds the
   integration branch on the new release, replays our patches in `patches.yml`
-  order, regenerates the frontend bundle, runs the test suite in an isolated
-  venv, and only then force-pushes `cmo/main` and pushes the new
-  `v<release>-cmo.<n>` tag.
+  order, regenerates the frontend bundle, has the fork's CI run the test
+  suite on the result (needs `gh`, logged in), and only then force-pushes
+  `cmo/main` and pushes the new `v<release>-cmo.<n>` tag.
 
 The order in `patches.yml` is the whole definition of the rebuild: `cmo/main`
 is the upstream release with those branches applied on top, in that sequence,
