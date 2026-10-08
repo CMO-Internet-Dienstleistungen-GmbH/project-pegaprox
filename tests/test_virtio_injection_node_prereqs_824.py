@@ -46,6 +46,13 @@ def _injection_node_script():
                            for v in n.values)
         if isinstance(n, ast.BinOp):
             return flatten(n.left) + flatten(n.right)
+        # Fork patch #15 stages firstboot.ps1 through a helper instead of a literal, so
+        # the concatenation has a real Call node in it here. Run the one helper this
+        # script calls rather than adding a general call-evaluator for arbitrary code.
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id == '_first_boot_script_staging'):
+            from pegaprox.core.v2p import _first_boot_script_staging
+            return _first_boot_script_staging(*(flatten(a) for a in n.args))
         return ''
 
     best = ''
@@ -67,6 +74,12 @@ def _node_commands():
     Deliberately the ARGUMENTS, not the surrounding source text: the comments there
     explain what was removed and why, and a test that greps the region would keep
     failing on its own explanation. What matters is what gets run on the node.
+
+    Matches calls to `run_on_node` too: that name is `node_exec or _pve_node_exec`,
+    the indirection fork patch #15 adds so a Hyper-V-sourced migration (API token +
+    non-root SSH key) can hand in a working connection instead of the shared helper's
+    hard-coded root login. Same function at runtime when node_exec is unset, which is
+    every call this file's tests exercise.
     """
     tree = ast.parse(_SRC)
     fn = next(n for n in ast.walk(tree)
@@ -74,7 +87,7 @@ def _node_commands():
     cmds = []
     for node in ast.walk(fn):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id == '_pve_node_exec'):
+                and node.func.id in ('_pve_node_exec', 'run_on_node')):
             continue
         for arg in node.args[1:]:
             if isinstance(arg, ast.Constant) and isinstance(arg.value, str):

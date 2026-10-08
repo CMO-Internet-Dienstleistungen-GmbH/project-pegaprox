@@ -22,6 +22,7 @@ from pegaprox.constants import *
 from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db
+from pegaprox.core import snapshot_meta  # fork patch (issue #39): snapshot author metadata
 
 from pegaprox.utils.auth import (require_auth, load_users, validate_session, build_authz_user,
                                  resolve_authz_user)
@@ -149,6 +150,19 @@ def get_datacenter_status(cluster_id):
         return error
 
     # MK: XCP-ng clusters build status from their own cached data
+    # A source that is not Proxmox has no Proxmox REST API to aggregate from, and this
+    # route is nothing but that aggregation. Asking the manager whether it can answer is
+    # better than listing the types that cannot: it covers every such source, including
+    # ones added later.
+    #
+    # This branch was removed once, on the assumption that a migration source never reaches
+    # this route. It does - sources live in the manager registry and appear in the cluster
+    # list exactly like an ESXi host - and the page then failed with a stack trace about a
+    # missing REST API.
+    if (getattr(manager, 'cluster_type', 'proxmox') != 'proxmox'
+            and hasattr(manager, 'datacenter_status')):
+        return jsonify(manager.datacenter_status())
+
     if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
         try:
             st = manager.get_cluster_status()
@@ -693,6 +707,12 @@ def get_datastores(cluster_id):
         return error
 
     # XCP-ng: return SR list as datastores
+    if getattr(manager, 'cluster_type', 'proxmox') == 'hyperv':
+        # Its disks are found through the VM that owns them, never through a host-wide
+        # storage list, so there is nothing honest to put here. Removed once on the wrong
+        # assumption that a source never reaches this route; it does.
+        return jsonify({'shared': [], 'local': {}})
+
     if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
         storages = manager.get_storages()
         return jsonify({'shared': storages, 'local': {}})
@@ -4060,6 +4080,13 @@ def vm_action_api(cluster_id, node, vm_type, vmid, action):
     except Exception as e:
         logging.warning(f"[VM-ACTION] Error parsing body: {e}")
     
+    # CMO fork patch #15: an imported VM and its Hyper-V original are one machine twice.
+    if action in ('start', 'resume'):
+        from pegaprox.core.hyperv_xhm import refuse_target_start
+        _refused = refuse_target_start(cluster_id, vmid)
+        if _refused:
+            return jsonify({'error': _refused}), 409
+
     logging.info(f"[VM-ACTION] Executing {action} with force={force}")
     manager = cluster_managers[cluster_id]
     try:
@@ -7266,6 +7293,7 @@ def get_snapshots_api(cluster_id, node, vm_type, vmid):
     
     manager = cluster_managers[cluster_id]
     snapshots = manager.get_snapshots(node, vmid, vm_type)
+    snapshot_meta.annotate_snapshots(cluster_id, vm_type, vmid, snapshots)
     return jsonify(snapshots)
 
 
@@ -7297,6 +7325,12 @@ def create_snapshot_api(cluster_id, node, vm_type, vmid):
     
     if result['success']:
         usr = getattr(request, 'session', {}).get('user', 'system')
+        snapshot_meta.record_creation(cluster_id, vm_type, vmid, snapname, usr)
+        # Bind the record to the snapshot that was just made, while we still know
+        # it is ours: a name that is replaced outside PegaProx before anyone opens
+        # a snapshot list would otherwise be able to claim this author.
+        snapshot_meta.annotate_snapshots(cluster_id, vm_type, vmid,
+                                         mgr.get_snapshots(node, vmid, vm_type))
         log_audit(usr, 'snapshot.created', f"{vm_type.upper()} {vmid} - snapshot '{snapname}' created" + (" (with RAM)" if vmstate else ""), cluster=mgr.config.name)
         return jsonify({'message': f'Snapshot {snapname} erstellt', 'task': result.get('task')})
     else:
@@ -7485,6 +7519,7 @@ def get_efficient_snapshots_api(cluster_id, node, vm_type, vmid):
     # writes the result into a synced table. A standby shows what the active recorded.
     refresh = request.args.get('refresh', 'false').lower() == 'true' and not ha.is_standby()
     snapshots = mgr.get_efficient_snapshots(cluster_id, vmid, refresh_usage=refresh)
+    snapshot_meta.annotate_efficient(snapshots)
     return jsonify(snapshots)
 
 
@@ -7510,7 +7545,9 @@ def create_efficient_snapshot_api(cluster_id, node, vm_type, vmid):
     description = data.get('description', '')
     snap_size_gb = data.get('snap_size_gb')
 
-    result = mgr.create_efficient_snapshot(node, vmid, vm_type, snapname, description, snap_size_gb)
+    created_by = getattr(request, 'session', {}).get('user', '') or ''
+    result = mgr.create_efficient_snapshot(node, vmid, vm_type, snapname, description, snap_size_gb,
+                                           created_by=created_by)
 
     if result['success']:
         usr = getattr(request, 'session', {}).get('user', 'system')
@@ -7665,7 +7702,12 @@ def snapshots_overview():
                     # which page you opened. snapshot_date stays for older frontends and
                     # because the table sorts on it.
                     "snapshot_ts": int(snap_ts),
-                    "age": age, "cluster_id": cid
+                    "age": age, "cluster_id": cid,
+                    # fork patch (issue #39): the description was already in the
+                    # hypervisor's answer and used to be dropped here; snaptime is
+                    # what the author record is bound to.
+                    "snaptime": snap_ts,
+                    "description": snap.get('description', '') or '',
                 })
             return results
         except Exception:
@@ -7681,6 +7723,8 @@ def snapshots_overview():
 
     snapshots.sort(key=lambda s: s["snapshot_date"], reverse=False)
     snapshots = snapshots[:filter_limit]
+    # fork patch (issue #39): one query for the whole page, never one per row
+    snapshot_meta.annotate_rows(snapshots)
 
     return jsonify({"snapshots": snapshots})
 

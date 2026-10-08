@@ -2,6 +2,49 @@
         // PegaProx - Tables & Cards
         // NodeCard + ResourceTable
         // ═══════════════════════════════════════════════
+        // NS: #127 - lazy-loaded guest-agent IPs, cached at module scope.
+        //
+        // Module scope rather than a component ref: ResourceTable is conditionally
+        // rendered (activeTab / resourcesSubTab), so a ref lost every entry on a tab
+        // switch and the whole visible page was re-fetched on the way back.
+        //
+        // Keyed by cluster AND vmid: a module-scope cache outlives the cluster
+        // selection, and vmids repeat across clusters.
+        //
+        // Entries carry a timestamp, because a cache that outlives the component has
+        // to expire or a guest that changed address never updates. A "no address"
+        // answer is stored as a RESULT: while it was left falsy, the guard read it as
+        // a miss and re-requested the guest on every pass — and since each answer
+        // bumps ipTick (-> new paginatedResources -> effect runs again) that closed
+        // into a loop whose rate was bounded only by response latency.
+        const IP_CACHE_TTL_MS = 300000;    // 5 min for a resolved address
+        // 2 min before retrying a guest that reported no address. Long, on purpose:
+        // a guest that has no agent does not grow one within seconds, and this
+        // interval is paid once per such guest per window — at a page size of 500
+        // a short retry is its own steady request load.
+        const IP_CACHE_RETRY_MS = 120000;
+        const IP_CACHE_MAX_PARALLEL = 6;   // page size goes up to 500 — do not fan out
+        const _ipCache = new Map();        // "cid/vmid" -> {ip: string|null, at: ms} | 'loading'
+
+        function _ipCacheKey(clusterId, vmid) { return clusterId + '/' + vmid; }
+
+        // undefined = nothing usable cached, go fetch. 'loading' = already in flight.
+        function _ipCacheEntry(clusterId, vmid) {
+            const e = _ipCache.get(_ipCacheKey(clusterId, vmid));
+            if (e === undefined || e === 'loading') return e;
+            const ttl = e.ip === null ? IP_CACHE_RETRY_MS : IP_CACHE_TTL_MS;
+            return (Date.now() - e.at) > ttl ? undefined : e;
+        }
+
+        // Last known address for display. Ignores the TTL on purpose so a row keeps
+        // showing the previous address instead of blanking while it refreshes.
+        function _ipCacheValue(clusterId, vmid) {
+            const e = _ipCache.get(_ipCacheKey(clusterId, vmid));
+            return (e && e !== 'loading' && e.ip) ? e.ip : '';
+        }
+
+        try { window.PegaProxIpCache = { map: _ipCache, key: _ipCacheKey, entry: _ipCacheEntry, value: _ipCacheValue }; } catch (_) {}
+
         function getProxmoxNodeHost(target = {}, fallbackName = '') {
             const candidates = [
                 target.node_ip,
@@ -1353,7 +1396,15 @@
         // NS: Added bulk select for mass operations (migration, etc.)
         // This component does a lot... might need to split it up eventually
         // NS: filtering + sorting uses useMemo below (lines 1320+)
-        function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenSpice, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, nodes, datastores, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus, authFetch, onBulkDone, favorites, onToggleFavorite }) {
+        function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenSpice, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, onHypervMigrate, nodes, datastores, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus, authFetch, onBulkDone, favorites, onToggleFavorite }) {
+            // Fork patch #15 — a Hyper-V guest is a migration source, not a machine this
+            // product runs. Most of the actions below address a Proxmox API its host does
+            // not have; two of them, clone and delete, would be aimed at a customer's
+            // production VM. What stays is what works: power it on, shut it down, look at
+            // its hardware, and move it to Proxmox.
+            const isHypervSource = typeof hvType === 'function'
+                && hvType((clusters || []).find(c => c.id === clusterId)) === 'hyperv';
+
             const { t } = useTranslation();
             const { getAuthHeaders, user, haReadOnly, haConsolesElsewhere } = useAuth();
             // #625 v2 - a standby shows the guests live but acts on none of them: no power,
@@ -1474,8 +1525,8 @@
             const [openDropdown, setOpenDropdown] = useState(null); // action dropdown menu
             const prevResources = useRef(resources);  // for comparison, not really used
 
-            // NS: #127 - lazy-load IPs from guest agent for running qemu VMs
-            const ipCache = useRef({});
+            // NS: #127 - lazy-load IPs from guest agent for running qemu VMs.
+            // The cache itself lives at module scope (see _ipCache above).
             const [ipTick, setIpTick] = useState(0);
 
             const filterLabels = {
@@ -1489,8 +1540,7 @@
             // NS #431: IP sorts by octet value, not as a string. Pull the IP from
             // the lazy guest-agent cache (qemu) or off the resource (lxc); blanks last.
             const getIp = (r) => {
-                const c = ipCache.current[r.vmid];
-                return (c && c !== 'loading') ? c : (r.ip || '');
+                return _ipCacheValue(r._clusterId || clusterId, r.vmid) || (r.ip || '');
             };
             const ipSortKey = (ip) => {
                 const m = String(ip || '').match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/);
@@ -1561,26 +1611,49 @@
             }, [filteredResources, effectivePage, itemsPerPage]);
 
             // fetch IPs for visible running qemu VMs - #127
+            //
+            // Skip any guest the resources frame already carries an address for.
+            // get_vm_resources() injects `ip`/`ip_addresses` from the manager's
+            // _ip_cache, which _ip_refresh_loop fills every 30s for watched
+            // clusters — so for most guests the answer is already on screen and
+            // asking again costs up to six guest-agent round trips for nothing.
+            // Guests the server has no address for (agent still booting, no agent
+            // at all) still fall through to the per-VM call, which walks the list
+            // at most IP_CACHE_MAX_PARALLEL at a time: a page holds up to 500 rows,
+            // and an unbounded forEach put every one of them on the wire at once.
             useEffect(() => {
                 if (!paginatedResources?.length) return;
                 const toFetch = paginatedResources.filter(r =>
-                    r.type === 'qemu' && r.status === 'running' && !ipCache.current[r.vmid]
+                    r.type === 'qemu' && r.status === 'running' &&
+                    !r.ip && _ipCacheEntry(r._clusterId || clusterId, r.vmid) === undefined
                 );
                 if (!toFetch.length) return;
-                toFetch.forEach(vm => {
-                    ipCache.current[vm.vmid] = 'loading';
+
+                let cancelled = false;
+                let cursor = 0;
+                const runNext = () => {
+                    if (cancelled || cursor >= toFetch.length) return;
+                    const vm = toFetch[cursor++];
                     const cid = vm._clusterId || clusterId;
+                    const key = _ipCacheKey(cid, vm.vmid);
+                    _ipCache.set(key, 'loading');
                     fetch(`/api/clusters/${cid}/vms/${vm.node}/qemu/${vm.vmid}/guest-info`, {
                         credentials: 'include', headers: getAuthHeaders()
                     })
                     .then(r => r.ok ? r.json() : null)
                     .then(data => {
-                        ipCache.current[vm.vmid] = data?.ip_addresses?.length ? data.ip_addresses[0] : null;
-                        setIpTick(t => t + 1);
+                        _ipCache.set(key, {
+                            ip: data?.ip_addresses?.length ? data.ip_addresses[0] : null,
+                            at: Date.now()
+                        });
+                        if (!cancelled) setIpTick(t => t + 1);
                     })
-                    .catch(() => { ipCache.current[vm.vmid] = null; });
-                });
-            }, [paginatedResources]);
+                    .catch(() => { _ipCache.set(key, { ip: null, at: Date.now() }); })
+                    .finally(runNext);
+                };
+                for (let i = 0; i < Math.min(IP_CACHE_MAX_PARALLEL, toFetch.length); i++) runNext();
+                return () => { cancelled = true; };
+            }, [paginatedResources, clusterId, getAuthHeaders]);
 
             const handleSort = (col) => {
                 let nextBy = col, nextDir = 'asc';
@@ -2030,7 +2103,7 @@
                                             <div className="flex items-center gap-1">
                                                 {getProxmoxObjectUrl(getVmProxmoxTarget(resource)) && (
                                                     <button
-                                                        onClick={() => openProxmoxObject(getVmProxmoxTarget(resource))}
+                                                        onClick={() => openProxmoxObject(getVmProxmoxTarget(resource))} style={{display: isHypervSource ? 'none' : undefined}}
                                                         className="p-1.5 rounded-lg hover:bg-cyan-500/20 text-gray-400 hover:text-cyan-400 transition-all"
                                                         title={t('openInProxmox') || 'Open in Proxmox'}
                                                     >
@@ -2057,7 +2130,7 @@
                                                             {actionLoading[`${resource.vmid}-shutdown`] ? <Icons.RotateCw className="animate-spin" /> : <Icons.Power />}
                                                         </button>
                                                         <button
-                                                            onClick={() => handleAction(resource, 'reboot')}
+                                                            onClick={() => handleAction(resource, 'reboot')} style={{display: isHypervSource ? 'none' : undefined}}
                                                             disabled={actionLoading[`${resource.vmid}-reboot`]}
                                                             className="p-1.5 rounded-lg hover:bg-orange-500/20 text-gray-400 hover:text-orange-400 transition-all disabled:opacity-50"
                                                             title={t('reboot')}
@@ -2068,7 +2141,7 @@
                                                 )}
                                                 {consoles && resource.status === 'running' && (
                                                     <button
-                                                        onClick={() => onOpenConsole(resource)}
+                                                        onClick={() => onOpenConsole(resource)} style={{display: isHypervSource ? 'none' : undefined}}
                                                         className="p-1.5 rounded-lg hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
                                                         title={t('console')}
                                                     >
@@ -2081,7 +2154,7 @@
                                                 )}
                                                 {consoles && resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
                                                     <button
-                                                        onClick={() => onOpenSpice(resource)}
+                                                        onClick={() => onOpenSpice(resource)} style={{display: isHypervSource ? 'none' : undefined}}
                                                         className="p-1.5 rounded-lg hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
                                                         title={t('spiceConsole') || 'SPICE'}
                                                     >
@@ -2097,7 +2170,9 @@
                                                 </button>
                                                 {acts && (
                                                 <button
-                                                    onClick={() => setShowMigrateModal(resource)}
+                                                    onClick={() => isHypervSource
+                                                        ? (onHypervMigrate && onHypervMigrate(resource))
+                                                        : setShowMigrateModal(resource)}
                                                     className="p-1.5 rounded-lg hover:bg-cyan-500/20 text-gray-400 hover:text-cyan-400 transition-all"
                                                     title={t('migrate')}
                                                 >
@@ -2337,7 +2412,7 @@
                                                     <span className="text-sm text-gray-300 truncate block" style={{maxWidth:'min(140px, 12vw)'}} title={resource.node}>{resource.node}</span>
                                                 </td>
                                                 <td className="px-4 py-3">
-                                                    <span className="text-xs font-mono text-gray-400">{ipCache.current[resource.vmid] && ipCache.current[resource.vmid] !== 'loading' ? ipCache.current[resource.vmid] : '-'}</span>
+                                                    <span className="text-xs font-mono text-gray-400">{_ipCacheValue(resource._clusterId || clusterId, resource.vmid) || '-'}</span>
                                                 </td>
                                                 <td className="px-4 py-3">
                                                     <div className="flex items-center gap-2">
@@ -2425,7 +2500,7 @@
                                                     <div className="flex items-center gap-0">
                                                         {getProxmoxObjectUrl(getVmProxmoxTarget(resource)) && (
                                                             <>
-                                                                <button onClick={() => openProxmoxObject(getVmProxmoxTarget(resource))} className="corp-action-btn" title={t('openInProxmox') || 'Open in Proxmox'}><Icons.ExternalLink className="w-3.5 h-3.5" /></button>
+                                                                <button onClick={() => openProxmoxObject(getVmProxmoxTarget(resource))} style={{display: isHypervSource ? 'none' : undefined}} className="corp-action-btn" title={t('openInProxmox') || 'Open in Proxmox'}><Icons.ExternalLink className="w-3.5 h-3.5" /></button>
                                                                 <span className="corp-toolbar-divider" style={{margin: '0 3px'}} />
                                                             </>
                                                         )}
@@ -2441,7 +2516,7 @@
                                                                     <button onClick={() => handleAction(resource, 'shutdown')} disabled={actionLoading[`${resource.vmid}-shutdown`]} className="corp-action-btn" title={t('shutdown')}>
                                                                         {actionLoading[`${resource.vmid}-shutdown`] ? <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" /> : <Icons.Power className="w-3.5 h-3.5" />}
                                                                     </button>
-                                                                    <button onClick={() => handleAction(resource, 'reboot')} disabled={actionLoading[`${resource.vmid}-reboot`]} className="corp-action-btn" title={t('reboot')}>
+                                                                    <button onClick={() => handleAction(resource, 'reboot')} style={{display: isHypervSource ? 'none' : undefined}} disabled={actionLoading[`${resource.vmid}-reboot`]} className="corp-action-btn" title={t('reboot')}>
                                                                         {actionLoading[`${resource.vmid}-reboot`] ? <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" /> : <Icons.RefreshCw className="w-3.5 h-3.5" />}
                                                                     </button>
                                                                 </>
@@ -2452,13 +2527,13 @@
                                                         {/* management group */}
                                                         <div className="corp-action-group">
                                                             {consoles && resource.status === 'running' && (
-                                                                <button onClick={() => onOpenConsole(resource)} className="corp-action-btn" title={t('openConsole')}><Icons.Monitor className="w-3.5 h-3.5" /></button>
+                                                                <button onClick={() => onOpenConsole(resource)} style={{display: isHypervSource ? 'none' : undefined}} className="corp-action-btn" title={t('openConsole')}><Icons.Monitor className="w-3.5 h-3.5" /></button>
                                                             )}
                                                             {!consoles && resource.status === 'running' && (
                                                                 <HaOnActiveLink vm={resource} clusterId={clusterId} iconOnly className="corp-action-btn" iconClass="w-3.5 h-3.5" />
                                                             )}
                                                             {consoles && resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
-                                                                <button onClick={() => onOpenSpice(resource)} className="corp-action-btn" title={t('spiceConsole') || 'SPICE'}><Icons.ExternalLink className="w-3.5 h-3.5" /></button>
+                                                                <button onClick={() => onOpenSpice(resource)} style={{display: isHypervSource ? 'none' : undefined}} className="corp-action-btn" title={t('spiceConsole') || 'SPICE'}><Icons.ExternalLink className="w-3.5 h-3.5" /></button>
                                                             )}
                                                             <button onClick={() => onOpenConfig(resource)} className="corp-action-btn" title={t('configuration')}><Icons.Cog className="w-3.5 h-3.5" /></button>
                                                             {canStar && (
@@ -2467,21 +2542,23 @@
                                                                     <Icons.Star className={`w-3.5 h-3.5 ${isFav(resource) ? 'fill-yellow-400 text-yellow-400' : ''}`} />
                                                                 </button>
                                                             )}
-                                                            {acts && (<>
+                                                            {isHypervSource ? (acts && (
+                                                                <button onClick={() => onHypervMigrate && onHypervMigrate(resource)} className="corp-action-btn" title={t('hvMigrateToProxmox') || 'Migrate to Proxmox'}><Icons.FolderInput className="w-3.5 h-3.5" /></button>
+                                                            )) : acts && (<>
                                                             <button onClick={() => setShowMigrateModal(resource)} className="corp-action-btn" title={t('migrate')}><Icons.ArrowRight className="w-3.5 h-3.5" /></button>
-                                                            <button onClick={() => setShowCloneModal(resource)} className="corp-action-btn" title={t('clone')}><Icons.Copy className="w-3.5 h-3.5" /></button>
+                                                            <button onClick={() => setShowCloneModal(resource)} style={{display: isHypervSource ? 'none' : undefined}} className="corp-action-btn" title={t('clone')}><Icons.Copy className="w-3.5 h-3.5" /></button>
                                                             </>)}
                                                         </div>
                                                         {acts && (<>
                                                         <span className="corp-toolbar-divider" style={{margin: '0 3px'}} />
-                                                        <button onClick={() => setShowDeleteConfirm(resource)} className="corp-action-btn danger" title={t('delete')}><Icons.Trash className="w-3.5 h-3.5" /></button>
+                                                        <button onClick={() => setShowDeleteConfirm(resource)} style={{display: isHypervSource ? 'none' : undefined}} className="corp-action-btn danger" title={t('delete')}><Icons.Trash className="w-3.5 h-3.5" /></button>
                                                         </>)}
                                                     </div>
                                                     ) : (
                                                     <div className="flex items-center gap-1">
                                                         {getProxmoxObjectUrl(getVmProxmoxTarget(resource)) && (
                                                             <button
-                                                                onClick={() => openProxmoxObject(getVmProxmoxTarget(resource))}
+                                                                onClick={() => openProxmoxObject(getVmProxmoxTarget(resource))} style={{display: isHypervSource ? 'none' : undefined}}
                                                                 className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-cyan-500/20 text-gray-400 hover:text-cyan-400 transition-all"
                                                                 title={t('openInProxmox') || 'Open in Proxmox'}
                                                             >
@@ -2540,7 +2617,7 @@
                                                         )}
                                                         {consoles && resource.status === 'running' && (
                                                             <button
-                                                                onClick={() => onOpenConsole(resource)}
+                                                                onClick={() => onOpenConsole(resource)} style={{display: isHypervSource ? 'none' : undefined}}
                                                                 className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
                                                                 title={t('openConsole')}
                                                             >
@@ -2549,7 +2626,7 @@
                                                         )}
                                                         {consoles && resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
                                                             <button
-                                                                onClick={() => onOpenSpice(resource)}
+                                                                onClick={() => onOpenSpice(resource)} style={{display: isHypervSource ? 'none' : undefined}}
                                                                 className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
                                                                 title={t('spiceConsole') || 'SPICE'}
                                                             >
@@ -2584,7 +2661,7 @@
                                                                     {actionLoading[`${resource.vmid}-stop`] ? <Icons.RotateCw /> : <Icons.XCircle />}
                                                                 </button>
                                                                 <button
-                                                                    onClick={() => handleAction(resource, 'reboot')}
+                                                                    onClick={() => handleAction(resource, 'reboot')} style={{display: isHypervSource ? 'none' : undefined}}
                                                                     disabled={actionLoading[`${resource.vmid}-reboot`]}
                                                                     className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-orange-500/20 text-gray-400 hover:text-orange-400 transition-all disabled:opacity-50"
                                                                     title={t('reboot')}
@@ -2604,14 +2681,14 @@
                                                             </>
                                                         )}
                                                         <button
-                                                            onClick={() => setShowCloneModal(resource)}
+                                                            onClick={() => setShowCloneModal(resource)} style={{display: isHypervSource ? 'none' : undefined}}
                                                             className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
                                                             title={t('clone')}
                                                         >
                                                             <Icons.Copy />
                                                         </button>
                                                         <button
-                                                            onClick={() => setShowDeleteConfirm(resource)}
+                                                            onClick={() => setShowDeleteConfirm(resource)} style={{display: isHypervSource ? 'none' : undefined}}
                                                             className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-red-500/20 text-gray-400 hover:text-red-400 transition-all"
                                                             title={t('delete')}
                                                         >
