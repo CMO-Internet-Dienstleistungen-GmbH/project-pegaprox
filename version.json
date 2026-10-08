@@ -155,6 +155,7 @@
     "pegaprox/core/manager.py",
     "pegaprox/core/pbs.py",
     "pegaprox/core/redfish.py",
+    "pegaprox/core/snapshot_meta.py",
     "pegaprox/core/v2p.py",
     "pegaprox/core/virtio_rbd_target.py",
     "pegaprox/core/vmware.py",
