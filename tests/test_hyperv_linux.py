@@ -528,7 +528,10 @@ echo "[   1.0] Converting"
 echo "virt-v2v-in-place: warning: Guestfs.Error(\\"debug: \\") (ignored)"
 for i in 1 2; do
   echo "[    0.000000] Linux version 6.12 (appliance kernel)" >&2
-  echo "commandrvf: sh -c 'say {linux.MARK_AGENT} present'" >&2
+  # The debug output carries the command's source as well.
+  cat >&2 <<'SOURCE'
+{linux.GUEST_AGENT_INSTALL}
+SOURCE
   echo "{linux.MARK_AGENT} installed from the guest's package sources" >&2
 done
 ''')
@@ -574,3 +577,22 @@ echo "libguestfs: trace: everything" >&2
 ''')
         done, _calls = node(script)
         assert linux.MARK_DEBUG not in done.stdout
+
+    def test_a_report_glued_to_a_scriptlets_unterminated_line_is_still_found(self, node):
+        """Measured on CentOS 8.4: rpm's scriptlet wrote to stderr without a line end, and
+        the report followed on the same line of the debug output."""
+        script = linux.conversion_script([linux.disk_source('/dev/pve/vm-1-disk-0')])
+        (node.tmp / 'bin' / 'virt-v2v-in-place').write_text(f'''#!/bin/bash
+echo "Failed to determine unit we run in, igno{linux.MARK_AGENT} installed from the archive x" >&2
+''')
+        done, _calls = node(script)
+        assert linux.read_result(done.stdout)['agent'] == 'installed from the archive x'
+
+    def test_the_report_starts_on_a_line_of_its_own(self, tmp_path):
+        """The install step's own output begins with a line break, so whatever was printed
+        before it without one cannot swallow the marker."""
+        script = linux.GUEST_AGENT_INSTALL.replace('/etc/os-release', str(tmp_path / 'none'))
+        done = subprocess.run(['/bin/sh', '-c', 'printf partial; ' + script], capture_output=True,
+                              text=True, env={'PATH': str(tmp_path)})
+        assert f'\n{linux.MARK_AGENT} failed:' in done.stdout
+        assert f'{linux.MARK_AGENT} ' not in linux.GUEST_AGENT_INSTALL
