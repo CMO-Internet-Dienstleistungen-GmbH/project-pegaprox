@@ -99,6 +99,13 @@ node. `libguestfs-xfs` is only a recommendation of libguestfs and is named
 because RHEL-family guests put `/boot` on XFS. Recommends stay off because
 `supermin` recommends a Debian kernel image.
 
+During a Linux conversion the node also needs **outgoing HTTP and HTTPS** to the
+guest's package sources, or to the archive its release moved to
+(`vault.centos.org`, `old-releases.ubuntu.com`, `archive.debian.org`): the QEMU
+guest agent is installed from there, through the libguestfs appliance's own
+user-mode network (ADR 0009). Without it the migration completes with errors
+and the guest arrives without an agent.
+
 What the install does to the node, measured on PVE 9.2 (trixie):
 
 | | |

@@ -204,7 +204,10 @@ VOLUMES = [{'index': 1, 'volume': 'vm-pool:vm-120-disk-2', 'controller': 'scsi'}
 def node(monkeypatch):
     """A node session that answers from a script and records every command."""
     calls = []
-    answers = {'tool': (0, '', ''), 'script': (0, '[ 1.0] Converting\nV2V_EXIT=0\n', '')}
+    answers = {'tool': (0, '', ''),
+               'script': (0, '[ 1.0] Converting\n'
+                             f"{hyperv_linux.MARK_AGENT} installed from the guest's package "
+                             'sources\nV2V_EXIT=0\n', '')}
 
     def run_on_node(_target, _node, command, timeout=600, **_):
         calls.append(command)
@@ -238,7 +241,7 @@ class TestTheLinuxConversionRuns:
         assert not getattr(task, 'completion_problem', None)
         assert not getattr(task, 'target_unbootable', False)
         script = calls[-1]
-        assert 'virt-v2v-in-place --block-driver virtio-scsi' in script
+        assert 'virt-v2v-in-place -v --block-driver virtio-scsi' in script
         assert any('guest-exec enabled' in line for line in task.log_lines)
 
     def test_the_guest_agent_leaves_selinux_confinement_in_the_conversion(self, node):
@@ -278,6 +281,43 @@ class TestTheLinuxConversionRuns:
         assert task.target_unbootable
         assert 'not started' in note
         assert not any('virt-v2v-in-place' in call for call in calls[2:])
+
+
+class TestTheGuestAgentIsReported:
+    """Without the agent nothing reaches an imported guest to set its addresses. A guest
+    without it still boots, so a failed install never stops the VM from starting -- but
+    the run does not end as a clean success either."""
+
+    def _run(self, node, report):
+        _, answers = node
+        answers['script'] = (0, f'[ 1.0] Converting\n{report}V2V_EXIT=0\n', '')
+        task = _Task()
+        note = hyperv_xhm._inject_drivers_if_asked(task, _Target(), 120, VOLUMES, {})
+        return task, note
+
+    def test_an_installed_agent_says_where_it_came_from(self, node):
+        task, note = self._run(node, f'{hyperv_linux.MARK_AGENT} installed from the archive '
+                                     'https://vault.centos.org/7.9.2009\n')
+        assert note is None and not getattr(task, 'completion_problem', None)
+        assert any('vault.centos.org/7.9.2009' in line for line in task.log_lines)
+
+    def test_an_agent_already_there_is_named(self, node):
+        task, _note = self._run(node, f'{hyperv_linux.MARK_AGENT} present\n')
+        assert not getattr(task, 'completion_problem', None)
+        assert any('already installed' in line for line in task.log_lines)
+
+    def test_a_failed_install_completes_with_errors_and_the_vm_still_starts(self, node):
+        task, note = self._run(node, f'{hyperv_linux.MARK_AGENT} failed: not installable from '
+                                     "the guest's package sources\n")
+        assert note is None
+        assert not getattr(task, 'target_unbootable', False)
+        assert 'not installable' in task.completion_problem
+        assert 'qemu-guest-agent' in task.completion_problem
+
+    def test_a_conversion_that_reported_nothing_is_not_taken_for_success(self, node):
+        task, _note = self._run(node, '')
+        assert 'reported nothing' in task.completion_problem
+        assert not getattr(task, 'target_unbootable', False)
 
 
 class TestAFailedConversionIsNotMovedToSata:
