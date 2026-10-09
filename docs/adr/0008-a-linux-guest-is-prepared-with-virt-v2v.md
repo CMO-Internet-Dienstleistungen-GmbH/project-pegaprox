@@ -39,7 +39,8 @@ runs `virt-v2v-in-place --block-driver virtio-scsi` on the target volume after t
 before anything starts the VM; one disk goes in as `-i disk`, several as `-i libvirtxml`.
 The conversion also empties `BLACKLIST_RPC` / `FILTER_RPC_ARGS` in
 `/etc/sysconfig/qemu-ga`, because every guest in this estate runs with `guest-exec`
-available and RHEL-family packages switch it off.
+available and RHEL-family packages switch it off. The agent itself is installed
+first, in the same run (ADR 0009).
 
 On a guest with SELinux configured (enforcing or permissive), the conversion then marks the
 agent's domain `virt_qemu_ga_t` permissive, as a CIL module `pegaprox_qemu_ga_permissive`

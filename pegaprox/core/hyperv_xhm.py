@@ -2093,7 +2093,27 @@ def _run_linux_conversion(task, target, run_on_node, ordered, new_vmid):
              'by virt-v2v, and guest-exec enabled for the QEMU guest agent. Where SELinux '
              f'is configured, the agent\'s domain virt_qemu_ga_t is permissive (module '
              f'{hyperv_linux.SELINUX_MODULE}).')
+    _report_guest_agent(task, result['agent'])
     return None
+
+
+def _report_guest_agent(task, agent):
+    """Say whether the guest has its agent now. A guest without it boots all the same, so
+    this never fails the conversion; but nothing can reach such a guest to set its
+    addresses, so the run does not end as a clean success either."""
+    if agent == 'present':
+        task.log('The QEMU guest agent was already installed in the guest.')
+        return
+    if agent and agent.startswith('installed'):
+        task.log(f'The QEMU guest agent was {agent}, during the conversion: virt-v2v would '
+                 f'install it only at first boot, through a network the guest does not '
+                 f'have yet.')
+        return
+    why = agent[len('failed:'):].strip() if agent else 'the install step reported nothing'
+    task.completion_problem = (f'The QEMU guest agent could not be installed in the guest '
+                               f'({why}). The VM boots, but nothing can reach it through '
+                               f'the agent: install qemu-guest-agent on its console')
+    task.log(task.completion_problem + '.')
 
 
 class _InjectionView:

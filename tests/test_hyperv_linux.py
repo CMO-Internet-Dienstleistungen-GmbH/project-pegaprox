@@ -80,8 +80,9 @@ if [ "$1" = map ]; then
 fi
 exit ${{RBD_MAP_RC:-0}}
 ''')
+    # One line per call: the install step is a multi-line argument.
     _stub(bin_dir, 'virt-v2v-in-place', f'''
-echo "v2v $*" >> {log}
+printf '%s\\n' "v2v $(printf %s "$*" | tr '\\n' ' ')" >> {log}
 echo "backend=$LIBGUESTFS_BACKEND" >> {log}
 for a in "$@"; do case "$a" in *.xml) cp "$a" {tmp_path}/seen.xml;; esac; done
 echo "[   0.0] Setting up the source"
@@ -109,7 +110,7 @@ class TestTheScriptOnOneDisk:
         assert done.returncode == 0
         assert calls[0] == ('rbd map -o notrim --id admin --keyring /etc/pve/priv/ceph/vm-pool.keyring '
                             '-c /etc/pve/ceph.conf vm-pool/vm-120-disk-1')
-        assert calls[1].startswith('v2v --block-driver virtio-scsi --run-command ')
+        assert calls[1].startswith('v2v -v --block-driver virtio-scsi --run-command ')
         assert calls[1].endswith(' -i disk -if raw /dev/rbd0')
         assert 'backend=direct' in calls
         assert [c for c in calls if c.startswith('rbd unmap')] == ['rbd unmap /dev/rbd0']
@@ -359,3 +360,217 @@ def test_the_log_keeps_the_steps_and_drops_the_chatter():
                                'virt-v2v-in-place: This guest requires UEFI on the target '
                                'to boot.']
     assert result['exit'] == 0 and result['uefi']
+
+
+# ---------------------------------------------------------------------------
+# The guest agent, installed during the conversion
+# ---------------------------------------------------------------------------
+
+class TestTheGuestAgentIsInstalled:
+    """virt-v2v installs the agent only at first boot, over a network the imported guest
+    does not have yet, and never tries again. The conversion installs it itself, over the
+    node's network: from the guest's own sources, then from the archive its release moved
+    to. Each case runs the real step against a stand-in root, with package managers that
+    record what they were asked and succeed only from the source the case names."""
+
+    TOOLS = ('grep', 'sed', 'mktemp', 'mkdir', 'rm', 'tail', 'cat', 'touch', 'cp')
+
+    def _run(self, tmp_path, managers, os_release='', centos_release=None, works_from='own'):
+        root = tmp_path / 'root'
+        for sub in ('etc/yum.repos.d', 'var/log', 'tmp'):
+            (root / sub).mkdir(parents=True)
+        (root / 'etc' / 'os-release').write_text(os_release)
+        if centos_release is not None:
+            (root / 'etc' / 'centos-release').write_text(centos_release + '\n')
+        base = tmp_path / 'base'
+        base.mkdir()
+        for tool in self.TOOLS:
+            (base / tool).symlink_to(shutil.which(tool))
+        stubs = tmp_path / 'stubs'
+        stubs.mkdir()
+        calls = tmp_path / 'calls'
+        done = root / 'installed'
+        archive = 'Dir::Etc::SourceList|--enablerepo=pegaprox-archive'
+        for manager in managers:
+            _stub(stubs, manager, f'''
+echo "{manager} $*" >> {calls}
+for a in "$@"; do case "$a" in Dir::Etc::SourceList=*) cp "${{a#*=}}" {root}/seen.list;; esac; done
+[ -f {root}/etc/yum.repos.d/pegaprox-archive.repo ] && cp {root}/etc/yum.repos.d/pegaprox-archive.repo {root}/seen.repo
+case " $* " in *" install "*) ;; *) exit 0;; esac
+if echo "$*" | grep -Eq '{archive}'; then from=archive; else from=own; fi
+if [ "$from" = "{works_from}" ]; then touch {done}; exit 0; fi
+echo "E: Unable to locate package qemu-guest-agent"; exit 100
+''')
+        _stub(stubs, 'dpkg-query', f'[ -f {done} ] && echo "install ok installed"\n')
+        _stub(stubs, 'rpm', f'[ -f {done} ]\n')
+        script = (linux.GUEST_AGENT_INSTALL
+                  .replace('/tmp/pegaprox-apt.', f'{root}/tmp/pegaprox-apt.')
+                  .replace('/etc/os-release', f'{root}/etc/os-release')
+                  .replace('/etc/centos-release', f'{root}/etc/centos-release')
+                  .replace('/etc/yum.repos.d/', f'{root}/etc/yum.repos.d/')
+                  .replace(linux.AGENT_INSTALL_LOG, f'{root}{linux.AGENT_INSTALL_LOG}'))
+        if 'dpkg-query' not in managers and 'apt-get' not in managers:
+            (stubs / 'dpkg-query').unlink()
+        if not {'dnf', 'yum', 'zypper'} & set(managers):
+            (stubs / 'rpm').unlink()
+        result = subprocess.run(['/bin/sh', '-c', script], capture_output=True, text=True,
+                                env={'PATH': f'{stubs}:{base}'}, timeout=30)
+        recorded = calls.read_text().splitlines() if calls.exists() else []
+        return result, recorded, root
+
+    def _report(self, result):
+        lines = [line for line in result.stdout.splitlines()
+                 if line.startswith(linux.MARK_AGENT + ' ')]
+        assert len(lines) == 1, result.stdout + result.stderr
+        return lines[0][len(linux.MARK_AGENT) + 1:]
+
+    def test_a_guest_that_has_it_is_left_alone(self, tmp_path):
+        (tmp_path / 'root').mkdir()
+        (tmp_path / 'root' / 'installed').touch()
+        result, calls, _ = self._run(tmp_path, ['apt-get'])
+        assert self._report(result) == 'present'
+        assert calls == []
+
+    def test_the_guests_own_sources_come_first(self, tmp_path):
+        result, calls, root = self._run(tmp_path, ['apt-get'],
+                                        'ID=ubuntu\nVERSION_CODENAME=focal\n')
+        assert self._report(result) == "installed from the guest's package sources"
+        assert [c.split()[-1] for c in calls if ' install ' in c] == ['qemu-guest-agent']
+        assert not (root / 'seen.list').exists()
+        assert all('--no-install-recommends' in c for c in calls if ' install ' in c)
+
+    def test_an_ubuntu_release_out_of_support_comes_from_old_releases(self, tmp_path):
+        result, _calls, root = self._run(tmp_path, ['apt-get'],
+                                         'ID=ubuntu\nVERSION_CODENAME=kinetic\n',
+                                         works_from='archive')
+        assert self._report(result) == (
+            'installed from the archive http://old-releases.ubuntu.com/ubuntu')
+        assert (root / 'seen.list').read_text() == (
+            'deb http://old-releases.ubuntu.com/ubuntu kinetic main universe\n'
+            'deb http://old-releases.ubuntu.com/ubuntu kinetic-updates main universe\n')
+        assert list((root / 'tmp').iterdir()) == []
+
+    def test_a_debian_release_out_of_support_comes_from_the_debian_archive(self, tmp_path):
+        result, _calls, root = self._run(tmp_path, ['apt-get'],
+                                         'ID=debian\nVERSION_CODENAME=buster\n',
+                                         works_from='archive')
+        assert self._report(result) == 'installed from the archive http://archive.debian.org/debian'
+        assert (root / 'seen.list').read_text() == 'deb http://archive.debian.org/debian buster main\n'
+
+    def test_centos_7_comes_from_the_vault_of_its_own_release(self, tmp_path):
+        result, calls, root = self._run(tmp_path, ['yum'], 'ID="centos"\nVERSION_ID="7"\n',
+                                        'CentOS Linux release 7.7.1908 (Core)',
+                                        works_from='archive')
+        assert self._report(result) == 'installed from the archive https://vault.centos.org/7.7.1908'
+        repo = (root / 'seen.repo').read_text()
+        assert 'baseurl=https://vault.centos.org/7.7.1908/os/x86_64/' in repo
+        assert 'baseurl=https://vault.centos.org/7.7.1908/updates/x86_64/' in repo
+        assert 'gpgcheck=1' in repo and 'RPM-GPG-KEY-CentOS-7' in repo
+        # Nothing it added stays configured, and its metadata does not stay cached.
+        assert not (root / 'etc' / 'yum.repos.d' / 'pegaprox-archive.repo').exists()
+        assert any(c.startswith('yum clean all') for c in calls)
+
+    def test_centos_8_comes_from_the_vault_and_stream_from_8_stream(self, tmp_path):
+        result, _calls, root = self._run(tmp_path, ['dnf'], 'ID="centos"\n',
+                                         'CentOS Linux release 8.4.2105', works_from='archive')
+        assert self._report(result) == 'installed from the archive https://vault.centos.org/8.4.2105'
+        assert 'RPM-GPG-KEY-centosofficial' in (root / 'seen.repo').read_text()
+
+        stream = tmp_path / 'stream'
+        stream.mkdir()
+        result, _calls, root = self._run(stream, ['dnf'], 'ID="centos"\n',
+                                         'CentOS Stream release 8', works_from='archive')
+        assert self._report(result) == 'installed from the archive https://vault.centos.org/8-stream'
+        assert '/8-stream/AppStream/x86_64/os/' in (root / 'seen.repo').read_text()
+
+    def test_a_release_with_no_archive_reports_why_and_where_the_log_is(self, tmp_path):
+        result, _calls, _root = self._run(tmp_path, ['dnf'], 'ID="rocky"\n', works_from='nowhere')
+        report = self._report(result)
+        assert report.startswith("failed: not installable from the guest's package sources")
+        assert 'Unable to locate package' in report
+        assert linux.AGENT_INSTALL_LOG in report
+        assert result.returncode == 0
+
+    def test_when_the_archive_fails_too_both_are_named(self, tmp_path):
+        result, _calls, _root = self._run(tmp_path, ['apt-get'],
+                                          'ID=ubuntu\nVERSION_CODENAME=bionic\n',
+                                          works_from='nowhere')
+        report = self._report(result)
+        assert 'and the archive http://old-releases.ubuntu.com/ubuntu' in report
+        assert result.returncode == 0
+
+    def test_suse_uses_zypper(self, tmp_path):
+        result, calls, _root = self._run(tmp_path, ['zypper'], 'ID="opensuse-leap"\n')
+        assert self._report(result) == "installed from the guest's package sources"
+        assert calls == ['zypper -n install qemu-guest-agent']
+
+    def test_a_guest_without_a_known_package_manager_still_converts(self, tmp_path):
+        result, _calls, _root = self._run(tmp_path, [], 'ID=alpine\n')
+        assert self._report(result).startswith('failed: the guest has none of the package managers')
+        assert result.returncode == 0
+
+    def test_it_runs_first_so_the_unlock_finds_the_fresh_filter(self):
+        """Measured on CentOS 7.9: a freshly installed package writes BLACKLIST_RPC with
+        guest-exec in it, so the install has to come before the unlock."""
+        script = linux.conversion_script([linux.disk_source('/dev/pve/vm-1-disk-0')])
+        install = script.index(linux.AGENT_INSTALL_LOG)
+        assert install < script.index('BLACKLIST_RPC=') < script.index('typepermissive')
+
+
+class TestTheAgentReportReachesTheLog:
+    """A command's output appears only in virt-v2v's debug output, on stderr."""
+
+    def test_the_debug_output_is_reduced_to_what_the_log_reads(self, node):
+        script = linux.conversion_script([linux.disk_source('/dev/pve/vm-1-disk-0')])
+        stub = node.tmp / 'bin' / 'virt-v2v-in-place'
+        stub.write_text(f'''#!/bin/bash
+echo "[   1.0] Converting"
+echo "virt-v2v-in-place: warning: Guestfs.Error(\\"debug: \\") (ignored)"
+for i in 1 2; do
+  echo "[    0.000000] Linux version 6.12 (appliance kernel)" >&2
+  echo "commandrvf: sh -c 'say {linux.MARK_AGENT} present'" >&2
+  echo "{linux.MARK_AGENT} installed from the guest's package sources" >&2
+done
+''')
+        before = set(Path('/tmp').glob('pegaprox-v2v-*.log'))
+        done, _calls = node(script)
+        result = linux.read_result(done.stdout)
+
+        assert result['agent'] == "installed from the guest's package sources"
+        assert not result['agent_failed']
+        assert result['lines'] == ['[   1.0] Converting']
+        assert done.stdout.count(linux.MARK_AGENT) == 1
+        assert set(Path('/tmp').glob('pegaprox-v2v-*.log')) == before
+
+    def test_a_conversion_without_a_report_counts_as_a_failed_install(self):
+        result = linux.read_result(f'[ 1.0] Converting\n{linux.MARK_EXIT}0\n')
+        assert result['agent'] is None and result['agent_failed']
+
+    def test_a_reported_failure_is_one(self):
+        result = linux.read_result(f'{linux.MARK_AGENT} failed: no sources\n{linux.MARK_EXIT}0\n')
+        assert result['agent'] == 'failed: no sources' and result['agent_failed']
+
+    def test_a_failure_libguestfs_names_reaches_the_log(self, node):
+        """Measured twice with parallel conversions: exit 1 after 5 s and not one line on
+        stdout. The reason was in the debug output, under a prefix the filter dropped."""
+        script = linux.conversion_script([linux.disk_source('/dev/pve/vm-1-disk-0')])
+        (node.tmp / 'bin' / 'virt-v2v-in-place').write_text('''#!/bin/bash
+echo "[    0.000000] Linux version 6.12 (appliance kernel)" >&2
+echo "libguestfs: error: could not create appliance through libvirt" >&2
+exit 1
+''')
+        done, _calls = node(script)
+        result = linux.read_result(done.stdout)
+
+        assert result['exit'] == 1
+        assert (f'{linux.MARK_DEBUG} libguestfs: error: could not create appliance through '
+                'libvirt') in result['lines']
+        assert not any('appliance kernel' in line for line in result['lines'])
+
+    def test_a_successful_run_keeps_its_debug_output_to_itself(self, node):
+        script = linux.conversion_script([linux.disk_source('/dev/pve/vm-1-disk-0')])
+        (node.tmp / 'bin' / 'virt-v2v-in-place').write_text('''#!/bin/bash
+echo "libguestfs: trace: everything" >&2
+''')
+        done, _calls = node(script)
+        assert linux.MARK_DEBUG not in done.stdout
