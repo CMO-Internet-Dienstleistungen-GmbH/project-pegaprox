@@ -123,6 +123,14 @@ choosing a VM out of a list; it is not evidence about a disk. See
      domain `virt_qemu_ga_t` permissive (module `pegaprox_qemu_ga_permissive`),
      so guest-exec can run `ip` and write under `/etc` there too. See
      `adr/0008-a-linux-guest-is-prepared-with-virt-v2v.md`.
+     Before all of that it installs the QEMU guest agent, with the guest's own
+     package manager over the node's network: virt-v2v alone would try that only
+     at first boot, when an imported guest has no network yet, and never again.
+     The guest's own sources come first, then the archive of a release that has
+     moved to one (CentOS vault, Ubuntu old-releases, Debian archive). The log
+     says where the agent came from; when it could not be installed, the
+     migration completes with errors and the VM is started all the same. See
+     `adr/0009-the-guest-agent-is-installed-during-the-linux-conversion.md`.
    - **No** builds the VM on hardware every guest already has drivers for, and
      the switch to VirtIO is then a step of its own afterwards (see *After the
      import*).
