@@ -131,3 +131,34 @@ asked through the agent (`qm agent ping`, then `qm guest exec` writing under `/e
   dropped, so after a failed run the last 30 debug lines (without the appliance's kernel
   log) are passed on, prefixed `V2V_DEBUG`.
 - Under `-v`, the debug output of one conversion was about 200 KB.
+- The report line is not always on a line of its own in the debug output. On CentOS 8.4
+  an rpm scriptlet wrote an unterminated line to stderr, and the report followed on it:
+  `Failed to determine unit we run in, ignoPEGAPROX_QGA installed from ...`. A filter
+  anchored at the line start lost it, and the migration would have completed with errors
+  for a guest that had its agent. The step now starts its report with a line break, the
+  filter finds the marker anywhere in a line, and the script assembles the marker from
+  two halves so its own source in the debug output never matches.
+
+### Reboot after first boot
+
+Same setup, every guest booted without a network adapter, probed through the agent,
+rebooted with `qm reboot`, and probed again: Ubuntu 18.04, 20.04, 22.04, 22.10 and 24.04,
+Debian 10, 11 and 12, CentOS 7.9, 8.4 and Stream 8, Rocky Linux 8.10 and 9.8, AlmaLinux
+9.8, openSUSE Leap 15.6, and Rocky Linux 9.8 with the agent kept.
+
+- After the reboot the agent answered on every guest within 3 to 11 s, `guest-exec`
+  wrote under `/etc`, and the agent service was active and enabled (`static` on Debian
+  and Ubuntu, where udev starts it on the virtio port).
+- On every RHEL-family guest the agent ran as `virt_qemu_ga_t` with SELinux `Enforcing`
+  after the reboot, and could write under `/etc`. During the first boot some showed
+  `Permissive` or `initrc_t`: virt-v2v's firstboot sets SELinux permissive while its
+  scripts run and starts the agent from there.
+- virt-v2v's own firstboot scripts were all gone after the reboot. On guests where the
+  probe of the first boot came while they still ran (its offline package install waits
+  for the network that is not there), the runner finished them on the next boot and did
+  not repeat any.
+- No `pegaprox-archive` repository file was left in any guest.
+- Right after the first answer the agent of one guest (Rocky Linux 9.8, agent kept) was
+  briefly unreachable ("QEMU guest agent is not running") and answered again after the
+  reboot. Whatever talks to a freshly imported guest through the agent has to retry
+  during its first minute.
