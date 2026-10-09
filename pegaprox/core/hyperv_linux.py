@@ -70,10 +70,15 @@ AGENT_INSTALL_LOG = '/var/log/pegaprox-guest-agent-install.log'
 #: before the unlock below, because a freshly installed RHEL package brings its filter.
 #: Its first line is a comment because virt-v2v's progress line shows the first line of
 #: the command it runs.
+#: The report starts with a line break and is found anywhere in a line: in the debug output
+#: a package scriptlet's unterminated stderr line can run straight into it (measured on
+#: CentOS 8.4: "... ignoPEGAPROX_QGA installed ..."). Its marker is assembled from two
+#: halves, so the script's own source, which the debug output also carries, never
+#: contains it.
 GUEST_AGENT_INSTALL = (r'''
 # PegaProx: install qemu-guest-agent now, not at first boot
 log=''' + AGENT_INSTALL_LOG + r'''
-say() { echo "''' + MARK_AGENT + r''' $*"; }
+say() { printf '\n%s%s %s\n' "''' + MARK_AGENT[:4] + r'''" "''' + MARK_AGENT[4:] + r'''" "$*"; }
 has() { command -v "$1" >/dev/null 2>&1; }
 present() {
   if has dpkg-query; then
@@ -326,8 +331,8 @@ def conversion_script(sources: list[dict], guest_name: str = 'guest') -> str:
         lines.append(f'{common} -i libvirtxml "$XML" 2>"$DEBUG"')
     lines.append('rc=$?')
     # The debug output repeats a command's output; each line is kept once.
-    lines.append(f"grep -E '^(virt-v2v|semodule|libsemanage|{MARK_AGENT} )' \"$DEBUG\" "
-                 "| awk '!seen[$0]++'")
+    lines.append("grep -E '^(virt-v2v|semodule|libsemanage)' \"$DEBUG\" | awk '!seen[$0]++'")
+    lines.append(f"grep -oE '{MARK_AGENT} .*' \"$DEBUG\" | awk '!seen[$0]++'")
     # Without the appliance's kernel log, which is what most of the rest is.
     lines.append(f"[ $rc -ne 0 ] && grep -vE '^\\[' \"$DEBUG\" | tail -n 30 "
                  f"| sed 's/^/{MARK_DEBUG} /'")
