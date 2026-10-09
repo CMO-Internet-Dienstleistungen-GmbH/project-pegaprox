@@ -42,6 +42,123 @@ INSTALL_COMMAND = (
 #: virtio-scsi, and a guest converted for virtio-blk would look for /dev/vda on it.
 BLOCK_DRIVER = 'virtio-scsi'
 
+#: Starts every line the install step reports. A command's output appears only in
+#: virt-v2v's debug output, and this is how the line is found there.
+MARK_AGENT = 'PEGAPROX_QGA'
+
+#: Where the install step keeps what the package manager said, inside the guest.
+AGENT_INSTALL_LOG = '/var/log/pegaprox-guest-agent-install.log'
+
+#: Install qemu-guest-agent in the guest during the conversion, over the node's network.
+#: virt-v2v installs it only at first boot, over the guest's own network, and a guest
+#: imported from Hyper-V has none then: its configuration names the adapters it had there.
+#: virt-v2v's firstboot runner moves each script aside before running it and deletes it
+#: afterwards, whatever the result, so that attempt is never repeated -- and without the
+#: agent nothing can reach the guest to set its addresses.
+#:
+#: The libguestfs appliance has outgoing network (measured on PVE 9.2, virt-v2v 2.6.0), so
+#: the guest's own package manager runs here, against the guest's own sources first: they
+#: may be an internal mirror, and they are what the guest is maintained from. Where they
+#: fail and the release is one its distributor has moved to an archive, the archive is
+#: tried, checked against the guest's own signing keys: CentOS 7 and 8 from vault.centos.org
+#: (mirrorlist.centos.org no longer resolves), Ubuntu from old-releases.ubuntu.com, Debian
+#: from archive.debian.org. Nothing it adds stays configured in the guest.
+#:
+#: It always exits 0: a failing --run-command stops virt-v2v, and an agent that could not be
+#: installed is no reason to leave the guest unbootable. It reports one line instead --
+#: `PEGAPROX_QGA present`, `... installed from <where>` or `... failed: <why>`. It runs
+#: before the unlock below, because a freshly installed RHEL package brings its filter.
+#: Its first line is a comment because virt-v2v's progress line shows the first line of
+#: the command it runs.
+GUEST_AGENT_INSTALL = (r'''
+# PegaProx: install qemu-guest-agent now, not at first boot
+log=''' + AGENT_INSTALL_LOG + r'''
+say() { echo "''' + MARK_AGENT + r''' $*"; }
+has() { command -v "$1" >/dev/null 2>&1; }
+present() {
+  if has dpkg-query; then
+    dpkg-query -W -f='${Status}' qemu-guest-agent 2>/dev/null | grep -q ' installed$' && return 0
+  fi
+  if has rpm; then rpm -q qemu-guest-agent >/dev/null 2>&1 && return 0; fi
+  return 1
+}
+if present; then say present; exit 0; fi
+ID=''; VERSION_CODENAME=''; UBUNTU_CODENAME=''
+[ -r /etc/os-release ] && . /etc/os-release
+code=${VERSION_CODENAME:-$UBUNTU_CODENAME}
+url=''
+apt_q() {
+  DEBIAN_FRONTEND=noninteractive apt-get -q -y -o Acquire::Retries=1 \
+    -o Acquire::http::Timeout=20 -o Dpkg::Options::=--force-confold "$@" >>"$log" 2>&1
+}
+apt_from() {
+  dir=$(mktemp -d /tmp/pegaprox-apt.XXXXXX) || return 1
+  mkdir -p "$dir/lists/partial"
+  printf '%s\n' "$@" > "$dir/sources.list"
+  set -- -o Dir::Etc::SourceList="$dir/sources.list" -o Dir::Etc::SourceParts="$dir/none" \
+    -o Dir::State::Lists="$dir/lists" -o Acquire::Check-Valid-Until=false
+  apt_q "$@" update
+  apt_q "$@" install --no-install-recommends qemu-guest-agent
+  rm -rf "$dir"
+}
+rpm_from() {
+  repo=/etc/yum.repos.d/pegaprox-archive.repo
+  key=$1
+  shift
+  : > "$repo"
+  n=0
+  for base in "$@"; do
+    n=$((n + 1))
+    printf '[pegaprox-archive-%s]\nname=archive %s\nbaseurl=%s\ngpgcheck=1\ngpgkey=file://%s\n' \
+      "$n" "$n" "$base" "$key" >> "$repo"
+  done
+  $pm -y --setopt=timeout=20 --setopt=retries=1 --disablerepo='*' \
+    --enablerepo='pegaprox-archive-*' install qemu-guest-agent >>"$log" 2>&1
+  $pm clean all --disablerepo='*' --enablerepo='pegaprox-archive-*' >/dev/null 2>&1
+  rm -f "$repo"
+}
+if has apt-get; then
+  apt_q update
+  apt_q install --no-install-recommends qemu-guest-agent
+  if present; then say "installed from the guest's package sources"; exit 0; fi
+  if [ -n "$code" ]; then
+    case "$ID" in
+      ubuntu) url=http://old-releases.ubuntu.com/ubuntu
+        apt_from "deb $url $code main universe" "deb $url $code-updates main universe" ;;
+      debian) url=http://archive.debian.org/debian
+        apt_from "deb $url $code main" ;;
+    esac
+  fi
+elif has dnf || has yum; then
+  if has dnf; then pm=dnf; else pm=yum; fi
+  $pm -y --setopt=timeout=20 --setopt=retries=1 install qemu-guest-agent >>"$log" 2>&1
+  if present; then say "installed from the guest's package sources"; exit 0; fi
+  release=$(sed -n 's/^CentOS.* release \([0-9][0-9.]*\).*/\1/p' /etc/centos-release 2>/dev/null)
+  case "$ID:$release" in
+    centos:7.*) url=https://vault.centos.org/$release
+      rpm_from /etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7 "$url/os/x86_64/" "$url/updates/x86_64/" ;;
+    centos:8 | centos:8.*) url=https://vault.centos.org/$release
+      [ "$release" = 8 ] && url=https://vault.centos.org/8-stream
+      rpm_from /etc/pki/rpm-gpg/RPM-GPG-KEY-centosofficial "$url/BaseOS/x86_64/os/" \
+        "$url/AppStream/x86_64/os/" ;;
+  esac
+elif has zypper; then
+  zypper -n install qemu-guest-agent >>"$log" 2>&1
+  if present; then say "installed from the guest's package sources"; exit 0; fi
+else
+  say "failed: the guest has none of the package managers this step knows (apt, dnf, yum, zypper)"
+  exit 0
+fi
+tried="the guest's package sources"
+if [ -n "$url" ]; then
+  if present; then say "installed from the archive $url"; exit 0; fi
+  tried="$tried and the archive $url"
+fi
+last=$(grep -E '^(E:|Error|No package|Cannot|Could not|Failed|Problem)' "$log" 2>/dev/null | tail -n 1)
+say "failed: not installable from $tried${last:+ (last error: $last)}; see $log in the guest"
+exit 0
+''').strip()
+
 #: Every guest in this estate is run with guest-exec available, and RHEL-family packages
 #: of qemu-guest-agent switch it off by default: RHEL 7 in BLACKLIST_RPC, later releases
 #: in FILTER_RPC_ARGS, both in /etc/sysconfig/qemu-ga. Emptying the variable lifts the
@@ -79,6 +196,9 @@ CONVERSION_TIMEOUT = 3600
 MARK_EXIT = 'V2V_EXIT='
 MARK_MAP_FAILED = 'RBD_MAP_FAILED'
 MARK_UNMAP_FAILED = 'RBD_UNMAP_FAILED'
+#: Prefixes the end of virt-v2v's debug output after a failed run: an error from libguestfs
+#: or supermin does not start with 'virt-v2v' and would otherwise not reach the log.
+MARK_DEBUG = 'V2V_DEBUG'
 
 _RBD_OPTION = re.compile(r':(conf|id|keyring|mon_host)=([^:]*)')
 _FILE_FORMATS = {'.raw': 'raw', '.qcow2': 'qcow2', '.img': 'raw'}
@@ -160,13 +280,14 @@ def conversion_script(sources: list[dict], guest_name: str = 'guest') -> str:
     # The unmap is retried: virt-v2v leaves on a signal before its nbdkit has let go of the
     # device, and one `rbd unmap` a moment later fails with EBUSY. Measured after a SIGTERM
     # on PVE 9.2: the device stayed mapped; unmapped by hand seconds later it went at once.
-    lines = ['set -u', 'MAPPED=""', 'XML=""',
+    lines = ['set -u', 'MAPPED=""', 'XML=""', 'DEBUG=""',
              'cleanup() { for d in $MAPPED; do '
              'for i in 1 2 3 4 5 6 7 8 9 10; do rbd unmap "$d" >/dev/null 2>&1 && break; '
              'sleep 3; done; '
              f'rbd showmapped 2>/dev/null | grep -q " $d\\$" && echo "{MARK_UNMAP_FAILED} $d"; '
-             'done; [ -n "$XML" ] && rm -f "$XML"; }',
-             'trap cleanup EXIT']
+             'done; [ -n "$XML" ] && rm -f "$XML"; [ -n "$DEBUG" ] && rm -f "$DEBUG"; }',
+             'trap cleanup EXIT',
+             'DEBUG=$(mktemp /tmp/pegaprox-v2v-XXXXXX.log)']
     exprs = []
     for index, source in enumerate(sources):
         var = f'DISK{index}'
@@ -179,12 +300,18 @@ def conversion_script(sources: list[dict], guest_name: str = 'guest') -> str:
             lines.append(f'{var}={shlex.quote(source["path"])}')
             exprs.append((var, source['kind'], source['format']))
 
-    common = (f'LIBGUESTFS_BACKEND=direct virt-v2v-in-place --block-driver {BLOCK_DRIVER} '
+    # -v because a command's output appears nowhere else; measured with 2.6.0, the debug
+    # output and that output go to stderr and the progress lines stay on stdout as they
+    # are without it. stderr is kept in a file and reduced to the lines the log reads:
+    # the debug output also carries the appliance's kernel log, whose lines start with '['
+    # like the progress lines do.
+    common = (f'LIBGUESTFS_BACKEND=direct virt-v2v-in-place -v --block-driver {BLOCK_DRIVER} '
+              f'--run-command {shlex.quote(GUEST_AGENT_INSTALL)} '
               f'--run-command {shlex.quote(GUEST_AGENT_UNLOCK)} '
               f'--run-command {shlex.quote(GUEST_AGENT_SELINUX)}')
     if len(exprs) == 1:
         var, _kind, fmt = exprs[0]
-        lines.append(f'{common} -i disk -if {fmt} "${var}"')
+        lines.append(f'{common} -i disk -if {fmt} "${var}" 2>"$DEBUG"')
     else:
         disks = ''.join(_libvirt_disk(i, f'${var}', kind, fmt)
                         for i, (var, kind, fmt) in enumerate(exprs))
@@ -196,8 +323,14 @@ def conversion_script(sources: list[dict], guest_name: str = 'guest') -> str:
             f"<vcpu>1</vcpu><os><type arch='x86_64'>hvm</type></os>"
             f'<devices>{disks}</devices></domain>\n'
             f'PEGAPROX_V2V_XML')
-        lines.append(f'{common} -i libvirtxml "$XML"')
+        lines.append(f'{common} -i libvirtxml "$XML" 2>"$DEBUG"')
     lines.append('rc=$?')
+    # The debug output repeats a command's output; each line is kept once.
+    lines.append(f"grep -E '^(virt-v2v|semodule|libsemanage|{MARK_AGENT} )' \"$DEBUG\" "
+                 "| awk '!seen[$0]++'")
+    # Without the appliance's kernel log, which is what most of the rest is.
+    lines.append(f"[ $rc -ne 0 ] && grep -vE '^\\[' \"$DEBUG\" | tail -n 30 "
+                 f"| sed 's/^/{MARK_DEBUG} /'")
     lines.append(f'echo "{MARK_EXIT}$rc"')
     lines.append('exit $rc')
     return '\n'.join(lines)
@@ -215,17 +348,23 @@ def read_result(output: str) -> dict:
     if found:
         exit_code = int(found[-1])
     lines = [line.rstrip() for line in text.splitlines()
-             if line.startswith(('[', 'virt-v2v', MARK_MAP_FAILED, MARK_UNMAP_FAILED,
+             if line.startswith(('[', 'virt-v2v', MARK_MAP_FAILED, MARK_UNMAP_FAILED, MARK_DEBUG,
                                  # What semodule said when the SELinux step failed.
                                  # Measured: virt-v2v's own error line only repeats the
                                  # command and "command exited with an error".
-                                 'semodule', 'libsemanage'))]
+                                 'semodule', 'libsemanage'))
+             # Printed by 2.6.0 under -v on every run, about the debug switch itself.
+             and 'Guestfs.Error("debug: ")' not in line]
+    reported = re.findall(rf'^{MARK_AGENT} (.+?)\s*$', text, re.M)
+    agent = reported[-1] if reported else None
     # virt-v2v names the failed command in its error line, and only this step's command
     # carries the module's type rule.
     selinux_failed = any(line.startswith('virt-v2v') and 'error:' in line
                          and 'typepermissive virt_qemu_ga_t' in line
                          for line in text.splitlines())
     return {'exit': exit_code, 'lines': lines, 'selinux_failed': selinux_failed,
+            'agent': agent,
+            'agent_failed': agent is None or agent.startswith('failed'),
             'map_failed': MARK_MAP_FAILED in text,
             'left_mapped': re.findall(rf'^{MARK_UNMAP_FAILED} (\S+)', text, re.M),
             'uefi': 'requires UEFI on the target' in text}
