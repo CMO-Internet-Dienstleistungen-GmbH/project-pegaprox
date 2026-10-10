@@ -193,6 +193,162 @@ GUEST_AGENT_SELINUX = (
     f"then printf '(typepermissive virt_qemu_ga_t)\\n' > /tmp/{SELINUX_MODULE}.cil "
     f"&& semodule -i /tmp/{SELINUX_MODULE}.cil && rm -f /tmp/{SELINUX_MODULE}.cil; fi")
 
+#: Starts every line the network step reports, like MARK_AGENT for the agent.
+MARK_NETWORK = 'PEGAPROX_NET'
+
+#: Give each adapter back the name the guest's configuration uses, by its MAC.
+#:
+#: On Hyper-V a Linux guest's adapters are netvsc devices, which the kernel names eth0,
+#: eth1, ...; the configuration -- netplan, ifupdown, ifcfg, NetworkManager, networkd,
+#: wicked -- names them so, and so may firewall rules and services. On Proxmox the same
+#: adapter, with the same MAC, is a VirtIO PCI device and comes up under a predictable name
+#: (ens18). Nothing applies the old configuration to it, and the guest has no network.
+#:
+#: Rather than rewriting every format the configuration may be in, the step pins the old
+#: name to the MAC: a systemd .link file (on RHEL 7 also HWADDR in the ifcfg file, which
+#: initscripts renames by). Everything that names the adapter then keeps working as it is,
+#: with the addresses it had. Which name belongs to which MAC is taken only from what the
+#: guest records -- ifcfg HWADDR, netplan match/macaddress, NetworkManager mac-address,
+#: networkd MACAddress=, 70-persistent-net.rules -- or, with a single adapter, from the one
+#: name the configuration uses. Anything else is reported and left alone; nothing is guessed.
+#:
+#: A name in the kernel's own eth namespace is pinned only where the kernel would hand it
+#: out to the same adapter anyway (eth<n> for the n-th adapter): renaming one adapter onto a
+#: name another still holds fails half-way. On Debian and Ubuntu the initramfs names the
+#: adapter before the root file system is mounted, so it is rebuilt to carry the .link file.
+#: The .link file matches the MAC together with the drivers of the NIC models a migration
+#: creates (VirtIO, e1000), so a VLAN or bridge that carries the same MAC is not renamed.
+#: `Type=ether` would say the same, but systemd before 246 compares it with DEVTYPE, which
+#: plain Ethernet does not set: on Ubuntu 18.04 and Debian 10 the file never applied.
+#: cloud-init's network rendering is switched off where it is on: with the datasource that
+#: changed with the hypervisor it treats the first boot as a new instance and writes its
+#: fallback configuration (DHCP on the first adapter) over the guest's own.
+#:
+#: Always exits 0 and reports one line per adapter, `PEGAPROX_NET <mac> pinned <name> (...)`
+#: or `PEGAPROX_NET <mac> unassigned: <why>`, and `PEGAPROX_NET cloud-init ...` where it
+#: switched cloud-init off.
+_NETWORK_PIN = r'''
+# PegaProx: give each adapter back the name its configuration uses
+macs='@MACS@'
+say() { printf '\n%s%s %s\n' "PEGA" "PROX_NET" "$*"; }
+work=$(mktemp -d /tmp/pegaprox-net.XXXXXX) || { say "failed: no scratch directory"; exit 0; }
+ev=$work/evidence names=$work/names
+: > "$ev"; : > "$names"
+low() { tr 'ABCDEF' 'abcdef'; }
+unq() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e "s/^[\"']//" -e "s/[\"']$//"; }
+ether() { case "$1" in ''|lo|*.*|*:*|bond*|br*|virbr*|docker*|veth*|vlan*|team*|tun*|tap*|wl*) return 1;; esac; }
+name_of() { [ -n "$1" ] && ether "$1" && echo "$1" >> "$names"; }
+pair() { m=$(printf '%s' "$1" | low | unq); n=$(printf '%s' "$2" | unq); [ -n "$m" ] && ether "$n" && echo "$m $n" >> "$ev"; }
+val() { sed -n "s/^[[:space:]]*$1=//p" "$2" | tail -n 1 | unq; }
+for f in /etc/sysconfig/network-scripts/ifcfg-*; do
+  [ -f "$f" ] || continue
+  case "$(val TYPE "$f" | low)" in ''|ethernet) ;; *) continue;; esac
+  n=$(val DEVICE "$f"); [ -n "$n" ] || n=${f##*/ifcfg-}
+  name_of "$n"; h=$(val HWADDR "$f"); [ -n "$h" ] && pair "$h" "$n"
+done
+for f in /etc/sysconfig/network/ifcfg-*; do [ -f "$f" ] && name_of "${f##*/ifcfg-}"; done
+for f in /etc/network/interfaces /etc/network/interfaces.d/*; do
+  [ -f "$f" ] || continue
+  for n in $(awk '$1 == "iface" || $1 == "auto" || $1 ~ /^allow-/ { for (i = 2; i <= NF; i++) if ($i !~ /^(inet6?|static|dhcp|manual|loopback)$/) print $i }' "$f"); do name_of "$n"; done
+done
+for f in /etc/systemd/network/*.network /etc/NetworkManager/system-connections/*; do
+  [ -f "$f" ] || continue
+  n=$(sed -n -e 's/^[[:space:]]*Name=//p' -e 's/^[[:space:]]*interface-name=//p' "$f" | head -n 1 | unq)
+  case "$n" in *'*'*|*' '*) n='' ;; esac
+  name_of "$n"
+  m=$(sed -n -e 's/^[[:space:]]*MACAddress=//p' -e 's/^[[:space:]]*mac-address=//p' "$f" | head -n 1)
+  [ -n "$m" ] && [ -n "$n" ] && pair "$m" "$n"
+done
+for f in /etc/netplan/*.yaml /etc/netplan/*.yml; do
+  [ -f "$f" ] || continue
+  awk -v names="$names" -v ev="$ev" '
+    function indent(s) { match(s, /^ */); return RLENGTH }
+    function flush() {
+      if (id != "") {
+        n = setname != "" ? setname : (mname != "" ? mname : (inmatch ? "" : id))
+        if (n != "" && n !~ /[*?]/) { print n >> names; if (mac != "") print tolower(mac), n >> ev }
+      }
+      id = ""; setname = ""; mname = ""; mac = ""; inmatch = 0
+    }
+    { sub(/#.*/, ""); gsub(/["\047]/, "") }
+    /^[ \t]*$/ { next }
+    {
+      d = indent($0); line = $0; sub(/^ +/, "", line)
+      if (line ~ /^ethernets:/) { flush(); eth = d; child = -1; next }
+      if (eth == "") next
+      if (d <= eth) { flush(); eth = ""; next }
+      if (child < 0) child = d
+      if (d == child) { flush(); id = line; sub(/:.*/, "", id); next }
+      if (line ~ /^match:/) { inmatch = 1; next }
+      if (line ~ /^set-name:/) { setname = line; sub(/^set-name: */, "", setname) }
+      else if (line ~ /^macaddress:/ && inmatch) { mac = line; sub(/^macaddress: */, "", mac) }
+      else if (line ~ /^name:/ && inmatch) { mname = line; sub(/^name: */, "", mname) }
+    }
+    END { flush() }' eth="" "$f"
+done
+f=/etc/udev/rules.d/70-persistent-net.rules
+if [ -f "$f" ]; then
+  sed -n 's/.*ATTR{address}=="\([^"]*\)".*NAME="\([^"]*\)".*/\1 \2/p' "$f" | while read -r m n; do pair "$m" "$n"; done
+fi
+count=0; for mac in $macs; do count=$((count + 1)); done
+sort -u "$names" -o "$names"
+pinned=0; i=0; taken=' '
+for mac in $macs; do
+  name=$(awk -v m="$mac" '$1 == m { print $2; exit }' "$ev")
+  how='the guest records this MAC for it'
+  if [ -z "$name" ] && [ "$count" = 1 ] && [ "$(wc -l < "$names")" -eq 1 ]; then
+    name=$(cat "$names"); how='the only adapter, and the only name its configuration uses'
+  fi
+  if [ -z "$name" ]; then
+    if [ -s "$names" ]; then
+      say "$mac unassigned: no record ties it to one of the configured names ($(tr '\n' ' ' < "$names" | sed 's/ $//'))"
+    else
+      say "$mac unassigned: the guest's configuration names no adapter"
+    fi
+  elif case "$taken" in *" $name "*) true;; *) false;; esac; then
+    say "$mac unassigned: $name is already given to another adapter"
+  elif [ "$count" -gt 1 ] && case "$name" in eth[0-9]*) [ "$name" != "eth$i" ];; *) false;; esac; then
+    say "$mac unassigned: $name belongs to another adapter's place in the kernel's eth order, and renaming onto it fails half-way"
+  else
+    taken="$taken$name "
+    mkdir -p /etc/systemd/network
+    printf '# Written by PegaProx: this adapter had this name on Hyper-V, and the\n# configuration still uses it.\n[Match]\nMACAddress=%s\nDriver=virtio_net e1000\n\n[Link]\nName=%s\n' \
+      "$mac" "$name" > "/etc/systemd/network/10-pegaprox-$name.link"
+    f=/etc/sysconfig/network-scripts/ifcfg-$name
+    if [ -f "$f" ] && ! grep -q '^[[:space:]]*HWADDR=' "$f"; then echo "HWADDR=$mac" >> "$f"; fi
+    pinned=$((pinned + 1))
+    say "$mac pinned $name ($how)"
+  fi
+  i=$((i + 1))
+done
+if [ "$pinned" -gt 0 ]; then
+  if command -v cloud-init >/dev/null 2>&1 && [ ! -f /etc/cloud/cloud-init.disabled ] && \
+     ! grep -qsE '^[[:space:]]*config:[[:space:]]*disabled|network:[[:space:]]*\{[[:space:]]*config:[[:space:]]*disabled' \
+       /etc/cloud/cloud.cfg /etc/cloud/cloud.cfg.d/*.cfg; then
+    mkdir -p /etc/cloud/cloud.cfg.d && \
+    printf '# Written by PegaProx: the network is configured by the files the guest\n# brought from Hyper-V, not rendered by cloud-init.\nnetwork: {config: disabled}\n' \
+      > /etc/cloud/cloud.cfg.d/99-pegaprox-network.cfg && \
+    say "cloud-init: its network rendering is switched off"
+  fi
+  if command -v update-initramfs >/dev/null 2>&1; then
+    update-initramfs -u -k all >/dev/null 2>&1 || say "initramfs: update-initramfs failed; the names apply once the root file system is up"
+  fi
+fi
+rm -rf "$work"
+exit 0
+'''.strip()
+
+
+def network_pin_command(macs):
+    """The network step for a VM with these MACs, in the order of its adapters."""
+    clean = []
+    for mac in macs or ():
+        text = str(mac or '').strip().lower()
+        if re.fullmatch(r'([0-9a-f]{2}:){5}[0-9a-f]{2}', text):
+            clean.append(text)
+    return _NETWORK_PIN.replace('@MACS@', ' '.join(clean)) if clean else None
+
+
 #: How long a conversion may take. Measured 191 s for 150 GiB, most of it spent marking
 #: unused areas; the ceiling leaves room for a guest several times that size.
 CONVERSION_TIMEOUT = 3600
@@ -269,13 +425,14 @@ def _libvirt_disk(index: int, path_expr: str, kind: str, fmt: str) -> str:
             f"<source dev=\"{path_expr}\"/><target dev='{target}' bus='scsi'/></disk>")
 
 
-def conversion_script(sources: list[dict], guest_name: str = 'guest') -> str:
+def conversion_script(sources: list[dict], guest_name: str = 'guest', macs=None) -> str:
     """The script the node runs: map what needs mapping, convert, unmap on every path.
 
     One disk goes in as `-i disk`, the input mode measured on a real guest. Several go in
     as `-i libvirtxml`, because `-i disk` takes exactly one and a guest's root can span
     disks. Mapped RBD devices are released by a trap, so a failed conversion does not leave
-    a kernel mapping of the guest's disk behind on the node.
+    a kernel mapping of the guest's disk behind on the node. `macs` are the VM's adapters in
+    their order; with them the network step pins each one's old name.
     """
     if not sources:
         raise UnsupportedVolume('There is no disk to convert')
@@ -314,6 +471,9 @@ def conversion_script(sources: list[dict], guest_name: str = 'guest') -> str:
               f'--run-command {shlex.quote(GUEST_AGENT_INSTALL)} '
               f'--run-command {shlex.quote(GUEST_AGENT_UNLOCK)} '
               f'--run-command {shlex.quote(GUEST_AGENT_SELINUX)}')
+    network = network_pin_command(macs)
+    if network:
+        common += f' --run-command {shlex.quote(network)}'
     if len(exprs) == 1:
         var, _kind, fmt = exprs[0]
         lines.append(f'{common} -i disk -if {fmt} "${var}" 2>"$DEBUG"')
@@ -332,7 +492,7 @@ def conversion_script(sources: list[dict], guest_name: str = 'guest') -> str:
     lines.append('rc=$?')
     # The debug output repeats a command's output; each line is kept once.
     lines.append("grep -E '^(virt-v2v|semodule|libsemanage)' \"$DEBUG\" | awk '!seen[$0]++'")
-    lines.append(f"grep -oE '{MARK_AGENT} .*' \"$DEBUG\" | awk '!seen[$0]++'")
+    lines.append(f"grep -oE '({MARK_AGENT}|{MARK_NETWORK}) .*' \"$DEBUG\" | awk '!seen[$0]++'")
     # Without the appliance's kernel log, which is what most of the rest is.
     lines.append(f"[ $rc -ne 0 ] && grep -vE '^\\[' \"$DEBUG\" | tail -n 30 "
                  f"| sed 's/^/{MARK_DEBUG} /'")
@@ -362,13 +522,14 @@ def read_result(output: str) -> dict:
              and 'Guestfs.Error("debug: ")' not in line]
     reported = re.findall(rf'^{MARK_AGENT} (.+?)\s*$', text, re.M)
     agent = reported[-1] if reported else None
+    network = re.findall(rf'^{MARK_NETWORK} (.+?)\s*$', text, re.M)
     # virt-v2v names the failed command in its error line, and only this step's command
     # carries the module's type rule.
     selinux_failed = any(line.startswith('virt-v2v') and 'error:' in line
                          and 'typepermissive virt_qemu_ga_t' in line
                          for line in text.splitlines())
     return {'exit': exit_code, 'lines': lines, 'selinux_failed': selinux_failed,
-            'agent': agent,
+            'agent': agent, 'network': network,
             'agent_failed': agent is None or agent.startswith('failed'),
             'map_failed': MARK_MAP_FAILED in text,
             'left_mapped': re.findall(rf'^{MARK_UNMAP_FAILED} (\S+)', text, re.M),

@@ -161,4 +161,5 @@ Debian 10, 11 and 12, CentOS 7.9, 8.4 and Stream 8, Rocky Linux 8.10 and 9.8, Al
 - Right after the first answer the agent of one guest (Rocky Linux 9.8, agent kept) was
   briefly unreachable ("QEMU guest agent is not running") and answered again after the
   reboot. Whatever talks to a freshly imported guest through the agent has to retry
-  during its first minute.
+  during its first minute. The cause, found later (ADR 0010): virt-v2v touches
+  `/.autorelabel` on the RHEL family, and the first boot relabels and reboots by itself.
