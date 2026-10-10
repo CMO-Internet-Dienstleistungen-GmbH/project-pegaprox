@@ -215,6 +215,8 @@ def node(monkeypatch):
             return answers['tool']
         if command == hyperv_linux.INSTALL_COMMAND:
             return answers.get('install', (0, 'installed', ''))
+        if command.startswith('qm config '):
+            return answers.get('config', (0, 'scsihw: virtio-scsi-single\n', ''))
         if command.startswith('pvesm path '):
             name = command.split("'")[-2] if "'" in command else command.split()[-1]
             return 0, f'/dev/pve/{name.split(":")[-1]}\n', ''
@@ -318,6 +320,53 @@ class TestTheGuestAgentIsReported:
         task, _note = self._run(node, '')
         assert 'reported nothing' in task.completion_problem
         assert not getattr(task, 'target_unbootable', False)
+
+
+class TestTheNetworkIsCarriedOver:
+    """Each adapter gets back the name the guest's configuration uses, by its MAC; the MACs
+    are read off the VM Proxmox now holds."""
+
+    CONFIG = ('boot: order=scsi0\nnet1: virtio=BC:24:11:00:00:02,bridge=vmbr1\n'
+              'net0: virtio=BC:24:11:00:00:01,bridge=vmbr0,tag=12\nscsi0: x\n')
+
+    def _run(self, node, report, config=CONFIG):
+        calls, answers = node
+        answers['config'] = (0, config, '')
+        answers['script'] = (0, f"[ 1.0] Converting\n{hyperv_linux.MARK_AGENT} present\n"
+                                f"{report}V2V_EXIT=0\n", '')
+        task = _Task()
+        note = hyperv_xhm._inject_drivers_if_asked(task, _Target(), 120, VOLUMES, {})
+        return task, note, calls[-1]
+
+    def test_the_macs_go_into_the_conversion_in_the_order_of_the_adapters(self, node):
+        _task, _note, script = self._run(node, '')
+        assert 'bc:24:11:00:00:01 bc:24:11:00:00:02' in script
+
+    def test_pinned_adapters_are_a_clean_success(self, node):
+        mark = hyperv_linux.MARK_NETWORK
+        task, note, _ = self._run(node, f'{mark} bc:24:11:00:00:01 pinned eth0 (x)\n'
+                                        f'{mark} bc:24:11:00:00:02 pinned eth1 (x)\n')
+        assert note is None and not getattr(task, 'completion_problem', None)
+        assert any('pinned eth1' in line for line in task.log_lines)
+
+    def test_an_unassigned_adapter_completes_with_errors_and_still_starts(self, node):
+        mark = hyperv_linux.MARK_NETWORK
+        task, note, _ = self._run(node, f'{mark} bc:24:11:00:00:01 pinned eth0 (x)\n'
+                                        f'{mark} bc:24:11:00:00:02 unassigned: no record\n')
+        assert note is None and not getattr(task, 'target_unbootable', False)
+        assert 'bc:24:11:00:00:02 unassigned' in task.completion_problem
+
+    def test_a_guest_that_configures_no_adapter_is_not_an_error(self, node):
+        mark = hyperv_linux.MARK_NETWORK
+        task, _note, _ = self._run(node, f'{mark} bc:24:11:00:00:01 unassigned: the guest\'s '
+                                         'configuration names no adapter\n',
+                                   config='net0: virtio=BC:24:11:00:00:01,bridge=vmbr0\n')
+        assert not getattr(task, 'completion_problem', None)
+
+    def test_a_vm_without_adapters_gets_no_network_step(self, node):
+        task, _note, script = self._run(node, '', config='scsi0: x\n')
+        assert 'give each adapter back' not in script
+        assert not getattr(task, 'completion_problem', None)
 
 
 class TestAFailedConversionIsNotMovedToSata:
