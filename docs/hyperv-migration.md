@@ -131,6 +131,17 @@ choosing a VM out of a list; it is not evidence about a disk. See
      says where the agent came from; when it could not be installed, the
      migration completes with errors and the VM is started all the same. See
      `adr/0009-the-guest-agent-is-installed-during-the-linux-conversion.md`.
+     Last, it gives each adapter back the name the guest's configuration uses
+     for it, pinned to the adapter's MAC: on Hyper-V the adapters were `eth0`,
+     `eth1`, on VirtIO they would come up as `ens18`, and the addresses
+     configured for `eth0` would apply to nothing. The guest keeps its own
+     configuration, unchanged, with the same addresses on the adapter with the
+     same MAC. Which name belongs to which MAC is taken only from what the guest
+     records, or, with one adapter, from the one name it configures; an adapter
+     that cannot be matched is named in the log and the migration completes
+     with errors. cloud-init's network rendering is switched off, since it would
+     otherwise write DHCP over the configuration at first boot. See
+     `adr/0010-the-adapters-keep-their-names-by-mac.md`.
    - **No** builds the VM on hardware every guest already has drivers for, and
      the switch to VirtIO is then a step of its own afterwards (see *After the
      import*).
