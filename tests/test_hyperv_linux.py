@@ -596,3 +596,181 @@ echo "Failed to determine unit we run in, igno{linux.MARK_AGENT} installed from 
                               text=True, env={'PATH': str(tmp_path)})
         assert f'\n{linux.MARK_AGENT} failed:' in done.stdout
         assert f'{linux.MARK_AGENT} ' not in linux.GUEST_AGENT_INSTALL
+
+
+# ---------------------------------------------------------------------------
+# The network: each adapter gets back the name its configuration uses
+# ---------------------------------------------------------------------------
+
+MAC0, MAC1 = 'bc:24:11:00:00:01', 'bc:24:11:00:00:02'
+
+
+class TestTheAdaptersGetTheirNamesBack:
+    """On Hyper-V the guest's adapters were eth0, eth1; on VirtIO they come up as ens18 and
+    nothing applies the old configuration. The step pins the old name to the MAC, from what
+    the guest records, and guesses nothing."""
+
+    TOOLS = ('grep', 'sed', 'awk', 'tr', 'sort', 'wc', 'cat', 'mktemp', 'mkdir', 'rm',
+             'head', 'tail')
+
+    def _run(self, tmp_path, files, macs, cloud_init=False, initramfs=False):
+        root = tmp_path / 'root'
+        (root / 'tmp').mkdir(parents=True)
+        for path, content in files.items():
+            target = root / path.lstrip('/')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        base = tmp_path / 'base'
+        base.mkdir()
+        for tool in self.TOOLS:
+            (base / tool).symlink_to(shutil.which(tool))
+        calls = tmp_path / 'calls'
+        if initramfs:
+            _stub(base, 'update-initramfs', f'echo "update-initramfs $*" >> {calls}\n')
+        if cloud_init:
+            _stub(base, 'cloud-init', 'exit 0\n')
+        script = (linux.network_pin_command(macs)
+                  .replace('/tmp/pegaprox-net.', f'{root}/tmp/pegaprox-net.')
+                  .replace('/etc/', f'{root}/etc/'))
+        done = subprocess.run(['/bin/sh', '-c', script], capture_output=True, text=True,
+                              env={'PATH': str(base)}, timeout=30)
+        assert done.returncode == 0, done.stderr
+        reports = [line[len(linux.MARK_NETWORK) + 1:] for line in done.stdout.splitlines()
+                   if line.startswith(linux.MARK_NETWORK + ' ')]
+        recorded = calls.read_text().splitlines() if calls.exists() else []
+        return reports, root, recorded
+
+    def _link(self, root, name):
+        path = root / 'etc' / 'systemd' / 'network' / f'10-pegaprox-{name}.link'
+        return path.read_text() if path.exists() else None
+
+    def test_a_netplan_guest_with_one_adapter_gets_eth0_back(self, tmp_path):
+        reports, root, calls = self._run(tmp_path, {'/etc/netplan/50-installer.yaml': '''
+network:
+  version: 2
+  ethernets:
+    eth0:
+      addresses: [192.0.2.10/24]
+      routes:
+        - to: default
+          via: 192.0.2.1
+'''}, [MAC0], cloud_init=True, initramfs=True)
+        assert reports[0].startswith(f'{MAC0} pinned eth0 (the only adapter')
+        link = self._link(root, 'eth0')
+        assert f'MACAddress={MAC0}' in link and 'Name=eth0' in link and 'Driver=virtio_net e1000' in link
+        # The initramfs names the adapter on Debian and Ubuntu, so it has to carry the file.
+        assert calls == ['update-initramfs -u -k all']
+        assert 'cloud-init: its network rendering is switched off' in reports
+        cfg = root / 'etc' / 'cloud' / 'cloud.cfg.d' / '99-pegaprox-network.cfg'
+        assert 'network: {config: disabled}' in cfg.read_text()
+
+    def test_the_link_file_matches_every_nic_model_a_migration_creates(self, tmp_path):
+        # Type=ether never matched on systemd before 246 (it is compared with DEVTYPE,
+        # which Ethernet leaves unset), so the file matches the NIC models' drivers.
+        from pegaprox.core import hyperv_xhm
+        drivers = {'virtio': 'virtio_net', 'e1000': 'e1000'}
+        _reports, root, _calls = self._run(
+            tmp_path, {'/etc/network/interfaces': 'auto eth0\niface eth0 inet dhcp\n'}, [MAC0])
+        match = next(line for line in self._link(root, 'eth0').splitlines()
+                     if line.startswith('Driver='))
+        for model in (hyperv_xhm.VIRTIO_NIC_MODEL, hyperv_xhm.COMPATIBLE_NIC_MODEL):
+            assert drivers[model] in match.split('=', 1)[1].split()
+        assert 'Type=' not in self._link(root, 'eth0')
+
+    def test_a_netplan_match_by_mac_is_a_record(self, tmp_path):
+        reports, root, _ = self._run(tmp_path, {'/etc/netplan/50-cloud-init.yaml': f'''
+network:
+    ethernets:
+        lan:
+            match:
+                macaddress: "{MAC1.upper()}"
+            set-name: eth1
+            dhcp4: true
+        wan:
+            match:
+                macaddress: {MAC0}
+            set-name: eth0
+'''}, [MAC0, MAC1])
+        assert reports == [f'{MAC0} pinned eth0 (the guest records this MAC for it)',
+                           f'{MAC1} pinned eth1 (the guest records this MAC for it)']
+
+    def test_rhel_ifcfg_gets_hwaddr_so_initscripts_renames_too(self, tmp_path):
+        reports, root, calls = self._run(tmp_path, {
+            '/etc/sysconfig/network-scripts/ifcfg-eth0':
+                'DEVICE="eth0"\nBOOTPROTO=none\nIPADDR=192.0.2.10\nPREFIX=24\nONBOOT=yes\n',
+            '/etc/sysconfig/network-scripts/ifcfg-lo': 'DEVICE=lo\n'}, [MAC0])
+        assert reports == [f'{MAC0} pinned eth0 (the only adapter, and the only name its '
+                           'configuration uses)']
+        ifcfg = (root / 'etc/sysconfig/network-scripts/ifcfg-eth0').read_text()
+        assert ifcfg.endswith(f'HWADDR={MAC0}\n') and 'IPADDR=192.0.2.10' in ifcfg
+        assert calls == []
+
+    def test_an_existing_hwaddr_is_the_record_and_is_left_as_it_is(self, tmp_path):
+        files = {f'/etc/sysconfig/network-scripts/ifcfg-eth{i}':
+                 f'DEVICE=eth{i}\nHWADDR={mac.upper()}\nBOOTPROTO=dhcp\n'
+                 for i, mac in enumerate((MAC0, MAC1))}
+        files['/etc/sysconfig/network-scripts/ifcfg-br0'] = 'DEVICE=br0\nTYPE=Bridge\n'
+        reports, root, _ = self._run(tmp_path, files, [MAC0, MAC1])
+        assert [r.split(' (')[0] for r in reports] == [f'{MAC0} pinned eth0', f'{MAC1} pinned eth1']
+        assert (root / 'etc/sysconfig/network-scripts/ifcfg-eth1').read_text().count('HWADDR') == 1
+        assert self._link(root, 'br0') is None
+
+    def test_names_that_swap_places_in_the_eth_order_are_left_alone(self, tmp_path):
+        reports, root, _ = self._run(tmp_path, {
+            '/etc/sysconfig/network-scripts/ifcfg-eth0': f'DEVICE=eth0\nHWADDR={MAC1}\n',
+            '/etc/sysconfig/network-scripts/ifcfg-eth1': f'DEVICE=eth1\nHWADDR={MAC0}\n'},
+            [MAC0, MAC1])
+        assert all('unassigned' in r and 'eth order' in r for r in reports), reports
+        assert not list((root / 'etc').rglob('*.link'))
+
+    def test_two_adapters_without_a_record_are_not_guessed(self, tmp_path):
+        reports, root, calls = self._run(tmp_path, {'/etc/network/interfaces': '''
+auto lo
+iface lo inet loopback
+auto eth0
+iface eth0 inet static
+    address 192.0.2.10/24
+allow-hotplug eth1
+iface eth1 inet dhcp
+'''}, [MAC0, MAC1], initramfs=True)
+        assert reports == [f'{MAC0} unassigned: no record ties it to one of the configured '
+                           'names (eth0 eth1)',
+                           f'{MAC1} unassigned: no record ties it to one of the configured '
+                           'names (eth0 eth1)']
+        assert calls == [] and not list((root / 'etc').rglob('*.link'))
+
+    def test_networkmanager_keyfiles_are_read(self, tmp_path):
+        reports, root, _ = self._run(tmp_path, {
+            '/etc/NetworkManager/system-connections/eth0.nmconnection':
+                f'[connection]\nid=eth0\ntype=ethernet\ninterface-name=eth0\n\n'
+                f'[ethernet]\nmac-address={MAC0.upper()}\n\n[ipv4]\nmethod=manual\n'
+                'address1=192.0.2.10/24\n'}, [MAC0])
+        assert reports == [f'{MAC0} pinned eth0 (the guest records this MAC for it)']
+
+    def test_a_guest_that_configures_no_adapter_is_told_so(self, tmp_path):
+        reports, root, calls = self._run(tmp_path, {}, [MAC0], cloud_init=True, initramfs=True)
+        assert reports == [f'{MAC0} unassigned: the guest\'s configuration names no adapter']
+        assert not (root / 'etc' / 'cloud').exists() and calls == []
+
+    def test_a_cloud_init_already_kept_off_the_network_is_left_alone(self, tmp_path):
+        reports, root, _ = self._run(tmp_path, {
+            '/etc/netplan/00-installer-config.yaml':
+                'network:\n  ethernets:\n    eth0:\n      dhcp4: true\n',
+            '/etc/cloud/cloud.cfg.d/subiquity-disable-cloudinit-networking.cfg':
+                'network: {config: disabled}\n'}, [MAC0], cloud_init=True)
+        assert not any(r.startswith('cloud-init') for r in reports)
+        assert not (root / 'etc/cloud/cloud.cfg.d/99-pegaprox-network.cfg').exists()
+
+    def test_only_well_formed_macs_reach_the_script(self):
+        assert linux.network_pin_command([]) is None
+        assert linux.network_pin_command(['', None, '00155D000001']) is None
+        script = linux.network_pin_command(['BC:24:11:00:00:01', 'nonsense'])
+        assert "macs='bc:24:11:00:00:01'" in script
+        assert f'{linux.MARK_NETWORK} ' not in script
+
+    def test_it_runs_last_and_only_with_macs(self):
+        source = [linux.disk_source('/dev/pve/vm-1-disk-0')]
+        assert 'give each adapter back' not in linux.conversion_script(source)
+        script = linux.conversion_script(source, macs=[MAC0])
+        assert script.index('typepermissive') < script.index('give each adapter back')
+        assert script.index('give each adapter back') < script.index('-i disk')
