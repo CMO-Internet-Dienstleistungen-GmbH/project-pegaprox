@@ -2070,7 +2070,9 @@ def _run_linux_conversion(task, target, run_on_node, ordered, new_vmid):
         except hyperv_linux.UnsupportedVolume as exc:
             return str(exc)
 
-    script = hyperv_linux.conversion_script(sources, guest_name=f'vm-{int(new_vmid)}')
+    macs = _vm_macs(run_on_node, target, node, new_vmid)
+    script = hyperv_linux.conversion_script(sources, guest_name=f'vm-{int(new_vmid)}',
+                                            macs=macs)
     rc, out, _ = run_on_node(target, node, script, timeout=hyperv_linux.CONVERSION_TIMEOUT)
     result = hyperv_linux.read_result(out)
     for line in result['lines']:
@@ -2094,7 +2096,48 @@ def _run_linux_conversion(task, target, run_on_node, ordered, new_vmid):
              f'is configured, the agent\'s domain virt_qemu_ga_t is permissive (module '
              f'{hyperv_linux.SELINUX_MODULE}).')
     _report_guest_agent(task, result['agent'])
+    _report_network(task, macs, result['network'])
     return None
+
+
+_NET_LINE = re.compile(r'^net(\d+):\s*[\w-]+=([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})', re.M)
+
+
+def _vm_macs(run_on_node, target, node, vmid):
+    """The MACs of the VM's adapters, in the order of their netN keys, as Proxmox holds
+    them now: what the network step pins the guest's adapter names to."""
+    try:
+        rc, out, _ = run_on_node(target, node, f'qm config {int(vmid)}', timeout=30)
+    except Exception:                                          # noqa: BLE001
+        return []
+    if rc != 0:
+        return []
+    found = sorted((int(index), mac.lower()) for index, mac in _NET_LINE.findall(str(out or '')))
+    return [mac for _index, mac in found]
+
+
+def _report_network(task, macs, lines):
+    """Say which adapter got its old name back. An adapter left without one keeps the
+    network it had on Hyper-V from coming up, so the run does not end as a clean success;
+    the VM still boots, and the configuration can be set through the agent."""
+    if not macs:
+        return
+    for line in lines:
+        task.log(f'Network: {line}')
+    open_ = [line for line in lines if ' unassigned' in line]
+    reported = {line.split()[0] for line in lines if line.split()}
+    missing = [mac for mac in macs if mac not in reported]
+    if not open_ and not missing:
+        return
+    if all('names no adapter' in line for line in open_) and not missing:
+        task.log('Network: the guest configures no adapter by name, so there was nothing to '
+                 'carry over.')
+        return
+    what = '; '.join(open_) or f'no report for {", ".join(missing)}'
+    problem = (f'The network configuration from Hyper-V could not be carried over for every '
+               f'adapter ({what}). Set it through the guest agent or on the console')
+    task.completion_problem = getattr(task, 'completion_problem', None) or problem
+    task.log(problem + '.')
 
 
 def _report_guest_agent(task, agent):
