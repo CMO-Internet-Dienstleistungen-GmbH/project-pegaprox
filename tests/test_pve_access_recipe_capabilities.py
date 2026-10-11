@@ -105,7 +105,9 @@ def test_the_commands_for_the_account_and_the_token():
 @pytest.mark.parametrize('kw', [
     {'user': 'root'}, {'user': 'a b@pve'}, {'user': 'x@pve;rm -rf /'}, {'user': "o'brien@pve"},
     {'token': '1abc'}, {'token': 'a!b'}, {'token': 'a$(id)'}, {'role': 'PVEAdmin'}, {'role': 'a"b'},
-    {'role': ''}, {'user': 'x@pve\n'}, {'token': 'abc\n'}, {'role': 'R\n'}])
+    {'role': ''}, {'user': 'x@pve\n'}, {'token': 'abc\n'}, {'role': 'R\n'},
+    # built-in names: the role as it is, a system password
+    {'role': 'Administrator'}, {'role': 'noaccess'}, {'user': 'root@pam'}, {'user': 'svc@PAM'}])
 def test_nothing_that_could_break_out_of_the_commands_gets_in(kw):
     with pytest.raises(ValueError):
         pve_access.recipe([], **kw)
@@ -186,7 +188,7 @@ def test_missing_privileges_turn_their_features_off_and_a_pool_grant_is_partial(
     assert caps['rollingUpdates']['status'] == 'no'
     assert {'code': 'priv', 'privs': ['VM.Migrate'], 'path': '/vms', 'partial': False} in caps['rollingUpdates']['needs']
     assert caps['backups']['status'] == 'yes'
-    assert caps['mappings']['status'] == 'no' and len(caps['mappings']['needs']) == 2
+    assert caps['mappings']['status'] == 'no' and len(caps['mappings']['needs']) == 3
 
 
 def test_unknown_privileges_say_so(db):

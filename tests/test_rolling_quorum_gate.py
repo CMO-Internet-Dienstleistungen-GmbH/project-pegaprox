@@ -56,6 +56,16 @@ def _no_qdevice(monkeypatch):
     return seen
 
 
+def _qd(algorithm='Fast Semi-Split', **connected):
+    """A qdevice.view with the row of each node as its own daemon answered: True, False, or
+    None for a node that was not asked."""
+    rows = [{'node': n, 'asked': c is not None, 'answered': c is not None, 'present': c is not None,
+             'connected': c, 'state': None if c is None else ('Connected' if c else 'Disconnected')}
+            for n, c in sorted(connected.items())]
+    first = next((r for r in rows if r['answered']), None)
+    return {'present': True, 'state': first['state'] if first else None, 'algorithm': algorithm, 'nodes': rows}
+
+
 def _facts(status, votes=None, qd=None, two_node=False, monkeypatch=None):
     m = _Voting(status=status, votes=votes)
     m.ha_config = {'fence_strategy': {'two_node_flag': two_node}}
@@ -81,17 +91,36 @@ def test_three_nodes_with_one_already_down_lose_it_with_a_second():
 
 
 def test_two_nodes_with_a_connected_qdevice_keep_it(monkeypatch):
-    qd = {'present': True, 'state': 'Connected', 'algorithm': 'Fast Semi-Split'}
+    qd = _qd(pve1=True, pve2=True)
     v = rolling_runs.quorum_without(_facts(_status(names=('pve1', 'pve2')), qd=qd, monkeypatch=monkeypatch), 'pve1')
     assert v['ok'] and (v['expected'], v['needed'], v['after']) == (3, 2, 2)
-    assert v['qdevice'] == {'present': True, 'connected': True}
+    assert v['qdevice'] == {'present': True, 'connected': True, 'not_connected': []}
 
 
 def test_two_nodes_whose_qdevice_lost_its_qnetd_do_not(monkeypatch):
-    qd = {'present': True, 'state': 'Disconnected', 'algorithm': 'Fast Semi-Split'}
+    qd = _qd(pve1=False, pve2=False)
     v = rolling_runs.quorum_without(_facts(_status(names=('pve1', 'pve2')), qd=qd, monkeypatch=monkeypatch), 'pve2')
     assert not v['ok'] and (v['expected'], v['needed'], v['after']) == (3, 2, 1)
-    assert 'QDevice NOT connected' in rolling_runs.quorum_said(v)
+    assert 'QDevice NOT connected on pve1' in rolling_runs.quorum_said(v)
+
+
+def test_the_qdevice_vote_counts_only_where_the_daemon_of_each_node_that_stays_says_so(monkeypatch):
+    # corosync adds the vote on each node from its own daemon: a node nobody asked is no yes
+    facts = _facts(_status(names=('pve1', 'pve2')), qd=_qd(pve1=True, pve2=None), monkeypatch=monkeypatch)
+    v = rolling_runs.quorum_without(facts, 'pve1')
+    assert not v['ok'] and (v['have'], v['after']) == (3, 1)
+    assert v['qdevice'] == {'present': True, 'connected': False, 'not_connected': ['pve2']}
+    details, _line = rolling_runs.quorum_hold(v, 'maintenance')
+    assert 'the QDevice vote does not count for pve2' in details['message']
+    assert details['qdevice']['not_connected'] == ['pve2']
+    assert rolling_runs.quorum_without(facts, 'pve2')['ok']
+    # four nodes, one down: the vote has to reach both that stay
+    facts = _facts(_status(online=('a', 'b', 'c'), names=('a', 'b', 'c', 'd')), qd=_qd(a=True, b=True, c=False),
+                   monkeypatch=monkeypatch)
+    assert rolling_runs.quorum_without(facts, 'c')['ok']
+    v = rolling_runs.quorum_without(facts, 'a')
+    assert not v['ok'] and (v['expected'], v['needed'], v['after']) == (5, 3, 2)
+    assert v['qdevice']['not_connected'] == ['c']
 
 
 def test_two_nodes_without_a_qdevice_lose_it_unless_corosync_runs_two_node():
@@ -102,7 +131,7 @@ def test_two_nodes_without_a_qdevice_lose_it_unless_corosync_runs_two_node():
 
 
 def test_an_lms_qdevice_carries_one_vote_less_than_the_nodes(monkeypatch):
-    qd = {'present': True, 'state': 'Connected', 'algorithm': 'LMS'}
+    qd = _qd('LMS', a=True, b=True)
     names = ('a', 'b', 'c', 'd')
     v = rolling_runs.quorum_without(_facts(_status(online=('a', 'b'), names=names), qd=qd,
                                            monkeypatch=monkeypatch), 'a')
@@ -125,6 +154,13 @@ def test_not_quorate_unreadable_standalone_and_xcpng():
     single = [{'type': 'node', 'name': 'pve1', 'online': 1}]
     assert rolling_runs.quorum_without(_facts(single), 'pve1') == {
         'ok': True, 'reason': None, 'node': 'pve1', 'standalone': True, 'offline': []}
+    # no node in the answer, or several without the cluster entry: no single node, the run holds
+    assert rolling_runs.quorum_facts(_Voting(status=[])) == {'error': 'status_unreadable'}
+    split = [e for e in _status(online=('pve1',)) if e['type'] == 'node']
+    v = rolling_runs.quorum_without(_facts(split), 'pve1')
+    assert not v['ok'] and v['reason'] == 'status_incomplete'
+    assert 'no cluster entry' in rolling_runs.quorum_said(v)
+    assert 'no cluster entry' in rolling_runs.quorum_hold(v, 'updating')[0]['message']
     xcp = _Voting()
     xcp.cluster_type = 'xcpng'
     assert rolling_runs.quorum_facts(xcp) is None
@@ -261,7 +297,7 @@ def test_a_node_that_drops_out_during_the_evacuation_holds_the_update(api, seed,
 
 
 def test_two_nodes_with_a_qdevice_run_through(api, seed, db, root, fast, _no_qdevice):  # noqa: F811
-    _no_qdevice['view'] = {'present': True, 'state': 'Connected', 'algorithm': 'Fast Semi-Split'}
+    _no_qdevice['view'] = _qd(**{n: True for n in NODES})
     cluster = api.set_manager(CID, _Voting(status=_status(names=NODES)))
     _start(api, root)
     _worker_gone()

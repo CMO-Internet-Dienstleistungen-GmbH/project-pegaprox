@@ -64,14 +64,21 @@ PRIVILEGE_NEEDS = (
     # PVE 8: a guest NIC on a bridge or vnet needs it on that bridge
     (('SDN.Use',), '/sdn', ('networks',)),
     (('Pool.Audit',), '/pool', ('pools',)),
+    # the pool editor, and a guest created into a pool (PVE checks /pool/<id> for it)
+    (('Pool.Allocate',), '/pool', ('pools',)),
     (('Mapping.Audit',), '/mapping', ('mappings',)),
     (('Mapping.Use',), '/mapping', ('mappings',)),
+    # the mapping editors (PCI, USB, directories)
+    (('Mapping.Modify',), '/mapping', ('mappings',)),
     (('Sys.PowerMgmt',), '/nodes', ('nodePower',)),
     (('Sys.Modify',), '/', ('nodeConfig',)),
     (('Sys.Syslog',), '/', ('syslog',)),
     # HA resources and rules, the ones a rolling update lets give way among them
     (('Sys.Console',), '/', ('haConfig',)),
     (('SDN.Audit',), '/sdn', ('sdn',)),
+    # MK Oct 2026 - the target side of remote_migrate (POST .../mtunnel wants it on /), the
+    # way cross-cluster migration, replication and Site Recovery move a guest in
+    (('Sys.Incoming',), '/', ('remoteMigration',)),
 )
 
 

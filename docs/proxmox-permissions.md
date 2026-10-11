@@ -37,7 +37,7 @@ Always in the role, for the features that use the API:
 | Storage view | `Datastore.Audit` |
 | Adding and moving disks | `Datastore.AllocateSpace` |
 | Guest network cards on bridges and vnets | `SDN.Use` |
-| Resource pools and pool-based access | `Pool.Audit` |
+| Resource pools and pool-based access, the pool editor, guests created into a pool | `Pool.Audit`, `Pool.Allocate` |
 
 Optional, each adds to the role:
 
@@ -48,18 +48,23 @@ Optional, each adds to the role:
 | Node reboot and shutdown | `nodePower` | `Sys.PowerMgmt` |
 | Node syslog | `syslog` | `Sys.Syslog` |
 | SDN view | `sdn` | `SDN.Audit` |
-| Resource mappings (PCI, USB, directories) | `mappings` | `Mapping.Audit`, `Mapping.Use` |
+| Resource mappings (PCI, USB, directories) and their editors | `mappings` | `Mapping.Audit`, `Mapping.Use`, `Mapping.Modify` |
 | Storage replication jobs | `replication` | `VM.Replicate` |
 | Proxmox HA resources and rules | `haConfig` | `Sys.Console` |
+| Taking in guests from another cluster: cross-cluster migration and replication, Site Recovery | `remoteMigration` | `Sys.Incoming` |
 
 The role goes on `/` and propagates, so it reaches every guest, storage and node.
+
+Not in the recipe: the SDN editor (zones, vnets, subnets: `SDN.Allocate`) and adding or
+changing storage, PBS included (`Datastore.Allocate`). A role for those needs the
+privilege added by hand.
 
 ## With an API token (recommended)
 
 Run on one node as root (PVE 9, every optional feature):
 
 ```
-pveum role add PegaProx --privs "Sys.Audit,VM.Audit,VM.PowerMgmt,VM.Migrate,VM.Console,VM.Snapshot,VM.Snapshot.Rollback,VM.Backup,VM.Allocate,VM.Clone,VM.Config.CPU,VM.Config.Memory,VM.Config.Disk,VM.Config.Network,VM.Config.Options,VM.Config.CDROM,VM.Config.HWType,VM.Config.Cloudinit,VM.GuestAgent.Audit,Datastore.Audit,Datastore.AllocateSpace,Datastore.AllocateTemplate,VM.Replicate,SDN.Use,Pool.Audit,Mapping.Audit,Mapping.Use,Sys.PowerMgmt,Sys.Modify,Sys.Syslog,Sys.Console,SDN.Audit"
+pveum role add PegaProx --privs "Sys.Audit,VM.Audit,VM.PowerMgmt,VM.Migrate,VM.Console,VM.Snapshot,VM.Snapshot.Rollback,VM.Backup,VM.Allocate,VM.Clone,VM.Config.CPU,VM.Config.Memory,VM.Config.Disk,VM.Config.Network,VM.Config.Options,VM.Config.CDROM,VM.Config.HWType,VM.Config.Cloudinit,VM.GuestAgent.Audit,Datastore.Audit,Datastore.AllocateSpace,Datastore.AllocateTemplate,VM.Replicate,SDN.Use,Pool.Audit,Pool.Allocate,Mapping.Audit,Mapping.Use,Mapping.Modify,Sys.PowerMgmt,Sys.Modify,Sys.Syslog,Sys.Console,SDN.Audit,Sys.Incoming"
 pveum user add pegaprox@pve --comment "PegaProx"
 pveum aclmod / --users pegaprox@pve --roles PegaProx
 pveum user token add pegaprox@pve pegaprox --privsep 1 --comment "PegaProx"
@@ -100,7 +105,9 @@ its own at the first login and keeps the password for what a token cannot do.
   token, `root@pam`'s own included; PegaProx needs the `root@pam` password for them.
 - **A password instead of a token typed in as user name**: the text terminal of guests
   (xterm.js), and cross-cluster migration, replication and Site Recovery into this
-  cluster, for which PegaProx creates a temporary API token on the target.
+  cluster, for which PegaProx creates a temporary API token on the target. That token
+  holds what the account holds, so the target's role needs `Sys.Incoming` as well
+  (`remoteMigration`).
 
 ## What works with a connection
 

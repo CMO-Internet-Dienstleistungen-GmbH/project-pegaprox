@@ -38,7 +38,8 @@ PRIV_FRESH = 3600
 CORE = ('monitoring', 'guests', 'power', 'migration', 'consoles', 'snapshots', 'hardware', 'agent',
         'storage', 'disks', 'create', 'clone', 'backups', 'networks', 'pools')
 # What a feature adds, in the order the recipe offers them
-OPTIONAL = ('uploads', 'nodeConfig', 'nodePower', 'syslog', 'sdn', 'mappings', 'replication', 'haConfig')
+OPTIONAL = ('uploads', 'nodeConfig', 'nodePower', 'syslog', 'sdn', 'mappings', 'replication', 'haConfig',
+            'remoteMigration')
 
 # What a role cannot give, and the features behind each
 NOT_BY_ROLE = (
@@ -68,8 +69,8 @@ CAPABILITIES = (
     ('cephOsd', (), ('root',)),
     ('backups', ('backups', 'disks'), ()),
     ('replication', ('guests', 'replication'), ()),
-    ('crossCluster', ('migration', 'create'), ('password_login',)),
-    ('siteRecovery', ('migration', 'create', 'power'), ('password_login',)),
+    ('crossCluster', ('migration', 'create', 'remoteMigration'), ('password_login',)),
+    ('siteRecovery', ('migration', 'create', 'power', 'remoteMigration'), ('password_login',)),
     ('nodeCredentials', (), ('ssh_on',)),
     ('transferCheck', (), ('ssh',)),
     ('fileRestoreVm', ('backups', 'agent'), ()),
@@ -85,6 +86,8 @@ _AGENT_PRIV = {8: 'VM.Monitor', 9: 'VM.GuestAgent.Audit'}
 _USER_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}@[A-Za-z][A-Za-z0-9._-]{0,31}')
 _TOKEN_RE = re.compile(r'[A-Za-z][A-Za-z0-9._-]{0,63}')
 _ROLE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
+# besides the PVE* ones
+_BUILT_IN_ROLES = ('administrator', 'noaccess')
 
 _cache = {}       # cluster id -> (epoch, user, privileges item)
 _locks = {}
@@ -131,10 +134,16 @@ def recipe(features=None, pve=9, user='pegaprox@pve', token='pegaprox', role='Pe
     # fullmatch: '$' alone lets a trailing line break through, a second command when pasted
     if not isinstance(user, str) or not _USER_RE.fullmatch(user):
         raise ValueError('user must look like name@realm')
+    # pam is the system's own login: 'pveum passwd x@pam' sets that password (root@pam's too)
+    if user.rsplit('@', 1)[1].lower() == 'pam':
+        raise ValueError('user must not be in the pam realm, pveum passwd would set its system password')
     if not isinstance(token, str) or not _TOKEN_RE.fullmatch(token):
         raise ValueError('token must start with a letter and hold letters, digits, . _ and - only')
     if not isinstance(role, str) or not _ROLE_RE.fullmatch(role) or role.upper().startswith('PVE'):
         raise ValueError('role must hold letters, digits, . _ and - only and not start with PVE')
+    # the built-in roles: 'role add' fails on them and the aclmod lines would grant them as they are
+    if role.lower() in _BUILT_IN_ROLES:
+        raise ValueError('role must not be a built-in role (Administrator, NoAccess)')
     picked = list(OPTIONAL) if features is None else [f for f in OPTIONAL if f in features]
     core = privileges_of(CORE, pve)
     privs = privileges_of(list(CORE) + picked, pve)

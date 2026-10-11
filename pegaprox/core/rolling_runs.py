@@ -429,18 +429,22 @@ def _config_votes(mgr):
 
 
 def _qdevice_of(mgr, node_count):
-    """{'present', 'connected', 'votes'} of the cluster's QDevice (core/qdevice.py, kept 30 s).
-    pvecm sets one up with the ffsplit algorithm, one vote; lms gives it one less than nodes."""
+    """{'present', 'connected', 'votes', 'nodes'} of the cluster's QDevice (core/qdevice.py,
+    kept 30 s). pvecm sets one up with the ffsplit algorithm, one vote; lms gives it one less
+    than nodes. nodes: {node: whether that node's own daemon said Connected}; a node that was
+    not asked or did not answer is False."""
     from pegaprox.core import qdevice
     try:
         v = qdevice.view(getattr(mgr, 'id', None), mgr)
     except Exception:
         v = None
     if not isinstance(v, dict) or not v.get('present'):
-        return {'present': False, 'connected': False, 'votes': 0}
+        return {'present': False, 'connected': False, 'votes': 0, 'nodes': {}}
     algo = str(v.get('algorithm') or '').lower()
     votes = max(1, node_count - 1) if 'lms' in algo else 1
-    return {'present': True, 'connected': v.get('state') == 'Connected', 'votes': votes}
+    rows = {str(r['node']): r.get('connected') is True
+            for r in v.get('nodes') or () if isinstance(r, dict) and r.get('node')}
+    return {'present': True, 'connected': v.get('state') == 'Connected', 'votes': votes, 'nodes': rows}
 
 
 def quorum_facts(mgr):
@@ -462,7 +466,14 @@ def quorum_facts(mgr):
     cluster = next((e for e in entries if isinstance(e, dict) and e.get('type') == 'cluster'), None)
     nodes = {str(e['name']): {'online': bool(e.get('online')), 'votes': 1}
              for e in entries if isinstance(e, dict) and e.get('type') == 'node' and e.get('name')}
+    # a 200 that names no node says nothing about the quorum
+    if not nodes:
+        return {'error': 'status_unreadable'}
     if cluster is None:
+        # only one node and no cluster entry is a node in no cluster; several nodes without
+        # one is an answer that misses what decides the quorum
+        if len(nodes) > 1:
+            return {'error': 'status_incomplete'}
         return {'standalone': True, 'quorate': True, 'nodes': nodes, 'qdevice': {'present': False},
                 'two_node': False}
     for name, votes in _config_votes(mgr).items():
@@ -478,7 +489,7 @@ def quorum_facts(mgr):
 
 def quorum_without(facts, node):
     """Whether the cluster stays quorate with `node` down. ok, reason ('not_quorate',
-    'would_lose', 'status_unreadable' or None) and the votes behind it."""
+    'would_lose', 'status_unreadable', 'status_incomplete' or None) and the votes behind it."""
     if facts is None:
         return {'ok': True, 'reason': None, 'skipped': True}
     if facts.get('error'):
@@ -491,9 +502,15 @@ def quorum_without(facts, node):
     q_votes = int(q.get('votes') or 0) if q.get('present') else 0
     expected = sum(v['votes'] for v in nodes.values()) + q_votes
     needed = 1 if facts.get('two_node') and len(nodes) == 2 and not q_votes else expected // 2 + 1
-    have = sum(v['votes'] for v in nodes.values() if v['online']) + (q_votes if q.get('connected') else 0)
-    mine = nodes.get(node) or {}
-    after = have - (mine.get('votes', 0) if mine.get('online') else 0)
+    # MK Oct 2026 - votequorum adds the QDevice vote on each node from that node's own daemon,
+    # so after `node` goes it counts only where every node that stays up has its daemon connected
+    q_rows = q.get('nodes') or {}
+    up = [n for n, v in nodes.items() if v['online']]
+    stay = [n for n in up if n != node]
+    q_missing = sorted(n for n in stay if q_rows.get(n) is not True) if q_votes else []
+    q_after = bool(q_votes and stay and not q_missing)
+    have = sum(nodes[n]['votes'] for n in up) + (q_votes if any(q_rows.get(n) is True for n in up) else 0)
+    after = sum(nodes[n]['votes'] for n in stay) + (q_votes if q_after else 0)
     reason = None
     if not facts.get('quorate'):
         reason = 'not_quorate'
@@ -501,7 +518,7 @@ def quorum_without(facts, node):
         reason = 'would_lose'
     return {'ok': reason is None, 'reason': reason, 'node': node, 'expected': expected, 'needed': needed,
             'have': have, 'after': after, 'offline': offline,
-            'qdevice': {'present': bool(q.get('present')), 'connected': bool(q.get('connected'))}}
+            'qdevice': {'present': bool(q.get('present')), 'connected': q_after, 'not_connected': q_missing}}
 
 
 def quorum_gate(mgr, node, sleep=time.sleep, stop=None, settle=QUORUM_SETTLE):
@@ -523,7 +540,9 @@ def quorum_said(verdict):
     if verdict.get('standalone'):
         return 'Quorum: a single node in no cluster, nothing to lose'
     if verdict.get('reason') == 'status_unreadable':
-        return 'Quorum: /cluster/status did not answer'
+        return 'Quorum: /cluster/status did not answer with the nodes of the cluster'
+    if verdict.get('reason') == 'status_incomplete':
+        return 'Quorum: /cluster/status names several nodes but no cluster entry'
     head = (f"Quorum with {verdict['node']} down: {verdict['after']} of {verdict['expected']} votes, "
             f"{verdict['needed']} needed")
     if verdict['offline']:
@@ -531,6 +550,8 @@ def quorum_said(verdict):
     q = verdict.get('qdevice') or {}
     if q.get('present'):
         head += ', QDevice ' + ('connected' if q.get('connected') else 'NOT connected')
+        if q.get('not_connected'):
+            head += f" on {', '.join(q['not_connected'])}"
     return head
 
 
@@ -539,7 +560,10 @@ def quorum_hold(verdict, phase):
     node = verdict.get('node') or ''
     step = 'goes into maintenance' if phase == 'maintenance' else 'is updated'
     if verdict.get('reason') == 'status_unreadable':
-        why = "the quorum of the cluster could not be read (/cluster/status did not answer)"
+        why = "the quorum of the cluster could not be read (/cluster/status did not answer with its nodes)"
+    elif verdict.get('reason') == 'status_incomplete':
+        why = ("the quorum of the cluster could not be read (/cluster/status names several nodes "
+               "but no cluster entry)")
     elif verdict.get('reason') == 'not_quorate':
         why = 'the cluster is not quorate right now'
     else:
@@ -547,6 +571,10 @@ def quorum_hold(verdict, phase):
                f"and the cluster needs {verdict['needed']}")
         if verdict.get('offline'):
             why += f" ({', '.join(verdict['offline'])} offline)"
+        missing = (verdict.get('qdevice') or {}).get('not_connected')
+        if missing:
+            why += (f"; the QDevice vote does not count for {', '.join(missing)}: its own "
+                    f"corosync-qdevice is not connected to the QNetd host or did not answer")
     details = {k: verdict.get(k) for k in ('node', 'reason', 'expected', 'needed', 'have', 'after',
                                            'offline', 'qdevice')}
     details.update(phase=phase, message=(
