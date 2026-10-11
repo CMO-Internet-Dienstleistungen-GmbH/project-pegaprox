@@ -37,6 +37,8 @@ def _blocks():
     return [
         _between(ui, '// LW Oct 2026 - the restore tests of a cluster', 'window.PegaProxRestoreTestsPanel = RestoreTestsPanel; } catch (_) {}'),
         _between(ui, "<div className=\"opacity-70 mb-1\">{t('rtestMaxAge')}</div>", "{t('rtestIsoNote')}</p>"),
+        _between(ui, '// LW Oct 2026 - real restores of real backups', "{t('rtestConsentConfirm')}"),
+        _between(ui, '// LW Oct 2026 - switched on, or on without a yes on record', 'const decline = () =>'),
         _between(storage, '{/* LW Oct 2026 - restore tests: the weekly run', '</button>'),
         _between(storage, "onClick={() => setActiveTab('recovery')} data-rtest-tab", '</button>'),
         _between(storage, ") : activeTab === 'recovery' ? (", '<RestoreTestsPanel clusterId={clusterId} addToast={addToast} />'),
@@ -59,7 +61,7 @@ def _keys():
 def test_every_new_string_is_in_every_language_once():
     tr = _read('web', 'src', 'translations.js')
     keys = _keys()
-    assert len(keys) == 85
+    assert len(keys) == 98
     starts = [(m.group(1), m.start()) for m in re.finditer(r'^            ([a-z][a-z]): \{', tr, re.M)]
     assert [s[0] for s in starts] == LANGS
     for i, (lang, at) in enumerate(starts):
@@ -135,7 +137,8 @@ def test_the_bundle_was_rebuilt():
     built = _read('web', 'index.html')
     for needle in ('function RestoreTestsPanel(', 'function CloudRestoreTests(', '/recovery-report',
                    '/recovery-settings/rules', 'data-rtest-tab', 'React.createElement("option",{value:"restore_test_age"}',
-                   'data-event-fields":"restore_test_age"', 'rtestCloudNotRecent', 'data-rtest-max-age'):
+                   'data-event-fields":"restore_test_age"', 'rtestCloudNotRecent', 'data-rtest-max-age',
+                   'data-rtest-max-gb', 'data-rtest-consent-confirm', 'data-rtest-skipped', 'rtestSkipNoSpace'):
         assert needle in built, needle
 
 
@@ -171,7 +174,8 @@ SETTINGS = {'cluster': {'rto_minutes': 10, 'agent': 'auto', 'ports': [], 'comman
                         'command': 'pg_isready', 'updated_at': '2026-10-09T10:00:00', 'updated_by': 'admin'}],
             'tags': [], 'can_edit': True, 'limits': {}}
 NEXT = '2026-10-11T04:00:00'
-STATUS = {'policy': {'enabled': True, 'weekly_count': 5, 'day': 'sun', 'hour': 4, 'scope': 'latest_per_vm', 'max_age_days': 30},
+STATUS = {'policy': {'enabled': True, 'weekly_count': 5, 'day': 'sun', 'hour': 4, 'scope': 'latest_per_vm', 'max_age_days': 30,
+                     'max_backup_gb': 32, 'confirmed_at': time.time() - 30 * 86400},
           'next_run': NEXT, 'running': False, 'timezone': 'Europe/Vienna',
           'last_run': {'slot': '2026-10-04T04:00:00', 'state': 'done', 'started_at': time.time() - 7 * 86400,
                        'finished_at': time.time() - 7 * 86400 + 1800, 'reason': '',
@@ -349,6 +353,124 @@ def test_runtime_a_refused_schedule_says_why(open_app):
     page.locator('[data-rtest-max-age]').wait_for(timeout=5000)
     page.get_by_role('button', name='Save').last.click()
     page.get_by_text('hour is a whole number from 0 to 23').wait_for(timeout=5000)
+    assert not app.errors, app.errors
+
+
+# --- switching the weekly run on: real restores, asked first ---------------------------------
+
+OFF = dict(STATUS['policy'], enabled=False, confirmed_at=None)
+
+
+def _schedule_dialog(open_app, layout, policy):
+    app = open_app(_reads({('GET', '/api/pbs/verify-schedule'): (200, policy),
+                           ('GET', '/api/pbs/verify-schedule/status'): (200, dict(STATUS, policy=policy))}),
+                   layout=layout)
+    page = _open_tab(app, layout)
+    page.locator('[data-rtest-edit-schedule]').click()
+    page.locator('[data-rtest-max-gb]').wait_for(timeout=5000)
+    return app, page
+
+
+def _puts(app):
+    return [c for c in app.server.calls if c == ('PUT', '/api/pbs/verify-schedule')]
+
+
+@pytest.mark.parametrize('layout', ['modern', 'corporate'])
+def test_runtime_switching_the_run_on_asks_first_and_says_what_it_does(open_app, layout):
+    app, page = _schedule_dialog(open_app, layout, OFF)
+    assert page.locator('[data-rtest-max-gb]').input_value() == '32' and page.locator('[data-rtest-max-gb]').is_disabled()
+    page.locator('[data-rtest-enabled]').check()
+    page.locator('[data-rtest-max-gb]').fill('64')
+    page.get_by_role('button', name='Save').last.click()
+    consent = page.locator('[data-rtest-consent]')
+    consent.wait_for(timeout=5000)
+    text = consent.inner_text()
+    for needle in ('Run real restore tests?', 'Real restores of real backups will run on the nodes of your clusters',
+                   'SUN 04:00', 'new isolated temporary guest that is removed afterwards', 'Up to 5 guests per week.',
+                   'Backups larger than 64 GB are skipped.', 'it uses disk space on the target storage'):
+        assert needle in text, (needle, text)
+    # nothing is stored before the yes
+    page.wait_for_timeout(300)
+    assert _puts(app) == []
+    _shot(page, f'rtest_consent_{layout}.png')
+    page.locator('[data-rtest-consent-confirm]').click()
+    assert _wait_for_call(app, ('PUT', '/api/pbs/verify-schedule'))
+    body = _body(app, '/api/pbs/verify-schedule')
+    assert body['enabled'] is True and body['confirmed'] is True and body['max_backup_gb'] == 64
+    assert 'confirmed_at' not in body
+    assert not app.errors, app.errors
+
+
+@pytest.mark.parametrize('layout', ['modern', 'corporate'])
+def test_runtime_cancel_keeps_the_run_off_and_saving_it_off_asks_nothing(open_app, layout):
+    app, page = _schedule_dialog(open_app, layout, OFF)
+    page.locator('[data-rtest-enabled]').check()
+    page.get_by_role('button', name='Save').last.click()
+    page.locator('[data-rtest-consent]').wait_for(timeout=5000)
+    page.locator('[data-rtest-consent-cancel]').click()
+    page.locator('[data-rtest-max-gb]').wait_for(timeout=5000)
+    assert page.locator('[data-rtest-consent]').count() == 0
+    assert not page.locator('[data-rtest-enabled]').is_checked()
+    page.wait_for_timeout(300)
+    assert _puts(app) == []
+    # saved off: no question, it is stored as it is
+    page.get_by_role('button', name='Save').last.click()
+    assert _wait_for_call(app, ('PUT', '/api/pbs/verify-schedule'))
+    assert page.locator('[data-rtest-consent]').count() == 0
+    body = _body(app, '/api/pbs/verify-schedule')
+    assert body['enabled'] is False and 'confirmed' not in body
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_run_switched_on_before_it_asked_asks_when_saved(open_app):
+    # on since before the question existed: no yes on record, so the next save asks
+    app, page = _schedule_dialog(open_app, 'modern', dict(STATUS['policy'], confirmed_at=None))
+    page.locator('[data-rtest-max-age]').fill('14')
+    page.get_by_role('button', name='Save').last.click()
+    page.locator('[data-rtest-consent]').wait_for(timeout=5000)
+    assert _puts(app) == []
+    page.locator('[data-rtest-consent-confirm]').click()
+    assert _wait_for_call(app, ('PUT', '/api/pbs/verify-schedule'))
+    body = _body(app, '/api/pbs/verify-schedule')
+    assert body['confirmed'] is True and body['max_age_days'] == 14
+    assert not app.errors, app.errors
+
+
+SKIPS = [{'cluster_id': 'c1', 'vmid': 105, 'name': 'files01', 'volid': 'pbs:backup/vm/105/x', 'status': 'skipped',
+          'reason': 'too_large', 'size': 300 * 2 ** 30, 'limit_gb': 32, 'task_id': None,
+          'cause': 'the backup is 300.0 GB, the schedule restores up to 32 GB'},
+         {'cluster_id': 'c1', 'vmid': 106, 'name': 'build01', 'volid': 'pbs:backup/vm/106/x', 'status': 'skipped',
+          'reason': 'no_space', 'storage': 'local-lvm', 'free': 2 ** 30, 'size': 2 * 2 ** 30, 'task_id': None,
+          'cause': 'local-lvm on pve1 has 1.0 GB free, the backup is 2.0 GB'},
+         {'cluster_id': 'c1', 'vmid': 107, 'name': 'ci01', 'volid': 'pbs:backup/vm/107/x', 'status': 'skipped',
+          'reason': 'size_unknown', 'size': None, 'task_id': None, 'cause': ''},
+         {'cluster_id': 'c1', 'vmid': 108, 'name': 'ci02', 'volid': 'pbs:backup/vm/108/x', 'status': 'skipped',
+          'reason': 'space_unknown', 'storage': 'scratch', 'task_id': None, 'cause': ''},
+         {'cluster_id': 'c1', 'vmid': 109, 'name': 'old01', 'volid': 'pbs:backup/vm/109/x', 'status': 'skipped',
+          'task_id': None, 'cause': 'the cluster is not connected'}]
+
+
+@pytest.mark.parametrize('layout', ['modern', 'corporate'])
+def test_runtime_the_tab_shows_what_the_last_run_left_out_and_why(open_app, layout):
+    last = dict(STATUS['last_run'], results=STATUS['last_run']['results'] + SKIPS,
+                counts={'picked': 2, 'passed': 1, 'failed': 1, 'skipped': 5})
+    app = open_app(_reads({('GET', '/api/pbs/verify-schedule/status'): (200, dict(STATUS, last_run=last))}), layout=layout)
+    page = _open_tab(app, layout)
+    assert 'up to 5 guests per week, backups up to 32 GB' in page.locator('[data-rtest-limits]').inner_text()
+    skipped = page.locator('[data-rtest-skipped]')
+    assert 'Skipped in the last run (5)' in skipped.inner_text()
+    rows = skipped.locator('[data-rtest-skip]')
+    assert rows.evaluate_all('rs => rs.map(r => [r.dataset.rtestSkip, r.dataset.reason])') == [
+        ['105', 'too_large'], ['106', 'no_space'], ['107', 'size_unknown'], ['108', 'space_unknown'], ['109', '']]
+    texts = [rows.nth(i).inner_text() for i in range(5)]
+    assert 'backup is 300.0 GB, larger than the limit of 32 GB' in texts[0]
+    assert 'not enough free space on local-lvm: 1.0 GB free, 2.0 GB needed' in texts[1]
+    assert 'size of the backup unknown' in texts[2]
+    assert 'free space of the target storage could not be read (scratch)' in texts[3]
+    assert 'the cluster is not connected' in texts[4]
+    # the tests that ran stay where they were
+    assert page.locator('[data-rtest-result]').evaluate_all('rs => rs.map(r => r.dataset.rtestResult)') == ['101', '100']
+    _shot(page, f'rtest_skipped_{layout}.png')
     assert not app.errors, app.errors
 
 

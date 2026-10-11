@@ -4255,18 +4255,53 @@ pre{white-space:pre-wrap;word-break:break-all;border:1px solid #ccc;padding:12px
         }
         try { window.PegaProxEncryptionKeyModal = EncryptionKeyModal; } catch (_) {}
 
+        // LW Oct 2026 - real restores of real backups: before the weekly run is switched on (or an
+        // enabled one nobody said yes to is saved) the dialog says what it will do and waits for a yes
+        function VerifyScheduleConsent({ cfg, busy, onConfirm, onCancel }) {
+            const { t } = useTranslation();
+            const when = `${String(cfg.day || 'sun').toUpperCase()} ${String(cfg.hour ?? 4).padStart(2, '0')}:00`;
+            return (
+                <div className="p-5 space-y-3" data-rtest-consent>
+                    <div className="text-sm font-semibold flex items-center gap-2">
+                        <Icons.AlertTriangle />
+                        {t('rtestConsentTitle')}
+                    </div>
+                    <p className="text-sm">{bkpFill(t('rtestConsentText'), { when })}</p>
+                    <ul className="text-sm list-disc pl-5 space-y-1">
+                        <li data-rtest-consent-count>{bkpFill(t('rtestConsentCount'), { n: cfg.weekly_count ?? 5 })}</li>
+                        <li data-rtest-consent-size>{bkpFill(t('rtestConsentSize'), { gb: cfg.max_backup_gb ?? 32 })}</li>
+                        <li>{t('rtestConsentSpace')}</li>
+                    </ul>
+                    <div className="flex justify-end gap-2 pt-2" style={{ borderTop: '1px solid var(--corp-border, #29414e)' }}>
+                        <button onClick={onCancel} data-rtest-consent-cancel
+                            className="px-3 py-1.5 text-sm"
+                            style={{ background: 'transparent', color: 'var(--corp-text)', border: '1px solid var(--corp-border, #485764)', borderRadius: '3px' }}>
+                            {t('cancel') || 'Cancel'}
+                        </button>
+                        <button onClick={onConfirm} disabled={busy} data-rtest-consent-confirm
+                            className="px-3 py-1.5 text-sm font-medium"
+                            style={{ background: 'var(--corp-accent, #0078a8)', color: '#fff', border: 'none', borderRadius: '3px', opacity: busy ? 0.5 : 1 }}>
+                            {t('rtestConsentConfirm')}
+                        </button>
+                    </div>
+                </div>
+            );
+        }
+
         // NS May 2026 — settings panel for the auto-verify schedule.
         // Backend at /api/pbs/verify-schedule (GET/PUT). Single dialog toggle.
         function VerifyScheduleModal({ authFetch, apiUrl, onClose }) {
             const { t } = useTranslation();
             const [cfg, setCfg] = React.useState(null);
+            const [stored, setStored] = React.useState(null);
+            const [confirming, setConfirming] = React.useState(false);
             const [busy, setBusy] = React.useState(false);
             const [err, setErr] = React.useState(null);
             React.useEffect(() => {
                 (async () => {
                     try {
                         const r = await authFetch(`${apiUrl}/pbs/verify-schedule`);
-                        if (r && r.ok) setCfg(await r.json());
+                        if (r && r.ok) { const body = await r.json(); setCfg(body); setStored(body); }
                         else setErr(`HTTP ${r?.status}`);
                     } catch (e) { setErr(String(e)); }
                 })();
@@ -4274,21 +4309,27 @@ pre{white-space:pre-wrap;word-break:break-all;border:1px solid #ccc;padding:12px
                 window.addEventListener('keydown', onKey);
                 return () => window.removeEventListener('keydown', onKey);
             }, [authFetch, apiUrl, onClose]);
-            const save = async () => {
+            const save = async (confirmed) => {
+                // LW Oct 2026 - switched on, or on without a yes on record: ask first
+                if (!confirmed && cfg.enabled && !(stored && stored.enabled && stored.confirmed_at)) { setConfirming(true); return; }
                 setBusy(true); setErr(null);
                 try {
+                    const { confirmed_at, ...body } = cfg;  // eslint-disable-line no-unused-vars
+                    if (confirmed) body.confirmed = true;
                     const r = await authFetch(`${apiUrl}/pbs/verify-schedule`, {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(cfg),
+                        body: JSON.stringify(body),
                     });
                     if (r && r.ok) onClose();
                     // LW Oct 2026 - what the server refuses, in its words (a field out of range is a 400 now)
-                    else setErr(await PegaProxApiErrors.message(r, `HTTP ${r?.status}`));
-                } catch (e) { setErr(String(e)); }
+                    else { setConfirming(false); setErr(await PegaProxApiErrors.message(r, `HTTP ${r?.status}`)); }
+                } catch (e) { setConfirming(false); setErr(String(e)); }
                 finally { setBusy(false); }
             };
             const update = (k, v) => setCfg(c => ({ ...c, [k]: v }));
+            // no yes: the run stays off, nothing is saved
+            const decline = () => { setConfirming(false); update('enabled', false); };
             // portal to <body> so an ancestor stacking context (a transform/filter on the PBS
             // view) can't trap this fixed overlay under the PBS table — #701
             return ReactDOM.createPortal(
@@ -4307,13 +4348,15 @@ pre{white-space:pre-wrap;word-break:break-all;border:1px solid #ccc;padding:12px
                         </div>
                         {!cfg ? (
                             <div className="p-6 text-center opacity-70">{err || (t('pbsLoadingEllipsis') || 'Loading…')}</div>
+                        ) : confirming ? (
+                            <VerifyScheduleConsent cfg={cfg} busy={busy} onConfirm={() => save(true)} onCancel={decline} />
                         ) : (
                             <div className="p-5 space-y-3">
                                 <p className="text-xs opacity-70">
                                     {t('pbsAutoBackupVerificationDesc') || 'Schedules a weekly backup-verification: a small set of recent snapshots is restored to scratch, booted, then cleaned up. Catches silent backup corruption.'}
                                 </p>
                                 <label className="flex items-center gap-3">
-                                    <input type="checkbox" checked={!!cfg.enabled} onChange={(e) => update('enabled', e.target.checked)} />
+                                    <input type="checkbox" checked={!!cfg.enabled} onChange={(e) => update('enabled', e.target.checked)} data-rtest-enabled />
                                     <span>{t('pbsEnableScheduledAutoVerification') || 'Enable scheduled auto-verification'}</span>
                                 </label>
                                 <div style={{ opacity: cfg.enabled ? 1 : 0.5 }}>
@@ -4361,6 +4404,14 @@ pre{white-space:pre-wrap;word-break:break-all;border:1px solid #ccc;padding:12px
                                             className="w-full px-2 py-1.5 text-sm"
                                             style={{ background: 'var(--corp-surface-2, #29414e)', color: 'var(--corp-text)', border: '1px solid var(--corp-border, #485764)' }} />
                                     </label>
+                                    <label className="text-sm block mt-3">
+                                        <div className="opacity-70 mb-1">{t('rtestMaxBackupGb')}</div>
+                                        <input type="number" min="1" max="2048" value={cfg.max_backup_gb ?? 32} data-rtest-max-gb
+                                            onChange={(e) => update('max_backup_gb', Math.max(1, Math.min(2048, parseInt(e.target.value) || 1)))}
+                                            disabled={!cfg.enabled}
+                                            className="w-full px-2 py-1.5 text-sm"
+                                            style={{ background: 'var(--corp-surface-2, #29414e)', color: 'var(--corp-text)', border: '1px solid var(--corp-border, #485764)' }} />
+                                    </label>
                                     <p className="text-xs opacity-60 mt-2">{t('rtestIsoNote')}</p>
                                 </div>
                                 {err && <div style={{ color: '#f54f47', fontSize: '12px' }}>{err}</div>}
@@ -4370,7 +4421,7 @@ pre{white-space:pre-wrap;word-break:break-all;border:1px solid #ccc;padding:12px
                                         style={{ background: 'transparent', color: 'var(--corp-text)', border: '1px solid var(--corp-border, #485764)', borderRadius: '3px' }}>
                                         {t('cancel') || 'Cancel'}
                                     </button>
-                                    <button onClick={save} disabled={busy}
+                                    <button onClick={() => save(false)} disabled={busy}
                                         className="px-3 py-1.5 text-sm font-medium"
                                         style={{ background: 'var(--corp-accent, #0078a8)', color: '#fff', border: 'none', borderRadius: '3px',
                                                  opacity: busy ? 0.5 : 1 }}>
@@ -4531,6 +4582,16 @@ pre{white-space:pre-wrap;word-break:break-all;border:1px solid #ccc;padding:12px
 
             const last = schedule && schedule.last_run;
             const mine = last ? (last.results || []).filter(r => r.cluster_id === clusterId) : [];
+            // LW Oct 2026 - what the last run left out and why: over the size cap, of unknown size, no room on the storage
+            const tested = mine.filter(r => r.status !== 'skipped');
+            const skippedRows = mine.filter(r => r.status === 'skipped');
+            const gb = (n) => (n == null ? '?' : (n / 1073741824).toFixed(1));
+            const skipText = (r) => (r.reason === 'too_large' ? bkpFill(t('rtestSkipTooLarge'), { size: gb(r.size), max: r.limit_gb ?? '?' })
+                : r.reason === 'size_unknown' ? t('rtestSkipSizeUnknown')
+                : r.reason === 'no_space' ? bkpFill(t('rtestSkipNoSpace'), { storage: r.storage || '?', free: gb(r.free), size: gb(r.size) })
+                : r.reason === 'space_unknown' ? t('rtestSkipSpaceUnknown') + (r.storage ? ` (${r.storage})` : '')
+                : (r.cause || ''));
+            const policy = (schedule && schedule.policy) || {};
             const ruleRows = settings ? [...(settings.guests || []), ...(settings.tags || [])] : [];
 
             return (
@@ -4564,6 +4625,11 @@ pre{white-space:pre-wrap;word-break:break-all;border:1px solid #ccc;padding:12px
                                     : schedule.policy && schedule.policy.enabled && schedule.next_run
                                         ? bkpFill(t('rtestNextRun'), { when: fmtSlot(schedule.next_run) + (schedule.timezone ? ` (${schedule.timezone})` : '') })
                                         : t('rtestScheduleOff')}
+                                {policy.enabled && (
+                                    <span className="text-gray-500" data-rtest-limits>
+                                        {' - '}{bkpFill(t('rtestScheduleLimits'), { n: policy.weekly_count ?? 5, gb: policy.max_backup_gb ?? 32 })}
+                                    </span>
+                                )}
                             </span>
                             {isAdmin && !haReadOnly && (
                                 <button onClick={() => setEditSchedule(true)} className="px-3 py-1 text-sm text-gray-300 hover:text-white border border-proxmox-border rounded" data-rtest-edit-schedule>
@@ -4580,14 +4646,26 @@ pre{white-space:pre-wrap;word-break:break-all;border:1px solid #ccc;padding:12px
                                 </span>
                             )}
                         </div>
-                        {mine.length > 0 && (
+                        {tested.length > 0 && (
                             <div className="mt-2 space-y-1">
-                                {mine.slice(0, 50).map(r => (
+                                {tested.slice(0, 50).map(r => (
                                     <div key={`${r.vmid}-${r.task_id}`} className="flex items-center gap-3 text-xs" data-rtest-result={r.vmid} data-state={r.status}>
                                         <span className="font-mono text-gray-400 w-16">{r.vmid}</span>
                                         <span className="text-gray-300 truncate flex-1">{r.name || ''}</span>
-                                        <span className={BKP_STATE_CLS[r.status === 'passed' ? 'ok' : r.status === 'skipped' ? 'skipped' : 'failed']}>{r.status}</span>
+                                        <span className={BKP_STATE_CLS[r.status === 'passed' ? 'ok' : 'failed']}>{r.status}</span>
                                         {r.cause && <span className="text-gray-500 truncate">{r.cause}</span>}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                        {skippedRows.length > 0 && (
+                            <div className="mt-2 space-y-1" data-rtest-skipped>
+                                <div className="text-xs text-gray-400">{bkpFill(t('rtestSkippedTitle'), { n: skippedRows.length })}</div>
+                                {skippedRows.slice(0, 50).map((r, i) => (
+                                    <div key={`${r.vmid}-${r.volid || i}`} className="flex items-center gap-3 text-xs" data-rtest-skip={r.vmid} data-reason={r.reason || ''}>
+                                        <span className="font-mono text-gray-400 w-16">{r.vmid}</span>
+                                        <span className="text-gray-300 truncate flex-1">{r.name || ''}</span>
+                                        <span className="text-yellow-400 truncate" title={r.cause || ''}>{skipText(r)}</span>
                                     </div>
                                 ))}
                             </div>
