@@ -42,7 +42,7 @@ from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth
 from pegaprox.api.helpers import check_cluster_access, require_unconfined
 from pegaprox.core.db import get_db
-from pegaprox.core import ha
+from pegaprox.core import dbcrypto, ha
 from pegaprox.background import guest_index
 from pegaprox.models.permissions import ROLE_ADMIN
 
@@ -1167,8 +1167,69 @@ _scanner_running = False
 _scanner_lock = threading.Lock()
 SCAN_INTERVAL = 6 * 3600
 
+# MK Oct 2026 - until _open_deviation_diffs, every scan wrote an unchanged deviation again,
+# removals included, so one drifted object could hold thousands of identical open rows.
+# The scanner thread collapses them when it starts: the oldest of each (the start of the
+# drift) stays open, the rest is superseded the way a baseline reset does it. drift_events
+# is per instance (core/ha.py LOCAL_TABLES), so this runs on every start, standby or not,
+# rather than once behind a marker the sync would carry to a standby with piles of its own.
+# Off the hub and in chunks: a big pile takes minutes to write (500k rows about two), the
+# start does not wait for it and another writer waits one chunk at most, some 0.2 s.
+# With nothing left it reads the open deviations, no more.
+_REPEAT_CHUNK = 1000
+_REPEAT_PAUSE = 0.05
+
+
+def _find_repeats(conn):
+    """Ids of the open deviations that repeat an older open one of the same cluster, kind
+    and scope with the very same diff text."""
+    oldest, repeats = {}, []
+    for r in conn.execute("SELECT id, cluster_id, kind, scope, diff FROM drift_events "
+                          "WHERE status='open' AND category=?", (CATEGORY_DEVIATION,)):
+        key = (r[1], r[2], r[3], _diff_digest(r[4]))
+        first = oldest.get(key)
+        if first is None:
+            oldest[key] = r[0]
+        elif r[0] < first:
+            oldest[key] = r[0]
+            repeats.append(first)
+        else:
+            repeats.append(r[0])
+    return sorted(repeats)
+
+
+def _supersede_repeats(conn, ids):
+    # still open and still a deviation: what an admin acknowledged or confirmed since stays
+    c = conn.cursor()
+    c.executemany("UPDATE drift_events SET status='superseded' WHERE id=? AND status='open' "
+                  "AND category=?", [(i, CATEGORY_DEVIATION) for i in ids])
+    return max(c.rowcount, 0)
+
+
+def _collapse_repeats():
+    """Supersede the repeated open deviations, logged as one line. A failure is logged and
+    leaves the rest for the next start. No alert and no audit entry: nothing new was found.
+    Returns how many rows it superseded."""
+    done = 0
+    try:
+        path = get_db().db_path
+        ids = dbcrypto.run_off_hub(_find_repeats, path)
+        for at in range(0, len(ids), _REPEAT_CHUNK):
+            if at:
+                time.sleep(_REPEAT_PAUSE)    # the other writers get the database in between
+            chunk = ids[at:at + _REPEAT_CHUNK]
+            done += dbcrypto.run_off_hub(lambda conn, chunk=chunk: _supersede_repeats(conn, chunk),
+                                         path, commit=True)
+    except Exception as e:
+        logging.warning(f"[drift] superseding repeated open deviations stopped after {done}: {e}")
+        return done
+    if done:
+        logging.info(f"[drift] {done} repeated open deviation(s) superseded, the oldest of each stays open")
+    return done
+
 
 def _scanner_loop():
+    _collapse_repeats()
     while _scanner_running:
         try:
             for cid in list(cluster_managers.keys()):
