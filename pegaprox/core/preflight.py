@@ -7,11 +7,12 @@ maps. Every guest comes back ready, warning or blocked with its reasons; the set
 totals, what the target nodes hold afterwards and the steps a run takes, in order, and
 what an abort leaves behind. Warnings proceed. A block is something Proxmox refuses or a
 rule of PegaProx forbids: the second kind (and a few that only might fail) the caller may
-override, with confirmation and an audit entry, the first kind not.
+override, with confirmation and an audit entry, the first kind not. An enforced affinity
+rule is overridden only by whoever may change the rules.
 
 The set is placed as a whole: the RAM, CPU and disk space each guest takes on its target
-count for the guests after it, and the affinity rules are judged on where every guest
-ends up, not on where the others are now.
+count for the guests after it (an overridden one too), and the affinity rules are judged
+on where every guest ends up, not on where the others are now.
 
 It reads only, and little: per cluster the guest list and node status the live view
 keeps, one storage list (/cluster/resources?type=storage, shared with the health score),
@@ -477,6 +478,20 @@ def backup_times(cluster_id, mgr):
 
 # --- the verdict of one guest ------------------------------------------------------------
 
+def _reason(level, code, text, overridable=False):
+    reason = {'level': level, 'code': code, 'text': text}
+    if level == BLOCKED:
+        reason['overridable'] = bool(overridable)
+    return reason
+
+
+def _goes(vmid, reasons, override):
+    """Whether a guest with these reasons moves: nothing blocks it, or the caller overrides
+    it and every block may be overridden"""
+    blocks = [r for r in reasons if r['level'] == BLOCKED]
+    return not blocks or (vmid in override and all(r['overridable'] for r in blocks))
+
+
 class _Guest:
     def __init__(self, vmid, g, kind=None):
         g = g or {}
@@ -490,10 +505,7 @@ class _Guest:
                     'overridable': False, 'overridden': False, 'reasons': [], 'abort': ''}
 
     def add(self, level, code, text, overridable=False):
-        reason = {'level': level, 'code': code, 'text': text}
-        if level == BLOCKED:
-            reason['overridable'] = bool(overridable)
-        self.row['reasons'].append(reason)
+        self.row['reasons'].append(_reason(level, code, text, overridable))
 
     def block(self, code, text, overridable=False):
         self.add(BLOCKED, code, text, overridable)
@@ -567,8 +579,9 @@ class _Sim:
                               'guests': 0} if total > 0 else None
         return self.mem[name]
 
-    def take(self, gv, t):
-        """Count a running guest on t; a block when it does not fit"""
+    def take(self, gv, t, forced=False):
+        """Count a running guest on t; a block when it does not fit, and counted all the same
+        when the caller overrides that (forced): the guests after it find it there"""
         if not gv.running:
             return
         n = self.node(t)
@@ -577,15 +590,17 @@ class _Sim:
             return
         need = _int(gv.g.get('maxmem'))
         after = n['mem_used'] + need
-        if after > n['mem_total']:
+        short = after > n['mem_total']
+        if short:
             figures = '' if self.scoped else f"{_gb(after)} of {_gb(n['mem_total'])}, "
             gv.block('memory_short', f"{t} runs out of memory with it ({figures}counting the guests before it "
                                      f"in this set)", overridable=True)
-            return
+            if not forced:
+                return
         n['mem_used'] = after
         n['guests'] += 1
         pct = after * 100.0 / n['mem_total']
-        if pct > MEM_WARN_PCT:
+        if pct > MEM_WARN_PCT and not short:
             gv.warn('memory_tight', f"{t} is nearly out of memory with it" if self.scoped
                     else f"{t} is at {pct:.0f}% memory with it")
         vcpus = _int(gv.g.get('maxcpu'))
@@ -596,18 +611,22 @@ class _Sim:
                 gv.warn('cpu_busy', f"{t} is nearly out of CPU with it" if self.scoped
                         else f"{t} is at {cpu_pct:.0f}% CPU with it")
 
-    def space(self, gv, t, storage, need, free):
-        """Count need bytes on storage of t; False when they do not fit"""
-        if free is None or not need:
-            return True
-        key = (t, storage)
+    def _left(self, key, free):
         if key not in self.disk:
             self.disk[key] = self.parent.disk.get(key, free) if self.parent is not None else free
-        left = self.disk[key]
-        if need > left:
-            return False
-        self.disk[key] = left - need
-        return True
+        return self.disk[key]
+
+    def space(self, t, storage, need, free):
+        """Whether need bytes fit on storage of t next to the guests placed before"""
+        if free is None or not need:
+            return True
+        return need <= self._left((t, storage), free)
+
+    def use(self, t, storage, need, free):
+        """Count need bytes on storage of t for the guests after it"""
+        if free is None or not need:
+            return
+        self.disk[(t, storage)] = self._left((t, storage), free) - need
 
     def view(self):
         out = []
@@ -628,22 +647,42 @@ def _free(row):
     return max(0, total - used) if total else None
 
 
-def _cpu_checks(gv, src_info, tgt_info, t, baseline, live, tgt_cpus):
+def _place(sim, gv, t, room, override):
+    """Count a guest on t for the guests after it once it goes there: nothing blocks it, or
+    the caller overrides every block it has. room: [(storage, bytes, free)] of its disks.
+    MK Oct 2026 - an overridden guest counted for nothing, so the guests after it were
+    judged on a node without it and together they landed on more memory than the node has."""
+    forced = gv.vmid in override
+    if gv.hard_blocked or (gv.blocked and not forced):
+        return
+    sim.take(gv, t, forced)
+    if gv.blocked and not forced:
+        return
+    for storage, need, free in room:
+        sim.use(t, storage, need, free)
+
+
+def _cpu_checks(gv, src_info, tgt_info, t, baseline, live, tgt_cpus, scoped=False):
     from pegaprox.core.manager import PegaProxManager
     if gv.kind != 'qemu':
         return
     vcpus = _int(gv.g.get('maxcpu'))
     if gv.running and vcpus and tgt_cpus and vcpus > tgt_cpus:
-        gv.block('vcpus', f"It has {vcpus} vCPUs and {t} has {tgt_cpus}: it cannot run there")
+        # a caller confined to some guests reads no figures of a node, nor its CPU model
+        gv.block('vcpus', f"It has more vCPUs than {t} has CPUs: it cannot run there" if scoped
+                 else f"It has {vcpus} vCPUs and {t} has {tgt_cpus}: it cannot run there")
     if gv.cfg is None:
         return
     vm_cpu = PegaProxManager.cpu_type_of(gv.cfg)
     verdict = PegaProxManager.cpu_verdict(vm_cpu, src_info, tgt_info, None)
     if live and gv.running:
         if not verdict.get('compatible', True):
-            gv.block('cpu_vendor', f"CPU type {vm_cpu}: {verdict.get('reason')} - it cannot move live to {t}")
+            gv.block('cpu_vendor', f"CPU type {vm_cpu}: {t} has a CPU of another vendor - it cannot move live "
+                                   f"to {t}" if scoped
+                     else f"CPU type {vm_cpu}: {verdict.get('reason')} - it cannot move live to {t}")
         elif verdict.get('warning'):
-            gv.warn('cpu_model', verdict['warning'])
+            gv.warn('cpu_model', f"CPU type {vm_cpu}: {t} has another CPU model - the migration may fail on "
+                                 f"CPU flags" if scoped else verdict['warning'])
     if baseline:
         policy = PegaProxManager.cpu_verdict(vm_cpu, {}, {}, baseline)
         if not policy.get('compatible', True):
@@ -716,10 +755,12 @@ _HOW = {'sequential': 'One at a time: the next starts once the migration before 
 
 
 def intra(cluster_id, mgr, vmids, target=None, online=True, with_local_disks=False, mode=None,
-          parallel=2, busy=(), scoped=False, override=(), backups=True):
+          parallel=2, busy=(), scoped=False, override=(), backups=True, affinity_override=True):
     """The preflight of a migration of `vmids` inside one cluster, to `target` or (None) each
     to the node it fits best. busy: the guests another bulk run moves; scoped: the caller is
-    confined to some guests (the answer names no others and no node figures)."""
+    confined to some guests (the answer names no others and no node figures);
+    affinity_override: the caller may override an enforced affinity rule of PegaProx, as
+    whoever may change the rules may (an admin)."""
     side = _Side(cluster_id, mgr)
     out = _frame('intra', side, scoped)
     out.update(target=target, online=bool(online), with_local_disks=bool(with_local_disks), mode=mode,
@@ -780,14 +821,9 @@ def intra(cluster_id, mgr, vmids, target=None, online=True, with_local_disks=Fal
         if not t:
             gv.block('no_node', 'No node can take it: on every node that could, one of the checks blocks it')
             continue
-        _intra_checks(side, sim, gv, t, online, with_local_disks)
+        _intra_checks(side, sim, gv, t, online, with_local_disks, override)
 
-    # where everyone is once the set moved, for the affinity rules of PegaProx and of HA
-    planned = {str(v): (g.get('node')) for v, g in (guests or {}).items()}
-    for gv in todo:
-        if gv.row['to'] and not gv.blocked:
-            planned[str(gv.vmid)] = gv.row['to']
-    _affinity_checks(side, todo, planned, scoped)
+    _affinity_checks(side, todo, guests, scoped, override, affinity_override)
     for gv in todo:
         if gv.row['to']:
             _intra_after(side, gv, gv.row['to'], backups)
@@ -820,7 +856,7 @@ def _pick(side, sim, gv, pool, online, with_local_disks):
     return best[1] if best else None
 
 
-def _intra_checks(side, sim, gv, t, online, with_local_disks):
+def _intra_checks(side, sim, gv, t, online, with_local_disks, override=()):
     nodes = side.nodes() or {}
     if nodes and t not in nodes:
         gv.block('target_unknown', f'{t} is no node of this cluster')
@@ -844,7 +880,8 @@ def _intra_checks(side, sim, gv, t, online, with_local_disks):
         gv.warn('ct_restart', f"It is a container: it stops on {gv.node} and starts again on {t}")
     _cpu_checks(gv, (nodes.get(gv.node) or {}).get('cpuinfo') or {}, tinfo.get('cpuinfo') or {}, t,
                 _setting(side.mgr, 'cpu_baseline'), live,
-                _int((tinfo.get('cpuinfo') or {}).get('cpus')) if isinstance(tinfo.get('cpuinfo'), dict) else 0)
+                _int((tinfo.get('cpuinfo') or {}).get('cpus')) if isinstance(tinfo.get('cpuinfo'), dict) else 0,
+                sim.scoped)
     ha = side.ha()
     if ha:
         allowed = ha['limits'].get(gv.vmid)
@@ -853,12 +890,11 @@ def _intra_checks(side, sim, gv, t, online, with_local_disks):
                                      f"(strict node affinity or a restricted group)")
     if gv.cfg is None:
         gv.warn('config_unread', 'Its configuration could not be read: disks, networks and devices are not checked')
-        if not gv.blocked:
-            sim.take(gv, t)
+        _place(sim, gv, t, (), override)
         return
 
     src_st, tgt_st = side.storages(gv.node), side.storages(t)
-    local = []
+    local, room = [], []
     for vol in guest_volumes(gv.cfg, gv.kind):
         if tgt_st is not None:
             row = tgt_st.get(vol['storage'])
@@ -880,9 +916,11 @@ def _intra_checks(side, sim, gv, t, online, with_local_disks):
             gv.info('local_disks', f"Its local disks are copied to {t}: {names}")
         for storage in sorted({v['storage'] for v in local}):
             need = sum(v['size'] for v in local if v['storage'] == storage)
-            if tgt_st is not None and not sim.space(gv, t, storage, need, _free(tgt_st.get(storage))):
+            free = _free(tgt_st.get(storage)) if tgt_st is not None else None
+            if not sim.space(t, storage, need, free):
                 gv.block('storage_full', f"Storage {storage} on {t} has less room than its {_gb(need)} "
                                          f"(counting the guests before it in this set)", overridable=True)
+            room.append((storage, need, free))
         if 'parent' in gv.cfg:
             repl = {str(j.get('target')) for j in side.jobs_of(gv.vmid)}
             if gv.running and live and gv.kind == 'qemu':
@@ -914,8 +952,7 @@ def _intra_checks(side, sim, gv, t, online, with_local_disks):
             else:
                 gv.warn('bridge_missing', f"{key} uses bridge {bridge}, which {t} does not have: it will not start there")
     _device_checks(gv, live)
-    if not gv.blocked:
-        sim.take(gv, t)
+    _place(sim, gv, t, room, override)
 
 
 def _busy_checks(gv):
@@ -926,43 +963,59 @@ def _busy_checks(gv):
         gv.block('ha_moving', 'Proxmox HA moves it right now')
 
 
-def _affinity_checks(side, todo, planned, scoped):
+def _affinity_checks(side, todo, guests, scoped, override=(), may_override=True):
     """The affinity rules of PegaProx and the resource affinity of Proxmox HA, on where every
-    guest ends up"""
-    moving_gv = [gv for gv in todo if gv.row['to'] and not gv.hard_blocked]
-    if not moving_gv:
+    guest ends up: a guest goes when nothing blocks it or the caller overrides every block
+    it has, the others stay where they are.
+
+    MK Oct 2026 - one pass counted an overridden guest as staying and one a rule held back
+    in that pass as gone, so web could move without db although a rule keeps them together.
+    A guest a rule holds back now stays for the others, and those sharing a rule with it are
+    judged again. One held back is not let go again, so it ends."""
+    cands = [gv for gv in todo if gv.row['to'] and not gv.hard_blocked]
+    if not cands:
         return
     from pegaprox.api import history
     try:
         rules = history.load_affinity_rules() or {'rules': []}
     except Exception:
         rules = {'rules': []}
+    ha = side.ha()
+    ha_rules = (ha or {}).get('affinity') or []
+    peers = {}
+
+    def _bind(members):
+        for v in members:
+            peers.setdefault(v, set()).update(members)
+
     ruled = set()
     for rule in rules.get('rules', []):
         if rule.get('cluster_id') == side.id and rule.get('enabled', True):
-            ruled.update(str(v) for v in (rule.get('vm_ids') or rule.get('vms') or []))
-    for gv in moving_gv:
-        if str(gv.vmid) not in ruled:
-            continue
-        try:
-            aff = history.check_affinity_violation(side.id, gv.vmid, gv.row['to'], vm_nodes=planned, config=rules)
-        except Exception as e:
-            log.debug(f"[PREFLIGHT] affinity of {gv.vmid}: {e}")
-            gv.warn('affinity_unread', 'The affinity rules could not be checked')
-            continue
-        if not isinstance(aff, dict) or aff.get('violation') is not True:
-            continue
-        if aff.get('enforce'):
-            gv.block('affinity', f"Affinity rule '{aff.get('rule')}' keeps it off {gv.row['to']}", overridable=True)
-        else:
-            gv.warn('affinity_soft', f"Affinity rule '{aff.get('rule')}' (not enforced)"
-                                     + ('' if scoped else f": {aff.get('message')}"))
-    ha = side.ha()
-    if not ha or not ha['affinity']:
-        return
-    for gv in moving_gv:
+            members = {str(v) for v in (rule.get('vm_ids') or rule.get('vms') or [])}
+            ruled |= members
+            _bind(members)
+    for rule in ha_rules:
+        _bind({str(_sid_vmid(s)) for s in rule['sids']})
+
+    def judge(gv, planned):
+        out = []
+        if str(gv.vmid) in ruled:
+            try:
+                aff = history.check_affinity_violation(side.id, gv.vmid, gv.row['to'], vm_nodes=planned,
+                                                       config=rules)
+            except Exception as e:
+                log.debug(f"[PREFLIGHT] affinity of {gv.vmid}: {e}")
+                aff = None
+                out.append(_reason(WARNING, 'affinity_unread', 'The affinity rules could not be checked'))
+            if isinstance(aff, dict) and aff.get('violation') is True:
+                if aff.get('enforce'):
+                    out.append(_reason(BLOCKED, 'affinity', f"Affinity rule '{aff.get('rule')}' keeps it off "
+                                                            f"{gv.row['to']}", overridable=may_override))
+                else:
+                    out.append(_reason(WARNING, 'affinity_soft', f"Affinity rule '{aff.get('rule')}' (not enforced)"
+                                       + ('' if scoped else f": {aff.get('message')}")))
         sid = sid_of(gv.vmid, gv.kind)
-        for rule in ha['affinity']:
+        for rule in ha_rules:
             if sid not in rule['sids']:
                 continue
             others = [s for s in rule['sids'] if s != sid]
@@ -971,11 +1024,34 @@ def _affinity_checks(side, todo, planned, scoped):
             if rule['positive']:
                 apart = [s for s, n in where.items() if n and n != gv.row['to']]
                 if apart:
-                    gv.warn('ha_together', f"HA rule {rule['rule']} keeps it together with other guests{who}: "
-                                           f"Proxmox HA moves them to {gv.row['to']} as well")
+                    out.append(_reason(WARNING, 'ha_together', f"HA rule {rule['rule']} keeps it together with "
+                                                               f"other guests{who}: Proxmox HA moves them to "
+                                                               f"{gv.row['to']} as well"))
             elif any(n == gv.row['to'] for n in where.values()):
-                gv.block('ha_apart', f"HA rule {rule['rule']} keeps it apart from other guests{who} that are "
-                                     f"on {gv.row['to']} then")
+                out.append(_reason(BLOCKED, 'ha_apart', f"HA rule {rule['rule']} keeps it apart from other "
+                                                        f"guests{who} that are on {gv.row['to']} then"))
+        return out
+
+    # where everyone is once the set moved
+    planned = {str(v): g.get('node') for v, g in (guests or {}).items()}
+    going = {gv.vmid for gv in cands if _goes(gv.vmid, gv.row['reasons'], override)}
+    for gv in cands:
+        if gv.vmid in going:
+            planned[str(gv.vmid)] = gv.row['to']
+    found, held, again = {}, {}, cands
+    while again:
+        for gv in again:
+            found[gv.vmid] = judge(gv, planned)
+        stay = [gv for gv in again if gv.vmid in going
+                and not _goes(gv.vmid, gv.row['reasons'] + found[gv.vmid], override)]
+        for gv in stay:
+            held[gv.vmid] = found[gv.vmid]
+            going.discard(gv.vmid)
+            planned[str(gv.vmid)] = gv.node
+        near = set().union(*(peers.get(str(gv.vmid), ()) for gv in stay)) if stay else set()
+        again = [gv for gv in cands if str(gv.vmid) in near and gv.vmid not in held]
+    for gv in cands:
+        gv.row['reasons'].extend(held.get(gv.vmid, found[gv.vmid]))
 
 
 def _intra_after(side, gv, t, backups):
@@ -1089,10 +1165,12 @@ def map_arg(value, name):
 def cross(src_id, src_mgr, tgt_id, tgt_mgr, vmids, target_node, storage_map=None, target_storage=None,
           bridge_map=None, target_bridge=None, target_vmid=None, online=True, force_online=False,
           delete_source=True, may_delete=True, user=None, vm_type=None, scoped=False, override=(),
-          backups=True):
+          backups=True, quota=True):
     """The preflight of a remote migration of `vmids` to `target_node` of another cluster.
     may_delete: the caller may remove the source guests; user: the authz user, for the
-    tenant's VMID range and quota at the target."""
+    tenant's VMID range and quota at the target. quota=False where the caller's quota gate
+    has weighed the guests already and holds their room: the hold is in every count after
+    it, so weighing them again counted each one twice."""
     src, tgt = _Side(src_id, src_mgr), _Side(tgt_id, tgt_mgr)
     out = _frame('cross', src, scoped)
     out.update(target_cluster_id=tgt_id, target_cluster=tgt.name, target=target_node, online=bool(online),
@@ -1153,8 +1231,8 @@ def cross(src_id, src_mgr, tgt_id, tgt_mgr, vmids, target_node, storage_map=None
         if target_ok:
             _cross_checks(src, tgt, sim, gv, target_node, storage_map, target_storage, bridge_map, target_bridge,
                           target_vmid if len(vmids) == 1 else None, online, force_online, delete_source,
-                          may_delete, user, taken, route)
-    if target_ok:
+                          may_delete, user, taken, route, override)
+    if target_ok and quota:
         _quota_check(src, tgt, [gv for gv in todo if not gv.hard_blocked], user, delete_source)
     for gv in todo:
         if backups and gv.g:
@@ -1174,7 +1252,7 @@ def cross(src_id, src_mgr, tgt_id, tgt_mgr, vmids, target_node, storage_map=None
 
 
 def _cross_checks(src, tgt, sim, gv, t, storage_map, target_storage, bridge_map, target_bridge, target_vmid,
-                  online, force_online, delete_source, may_delete, user, taken, route):
+                  online, force_online, delete_source, may_delete, user, taken, route, override=()):
     _busy_checks(gv)
     if delete_source and not may_delete:
         gv.block('needs_delete', 'Removing the source guest needs vm.delete on it')
@@ -1207,7 +1285,8 @@ def _cross_checks(src, tgt, sim, gv, t, storage_map, target_storage, bridge_map,
     tinfo = tnodes.get(t) or {}
     _cpu_checks(gv, (nodes_src.get(gv.node) or {}).get('cpuinfo') or {}, tinfo.get('cpuinfo') or {}, t,
                 _setting(tgt.mgr, 'cpu_baseline'), live,
-                _int((tinfo.get('cpuinfo') or {}).get('cpus')) if isinstance(tinfo.get('cpuinfo'), dict) else 0)
+                _int((tinfo.get('cpuinfo') or {}).get('cpus')) if isinstance(tinfo.get('cpuinfo'), dict) else 0,
+                sim.scoped)
 
     ha = src.ha()
     if ha and gv.vmid in ha['managed']:
@@ -1222,8 +1301,7 @@ def _cross_checks(src, tgt, sim, gv, t, storage_map, target_storage, bridge_map,
     if gv.cfg is None:
         if gv.g:
             gv.warn('config_unread', 'Its configuration could not be read: disks, networks and devices are not checked')
-        if not gv.blocked:
-            sim.take(gv, t)
+        _place(sim, gv, t, (), override)
         return
     tgt_st = tgt.storages(t)
     if tgt_st is None:
@@ -1245,8 +1323,9 @@ def _cross_checks(src, tgt, sim, gv, t, storage_map, target_storage, bridge_map,
             gv.block('storage_content', f"{vol['key']} goes to storage {dst}, which does not take {content}")
             continue
         need[dst] = need.get(dst, 0) + vol['size']
-    for dst, size in sorted(need.items()):
-        if not sim.space(gv, t, dst, size, _free((tgt_st or {}).get(dst))):
+    room = [(dst, size, _free((tgt_st or {}).get(dst))) for dst, size in sorted(need.items())]
+    for dst, size, free in room:
+        if not sim.space(t, dst, size, free):
             gv.block('storage_full', f"Storage {dst} on {t} has less room than its {_gb(size)} (counting the "
                                      f"guests before it in this set)", overridable=True)
     for key, _storage, volid in cdrom_images(gv.cfg):
@@ -1270,8 +1349,7 @@ def _cross_checks(src, tgt, sim, gv, t, storage_map, target_storage, bridge_map,
         gv.block('snapshots_remote', 'It has snapshots: a remote migration does not take them along - remove '
                                      'them first', overridable=True)
     _device_checks(gv, live)
-    if not gv.blocked:
-        sim.take(gv, t)
+    _place(sim, gv, t, room, override)
 
 
 def _quota_check(src, tgt, movers, user, delete_source):

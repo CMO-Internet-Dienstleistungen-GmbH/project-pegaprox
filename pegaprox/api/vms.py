@@ -13512,8 +13512,7 @@ def migration_preflight_api(cluster_id):
         return jsonify({'error': oerr}), 400
     try:
         res = preflight.intra(cluster_id, mgr, wanted, target, online, local, mode, parallel,
-                              busy=bulk.busy_vmids(cluster_id), scoped=caller_is_scoped(user, cluster_id),
-                              override=override)
+                              busy=bulk.busy_vmids(cluster_id), override=override, **_pf_caller(user, cluster_id))
     except Exception as e:
         logging.error(f"[PREFLIGHT] {cluster_id}: {e}", exc_info=True)
         return jsonify({'error': 'The migration preflight failed - see the PegaProx log'}), 500
@@ -13541,10 +13540,11 @@ def bulk_migrate_api(cluster_id):
     to each start.
 
     Either way the preflight (POST .../migration-preflight) is asked first: what it blocks
-    does not start. override names guests whose blocks may be overridden (an enforced
-    affinity rule, too little memory or disk space on the target, ...), with
+    does not start. override names guests whose blocks may be overridden (too little memory
+    or disk space on the target, an enforced affinity rule for an admin, ...), with
     confirm_override: true; that goes to the audit log. dry_run: true starts nothing and
-    answers with the preflight and the steps the run would take.
+    answers with the preflight and the steps the run would take. A preflight that fails
+    starts nothing either (500).
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
@@ -13579,11 +13579,17 @@ def bulk_migrate_api(cluster_id):
         if not has_permission(build_authz_user(request.session.get('user', ''), request.session), 'xapi.vm.migrate'):
             return jsonify({'error': 'Permission denied: xapi.vm.migrate'}), 403
 
-    if data.get('dry_run', False) not in (True, False):
+    # by type: 1 == True passed "true or false" here and `is True` below read it as false,
+    # so a dry run asked for as 1 migrated the guests
+    if not isinstance(data.get('dry_run', False), bool):
         return jsonify({'error': 'dry_run is true or false'}), 400
     if data.get('mode') is not None or data.get('dry_run') is True:
         return _start_bulk_run(cluster_id, mgr, data)
 
+    # a target in another shape (['pve2']) broke the preflight, and Proxmox still read it as a node
+    from pegaprox.utils.sanitization import validate_hostname
+    if not isinstance(target_node, str) or not validate_hostname(target_node):
+        return jsonify({'error': 'Target node is required'}), 400
     if not isinstance(vms, list) or not all(isinstance(v, dict) and v.get('node') and v.get('type') in ('qemu', 'lxc')
                                              for v in vms):
         return jsonify({'error': 'vms is a list of {vmid, node, type}'}), 400
@@ -13595,7 +13601,6 @@ def bulk_migrate_api(cluster_id):
         return jsonify({'error': oerr}), 400
 
     user = getattr(request, 'session', {}).get('user', 'system')
-    log_audit(user, 'vm.bulk_migrated', f"Bulk migration of {len(vms)} VMs to {target_node}", cluster=mgr.config.name)
 
     # NS Aug 2026 (audit) — the single-VM migrate gates every vmid via user_can_access_vm, but this
     # bulk twin only had the cluster gate, so a VM-ACL/pool-scoped user could relocate foreign VMs
@@ -13605,11 +13610,16 @@ def bulk_migrate_api(cluster_id):
     _authz_user = build_authz_user(request.session['user'], request.session)
 
     # LW: Feb 2026 - enforced violations skip that VM but don't abort the whole batch
-    # MK Oct 2026 - the preflight judges the affinity rules now, with everything else it checks
+    # MK Oct 2026 - the preflight judges the affinity rules now, with everything else it checks,
+    # and skips what a bulk run moves already, as the dry run of the same body says
+    from pegaprox.core import bulk_migrate as bulk
     reach = [v for v, vm in zip(wanted, vms)
              if user_can_access_vm(_authz_user, cluster_id, v, 'vm.migrate', vm.get('type', 'qemu'))]
     verdicts = _bulk_preflight(cluster_id, mgr, reach, target_node, online is not False, False, None, 1,
-                               _authz_user, override)
+                               _authz_user, override, busy=bulk.busy_vmids(cluster_id))
+    if verdicts is None:
+        return jsonify({'error': 'The migration preflight failed - see the PegaProx log'}), 500
+    log_audit(user, 'vm.bulk_migrated', f"Bulk migration of {len(vms)} VMs to {target_node}", cluster=mgr.config.name)
     _audit_overrides(user, mgr, f"Bulk migration to {target_node}", verdicts)
 
     results = []
@@ -13672,16 +13682,26 @@ def _override_ids(data, wanted):
     return set(ids), None
 
 
+def _pf_caller(user, cluster_id):
+    """What the preflight takes of the caller: confined to some guests or not, and whether
+    they may override an enforced affinity rule. MK Oct 2026 - only whoever may change the
+    rules (history.py: an admin) may: the single migrate and the node's migrate-all refuse
+    such a move to everyone, and bulk-migrate let a VM-ACL user past an admin's rule."""
+    from pegaprox.utils.rbac import acts_as_admin
+    return {'scoped': caller_is_scoped(user, cluster_id), 'affinity_override': acts_as_admin(user)}
+
+
 def _bulk_preflight(cluster_id, mgr, vmids, target, online, local, mode, parallel, user, override,
                     backups=False, busy=()):
-    """{vmid: preflight row} of a bulk migration that starts now, {} when the preflight broke
-    (the migrations then go as they did before it existed)"""
+    """{vmid: preflight row} of a bulk migration that starts now, None when the preflight
+    broke: nothing starts then. Going on "as before the preflight existed" meant no check at
+    all, the affinity check it replaced among them."""
     try:
         res = preflight.intra(cluster_id, mgr, vmids, target, online, local, mode, parallel, busy=busy,
-                              scoped=caller_is_scoped(user, cluster_id), override=override, backups=backups)
+                              override=override, backups=backups, **_pf_caller(user, cluster_id))
     except Exception as e:
         logging.error(f"[PREFLIGHT] bulk migration to {target} on {cluster_id}: {e}", exc_info=True)
-        return {}
+        return None
     return {r['vmid']: r for r in res['guests']}
 
 
@@ -13740,13 +13760,15 @@ def _start_bulk_run(cluster_id, mgr, data):
     if dry_run:
         try:
             res = preflight.intra(cluster_id, mgr, wanted, target, online, local, mode, parallel, busy=busy,
-                                  scoped=caller_is_scoped(user, cluster_id), override=override)
+                                  override=override, **_pf_caller(user, cluster_id))
         except Exception as e:
             logging.error(f"[PREFLIGHT] dry run of a bulk migration to {target}: {e}", exc_info=True)
             return jsonify({'error': 'The migration preflight failed - see the PegaProx log'}), 500
         return jsonify({'dry_run': True, 'preflight': res, 'steps': res['steps']})
     verdicts = _bulk_preflight(cluster_id, mgr, wanted, target, online, local, mode, parallel, user, override,
                                busy=busy)
+    if verdicts is None:
+        return jsonify({'error': 'The migration preflight failed - see the PegaProx log'}), 500
     rows = []
     for vmid in wanted:
         g = guests[vmid]
@@ -13993,13 +14015,16 @@ def _cross_preflight_args(data, storage_map, bridge_map):
 def _cross_preflight_for(data, src_id, tgt_id, vmids, vm_type, target_node, storage_map, target_storage,
                          bridge_map, target_bridge, target_vmid, online, force_online, delete_source, user):
     """The preflight a cross-cluster migration starts with: (result or None, an answer to
-    return instead of migrating: the dry run, a 400 or the 409 of a block)"""
+    return instead of migrating: the dry run, a 400, the 409 of a block or a 500 when the
+    preflight broke)"""
     args, err = _cross_preflight_args(data, storage_map, bridge_map)
     if err:
         return None, (jsonify({'error': err}), 400)
     override, err = _override_ids(data, vmids)
     if err:
         return None, (jsonify({'error': err}), 400)
+    # MK Oct 2026 - a real run leaves the quota to the gate before it, which holds the room
+    # for the guest; weighed here again the guest counted twice and a copy that fit was refused
     try:
         pf = preflight.cross(src_id, cluster_managers[src_id], tgt_id, cluster_managers[tgt_id], vmids, target_node,
                              storage_map=args['storage_map'], target_storage=None if args['storage_map'] else target_storage,
@@ -14008,12 +14033,11 @@ def _cross_preflight_for(data, src_id, tgt_id, vmids, vm_type, target_node, stor
                              target_vmid=_vmid_or_none(target_vmid), online=bool(online),
                              force_online=bool(force_online), delete_source=bool(delete_source), may_delete=True,
                              user=user, vm_type=vm_type, scoped=caller_is_scoped(user, src_id), override=override,
-                             backups=args['dry_run'])
+                             backups=args['dry_run'], quota=args['dry_run'])
     except Exception as e:
+        # a broken preflight starts nothing: what it would have blocked was let through
         logging.error(f"[PREFLIGHT] cross-cluster {src_id} -> {tgt_id}: {e}", exc_info=True)
-        if args['dry_run']:
-            return None, (jsonify({'error': 'The migration preflight failed - see the PegaProx log'}), 500)
-        return None, None
+        return None, (jsonify({'error': 'The migration preflight failed - see the PegaProx log'}), 500)
     if args['dry_run']:
         return pf, (jsonify({'dry_run': True, 'preflight': pf, 'steps': pf['steps']}), 200)
     row = pf['guests'][0]
@@ -14155,7 +14179,10 @@ def cross_cluster_migrate_api():
     delete_source = data.get('delete_source', True)
     bwlimit = data.get('bwlimit', 0)  # 0 = no limit (maximum speed to beat ticket timeout)
     
-    if not target_node:
+    # MK Oct 2026 - checked as the preflight route checks it: a node as a list broke the
+    # preflight and the migration started anyway
+    from pegaprox.utils.sanitization import validate_hostname
+    if not isinstance(target_node, str) or not validate_hostname(target_node):
         return jsonify({'error': 'Target node is required for cross-cluster migration'}), 400
     # NS Oct 2026 (#1048) - the gates and the migration have to mean the same guest. '0100'
     # or ' 100' missed the ACL row of VM 100 and got decided by the role instead.
@@ -14196,6 +14223,14 @@ def cross_cluster_migrate_api():
         _rok, _rmsg = check_tenant_vmid(_xu.get('tenant_id') or DEFAULT_TENANT_ID, target_vmid or vmid)
         if not _rok:
             return jsonify({'error': _rmsg}), 403
+    # one VMID, and the preflight judges the one Proxmox is handed: a list had it look at
+    # the source VMID while target-vmid went out form-encoded
+    if target_vmid in (None, '', 0):
+        target_vmid = None
+    elif _vmid_or_none(target_vmid) is None:
+        return jsonify({'error': 'target_vmid is one VMID'}), 400
+    else:
+        target_vmid = _vmid_or_none(target_vmid)
     # NS Oct 2026 (#1048) - delete_source destroys the source guest: vm.delete, like XHM
     if delete_source:
         err = _require_vm_access(source_cluster_id, vmid, 'vm.delete', vm_type)
