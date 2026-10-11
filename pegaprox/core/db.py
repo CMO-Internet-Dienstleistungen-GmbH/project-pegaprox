@@ -2405,6 +2405,14 @@ class PegaProxDB:
             ''')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_drift_events_cluster ON drift_events(cluster_id, detected_at DESC)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_drift_events_status ON drift_events(status, cluster_id)')
+            # MK Oct 2026 - what an event is: a deviation from the baseline (default), a policy
+            # violation, or an incident an admin confirmed. Local table, like the rest of the events.
+            _have = {r[1] for r in cursor.execute("PRAGMA table_info(drift_events)").fetchall()}
+            for _cn, _cd in (('category', "TEXT NOT NULL DEFAULT 'deviation'"),
+                             ('confirmed_by', "TEXT DEFAULT ''"),
+                             ('confirmed_at', 'TEXT')):
+                if _cn not in _have:
+                    cursor.execute(f"ALTER TABLE drift_events ADD COLUMN {_cn} {_cd}")
             logging.info("Ensured drift_baselines + drift_events tables exist")
         except Exception as e:
             logging.error(f"Error creating drift tables: {e}")

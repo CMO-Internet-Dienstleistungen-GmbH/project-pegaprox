@@ -10,6 +10,10 @@ Categories tracked:
   - storage         /etc/pve/storage.cfg (via /api2/json/storage)
   - network         per-node /etc/network/interfaces (via /api2/json/nodes/<n>/network)
   - cluster_options /etc/pve/datacenter.cfg (via /api2/json/cluster/options)
+  - firewall        cluster options/rules/aliases/ipsets/groups, node and guest rules
+  - ha_rules        HA rules (PVE 9) or groups (PVE 8), and the HA resources
+  - backup_jobs     /cluster/backup
+  - access          users, groups, roles and ACL entries (never a secret, tokens by id)
 
 Workflow:
   1. Admin clicks "Set baseline" — current state stored in drift_baselines.
@@ -25,6 +29,7 @@ Slack/Discord/ntfy/web-push channels users have configured for alerts also
 get drift notifications without extra plumbing.
 """
 import json
+import re
 import time
 import hashlib
 import uuid
@@ -80,7 +85,11 @@ def _redact_secret(value):
     return f"<redacted:{digest[:16]}>"
 
 
-def _strip_volatile(d, volatile_keys):
+# MK Oct 2026 - comma lists of the new kinds that come back in no fixed order
+_CSV_NORMALIZE_NEW = _CSV_NORMALIZE_KEYS | {'groups', 'users', 'privs', 'resources', 'vmid'}
+
+
+def _strip_volatile(d, volatile_keys, csv_keys=_CSV_NORMALIZE_KEYS):
     if not isinstance(d, dict): return d
     out = {}
     for k, v in d.items():
@@ -88,7 +97,7 @@ def _strip_volatile(d, volatile_keys):
         if k in _SECRET_KEYS:
             out[k] = _redact_secret(v)
             continue
-        if k in _CSV_NORMALIZE_KEYS and isinstance(v, str) and ',' in v:
+        if k in csv_keys and isinstance(v, str) and ',' in v:
             parts = [p.strip() for p in v.split(',') if p.strip()]
             v = ','.join(sorted(parts))
         out[k] = v
@@ -107,6 +116,8 @@ class _State(list):
         self.unread_kinds = set()    # the read of the whole kind failed
         self.unread_scopes = set()   # (kind, scope): listed, but its own read failed
         self.unread_nodes = set()    # nodes whose network read failed
+        self.unread_prefixes = set() # (kind, prefix): a list that names the scopes did not answer
+        self.read_kinds = set()      # kinds whose main read answered, even with nothing in it
 
 
 def _not_read(state, kind, scope):
@@ -115,6 +126,8 @@ def _not_read(state, kind, scope):
     if kind in getattr(state, 'unread_kinds', ()):
         return True
     if (kind, scope) in getattr(state, 'unread_scopes', ()):
+        return True
+    if any(kind == k and scope.startswith(p) for k, p in getattr(state, 'unread_prefixes', ())):
         return True
     return kind == 'network' and scope.split('/', 1)[0] in getattr(state, 'unread_nodes', ())
 
@@ -132,6 +145,7 @@ def _fetch_state(mgr, cluster_id):
         if r is not None and getattr(r, 'status_code', 0) == 200:
             data = r.json().get('data') or {}
             out.append(('cluster_options', 'global', data))
+            out.read_kinds.add('cluster_options')
         else:
             out.unread_kinds.add('cluster_options')
     except Exception as e:
@@ -148,6 +162,7 @@ def _fetch_state(mgr, cluster_id):
                 # _strip_volatile sorts comma-list fields like `content`, `nodes`
                 # which Proxmox returns in non-deterministic order
                 out.append(('storage', sid, _strip_volatile(s, set())))
+            out.read_kinds.add('storage')
         else:
             out.unread_kinds.add('storage')
     except Exception as e:
@@ -162,6 +177,8 @@ def _fetch_state(mgr, cluster_id):
     if not nodes:
         # a cluster has at least one node: no node list is a failed read
         out.unread_kinds.add('network')
+    else:
+        out.read_kinds.add('network')
     for node in nodes:
         try:
             r = mgr._api_get(f"https://{host}:{port}/api2/json/nodes/{node}/network")
@@ -178,12 +195,16 @@ def _fetch_state(mgr, cluster_id):
             logging.debug(f"[drift] network/{node} fetch failed: {e}")
 
     # per-VM/CT configs
+    fw_guests = []   # guests with the firewall on a NIC: their rules are read below
     try:
         guests = mgr.get_vm_resources()
         if getattr(guests, 'unavailable', False):
             # the guest list itself did not answer (UnreadList), not an empty cluster
             out.unread_kinds.add('vm_config')
+            out.unread_prefixes.add(('firewall', 'guest/'))
             guests = []
+        else:
+            out.read_kinds.add('vm_config')
         for r in (guests or []):
             t = r.get('type')
             vmid = r.get('vmid')
@@ -195,20 +216,276 @@ def _fetch_state(mgr, cluster_id):
                 resp = mgr._api_get(url)
                 if resp is None or getattr(resp, 'status_code', 0) != 200:
                     out.unread_scopes.add(('vm_config', f"{t}/{vmid}"))
+                    out.unread_scopes.add(('firewall', f"guest/{t}/{vmid}"))
                     continue
                 cfg = resp.json().get('data') or {}
                 # the search index takes the same read (MAC, notes, configured IPs)
                 guest_index.ingest(cluster_id, t, vmid, cfg)
                 clean = _strip_volatile(cfg, _VM_VOLATILE_KEYS)
                 out.append(('vm_config', f"{t}/{vmid}", clean))
+                if _guest_firewall_on(cfg):
+                    fw_guests.append((t, vmid, node))
             except Exception:
                 out.unread_scopes.add(('vm_config', f"{t}/{vmid}"))
+                out.unread_scopes.add(('firewall', f"guest/{t}/{vmid}"))
                 continue
     except Exception as e:
         out.unread_kinds.add('vm_config')
+        out.unread_prefixes.add(('firewall', 'guest/'))
         logging.debug(f"[drift] vm enumeration failed: {e}")
 
+    # MK Oct 2026 - the kinds added later; each marks what it could not read the same way
+    for fetch, kind in ((lambda: _fetch_firewall(mgr, out, nodes, fw_guests, cluster_id), 'firewall'),
+                        (lambda: _fetch_ha(mgr, out), 'ha_rules'),
+                        (lambda: _fetch_backup_jobs(mgr, out), 'backup_jobs'),
+                        (lambda: _fetch_access(mgr, out), 'access')):
+        try:
+            fetch()
+        except Exception as e:
+            out.unread_kinds.add(kind)
+            out.read_kinds.discard(kind)
+            logging.debug(f"[drift] {kind} fetch failed: {e}")
+
     return out
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Firewall, HA rules, backup jobs, access - MK Oct 2026
+# ──────────────────────────────────────────────────────────────────────────
+
+# a snapshot of these is one dict per object (keyed by its id), so the diff names the
+# object that was added, removed or changed
+_FW_VOLATILE = {'digest'}
+_BACKUP_VOLATILE = {'digest', 'next-run'}
+_HA_VOLATILE = {'digest'}
+
+# guest rules are read for guests with the firewall on a NIC only, and not all at once:
+# at 10k guests that would be thousands of calls in one scan. A read is kept for a while
+# and the oldest ones are refreshed first, so every scan moves the whole set along.
+_FW_GUEST_TTL = 5 * 3600
+_FW_GUEST_BUDGET = 300
+_FW_GUEST_PAUSE = 0.02
+_fw_guest_cache = {}   # (cluster_id, 'qemu/101') -> (read at, snapshot)
+_fw_cache_lock = threading.Lock()
+
+_NIC_FW_ON = re.compile(r'(^|,)firewall=1(,|$)')
+
+
+def _guest_firewall_on(cfg):
+    for k, v in (cfg or {}).items():
+        if k.startswith('net') and k[3:].isdigit() and isinstance(v, str) and _NIC_FW_ON.search(v):
+            return True
+    return False
+
+
+def _api_data(mgr, path):
+    """(status, data) of one read under /api2/json; (0, None) when it raised."""
+    try:
+        r = mgr._api_get(f"https://{mgr.host}:{mgr.api_port}/api2/json{path}")
+        code = getattr(r, 'status_code', 0) if r is not None else 0
+        if code == 200:
+            return 200, r.json().get('data')
+        return code, None
+    except Exception as e:
+        logging.debug(f"[drift] read {path} failed: {e}")
+        return 0, None
+
+
+def _keyed(rows, key_field, volatile, csv_keys=_CSV_NORMALIZE_NEW):
+    """{id: cleaned row} for a PVE list; a row without its id field is skipped."""
+    out = {}
+    for row in rows or []:
+        if isinstance(row, dict) and row.get(key_field) not in (None, ''):
+            out[str(row[key_field])] = _strip_volatile(
+                {k: v for k, v in row.items() if k != key_field}, volatile, csv_keys)
+    return out
+
+
+def _rules_snapshot(rows):
+    """Firewall rules by position. A rule inserted in the middle moves those below it,
+    which is a change of the list and reads as one."""
+    out = {}
+    for row in rows or []:
+        if isinstance(row, dict):
+            pos = row.get('pos', len(out))
+            out[f"rule {int(pos):04d}" if str(pos).isdigit() else f"rule {pos}"] = _strip_volatile(
+                {k: v for k, v in row.items() if k != 'pos'}, _FW_VOLATILE)
+    return out
+
+
+def _read_list(mgr, out, kind, scope, path):
+    """The list at path, or None after noting the scope as unread."""
+    code, data = _api_data(mgr, path)
+    if code == 200 and isinstance(data, list):
+        return data
+    out.unread_scopes.add((kind, scope))
+    return None
+
+
+def _fetch_firewall(mgr, out, nodes, fw_guests, cluster_id):
+    code, opts = _api_data(mgr, '/cluster/firewall/options')
+    if code == 200 and isinstance(opts, dict):
+        out.append(('firewall', 'cluster/options', _strip_volatile(opts, _FW_VOLATILE)))
+        out.read_kinds.add('firewall')
+    else:
+        out.unread_scopes.add(('firewall', 'cluster/options'))
+    rows = _read_list(mgr, out, 'firewall', 'cluster/rules', '/cluster/firewall/rules')
+    if rows is not None:
+        out.append(('firewall', 'cluster/rules', _rules_snapshot(rows)))
+        out.read_kinds.add('firewall')
+    rows = _read_list(mgr, out, 'firewall', 'cluster/aliases', '/cluster/firewall/aliases')
+    if rows is not None:
+        out.append(('firewall', 'cluster/aliases', _keyed(rows, 'name', _FW_VOLATILE)))
+        out.read_kinds.add('firewall')
+
+    sets = _read_list(mgr, out, 'firewall', 'cluster/ipset', '/cluster/firewall/ipset')
+    if sets is None:
+        out.unread_prefixes.add(('firewall', 'cluster/ipset/'))
+    for row in sets or []:
+        name = row.get('name') if isinstance(row, dict) else None
+        if not name:
+            continue
+        scope = f"cluster/ipset/{name}"
+        items = _read_list(mgr, out, 'firewall', scope, f"/cluster/firewall/ipset/{name}")
+        if items is not None:
+            snap = _keyed(items, 'cidr', _FW_VOLATILE)
+            snap['@comment'] = row.get('comment', '')
+            out.append(('firewall', scope, snap))
+    groups = _read_list(mgr, out, 'firewall', 'cluster/group', '/cluster/firewall/groups')
+    if groups is None:
+        out.unread_prefixes.add(('firewall', 'cluster/group/'))
+    for row in groups or []:
+        name = row.get('group') if isinstance(row, dict) else None
+        if not name:
+            continue
+        scope = f"cluster/group/{name}"
+        items = _read_list(mgr, out, 'firewall', scope, f"/cluster/firewall/groups/{name}")
+        if items is not None:
+            out.append(('firewall', scope, _rules_snapshot(items)))
+
+    for node in nodes:
+        scope = f"node/{node}"
+        rows = _read_list(mgr, out, 'firewall', scope, f"/nodes/{node}/firewall/rules")
+        if rows is not None:
+            out.append(('firewall', scope, _rules_snapshot(rows)))
+    _fetch_guest_firewall(mgr, out, fw_guests, cluster_id)
+
+
+def _fetch_guest_firewall(mgr, out, fw_guests, cluster_id):
+    now = time.time()
+    with _fw_cache_lock:
+        have = {(t, vmid): _fw_guest_cache.get((cluster_id, f"{t}/{vmid}")) for t, vmid, _ in fw_guests}
+    # never read first, then the oldest read
+    order = sorted(fw_guests, key=lambda g: (have[(g[0], g[1])] or (0,))[0])
+    budget = _FW_GUEST_BUDGET
+    for t, vmid, node in order:
+        scope = f"guest/{t}/{vmid}"
+        hit = have[(t, vmid)]
+        if hit and now - hit[0] < _FW_GUEST_TTL:
+            out.append(('firewall', scope, hit[1]))
+            continue
+        if budget > 0:
+            budget -= 1
+            time.sleep(_FW_GUEST_PAUSE)
+            code, rows = _api_data(mgr, f"/nodes/{node}/{t}/{vmid}/firewall/rules")
+            if code == 200 and isinstance(rows, list):
+                snap = _rules_snapshot(rows)
+                with _fw_cache_lock:
+                    _fw_guest_cache[(cluster_id, f"{t}/{vmid}")] = (now, snap)
+                out.append(('firewall', scope, snap))
+                continue
+        # past the budget, or the read failed: an older read is still the better answer
+        # than none, and with none the scope is unread (its baseline stays)
+        if hit:
+            out.append(('firewall', scope, hit[1]))
+        else:
+            out.unread_scopes.add(('firewall', scope))
+    # forget guests that no longer have the firewall on
+    live = {f"{t}/{vmid}" for t, vmid, _ in fw_guests}
+    with _fw_cache_lock:
+        for key in [k for k in _fw_guest_cache if k[0] == cluster_id and k[1] not in live]:
+            _fw_guest_cache.pop(key, None)
+
+
+def _fetch_ha(mgr, out):
+    # PVE 9 has HA rules; PVE 8 has groups. The path that is not there answers 404 or 501,
+    # which is "this version has no such thing", not a failed read.
+    got = False
+    code, rows = _api_data(mgr, '/cluster/ha/rules')
+    if code == 200 and isinstance(rows, list):
+        out.append(('ha_rules', 'rules', _keyed(rows, 'rule', _HA_VOLATILE)))
+        got = True
+    elif code in (404, 501):
+        code, rows = _api_data(mgr, '/cluster/ha/groups')
+        if code == 200 and isinstance(rows, list):
+            out.append(('ha_rules', 'groups', _keyed(rows, 'group', _HA_VOLATILE)))
+            got = True
+        elif code not in (404, 501):
+            out.unread_scopes.add(('ha_rules', 'groups'))
+    else:
+        out.unread_scopes.add(('ha_rules', 'rules'))
+    code, rows = _api_data(mgr, '/cluster/ha/resources')
+    if code == 200 and isinstance(rows, list):
+        out.append(('ha_rules', 'resources', _keyed(rows, 'sid', _HA_VOLATILE)))
+        got = True
+    else:
+        out.unread_scopes.add(('ha_rules', 'resources'))
+    if got:
+        out.read_kinds.add('ha_rules')
+    else:
+        out.unread_kinds.add('ha_rules')
+
+
+def _fetch_backup_jobs(mgr, out):
+    code, rows = _api_data(mgr, '/cluster/backup')
+    if code != 200 or not isinstance(rows, list):
+        out.unread_kinds.add('backup_jobs')
+        return
+    for job_id, snap in _keyed(rows, 'id', _BACKUP_VOLATILE).items():
+        out.append(('backup_jobs', job_id, snap))
+    out.read_kinds.add('backup_jobs')
+
+
+def _fetch_access(mgr, out):
+    """Users, groups, roles and ACL entries. Only fields that name who may do what are
+    kept (no e-mail, name, comment, password or second-factor key), a token only as its
+    id and expiry: a snapshot never holds a secret."""
+    code, rows = _api_data(mgr, '/access/users?full=1')
+    if code == 200 and isinstance(rows, list):
+        users = {}
+        for u in rows:
+            if not isinstance(u, dict) or not u.get('userid'):
+                continue
+            snap = _strip_volatile({k: u.get(k) for k in ('enable', 'expire', 'groups') if k in u},
+                                   set(), _CSV_NORMALIZE_NEW)
+            for tok in (u.get('tokens') or []):
+                if isinstance(tok, dict) and tok.get('tokenid'):
+                    snap[f"token:{tok['tokenid']}"] = tok.get('expire', 0)
+            users[u['userid']] = snap
+        out.append(('access', 'users', users))
+        out.read_kinds.add('access')
+    else:
+        out.unread_scopes.add(('access', 'users'))
+    rows = _read_list(mgr, out, 'access', 'groups', '/access/groups')
+    if rows is not None:
+        grp = _keyed(rows, 'groupid', set(), _CSV_NORMALIZE_NEW)
+        out.append(('access', 'groups', {g: {'users': v.get('users', '')} for g, v in grp.items()}))
+        out.read_kinds.add('access')
+    rows = _read_list(mgr, out, 'access', 'roles', '/access/roles')
+    if rows is not None:
+        rl = _keyed(rows, 'roleid', set(), _CSV_NORMALIZE_NEW)
+        out.append(('access', 'roles', {r: {'privs': v.get('privs', ''), 'special': v.get('special', 0)}
+                                        for r, v in rl.items()}))
+        out.read_kinds.add('access')
+    rows = _read_list(mgr, out, 'access', 'acl', '/access/acl')
+    if rows is not None:
+        acl = {}
+        for a in rows:
+            if isinstance(a, dict) and a.get('path') is not None and a.get('roleid'):
+                acl[f"{a['path']} | {a.get('type', 'user')}:{a.get('ugid', '')} | {a['roleid']}"] = {
+                    'propagate': a.get('propagate', 1)}
+        out.append(('access', 'acl', acl))
+        out.read_kinds.add('access')
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -235,7 +512,7 @@ def _flat_diff(baseline, current):
     return diffs
 
 
-def _severity_for(kind, diffs):
+def _severity_for(kind, diffs, scope=''):
     """Heuristic — VM disks/network changes are louder than e.g. description edits."""
     paths = {d['path'] for d in diffs}
     sensitive_vm = {'scsi0', 'sata0', 'virtio0', 'ide0', 'net0', 'net1', 'net2',
@@ -246,6 +523,14 @@ def _severity_for(kind, diffs):
                          'bond_slaves', 'vlan-raw-device'}
     if kind == 'cluster_options':
         return 'warning'
+    # MK Oct 2026 - who may do what is the loudest of the new kinds; the rest changes how
+    # traffic, backups and failover behave, which is worth a warning
+    if kind == 'access':
+        return 'critical' if scope in ('acl', 'roles') else 'warning'
+    if kind in ('firewall', 'ha_rules'):
+        return 'warning'
+    if kind == 'backup_jobs':
+        return 'warning' if paths & {'enabled', 'schedule', 'storage', 'vmid', 'all', 'pool'} else 'info'
     if kind == 'vm_config' and (paths & sensitive_vm):
         return 'warning'
     if kind == 'storage' and (paths & sensitive_storage):
@@ -314,15 +599,23 @@ def _set_baseline(cluster_id, kind, scope, snapshot, user):
         logging.warning(f"[drift] set_baseline failed: {e}")
 
 
-def _record_event(cluster_id, kind, scope, diffs, severity, summary):
+CATEGORY_DEVIATION = 'deviation'
+CATEGORY_POLICY = 'policy_violation'
+CATEGORY_INCIDENT = 'incident'
+CATEGORIES = (CATEGORY_DEVIATION, CATEGORY_POLICY, CATEGORY_INCIDENT)
+KINDS = ('vm_config', 'storage', 'network', 'cluster_options',
+         'firewall', 'ha_rules', 'backup_jobs', 'access')
+
+
+def _record_event(cluster_id, kind, scope, diffs, severity, summary, category=CATEGORY_DEVIATION):
     try:
         c = get_db().conn.cursor()
         c.execute('''
             INSERT INTO drift_events (cluster_id, kind, scope, severity,
-                                      summary, diff, detected_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'open')
+                                      summary, diff, detected_at, status, category)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
         ''', (cluster_id, kind, scope, severity, summary,
-              json.dumps(diffs), datetime.now().isoformat()))
+              json.dumps(diffs), datetime.now().isoformat(), category))
         eid = c.lastrowid
         get_db().conn.commit()
         return eid
@@ -366,6 +659,11 @@ def _owning_node(kind, scope, guest_nodes=None):
         return node or None
     if kind == 'vm_config' and guest_nodes:
         return guest_nodes.get(scope) or None
+    if kind == 'firewall':
+        if scope.startswith('node/'):
+            return scope.split('/', 1)[1] or None
+        if scope.startswith('guest/') and guest_nodes:
+            return guest_nodes.get(scope.split('/', 1)[1]) or None
     return None
 
 
@@ -440,6 +738,190 @@ def _supersede_events(ids):
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Policy checks and what the last scan could read - MK Oct 2026
+# ──────────────────────────────────────────────────────────────────────────
+#
+# A policy check is a forbidden state for one kind, judged on the snapshot the scan just
+# took. It is evaluated whether or not a baseline exists. What the scan could not read is
+# "not checked", never a pass: a check passes only on data that was read.
+
+POLICY_CHECKS = {
+    'access_admin_role': {'kind': 'access', 'severity': 'critical', 'allow': ['root@pam']},
+    'access_token_expiry': {'kind': 'access', 'severity': 'warning'},
+    'firewall_cluster_enabled': {'kind': 'firewall', 'severity': 'warning'},
+    'backup_none_disabled': {'kind': 'backup_jobs', 'severity': 'warning'},
+}
+_POLICY_ALLOW_MAX = 100
+
+# cluster_id -> {'at', 'kinds': {kind: checked|partial|not_checked}, 'policy': [result]}
+_last_scan = {}
+
+
+def _policy_key(cluster_id):
+    return f"drift_policy:{cluster_id}"
+
+
+def _policy_settings(cluster_id):
+    """The admin's choices per check: {check_id: {'enabled': bool, 'allow': [...]}}.
+    A check nobody switched on is off, so an upgrade raises nothing by itself."""
+    try:
+        from pegaprox.core.recovery import _kv_read
+        stored = _kv_read(_policy_key(cluster_id)) or {}
+    except Exception as e:
+        logging.debug(f"[drift] policy settings read failed: {e}")
+        stored = {}
+    out = {}
+    for cid, spec in POLICY_CHECKS.items():
+        mine = stored.get(cid) if isinstance(stored.get(cid), dict) else {}
+        allow = mine.get('allow', spec.get('allow', []))
+        out[cid] = {'enabled': bool(mine.get('enabled', False)),
+                    'allow': [a for a in allow if isinstance(a, str)] if isinstance(allow, list) else []}
+    return out
+
+
+def _kinds_state(state):
+    """Per kind: 'checked', 'partial' (some scopes did not answer) or 'not_checked'."""
+    read = getattr(state, 'read_kinds', None)
+    if read is None:
+        # a plain list (no record of what was read): a kind is checked when it has rows
+        read = {k for k, _, _ in state}
+    bad_kinds = getattr(state, 'unread_kinds', set())
+    unread = {k for k, _ in getattr(state, 'unread_scopes', set())} | \
+             {k for k, _ in getattr(state, 'unread_prefixes', set())}
+    out = {}
+    for kind in KINDS:
+        if kind in bad_kinds or kind not in read:
+            out[kind] = 'not_checked'
+        elif kind in unread or (kind == 'network' and getattr(state, 'unread_nodes', None)):
+            out[kind] = 'partial'
+        else:
+            out[kind] = 'checked'
+    return out
+
+
+def _check_access_admin_role(idx, state, params):
+    acl = idx.get(('access', 'acl'))
+    if acl is None:
+        return None
+    allow = set(params.get('allow') or [])
+    bad = []
+    for key in sorted(acl):
+        path, _, rest = key.partition(' | ')
+        who, _, role = rest.rpartition(' | ')
+        if role == 'Administrator' and who.partition(':')[2] not in allow:
+            bad.append((who, f"Administrator on {path}"))
+    return bad
+
+
+def _check_access_token_expiry(idx, state, params):
+    users = idx.get(('access', 'users'))
+    if users is None:
+        return None
+    bad = []
+    for uid in sorted(users):
+        for k, v in sorted((users[uid] or {}).items()):
+            if k.startswith('token:') and str(v or 0) == '0':
+                bad.append((f"{uid}!{k[6:]}", 'token never expires'))
+    return bad
+
+
+def _check_firewall_cluster_enabled(idx, state, params):
+    opts = idx.get(('firewall', 'cluster/options'))
+    if opts is None:
+        return None
+    if str(opts.get('enable', 0)).lower() in ('1', 'true'):
+        return []
+    return [('cluster firewall', 'the cluster firewall is off')]
+
+
+def _check_backup_none_disabled(idx, state, params):
+    if 'backup_jobs' not in getattr(state, 'read_kinds', set()) or 'backup_jobs' in state.unread_kinds:
+        return None
+    return [(scope, 'backup job is disabled') for (kind, scope), snap in sorted(idx.items())
+            if kind == 'backup_jobs' and str((snap or {}).get('enabled', 1)).lower() in ('0', 'false')]
+
+
+_POLICY_FUNCS = {
+    'access_admin_role': _check_access_admin_role,
+    'access_token_expiry': _check_access_token_expiry,
+    'firewall_cluster_enabled': _check_firewall_cluster_enabled,
+    'backup_none_disabled': _check_backup_none_disabled,
+}
+
+
+def _evaluate_policy(state, settings):
+    """One result per check: status is 'pass', 'fail', 'not_checked' (the data it needs
+    was not read) or 'disabled'; violations are [{'path', 'detail'}]."""
+    idx = {(k, s): snap for k, s, snap in state}
+    results = []
+    for cid, spec in POLICY_CHECKS.items():
+        mine = settings.get(cid) or {'enabled': False, 'allow': spec.get('allow', [])}
+        res = {'id': cid, 'kind': spec['kind'], 'severity': spec['severity'],
+               'enabled': mine['enabled'], 'violations': []}
+        if 'allow' in spec:
+            res['allow'] = mine['allow']
+        if not mine['enabled']:
+            res['status'] = 'disabled'
+        else:
+            try:
+                bad = _POLICY_FUNCS[cid](idx, state, mine)
+            except Exception as e:
+                logging.debug(f"[drift] policy check {cid} failed: {e}")
+                bad = None
+            if bad is None:
+                res['status'] = 'not_checked'
+            else:
+                res['violations'] = [{'path': p, 'detail': d} for p, d in bad]
+                res['status'] = 'fail' if bad else 'pass'
+        results.append(res)
+    return results
+
+
+def _violation_fingerprint(diffs):
+    try:
+        return sorted(d.get('path', '') for d in diffs)
+    except Exception:
+        return []
+
+
+def _apply_policy(cluster_id, results):
+    """Turn the results into events: one open event per failing check while the offenders
+    stay the same, a new one when they change, and a pass closes the check's events. A
+    check that was not checked leaves everything as it is. Incidents are never touched."""
+    new_events = []
+    c = get_db().conn.cursor()
+    for res in results:
+        scope = f"policy:{res['id']}"
+        if res['status'] not in ('pass', 'fail'):
+            continue
+        c.execute("SELECT id, diff, category FROM drift_events WHERE cluster_id=? AND kind=? "
+                  "AND scope=? AND status IN ('open','acknowledged') AND category=?",
+                  (cluster_id, res['kind'], scope, CATEGORY_POLICY))
+        live = c.fetchall()
+        if res['status'] == 'pass':
+            c.executemany("UPDATE drift_events SET status='resolved' WHERE id=?",
+                          [(r['id'],) for r in live])
+            continue
+        diffs = [{'path': v['path'], 'op': 'violation', 'before': None, 'after': v['detail']}
+                 for v in res['violations']]
+        same = _violation_fingerprint(diffs)
+        if any(_violation_fingerprint(json.loads(r['diff'] or '[]')) == same for r in live):
+            continue
+        # the offenders changed: the old row is replaced, not left beside the new one
+        c.executemany("UPDATE drift_events SET status='superseded' WHERE id=?", [(r['id'],) for r in live])
+        get_db().conn.commit()
+        names = ', '.join(v['path'] for v in res['violations'][:3])
+        more = len(res['violations']) - 3
+        summary = f"policy {res['id']}: {names}" + (f", +{more} more" if more > 0 else '')
+        eid = _record_event(cluster_id, res['kind'], scope, diffs, res['severity'], summary,
+                            category=CATEGORY_POLICY)
+        new_events.append({'id': eid, 'kind': res['kind'], 'scope': scope, 'severity': res['severity'],
+                           'summary': summary, 'category': CATEGORY_POLICY})
+    get_db().conn.commit()
+    return new_events
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Scan
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -469,7 +951,7 @@ def _scan_cluster(cluster_id, autobaseline=False):
             continue
         diffs = _flat_diff(bk['snapshot'], snap)
         if not diffs: continue
-        sev = _severity_for(kind, diffs)
+        sev = _severity_for(kind, diffs, scope)
         summary = _short_summary(kind, scope, diffs)
         eid = _record_event(cluster_id, kind, scope, diffs, sev, summary)
         new_events.append({'id': eid, 'kind': kind, 'scope': scope,
@@ -503,7 +985,8 @@ def _scan_cluster(cluster_id, autobaseline=False):
             # before the guest list below, which is the read that just failed
             not_read.add((kind, scope))
             continue
-        if kind == 'vm_config' and guest_nodes is None:
+        if (kind == 'vm_config' or (kind == 'firewall' and scope.startswith('guest/'))) \
+                and guest_nodes is None:
             guest_nodes = _guest_nodes(mgr)
         owning_node = _owning_node(kind, scope, guest_nodes)
         if owning_node and offline_nodes is None:
@@ -524,11 +1007,21 @@ def _scan_cluster(cluster_id, autobaseline=False):
             continue
         diffs = [{'path': '*', 'op': 'removed', 'before': bk['snapshot'], 'after': None}]
         summary = f"{kind} {scope}: object removed"
-        sev = 'warning' if kind in ('vm_config', 'storage') else 'info'
+        sev = 'warning' if kind in ('vm_config', 'storage', 'firewall', 'access', 'backup_jobs') else 'info'
         eid = _record_event(cluster_id, kind, scope, diffs, sev, summary)
         new_events.append({'id': eid, 'kind': kind, 'scope': scope,
                            'severity': sev, 'summary': summary})
         removed.append(scope)
+
+    # MK Oct 2026 - policy checks judge this scan's snapshot, and the result of the scan
+    # says per kind what was read: a kind that was not is "not checked", not "no drift"
+    kinds = _kinds_state(state)
+    results = _evaluate_policy(state, _policy_settings(cluster_id))
+    try:
+        new_events.extend(_apply_policy(cluster_id, results))
+    except Exception as e:
+        logging.warning(f"[drift] policy events failed: {e}")
+    _last_scan[cluster_id] = {'at': datetime.now().isoformat(), 'kinds': kinds, 'policy': results}
 
     unread = sorted({kind for kind, _ in not_read})
     if not_read:
@@ -547,6 +1040,7 @@ def _scan_cluster(cluster_id, autobaseline=False):
             from pegaprox.background import alerts as alerts_mod
             alertable = [e for e in new_events if not e.get('node_offline')]
             count = len(alertable)
+            npol = sum(1 for e in alertable if e.get('category') == CATEGORY_POLICY)
             top_sev = 'critical' if any(e['severity'] == 'critical' for e in alertable) \
                 else 'warning' if any(e['severity'] == 'warning' for e in alertable) \
                 else 'info'
@@ -554,7 +1048,8 @@ def _scan_cluster(cluster_id, autobaseline=False):
                 'alert_name': 'Config Drift',
                 'severity': top_sev,
                 'cluster_id': cluster_id,
-                'message': f"{count} config drift event(s) detected",
+                'message': f"{count} config drift event(s) detected" + (
+                    f" ({npol} policy violation(s))" if npol else ''),
                 'metric': 'drift',
                 'target_type': 'cluster',
                 'target_name': cluster_id,
@@ -587,6 +1082,9 @@ def _scan_cluster(cluster_id, autobaseline=False):
         'suppressed_offline': len(masked),
         'suppressed_unread': len(not_read),
         'unread': unread,
+        'kinds': kinds,
+        'not_checked': sorted(k for k, v in kinds.items() if v != 'checked'),
+        'policy_failed': [r['id'] for r in results if r['status'] == 'fail'],
         'events': new_events,
     }
 
@@ -653,18 +1151,20 @@ def drift_status(cluster_id):
     try:
         c = get_db().conn.cursor()
         c.execute('''
-            SELECT kind, severity, COUNT(*) AS n
+            SELECT kind, severity, category, COUNT(*) AS n
             FROM drift_events
             WHERE cluster_id = ? AND status = 'open'
-            GROUP BY kind, severity
+            GROUP BY kind, severity, category
         ''', (cluster_id,))
         by_kind = {}
         total = 0
         sev_total = {'critical': 0, 'warning': 0, 'info': 0}
+        by_category = {cat: 0 for cat in CATEGORIES}
         for r in c.fetchall():
             d = by_kind.setdefault(r['kind'], {'critical': 0, 'warning': 0, 'info': 0})
-            d[r['severity']] = r['n']
+            d[r['severity']] = d.get(r['severity'], 0) + r['n']
             sev_total[r['severity']] = sev_total.get(r['severity'], 0) + r['n']
+            by_category[r['category']] = by_category.get(r['category'], 0) + r['n']
             total += r['n']
 
         # baseline count
@@ -680,8 +1180,12 @@ def drift_status(cluster_id):
             'open_total': total,
             'by_kind': by_kind,
             'by_severity': sev_total,
+            'by_category': by_category,
             'baselines': baseline_count,
             'last_event_at': last_event_t,
+            # what the last scan could read per kind; empty until this instance has scanned
+            'kinds': (_last_scan.get(cluster_id) or {}).get('kinds', {}),
+            'last_scan_at': (_last_scan.get(cluster_id) or {}).get('at'),
         })
     except Exception as e:
         logging.exception('handler error in drift.py'); return jsonify({'error': 'internal error'}), 500
@@ -705,16 +1209,28 @@ def list_events(cluster_id):
     if _cerr: return _cerr
     status = request.args.get('status', 'open')
     limit = max(1, min(int(request.args.get('limit', '100')), 500))
+    # MK Oct 2026 - optional filters; a value that is no kind or category is a 400, not an
+    # empty list that reads as "nothing drifted"
+    kind = request.args.get('kind', '')
+    category = request.args.get('category', '')
+    if kind and kind not in KINDS:
+        return jsonify({'error': 'unknown kind', 'kinds': list(KINDS)}), 400
+    if category and category not in CATEGORIES:
+        return jsonify({'error': 'unknown category', 'categories': list(CATEGORIES)}), 400
     try:
         c = get_db().conn.cursor()
-        if status == 'all':
-            c.execute('''SELECT * FROM drift_events WHERE cluster_id=?
-                         ORDER BY detected_at DESC LIMIT ?''',
-                      (cluster_id, limit))
-        else:
-            c.execute('''SELECT * FROM drift_events WHERE cluster_id=? AND status=?
-                         ORDER BY detected_at DESC LIMIT ?''',
-                      (cluster_id, status, limit))
+        sql = 'SELECT * FROM drift_events WHERE cluster_id=?'
+        args = [cluster_id]
+        if status != 'all':
+            sql += ' AND status=?'
+            args.append(status)
+        if kind:
+            sql += ' AND kind=?'
+            args.append(kind)
+        if category:
+            sql += ' AND category=?'
+            args.append(category)
+        c.execute(sql + ' ORDER BY detected_at DESC LIMIT ?', args + [limit])
         out = []
         for r in c.fetchall():
             d = dict(r)
@@ -757,6 +1273,9 @@ def acknowledge_event(eid):
         if _cerr:
             return _cerr
         if promote:
+            if (ev['category'] if 'category' in ev.keys() else '') == CATEGORY_POLICY:
+                # a violation of a rule has no baseline to rebase onto
+                return jsonify({'error': 'a policy violation has no baseline to promote'}), 400
             _werr = _refuse_baseline_write()
             if _werr:
                 return _werr
@@ -776,6 +1295,10 @@ def acknowledge_event(eid):
             cid = ev['cluster_id']
             mgr = cluster_managers.get(cid)
             if mgr and not unknown:
+                if ev['kind'] == 'firewall' and ev['scope'].startswith('guest/'):
+                    # the baseline must be what the guest has now, not a read from earlier
+                    with _fw_cache_lock:
+                        _fw_guest_cache.pop((cid, ev['scope'].split('/', 1)[1]), None)
                 state = _fetch_state(mgr, cid)
                 for kind, scope, snap in state:
                     if kind == ev['kind'] and scope == ev['scope']:
@@ -836,8 +1359,9 @@ def reset_baseline(cluster_id):
                           [(bk['id'],) for key, bk in baselines.items() if key not in keep])
         else:
             c.execute('DELETE FROM drift_baselines WHERE cluster_id=?', (cluster_id,))
-        c.execute("UPDATE drift_events SET status='superseded' WHERE cluster_id=? AND status='open'",
-                  (cluster_id,))
+        # policy violations and incidents do not depend on a baseline
+        c.execute("UPDATE drift_events SET status='superseded' WHERE cluster_id=? AND status='open' "
+                  "AND category=?", (cluster_id, CATEGORY_DEVIATION))
         for kind, scope, snap in state:
             c.execute('''
                 INSERT INTO drift_baselines (id, cluster_id, kind, scope, snapshot, created_at, created_by)
@@ -849,3 +1373,122 @@ def reset_baseline(cluster_id):
                         'unread': sorted({kind for kind, _ in keep})})
     except Exception as e:
         logging.exception('handler error in drift.py'); return jsonify({'error': 'internal error'}), 500
+
+
+@bp.route('/api/drift/events/<int:eid>/incident', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def confirm_incident(eid):
+    """An admin confirms an event as an incident (body {incident: false} takes it back).
+    Nothing sets this on its own: a deviation or a violation is an incident only because a
+    person looked and said so."""
+    body = request.get_json(silent=True) or {}
+    flag = body.get('incident', True)
+    if not isinstance(flag, bool):
+        return jsonify({'error': 'incident must be true or false'}), 400
+    try:
+        c = get_db().conn.cursor()
+        c.execute('SELECT * FROM drift_events WHERE id=?', (eid,))
+        ev = c.fetchone()
+        if not ev:
+            return jsonify({'error': 'not found'}), 404
+        ok, err = check_cluster_access(ev['cluster_id'])
+        if not ok:
+            return jsonify({'error': 'not found'}), 404
+        _cerr = require_unconfined(ev['cluster_id'])
+        if _cerr:
+            return _cerr
+        if flag:
+            c.execute("UPDATE drift_events SET category=?, confirmed_by=?, confirmed_at=? WHERE id=?",
+                      (CATEGORY_INCIDENT, _current_user(), datetime.now().isoformat(), eid))
+        else:
+            if ev['category'] != CATEGORY_INCIDENT:
+                return jsonify({'error': 'not an incident'}), 400
+            back = CATEGORY_POLICY if str(ev['scope']).startswith('policy:') else CATEGORY_DEVIATION
+            c.execute("UPDATE drift_events SET category=?, confirmed_by='', confirmed_at=NULL WHERE id=?",
+                      (back, eid))
+        get_db().conn.commit()
+        try:
+            from pegaprox.utils.audit import log_audit
+            log_audit(_current_user(), 'drift.incident' if flag else 'drift.incident_withdrawn',
+                      f"event {eid} ({ev['kind']} {ev['scope']})", cluster_id=ev['cluster_id'])
+        except Exception as e:
+            logging.debug(f"[drift] incident audit entry failed: {e}")
+        return jsonify({'ok': True, 'category': CATEGORY_INCIDENT if flag else back})
+    except Exception:
+        logging.exception('handler error in drift.py'); return jsonify({'error': 'internal error'}), 500
+
+
+def _policy_view(cluster_id):
+    """The checks with the admin's choices and the result of the last scan. A check no scan
+    has judged yet is 'not_checked'."""
+    settings = _policy_settings(cluster_id)
+    last = _last_scan.get(cluster_id)
+    by_id = {r['id']: r for r in (last or {}).get('policy', [])}
+    out = []
+    for cid, spec in POLICY_CHECKS.items():
+        res = dict(by_id.get(cid) or {'id': cid, 'kind': spec['kind'], 'severity': spec['severity'],
+                                      'violations': []})
+        res['enabled'] = settings[cid]['enabled']
+        if 'allow' in spec:
+            res['allow'] = settings[cid]['allow']
+        # a result from before the admin switched the check on or off is not its result
+        if not res['enabled']:
+            res['status'] = 'disabled'
+        elif by_id.get(cid, {}).get('status') in (None, 'disabled'):
+            res['status'] = 'not_checked'
+        out.append(res)
+    return out, (last or {}).get('at')
+
+
+@bp.route('/api/clusters/<cluster_id>/drift/policy', methods=['GET'])
+@require_auth(perms=['admin.audit'])
+def get_policy(cluster_id):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr: return _cerr
+    checks, at = _policy_view(cluster_id)
+    return jsonify({'checks': checks, 'last_scan_at': at})
+
+
+@bp.route('/api/clusters/<cluster_id>/drift/policy', methods=['PUT'])
+@require_auth(perms=['admin.audit'])
+def set_policy(cluster_id):
+    """Body {checks: {<id>: {enabled: bool, allow: [str]}}}. Switching a check on or
+    changing what it allows is a change to the cluster's rules, so it needs cluster.config
+    like rewriting a baseline."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr: return _cerr
+    _werr = _refuse_baseline_write()
+    if _werr: return _werr
+    body = request.get_json(silent=True)
+    checks = body.get('checks') if isinstance(body, dict) else None
+    if not isinstance(checks, dict) or not checks:
+        return jsonify({'error': 'checks must be an object of check ids'}), 400
+    current = _policy_settings(cluster_id)
+    for cid, spec in checks.items():
+        if cid not in POLICY_CHECKS:
+            return jsonify({'error': f'unknown check: {cid}', 'checks': list(POLICY_CHECKS)}), 400
+        if not isinstance(spec, dict):
+            return jsonify({'error': f'{cid}: expected an object'}), 400
+        if 'enabled' in spec:
+            if not isinstance(spec['enabled'], bool):
+                return jsonify({'error': f'{cid}: enabled must be true or false'}), 400
+            current[cid]['enabled'] = spec['enabled']
+        if 'allow' in spec:
+            allow = spec['allow']
+            if 'allow' not in POLICY_CHECKS[cid]:
+                return jsonify({'error': f'{cid}: this check has no allow list'}), 400
+            if (not isinstance(allow, list) or len(allow) > _POLICY_ALLOW_MAX
+                    or not all(isinstance(a, str) and 0 < len(a.strip()) <= 128 for a in allow)):
+                return jsonify({'error': f'{cid}: allow must be a list of up to {_POLICY_ALLOW_MAX} names'}), 400
+            current[cid]['allow'] = sorted({a.strip() for a in allow})
+    try:
+        from pegaprox.core.recovery import _kv_write
+        _kv_write(_policy_key(cluster_id), current)
+    except Exception:
+        logging.exception('handler error in drift.py'); return jsonify({'error': 'internal error'}), 500
+    checks_out, at = _policy_view(cluster_id)
+    return jsonify({'ok': True, 'checks': checks_out, 'last_scan_at': at})

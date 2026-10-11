@@ -226,6 +226,7 @@ LEADER_ONLY_READS = frozenset((
     '/api/clusters/<cluster_id>/active-alerts',
     '/api/clusters/<cluster_id>/drift/status',
     '/api/clusters/<cluster_id>/drift/events',
+    '/api/clusters/<cluster_id>/drift/policy',
     '/api/push/inbox',
     '/api/migration-history',
     '/api/clusters/<cluster_id>/vms/<int:vmid>/migration-history',
