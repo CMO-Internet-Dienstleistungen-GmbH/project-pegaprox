@@ -23847,6 +23847,294 @@
         ]
       }
     },
+    "/api/clusters/{cluster_id}/recovery-assurance": {
+      "get": {
+        "operationId": "pbs.get_recovery_assurance_get",
+        "tags": [
+          "pbs"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "How much of the cluster is proven recoverable: the share of critical guests (and of all) with a passed restore test in the period, an agent check and an application check that passed; the gaps behind the rest; manual confirmations beside, never in place of that. ?days= (default 30) is the period, ?refresh=1 reads the backups again.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "backup.view"
+        ]
+      }
+    },
+    "/api/clusters/{cluster_id}/recovery-evidence": {
+      "get": {
+        "operationId": "pbs.get_recovery_evidence_get",
+        "tags": [
+          "pbs"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The evidence of a cluster as a signed document: per guest what PegaProx measured (run ids, times) apart from what an administrator confirmed, the coverage, the gaps, the PegaProx version and the head of the audit chain. ?days=, ?format=json|csv.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "backup.view"
+        ]
+      }
+    },
+    "/api/tenants/{tenant_id}/recovery-evidence": {
+      "get": {
+        "operationId": "pbs.get_tenant_recovery_evidence_get",
+        "tags": [
+          "pbs"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The evidence over every Proxmox cluster of a tenant the caller reaches, signed; a cluster that is offline or unreadable is listed as such and its guests are not claimed proven. ?days=, ?format=json|csv.",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "backup.view"
+        ]
+      }
+    },
+    "/api/recovery-evidence/verify": {
+      "post": {
+        "operationId": "pbs.verify_recovery_evidence_post",
+        "tags": [
+          "pbs"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Check an evidence document against this instance: whether it signed it, unchanged, and whether the audit chain head it names is in this instance's chain.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "backup.view"
+        ]
+      }
+    },
+    "/api/clusters/{cluster_id}/recovery-confirmations": {
+      "post": {
+        "operationId": "pbs.post_recovery_confirmation_post",
+        "tags": [
+          "pbs"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Record that an administrator confirmed a guest is recoverable (vmid, text, optional expires_days). It is kept and shown apart; the guest stays 'not proven' until the automatic checks say otherwise.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-roles": [
+          "admin"
+        ]
+      }
+    },
+    "/api/clusters/{cluster_id}/recovery-confirmations/{conf_id}": {
+      "delete": {
+        "operationId": "pbs.delete_recovery_confirmation_delete",
+        "tags": [
+          "pbs"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Withdraw a manual confirmation; the row stays, marked revoked.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "conf_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-roles": [
+          "admin"
+        ]
+      }
+    },
     "/api/pbs/probe-fingerprint": {
       "post": {
         "operationId": "pbs.probe_pbs_fingerprint_post",

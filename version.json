@@ -124,6 +124,7 @@
     "pegaprox/constants.py",
     "pegaprox/core/__init__.py",
     "pegaprox/core/acme.py",
+    "pegaprox/core/assurance.py",
     "pegaprox/core/backup_runs.py",
     "pegaprox/core/backup_verify.py",
     "pegaprox/core/batch_restore.py",

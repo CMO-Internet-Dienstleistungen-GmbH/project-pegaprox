@@ -2003,6 +2003,26 @@ class PegaProxDB:
                     PRIMARY KEY (cluster_id, vmid)
                 )
             ''')
+            # MK Oct 2026 - the tags that make a guest critical, on the cluster row; and the
+            # manual confirmations an admin records beside the automatic facts
+            cols = [r[1] for r in cursor.execute('PRAGMA table_info(recovery_targets)').fetchall()]
+            if 'critical_tags' not in cols:
+                cursor.execute('ALTER TABLE recovery_targets ADD COLUMN critical_tags TEXT')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS recovery_confirmations (
+                    id TEXT PRIMARY KEY,
+                    cluster_id TEXT NOT NULL,
+                    vmid INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    confirmed_by TEXT,
+                    confirmed_at REAL,
+                    expires_at REAL,
+                    revoked_at REAL,
+                    revoked_by TEXT
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_recovery_conf_guest '
+                           'ON recovery_confirmations(cluster_id, vmid)')
         except Exception as e:
             logging.error(f"Error creating the restore test tables: {e}")
 
@@ -4839,6 +4859,29 @@ class PegaProxDB:
         if cp is not None:
             return cp['chain_seq'], cp['row_hash']
         return None
+
+    def audit_chain_head(self):
+        """{'chain_seq', 'hash'} the audit chain of this host stands at, None when it has no
+        chain yet or cannot be read. MK Oct 2026"""
+        try:
+            tail = self._audit_chain_tail(self.conn.cursor())
+        except Exception:
+            return None
+        return {'chain_seq': tail[0], 'hash': tail[1]} if tail else None
+
+    def audit_chain_has(self, seq, row_hash):
+        """True when the chain holds `row_hash` at `seq`: as a row, or as the checkpoint of
+        a pruned stretch. MK Oct 2026"""
+        try:
+            cur = self.conn.cursor()
+            row = cur.execute('SELECT * FROM audit_log WHERE chain_seq = ?', (int(seq),)).fetchone()
+            if row is not None:
+                return hmac.compare_digest(self._audit_row_hash(dict(row)), str(row_hash))
+            cp = cur.execute('SELECT row_hash FROM audit_checkpoints WHERE chain_seq = ? '
+                             'ORDER BY id DESC LIMIT 1', (int(seq),)).fetchone()
+            return bool(cp) and hmac.compare_digest(str(cp['row_hash']), str(row_hash))
+        except Exception:
+            return False
 
     def _audit_chain_txn(self, conn, work):
         """work(cursor) with the chain held. The one lock is the database's write lock, taken

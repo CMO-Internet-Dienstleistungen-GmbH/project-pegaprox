@@ -46,10 +46,13 @@ SKIP_TAGS = (TEST_TAG,)
 ISOLATIONS = ('link_down', 'bridge')
 AGENT_MODES = ('auto', 'require', 'off')
 DEFAULTS = {'rto_minutes': None, 'agent': 'auto', 'ports': [], 'command': '',
-            'isolation': 'link_down', 'test_bridge': '', 'test_storage': '', 'boot_timeout': 180}
+            'isolation': 'link_down', 'test_bridge': '', 'test_storage': '', 'boot_timeout': 180,
+            'critical_tags': ['critical']}
 # what a guest or a tag may set; the rest is the cluster's alone
 GUEST_FIELDS = ('rto_minutes', 'agent', 'ports', 'command')
-CLUSTER_FIELDS = GUEST_FIELDS + ('isolation', 'test_bridge', 'test_storage', 'boot_timeout')
+CLUSTER_FIELDS = GUEST_FIELDS + ('isolation', 'test_bridge', 'test_storage', 'boot_timeout',
+                                 'critical_tags')
+CRITICAL_TAGS_MAX = 10
 
 RTO_MAX = 10080              # minutes
 PORTS_MAX = 20
@@ -143,10 +146,11 @@ def backup_time(volid, fallback=None):
 
 def _decode(row):
     out = {k: row[k] for k in row.keys()}
-    try:
-        out['ports'] = json.loads(out['ports']) if out.get('ports') is not None else None
-    except (TypeError, ValueError):
-        out['ports'] = None
+    for k in ('ports', 'critical_tags'):
+        try:
+            out[k] = json.loads(out[k]) if out.get(k) is not None else None
+        except (TypeError, ValueError):
+            out[k] = None
     return out
 
 
@@ -274,6 +278,17 @@ def clean_rule(body, scope):
             if not isinstance(v, str) or len(v) > COMMAND_MAX or _CTRL_RE.search(v) or not v.strip():
                 return None, f'command is one line of at most {COMMAND_MAX} characters'
             v = v.strip()
+        elif k == 'critical_tags':
+            if not isinstance(v, list) or len(v) > CRITICAL_TAGS_MAX:
+                return None, f'critical_tags is a list of at most {CRITICAL_TAGS_MAX} tags'
+            tags = []
+            for t in v:
+                t = str(t or '').strip().lower()
+                if not _TAG_RE.match(t) or t == TEST_TAG:
+                    return None, 'a critical tag is a tag name (letters, digits, . _ + -)'
+                if t not in tags:
+                    tags.append(t)
+            v = sorted(tags)
         elif k == 'test_bridge':
             if not isinstance(v, str) or not _BRIDGE_RE.match(v):
                 return None, 'test_bridge is the name of a bridge or VNet (vmbr9, testnet)'
@@ -328,11 +343,12 @@ def save_rule(cluster_id, scope, key, fields, user):
                 values[k] = None
     cur.execute(
         'INSERT OR REPLACE INTO recovery_targets (cluster_id, scope, scope_key, rto_minutes, agent, '
-        'ports, command, isolation, test_bridge, test_storage, boot_timeout, updated_at, updated_by) '
-        'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        'ports, command, isolation, test_bridge, test_storage, boot_timeout, critical_tags, updated_at, '
+        'updated_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
         (cluster_id, scope, key, values['rto_minutes'], values['agent'],
          None if values['ports'] is None else json.dumps(values['ports']), values['command'],
          values['isolation'], values['test_bridge'], values['test_storage'], values['boot_timeout'],
+         None if values['critical_tags'] is None else json.dumps(values['critical_tags']),
          datetime.now().isoformat(timespec='seconds'), str(user or '')[:64]))
     conn.commit()
     out = dict(values, scope=scope, scope_key=key)

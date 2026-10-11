@@ -3261,26 +3261,16 @@ def get_guest_recovery(cluster_id, vmid):
                                 for b in (backups or [])[:5]]})
 
 
-@bp.route('/api/tenants/<tenant_id>/recovery-report', methods=['GET'])
-@require_auth(perms=['backup.view'])
-def get_tenant_recovery_report(tenant_id):
-    """The recovery report over every Proxmox cluster of a tenant the caller reaches; an
-    admin asks for any tenant, everybody else for their own. ?days=, ?format=csv."""
+def _tenant_recovery_clusters(tenant_id):
+    """(clusters, reach, None) of the Proxmox clusters of a tenant the caller reaches, or
+    (None, None, error response). `reach` holds the connected ones as (id, manager, entry)."""
     import pegaprox.utils.rbac as _rbac
-    from pegaprox.core import recovery
-    from pegaprox.utils.concurrent import run_concurrent
-    days, err = _report_days()
-    if err:
-        return err
-    fmt, err = _report_format()
-    if err:
-        return err
     _rbac.tenants_db = _rbac.load_tenants()
     if tenant_id not in (_rbac.tenants_db or {}) and tenant_id != _rbac.DEFAULT_TENANT_ID:
-        return jsonify({'error': 'Tenant not found'}), 404
+        return None, None, (jsonify({'error': 'Tenant not found'}), 404)
     if not caller_acts_as_admin():
         if tenant_id != (_caller().get('tenant_id') or _rbac.DEFAULT_TENANT_ID):
-            return jsonify({'error': 'Access denied to this tenant'}), 403
+            return None, None, (jsonify({'error': 'Access denied to this tenant'}), 403)
     allowed = _rbac.get_user_clusters({'role': _rbac.ROLE_VIEWER, 'tenant_id': tenant_id})
     reach, clusters = [], []
     for cid, mgr in sorted(list(cluster_managers.items()), key=lambda kv: _cluster_label(*kv).lower()):
@@ -3297,6 +3287,26 @@ def get_tenant_recovery_report(tenant_id):
             entry['state'] = 'offline'
             continue
         reach.append((cid, mgr, entry))
+    return clusters, reach, None
+
+
+@bp.route('/api/tenants/<tenant_id>/recovery-report', methods=['GET'])
+@require_auth(perms=['backup.view'])
+def get_tenant_recovery_report(tenant_id):
+    """The recovery report over every Proxmox cluster of a tenant the caller reaches; an
+    admin asks for any tenant, everybody else for their own. ?days=, ?format=csv."""
+    import pegaprox.utils.rbac as _rbac
+    from pegaprox.core import recovery
+    from pegaprox.utils.concurrent import run_concurrent
+    days, err = _report_days()
+    if err:
+        return err
+    fmt, err = _report_format()
+    if err:
+        return err
+    clusters, reach, err = _tenant_recovery_clusters(tenant_id)
+    if err:
+        return err
     results = run_concurrent([lambda c=cid, m=mgr: recovery.cluster_report(c, m, stale_days=days)
                               for cid, mgr, _e in reach], timeout=120)
     rows = []
@@ -3315,6 +3325,240 @@ def get_tenant_recovery_report(tenant_id):
         return _csv_response(rows, f'recovery-{tenant_id}')
     return jsonify({'tenant_id': tenant_id, 'stale_days': days, 'clusters': clusters,
                     'summary': recovery.summary(rows), 'guests': rows})
+
+
+# ---------------------------------------------------------------------------
+# MK Oct 2026 - recovery assurance: coverage of the guests that matter, the gaps, manual
+# confirmations and the signed evidence (core/assurance.py)
+# ---------------------------------------------------------------------------
+
+def _assured(cluster_id, label, rows, settings):
+    """Report rows of one cluster, assessed and with their confirmation. The caller has
+    scoped `rows` already."""
+    from pegaprox.core import assurance
+    for r in rows:
+        r['cluster_id'], r['cluster_name'] = cluster_id, label
+    assurance.assess(rows, settings)
+    confs = assurance.load_confirmations(cluster_id)
+    for r in rows:
+        r['confirmation'] = confs.get(r['vmid'])
+    return rows
+
+
+def _site_gaps(cluster_id):
+    """Site Recovery plan gaps of a cluster as far as the caller may see them: a confined
+    caller sees none, the plans are not theirs."""
+    from pegaprox.core import assurance
+    from pegaprox.api.helpers import caller_is_scoped
+    if caller_is_scoped(_caller(), cluster_id):
+        return []
+
+    def state_of(cid):
+        m = cluster_managers.get(cid)
+        if m is None:
+            return 'missing'
+        return 'ok' if getattr(m, 'is_connected', False) else 'offline'
+    return assurance.plan_gaps(cluster_id, state_of)
+
+
+def _evidence_for(cluster_id, rows):
+    """The evidence entry of each assessed row of one cluster, under row['_evidence']."""
+    from pegaprox.core import assurance, recovery
+    marks, runs = recovery.load_marks(cluster_id), assurance.passed_runs(cluster_id)
+    for r in rows:
+        r['_evidence'] = assurance.evidence_guest(r, marks, runs, r.get('confirmation'))
+
+
+def _evidence_response(doc, fmt, name):
+    import json as _json
+    from flask import Response
+    from pegaprox.core import assurance
+    if fmt == 'csv':
+        return Response(assurance.evidence_csv(doc), mimetype='text/csv',
+                        headers={'Content-Disposition': f'attachment; filename="{name}.csv"'})
+    return Response(_json.dumps(doc, ensure_ascii=False, indent=1), mimetype='application/json',
+                    headers={'Content-Disposition': f'attachment; filename="{name}.json"'})
+
+
+@bp.route('/api/clusters/<cluster_id>/recovery-assurance', methods=['GET'])
+@require_auth(perms=['backup.view'])
+def get_recovery_assurance(cluster_id):
+    """How much of the cluster is proven recoverable: the share of critical guests (and of
+    all) with a passed restore test in the period, an agent check and an application check
+    that passed; the gaps behind the rest; manual confirmations beside, never in place of
+    that. ?days= (default 30) is the period, ?refresh=1 reads the backups again."""
+    from pegaprox.core import assurance, recovery
+    from pegaprox.api.helpers import caller_is_scoped
+    mgr, err = _recovery_cluster(cluster_id)
+    if err:
+        return err
+    days, err = _report_days()
+    if err:
+        return err
+    if not getattr(mgr, 'is_connected', False):
+        return jsonify({'error': 'cluster offline'}), 503
+    try:
+        rows, meta = recovery.cluster_report(cluster_id, mgr, stale_days=days,
+                                             refresh=request.args.get('refresh') in ('1', 'true'))
+        label = _cluster_label(cluster_id, mgr)
+        rows = _assured(cluster_id, label, scope_vm_rows(cluster_id, rows), meta['settings'])
+        plan_gaps = _site_gaps(cluster_id)
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The recovery assurance could not be made')}), 500
+    gaps, counts, cut = assurance.gap_list(rows, label)
+    for p in plan_gaps:
+        counts[p['kind']] = counts.get(p['kind'], 0) + 1
+    for r in rows:
+        r.pop('last_checks', None)
+    crit = meta['settings']['critical_tags']
+    return jsonify({'cluster_id': cluster_id, 'cluster_name': label, 'stale_days': days,
+                    'backups_state': meta['backups_state'], 'critical_tags': crit,
+                    'coverage': assurance.coverage(rows), 'gap_counts': counts, 'gaps': gaps,
+                    'gaps_truncated': cut, 'plan_gaps': plan_gaps, 'guests': rows})
+
+
+@bp.route('/api/clusters/<cluster_id>/recovery-evidence', methods=['GET'])
+@require_auth(perms=['backup.view'])
+def get_recovery_evidence(cluster_id):
+    """The evidence of a cluster as a signed document: per guest what PegaProx measured (run
+    ids, times) apart from what an administrator confirmed, the coverage, the gaps, the
+    PegaProx version and the head of the audit chain. ?days=, ?format=json|csv."""
+    from pegaprox.core import assurance, recovery
+    mgr, err = _recovery_cluster(cluster_id)
+    if err:
+        return err
+    days, err = _report_days()
+    if err:
+        return err
+    fmt, err = _report_format()
+    if err:
+        return err
+    if not getattr(mgr, 'is_connected', False):
+        return jsonify({'error': 'cluster offline'}), 503
+    try:
+        rows, meta = recovery.cluster_report(cluster_id, mgr, stale_days=days)
+        label = _cluster_label(cluster_id, mgr)
+        rows = _assured(cluster_id, label, scope_vm_rows(cluster_id, rows), meta['settings'])
+        plan_gaps = _site_gaps(cluster_id)
+        _evidence_for(cluster_id, rows)
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The evidence could not be made')}), 500
+    gaps, _counts, _cut = assurance.gap_list(rows, label)
+    log_audit(request.session.get('user', 'system'), 'backup.recovery_evidence',
+              f'Exported the recovery evidence of {label} ({len(rows)} guests)', cluster=label)
+    doc = assurance.build_evidence(
+        'cluster', cluster_id, days, [{'cluster_id': cluster_id, 'cluster_name': label, 'state': 'ok'}],
+        rows, gaps, plan_gaps, assurance.coverage(rows))
+    return _evidence_response(doc, fmt, f'recovery-evidence-{cluster_id}')
+
+
+@bp.route('/api/tenants/<tenant_id>/recovery-evidence', methods=['GET'])
+@require_auth(perms=['backup.view'])
+def get_tenant_recovery_evidence(tenant_id):
+    """The evidence over every Proxmox cluster of a tenant the caller reaches, signed; a
+    cluster that is offline or unreadable is listed as such and its guests are not claimed
+    proven. ?days=, ?format=json|csv."""
+    from pegaprox.core import assurance, recovery
+    from pegaprox.utils.concurrent import run_concurrent
+    days, err = _report_days()
+    if err:
+        return err
+    fmt, err = _report_format()
+    if err:
+        return err
+    clusters, reach, err = _tenant_recovery_clusters(tenant_id)
+    if err:
+        return err
+    results = run_concurrent([lambda c=cid, m=mgr: recovery.cluster_report(c, m, stale_days=days)
+                              for cid, mgr, _e in reach], timeout=120)
+    rows, plan_gaps = [], []
+    try:
+        for (cid, _mgr, entry), res in zip(reach, results):
+            if not res:
+                entry['state'] = 'unreadable'
+                continue
+            found = _assured(cid, entry['cluster_name'], scope_vm_rows(cid, res[0]), res[1]['settings'])
+            _evidence_for(cid, found)
+            rows += found
+            plan_gaps += [dict(g, cluster_id=cid) for g in _site_gaps(cid)]
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The evidence could not be made')}), 500
+    for c in clusters:
+        c.pop('summary', None)
+    gaps, _counts, _cut = assurance.gap_list(rows)
+    log_audit(request.session.get('user', 'system'), 'backup.recovery_evidence',
+              f'Exported the recovery evidence of tenant {tenant_id} ({len(rows)} guests)')
+    doc = assurance.build_evidence('tenant', tenant_id, days, clusters, rows, gaps, plan_gaps,
+                                   assurance.coverage(rows))
+    return _evidence_response(doc, fmt, f'recovery-evidence-{tenant_id}')
+
+
+@bp.route('/api/recovery-evidence/verify', methods=['POST'])
+@require_auth(perms=['backup.view'])
+def verify_recovery_evidence():
+    """Check an evidence document against this instance: whether it signed it, unchanged,
+    and whether the audit chain head it names is in this instance's chain."""
+    from pegaprox.core import assurance
+    res = assurance.verify(request.get_json(silent=True))
+    if res is None:
+        return jsonify({'error': 'The body must be a recovery evidence document'}), 400
+    return jsonify(res)
+
+
+@bp.route('/api/clusters/<cluster_id>/recovery-confirmations', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def post_recovery_confirmation(cluster_id):
+    """Record that an administrator confirmed a guest is recoverable (vmid, text, optional
+    expires_days). It is kept and shown apart; the guest stays 'not proven' until the
+    automatic checks say otherwise."""
+    from pegaprox.core import assurance, recovery
+    mgr, err = _recovery_cluster(cluster_id)
+    if err:
+        return err
+    refused = _recovery_admin(cluster_id)
+    if refused:
+        return refused
+    fields, bad = assurance.clean_confirmation(request.get_json(silent=True))
+    if bad:
+        return jsonify({'error': bad}), 400
+    if not getattr(mgr, 'is_connected', False):
+        return jsonify({'error': 'cluster offline'}), 503
+    if fields['vmid'] not in recovery.report_guests(mgr.get_vm_resources(max_age=60) or []):
+        return jsonify({'error': 'Guest not found'}), 404
+    user = request.session.get('user', '')
+    try:
+        cid = assurance.add_confirmation(cluster_id, fields, user)
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The confirmation could not be saved')}), 500
+    log_audit(user or 'system', 'backup.recovery_confirmation',
+              f"Confirmed the recoverability of guest {fields['vmid']} manually: {fields['text'][:200]}",
+              cluster=_cluster_label(cluster_id, mgr))
+    return jsonify({'success': True, 'id': cid})
+
+
+@bp.route('/api/clusters/<cluster_id>/recovery-confirmations/<conf_id>', methods=['DELETE'])
+@require_auth(roles=[ROLE_ADMIN])
+def delete_recovery_confirmation(cluster_id, conf_id):
+    """Withdraw a manual confirmation; the row stays, marked revoked."""
+    from pegaprox.core import assurance
+    mgr, err = _recovery_cluster(cluster_id)
+    if err:
+        return err
+    refused = _recovery_admin(cluster_id)
+    if refused:
+        return refused
+    if not re.fullmatch(r'[0-9a-f]{16}', conf_id or ''):
+        return jsonify({'error': 'Confirmation not found'}), 404
+    user = request.session.get('user', '')
+    try:
+        gone = assurance.revoke_confirmation(cluster_id, conf_id, user)
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The confirmation could not be withdrawn')}), 500
+    if gone is None:
+        return jsonify({'error': 'Confirmation not found'}), 404
+    log_audit(user or 'system', 'backup.recovery_confirmation',
+              f"Withdrew the manual confirmation of guest {gone['vmid']}", cluster=_cluster_label(cluster_id, mgr))
+    return jsonify({'success': True})
 
 
 # ============================================================================

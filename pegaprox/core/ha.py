@@ -334,6 +334,8 @@ SYNC_TABLES = (
     # what restore tests check per cluster, guest and tag, and each guest's last result: the
     # weekly run and the restore_test_age alert go by them on whichever instance leads
     'recovery_targets', 'restore_test_marks',
+    # manual confirmations of a guest's recoverability, beside the automatic facts
+    'recovery_confirmations',
 )
 LOCAL_TABLES = (
     'sessions', 'audit_log', 'task_users', 'migration_history', 'metrics_history',
