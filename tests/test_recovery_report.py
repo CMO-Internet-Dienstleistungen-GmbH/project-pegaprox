@@ -34,6 +34,15 @@ from test_ha_api import ha_env, _standby_of_active  # noqa: F401
 NOW = time.time()
 
 
+@pytest.fixture(autouse=True)
+def _now_at_the_test():
+    """NOW is when the test starts. Taken once at import it was as old as the suite had run
+    by the time a late test came (40 minutes in CI), and a backup seeded 5 h ago read 5.6 h."""
+    global NOW, CONTENT
+    NOW = time.time()
+    CONTENT = _content()
+
+
 def _bk(vmid, hours_ago, kind='qemu'):
     t = int(NOW - hours_ago * 3600)
     iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(t))
@@ -48,7 +57,11 @@ GUESTS = [
     {'vmid': 103, 'type': 'qemu', 'node': 'pve2', 'name': 'tmpl', 'template': 1},
     {'vmid': 900, 'type': 'qemu', 'node': 'pve1', 'name': 'web01', 'tags': 'pegaprox-verify'},
 ]
-CONTENT = [_bk(100, 3), _bk(100, 27), _bk(101, 40), _bk(102, 2, 'lxc')]
+def _content():
+    return [_bk(100, 3), _bk(100, 27), _bk(101, 40), _bk(102, 2, 'lxc')]
+
+
+CONTENT = _content()
 
 
 def _manager(api, cid='c1', connected=True):
