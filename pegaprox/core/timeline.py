@@ -30,11 +30,15 @@ LINKS_MAX = 5
 # a number past this is no epoch second of ours (the year 2100)
 _EPOCH_MAX = 4102444800
 _EPOCH = re.compile(r'\d{1,12}(?:\.\d{1,6})?')
+_FIRST = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_LAST = datetime.fromtimestamp(_EPOCH_MAX, timezone.utc)
+# the id of a cursor below every event of its second: that whole second was on the page before
+BELOW = ':'
 
 
 def parse_when(value):
     """A time of the query as aware UTC: ISO 8601 (without an offset it is UTC) or epoch
-    seconds. ValueError when it is neither."""
+    seconds, from 1970 to 2100. ValueError when it is neither."""
     text = str(value if value is not None else '').strip()
     if not text or len(text) > 40:
         raise ValueError('not a time')
@@ -45,11 +49,15 @@ def parse_when(value):
                 raise ValueError('not a time')
             return datetime.fromtimestamp(seconds, timezone.utc)
         dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
     except (OverflowError, OSError) as e:
         raise ValueError('not a time') from e
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    # MK Oct 2026 - the year 1 is a time, but the window around it is not (a day before it)
+    if not _FIRST <= dt <= _LAST:
+        raise ValueError('not a time')
+    return dt
 
 
 def stored_time(value, naive='local'):
@@ -102,13 +110,27 @@ def event(kind, ref, at, *, cluster, severity='info', title='', node=None, nodes
         'source': {'route': route, 'id': str(ref)},
     }
     ev['_at'] = at
+    ev['_key'] = (at, _rank(ev['id']))
     ev['_nodes'] = {n for n in (node, *nodes) if n}
     ev['_anchor'] = bool(anchor)
     return ev
 
 
+def _rank(eid):
+    """Where an event id sorts within its second: by kind, then by its id in the source, a
+    number as a number (migration:9 before migration:14, as the source counts them)."""
+    kind, _, ref = str(eid).partition(':')
+    return kind, ref.rjust(20, '0') if ref.isascii() and ref.isdigit() else ref
+
+
 def order(ev):
-    return (ev['_at'], ev['id'])
+    return ev['_key']
+
+
+def earlier(ev, before):
+    """Whether the event is at or above the cursor `before` (parse_cursor), so on a page
+    before the one asked for."""
+    return before is not None and order(ev) >= (before[0], _rank(before[1]))
 
 
 def parse_cursor(text):
@@ -124,6 +146,11 @@ def cursor_of(ev):
     return f"{ev['time']}|{ev['id']}"
 
 
+def cursor_below(at):
+    """The cursor of a page that went down to the second `at` and held nothing of it back."""
+    return f'{iso(at)}|{BELOW}'
+
+
 def page(events, since, until, *, before=None, kinds=None, severities=None, limit=LIMIT_DEFAULT,
          floor=None):
     """The events of [since, until], older than `before` when given, of the kinds and
@@ -136,7 +163,7 @@ def page(events, since, until, *, before=None, kinds=None, severities=None, limi
         seen.add(ev['id'])
         if not since <= ev['_at'] <= until:
             continue
-        if before is not None and order(ev) >= before:
+        if earlier(ev, before):
             continue
         if kinds and ev['kind'] not in kinds:
             continue

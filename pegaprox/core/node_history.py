@@ -15,7 +15,9 @@ PegaProx is no event. Where each node stood is read back from the newest rows on
 cluster, so a restart reports what changed while it was down and nothing else.
 
 Only an instance that may act records (ha.is_active). The table is per host
-(core/ha.py LOCAL_TABLES), and a standby reads the timeline from its active.
+(core/ha.py LOCAL_TABLES), and a standby reads the timeline from its active. A standby still
+follows the reads in memory, so after a takeover the first read is compared with what it
+last saw, not with the rows it wrote when it last acted.
 """
 
 import logging
@@ -54,11 +56,16 @@ def status_of(info):
     return UNKNOWN
 
 
-def _recording():
-    """An instance that may act, with its database open: a CLI run or a test that never
-    opened one records nothing (and creates no database for it)."""
+def _following():
+    """The database is open: a CLI run or a test that never opened one follows nothing
+    (and creates no database for it)."""
     from pegaprox.core import db as dbmod
-    return dbmod._db is not None and ha.is_active()
+    return dbmod._db is not None
+
+
+def _recording():
+    """An instance that may act, with its database open."""
+    return _following() and ha.is_active()
 
 
 def _seeded(cluster_id):
@@ -118,10 +125,12 @@ def observe(cluster_id, node_status):
     if not cluster_id or not isinstance(node_status, dict) or not node_status:
         return
     try:
-        if not _recording():
+        if not _following():
             return
+        # MK Oct 2026 - a standby moves on with the reads and writes nothing: a node that came
+        # back while it stood by was dated at the takeover
         rows = changes(cluster_id, node_status)
-        if rows:
+        if rows and _recording():
             from pegaprox.core.db import get_db
             get_db().add_node_states(cluster_id, rows)
     except Exception as e:
@@ -134,14 +143,14 @@ def observe_quorum(cluster_id, quorate, outside=None):
     if not cluster_id or quorate is None:
         return
     try:
-        if not _recording():
+        if not _following():
             return
         known = _seeded(cluster_id)
         state = QUORATE if quorate else NO_QUORUM
         with _lock:
             was = known.get('quorum')
             known['quorum'] = state
-        if was == state or (was is None and state == QUORATE):
+        if was == state or (was is None and state == QUORATE) or not _recording():
             return
         detail = ''
         if outside:

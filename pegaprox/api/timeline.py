@@ -35,10 +35,14 @@ from pegaprox.api.helpers import bounded_limit, caller_is_scoped, check_cluster_
 bp = Blueprint('timeline', __name__)
 
 _NODE = re.compile(r'[A-Za-z0-9][A-Za-z0-9.\-]{0,62}')
+_DIGITS = re.compile(r'[0-9]{1,9}')
 _GUEST_IN_TEXT = re.compile(r'\b(?:VM|CT|QEMU|LXC)\s+(\d{1,9})(?!\d)|\b(?:qemu|lxc)/(\d{1,9})(?!\d)')
 _NODE_IN_TEXT = re.compile(r'\bnode\s+[\'"]?([A-Za-z0-9][A-Za-z0-9.\-]{0,62})', re.I)
 # rows read where they have to be filtered by guest or node before the cap applies
 SCAN = 2000
+# rows read of a source the severity asked for thins out: the newest page of audit rows is
+# mostly info, and a page of critical events would else be empty on a busy cluster
+SIFT = SCAN
 # the Proxmox tasks: what the broadcast loop reads every second (core/manager.py get_tasks)
 TASKS_READ = 50
 PLANS_READ = 200
@@ -48,11 +52,15 @@ VMID_MAX = 999999999
 class _Ask:
     """One request: the cluster, the filters, the window to read and who asks."""
 
-    def __init__(self, cid, mgr, user, node, vmid, lo, hi, cap):
+    def __init__(self, cid, mgr, user, node, vmid, lo, hi, cap, *, edge=None, before=None, kinds=None,
+                 severities=None):
         from pegaprox.utils.rbac import acts_as_admin
         self.cid, self.mgr, self.user = cid, mgr, user
         self.node, self.vmid = node, vmid
         self.lo, self.hi, self.cap = lo, hi, cap
+        # the cursor's second, read whole (the page before showed part of it), and the cursor
+        self.edge, self.before = edge, before
+        self.kinds, self.severities = kinds, severities
         self.scoped = caller_is_scoped(user, cid)
         self.admin = acts_as_admin(user)
         self._guests = {}
@@ -80,6 +88,22 @@ class _Ask:
     def bounds(self, naive='local'):
         """The window to read as text for a source's stored times, the upper end exclusive."""
         return tl.bound(self.lo, naive), tl.bound(self.hi + timedelta(seconds=1), naive)
+
+    def reads(self, kind, filtered=False):
+        """Rows to read of a source: SCAN where rows are dropped after the read by guest or
+        node, SIFT where the severity asked for drops them, the page size else."""
+        if filtered:
+            return SCAN
+        if self.severities and (not self.kinds or kind in self.kinds):
+            return max(SIFT, self.cap)
+        return self.cap
+
+    def counts(self, ev):
+        """Whether an event takes a place on the page: one the filters keep, or any event of
+        a kind that is only read for the links."""
+        if self.kinds and ev['kind'] not in self.kinds:
+            return True
+        return not self.severities or ev['severity'] in self.severities
 
     def guest_map(self):
         """{vmid: (node, name)} from the guest list the manager already holds, never a fresh
@@ -117,8 +141,73 @@ class _Ask:
         return True
 
 
-def _note(shown=True, why='', capped=False, count=0):
-    return {'shown': shown, 'why': why, 'capped': capped, 'count': count}
+def _note(shown=True, why='', capped=False, count=0, depth=None):
+    note = {'shown': shown, 'why': why, 'capped': capped, 'count': count}
+    if depth is not None:
+        note['_floor'] = depth
+    return note
+
+
+def _select(sql, params, col, order=', id DESC', query=None):
+    """A read for _window: `sql` ends in its WHERE filters, the window and the order follow."""
+    full = f'{sql} AND {col} >= ? AND {col} < ? ORDER BY {col} DESC{order} LIMIT ?'
+    query = query or get_db().query
+    return lambda since, until, n: query(full, (*params, since, until, n))
+
+
+def _window(ask, fetch, col, limit, naive='local'):
+    """A source's rows of the window newest first, no second of them read in part.
+
+    MK Oct 2026 - a read of the newest `limit` rows up to the cursor's second counted the rows
+    the page before had shown, and with that many in one second the next page read the same
+    rows again and the list ended there. Now the cursor's second is read whole (what was shown
+    is dropped by the event, not counted), then at most `limit` older rows, then the rest of
+    the second the oldest of them fell in. (rows, that second when `limit` was reached)"""
+    one = timedelta(seconds=1)
+    rows = []
+    since, until = ask.bounds(naive)
+    if ask.edge is not None:
+        rows += fetch(tl.bound(ask.edge, naive), tl.bound(ask.edge + one, naive), SCAN)
+        until = tl.bound(ask.edge, naive)
+    older = list(fetch(since, until, limit))
+    rows += older
+    if len(older) < limit:
+        return rows, None
+    last = next((at for at in (tl.stored_time(r[col], naive) for r in reversed(older)) if at), None)
+    if last is None:
+        return rows, None
+    last = last.replace(microsecond=0)
+    seen = {r['id'] for r in older}
+    rows += [r for r in fetch(tl.bound(last, naive), tl.bound(last + one, naive), SCAN) if r['id'] not in seen]
+    return rows, last
+
+
+class _Kept:
+    """What a source hands out of its rows, which come newest first in whole seconds: its
+    events until `cap` of them take a place on the page and that second is over. One a page
+    before showed takes no place (it is still there for the links). How deep it went is the
+    floor of the page."""
+
+    def __init__(self, ask, depth=None):
+        self.ask, self.out, self.depth = ask, [], depth
+        self._placed, self._last = 0, None
+
+    def done(self, at):
+        """Whether a row at `at` is past the cut: call it for every row before anything else."""
+        if self._last is None or at is None or at.replace(microsecond=0) >= self._last:
+            return False
+        self.depth = self._last
+        return True
+
+    def add(self, ev):
+        self.out.append(ev)
+        if not tl.earlier(ev, self.ask.before) and self.ask.counts(ev):
+            self._placed += 1
+            if self._placed == self.ask.cap:
+                self._last = ev['_at']
+
+    def result(self):
+        return self.out, _note(capped=self.depth is not None, depth=self.depth)
 
 
 def _guests_in(text):
@@ -135,18 +224,18 @@ def _guests_in(text):
 def _audit(ask):
     """The cluster's audit rows (settings.py /api/clusters/<id>/audit). A confined caller
     gets the rows that name one of their guests, as there."""
-    since, until = ask.bounds()
     filtered = ask.scoped or ask.vmid is not None or ask.node is not None
-    rows = get_db().query(
-        'SELECT id, timestamp, user, action, details, severity FROM audit_log '
-        'WHERE cluster_id = ? AND timestamp >= ? AND timestamp < ? ORDER BY timestamp DESC, id DESC LIMIT ?',
-        (ask.cid, since, until, SCAN if filtered else ask.cap))
+    rows, depth = _window(ask, _select('SELECT id, timestamp, user, action, details, severity FROM audit_log '
+                                       'WHERE cluster_id = ?', (ask.cid,), 'timestamp'),
+                          'timestamp', ask.reads('audit', filtered))
     known = set(ask.node_names())
-    out = []
+    kept = _Kept(ask, depth)
     for r in rows:
         at = tl.stored_time(r['timestamp'])
         if at is None:
             continue
+        if kept.done(at):
+            break
         details = r['details'] or ''
         guests = _guests_in(details)
         if ask.scoped:
@@ -161,37 +250,35 @@ def _audit(ask):
         node = m.group(1) if m and not ask.scoped and m.group(1) in known else None
         if not ask.keeps(guest, {node} if node else ()):
             continue
-        out.append(tl.event('audit', r['id'], at, cluster=ask.cid, severity=tl.severity_of(r['severity']),
-                            title=r['action'], details=details, node=node, guest=guest,
-                            guest_name=ask.guest_name(guest) if guest is not None else '',
-                            what='audit', params={'action': r['action'], 'user': r['user'] or ''},
-                            route=f'/api/clusters/{ask.cid}/audit'))
-    return out[:ask.cap], _note(capped=len(rows) >= (SCAN if filtered else ask.cap))
+        kept.add(tl.event('audit', r['id'], at, cluster=ask.cid, severity=tl.severity_of(r['severity']),
+                          title=r['action'], details=details, node=node, guest=guest,
+                          guest_name=ask.guest_name(guest) if guest is not None else '',
+                          what='audit', params={'action': r['action'], 'user': r['user'] or ''},
+                          route=f'/api/clusters/{ask.cid}/audit'))
+    return kept.result()
 
 
 def _alerts(ask):
     """Alerts as they fired and cleared (alerts.py active-alerts keeps the open ones). A
     confined caller gets the ones on their guests and none about a node."""
-    since, until = ask.bounds()
     filtered = ask.scoped or ask.node is not None
     cols = ('id, alert_id, severity, message, metric, target_type, target_id, target_name, '
             'triggered_at, resolved_at, resolved_by')
-    out, capped = [], False
+    out, depths = [], []
     for column, resolved in (('triggered_at', False), ('resolved_at', True)):
-        sql = f'SELECT {cols} FROM active_alerts WHERE cluster_id = ? AND {column} >= ? AND {column} < ?'
-        params = [ask.cid, since, until]
+        sql = f'SELECT {cols} FROM active_alerts WHERE cluster_id = ?'
+        params = [ask.cid]
         if ask.vmid is not None:
             sql += " AND target_type = 'vm' AND target_id = ?"
             params.append(str(ask.vmid))
-        sql += f' ORDER BY {column} DESC LIMIT ?'
-        params.append(SCAN if filtered else ask.cap)
-        rows = get_db().query(sql, tuple(params))
-        capped = capped or len(rows) >= params[-1]
-        kept = 0
+        rows, depth = _window(ask, _select(sql, params, column, order=''), column, ask.reads('alert', filtered))
+        kept = _Kept(ask, depth)
         for r in rows:
             at = tl.stored_time(r[column])
             if at is None:
                 continue
+            if kept.done(at):
+                break
             guest, node = None, None
             if r['target_type'] == 'vm':
                 try:
@@ -215,23 +302,31 @@ def _alerts(ask):
                                   'by': (r['resolved_by'] or '') if resolved else ''},
                           route=f'/api/clusters/{ask.cid}/active-alerts',
                           anchor=not resolved and sev in ('warning', 'critical'))
-            out.append(ev)
-            kept += 1
-            if kept >= ask.cap:
-                break
-    return out, _note(capped=capped)
+            kept.add(ev)
+        got, note = kept.result()
+        out += got
+        if note['capped']:
+            depths.append(note['_floor'])
+    # MK Oct 2026 - two reads, each as deep as it went: the oldest clear of the cleared ones
+    # is no floor for the fired ones the capped read of those left out
+    depth = max(depths, default=None)
+    return out, _note(capped=depth is not None, depth=depth)
 
 
 def _moves(ask, balancer):
     """Migrations (history.py), the balancer's moves apart. A confined caller gets their
     guests' moves, the balancer's without why, as in the balance history."""
     from pegaprox.core.db import PegaProxDB
+    kind = 'balancer' if balancer else 'migration'
+    # MK Oct 2026 - the migration routes ask vm.view of every guest (history.py); a caller who
+    # is not confined to some guests holds it for all of them or for none. The balance history
+    # asks cluster.view only, so its moves stay as they were.
+    if not balancer and not ask.scoped and not ask.holds('vm.view'):
+        return [], _note(False, 'permission')
     triggers = PegaProxDB.BALANCER_TRIGGERS
-    since, until = ask.bounds()
     sql = ('SELECT id, vmid, vm_name, source_node, target_node, reason, status, duration_seconds, '
-           'timestamp, trigger_kind FROM migration_history WHERE cluster_id = ? AND timestamp >= ? '
-           'AND timestamp < ?')
-    params = [ask.cid, since, until]
+           'timestamp, trigger_kind FROM migration_history WHERE cluster_id = ?')
+    params = [ask.cid]
     marks = ','.join('?' * len(triggers))
     if balancer:
         sql += f' AND trigger_kind IN ({marks})'
@@ -244,16 +339,18 @@ def _moves(ask, balancer):
     if ask.node is not None:
         sql += ' AND (source_node = ? OR target_node = ?)'
         params += [ask.node, ask.node]
-    limit = SCAN if ask.scoped else ask.cap
-    rows = get_db().query(sql + ' ORDER BY timestamp DESC, id DESC LIMIT ?', (*params, limit))
-    kind = 'balancer' if balancer else 'migration'
-    out = []
+    rows, depth = _window(ask, _select(sql, params, 'timestamp'), 'timestamp', ask.reads(kind, ask.scoped))
+    kept = _Kept(ask, depth)
     for r in rows:
         at = tl.stored_time(r['timestamp'])
-        if at is None or (ask.scoped and not ask.sees(r['vmid'])):
+        if at is None:
+            continue
+        if kept.done(at):
+            break
+        if ask.scoped and not ask.sees(r['vmid']):
             continue
         reason = '' if (ask.scoped and balancer) else (r['reason'] or '')
-        out.append(tl.event(
+        kept.add(tl.event(
             kind, r['id'], at, cluster=ask.cid, severity='warning' if r['status'] == 'failed' else 'info',
             title=f"{r['vm_name'] or r['vmid']}: {r['source_node']} -> {r['target_node']} ({r['status']})",
             details=reason, node=r['target_node'], nodes=(r['source_node'],), guest=r['vmid'],
@@ -262,9 +359,7 @@ def _moves(ask, balancer):
                     'trigger': r['trigger_kind'] or '', 'duration': r['duration_seconds'] or 0},
             route=(f'/api/clusters/{ask.cid}/balance-history' if balancer
                    else f'/api/clusters/{ask.cid}/vms/{r["vmid"]}/migration-history')))
-        if len(out) >= ask.cap:
-            break
-    return out, _note(capped=len(rows) >= limit)
+    return kept.result()
 
 
 def _drift(ask):
@@ -273,20 +368,20 @@ def _drift(ask):
         return [], _note(False, 'confined')
     if not ask.holds('admin.audit'):
         return [], _note(False, 'permission')
-    since, until = ask.bounds()
-    sql = ('SELECT id, kind, scope, severity, summary, detected_at, status FROM drift_events '
-           'WHERE cluster_id = ? AND detected_at >= ? AND detected_at < ?')
-    params = [ask.cid, since, until]
+    sql = 'SELECT id, kind, scope, severity, summary, detected_at, status FROM drift_events WHERE cluster_id = ?'
+    params = [ask.cid]
     if ask.vmid is not None:
         sql += " AND kind = 'vm_config' AND scope IN (?, ?)"
         params += [f'qemu/{ask.vmid}', f'lxc/{ask.vmid}']
-    limit = SCAN if ask.node is not None else ask.cap
-    rows = get_db().query(sql + ' ORDER BY detected_at DESC, id DESC LIMIT ?', (*params, limit))
-    out = []
+    rows, depth = _window(ask, _select(sql, params, 'detected_at'), 'detected_at',
+                          ask.reads('drift', ask.node is not None))
+    kept = _Kept(ask, depth)
     for r in rows:
         at = tl.stored_time(r['detected_at'])
         if at is None:
             continue
+        if kept.done(at):
+            break
         guest, node = None, None
         scope = r['scope'] or ''
         if r['kind'] == 'vm_config' and scope.partition('/')[2].isdigit():
@@ -295,14 +390,12 @@ def _drift(ask):
             node = scope.partition('/')[0] or None
         if not ask.keeps(guest, {node} if node else ()):
             continue
-        out.append(tl.event('drift', r['id'], at, cluster=ask.cid, severity=tl.severity_of(r['severity']),
-                            title=r['summary'] or f"{r['kind']} {scope}", node=node, guest=guest,
-                            guest_name=ask.guest_name(guest) if guest is not None else '', what='drift',
-                            params={'drift_kind': r['kind'], 'scope': scope, 'status': r['status']},
-                            route=f'/api/clusters/{ask.cid}/drift/events'))
-        if len(out) >= ask.cap:
-            break
-    return out, _note(capped=len(rows) >= limit)
+        kept.add(tl.event('drift', r['id'], at, cluster=ask.cid, severity=tl.severity_of(r['severity']),
+                          title=r['summary'] or f"{r['kind']} {scope}", node=node, guest=guest,
+                          guest_name=ask.guest_name(guest) if guest is not None else '', what='drift',
+                          params={'drift_kind': r['kind'], 'scope': scope, 'status': r['status']},
+                          route=f'/api/clusters/{ask.cid}/drift/events'))
+    return kept.result()
 
 
 def _tasks(ask):
@@ -371,25 +464,28 @@ def _node_states(ask):
         node = (ask.guest_map().get(ask.vmid) or ('', ''))[0]
         if not node:
             return [], _note()
-    since, until = ask.bounds('utc')
-    rows = get_db().list_node_states(ask.cid, since, until, node=node, limit=ask.cap)
-    out = []
+    db = get_db()
+    rows, depth = _window(ask, lambda since, until, n: db.list_node_states(ask.cid, since, until, node=node, limit=n),
+                          'at', ask.reads('node'), 'utc')
+    kept = _Kept(ask, depth)
     for r in rows:
         at = tl.stored_time(r['at'], 'utc')
         if at is None:
             continue
+        if kept.done(at):
+            break
         state, maint = r['state'], r['detail'] == 'in maintenance'
         down = state in (node_history.OFFLINE, node_history.UNKNOWN)
         sev = 'info'
         if (down and not maint) or state == node_history.NO_QUORUM:
             sev = 'critical'
         name = r['node'] or None
-        out.append(tl.event(
+        kept.add(tl.event(
             'node', r['id'], at, cluster=ask.cid, severity=sev,
             title=f"{name or ask.name or ask.cid}: {state}", details=r['detail'], node=name,
             what=f'node.{state}', params={'node': name or '', 'previous': r['previous'], 'detail': r['detail']},
             route='/api/timeline', anchor=sev == 'critical'))
-    return out, _note(capped=len(rows) >= ask.cap)
+    return kept.result()
 
 
 def _backup_verify(ask):
@@ -397,33 +493,34 @@ def _backup_verify(ask):
     caller's own guests only."""
     if not ask.holds('vm.backup'):
         return [], _note(False, 'permission')
-    since, until = ask.bounds()
     sql = ('SELECT id, vmid, vm_name, node, status, phase, error, started_at, completed_at '
-           'FROM backup_verifications WHERE cluster_id = ? AND started_at >= ? AND started_at < ?')
-    params = [ask.cid, since, until]
+           'FROM backup_verifications WHERE cluster_id = ?')
+    params = [ask.cid]
     if ask.vmid is not None:
         sql += ' AND vmid = ?'
         params.append(ask.vmid)
     if ask.node is not None:
         sql += ' AND node = ?'
         params.append(ask.node)
-    limit = SCAN if ask.scoped else ask.cap
-    rows = get_db().query(sql + ' ORDER BY started_at DESC LIMIT ?', (*params, limit))
-    out = []
+    rows, depth = _window(ask, _select(sql, params, 'started_at', order=''), 'started_at',
+                          ask.reads('backup_verify', ask.scoped))
+    kept = _Kept(ask, depth)
     for r in rows:
         at = tl.stored_time(r['started_at'])
-        if at is None or (ask.scoped and not ask.sees(r['vmid'], 'vm.backup')):
+        if at is None:
+            continue
+        if kept.done(at):
+            break
+        if ask.scoped and not ask.sees(r['vmid'], 'vm.backup'):
             continue
         failed = r['status'] in ('failed', 'error')
-        out.append(tl.event(
+        kept.add(tl.event(
             'backup_verify', r['id'], at, cluster=ask.cid, severity='critical' if failed else 'info',
             title=f"{r['vm_name'] or r['vmid']}: {r['status']}", details=r['error'] or '',
             node=None if ask.scoped else (r['node'] or None), guest=r['vmid'], guest_name=r['vm_name'] or '',
             what='backup_verify', params={'status': r['status'], 'phase': r['phase'] or ''},
             route=f'/api/clusters/{ask.cid}/backup-verify/{r["id"]}', anchor=failed))
-        if len(out) >= ask.cap:
-            break
-    return out, _note(capped=len(rows) >= limit)
+    return kept.result()
 
 
 def _site_recovery(ask):
@@ -453,26 +550,27 @@ def _site_recovery(ask):
         plans = {k: v for k, v in plans.items() if k in holding}
     if not plans:
         return [], _note()
-    since, until = ask.bounds('utc')
     marks = ','.join('?' * len(plans))
-    rows = db.query(
-        f'SELECT id, plan_id, event_type, status, started_at, completed_at, triggered_by '
-        f'FROM site_recovery_events WHERE plan_id IN ({marks}) AND started_at >= ? AND started_at < ? '
-        f'ORDER BY started_at DESC LIMIT ?', (*plans, since, until, ask.cap))
-    out = []
+    sql = (f'SELECT id, plan_id, event_type, status, started_at, completed_at, triggered_by '
+           f'FROM site_recovery_events WHERE plan_id IN ({marks})')
+    rows, depth = _window(ask, _select(sql, list(plans), 'started_at', order=''), 'started_at',
+                          ask.reads('site_recovery'), 'utc')
+    kept = _Kept(ask, depth)
     for r in rows:
         at = tl.stored_time(r['started_at'], 'utc')
         if at is None:
             continue
+        if kept.done(at):
+            break
         plan = plans[r['plan_id']]
-        out.append(tl.event(
+        kept.add(tl.event(
             'site_recovery', r['id'], at, cluster=ask.cid,
             severity='critical' if r['status'] == 'failed' else 'info',
             title=f"{plan['name']}: {r['event_type']} ({r['status']})", guest=ask.vmid,
             what='site_recovery', params={'plan': plan['name'], 'event_type': r['event_type'],
                                           'status': r['status'], 'by': r['triggered_by'] or ''},
             route=f"/api/site-recovery/plans/{r['plan_id']}/events"))
-    return out, _note(capped=len(rows) >= ask.cap)
+    return kept.result()
 
 
 def _rolling(ask):
@@ -507,7 +605,14 @@ def _rolling(ask):
                                 severity=sev, title=f'rolling update {edge} ({status})',
                                 node=ask.node, what=f'rolling.{edge}', params=params,
                                 route=f'/api/clusters/{ask.cid}/updates/rolling/history'))
-    return out[:ask.cap], _note()
+    # MK Oct 2026 - the runs come as stored, each start before its end: newest first before
+    # the cut, else the end of an older run fell between two pages
+    kept = _Kept(ask)
+    for ev in sorted(out, key=tl.order, reverse=True):
+        if kept.done(ev['_at']):
+            break
+        kept.add(ev)
+    return kept.result()
 
 
 def _syslog(ask):
@@ -528,39 +633,47 @@ def _syslog(ask):
     if not os.path.exists(os.path.abspath(DB_FILE)):
         return [], _note()
     from pegaprox.api import reports
-    names = [ask.node] if ask.node is not None else ask.node_names()
+    names = ask.node_names()
+    # MK Oct 2026 - the logs are kept by host name, not by cluster: a node page names one of
+    # the cluster's nodes, or any name became the host names of another tenant's node (or of
+    # a sender no cluster claims), which /api/syslog/events does not hand this caller
+    if ask.node is not None:
+        if ask.node not in names:
+            return [], _note()
+        names = [ask.node]
     tokens = set()
     for value in names:
         tokens |= reports._syslog_hostname_tokens(value)
     if not tokens:
         return [], _note()
-    since, until = ask.bounds()
-    params = [since, until]
-    hosts = reports._syslog_host_clause(tokens, params)
+    params = []
+    hosts = reports._syslog_host_clause(tokens, params, cached_only=True)
     from pegaprox.core import dbcrypto
     conn = dbcrypto.connect(os.path.abspath(DB_FILE))
     conn.row_factory = dbcrypto.Row
     try:
-        rows = conn.execute(
-            f'SELECT id, timestamp, hostname, severity, severity_text, message FROM logs '
-            f'WHERE severity IN (0, 1, 2, 3) AND timestamp >= ? AND timestamp < ? AND {hosts} '
-            f'ORDER BY timestamp DESC, id DESC LIMIT ?', (*params, ask.cap)).fetchall()
+        rows, depth = _window(ask, _select(f'SELECT id, timestamp, hostname, severity, severity_text, message '
+                                           f'FROM logs WHERE severity IN (0, 1, 2, 3) AND {hosts}', params,
+                                           'timestamp', query=lambda sql, p: conn.execute(sql, p).fetchall()),
+                              'timestamp', ask.reads('syslog'))
     finally:
         conn.close()
     lowered = {n.lower(): n for n in names}
-    out = []
+    kept = _Kept(ask, depth)
     for r in rows:
         at = tl.stored_time(r['timestamp'])
         if at is None:
             continue
+        if kept.done(at):
+            break
         host = str(r['hostname'] or '').lower()
         node = lowered.get(host) or lowered.get(host.split('.', 1)[0])
-        out.append(tl.event('syslog', r['id'], at, cluster=ask.cid,
-                            severity='critical' if (r['severity'] or 0) <= 2 else 'warning',
-                            title=str(r['message'] or '')[:200], node=node, what='syslog',
-                            params={'host': r['hostname'] or '', 'level': r['severity_text'] or ''},
-                            route='/api/syslog/events'))
-    return out, _note(capped=len(rows) >= ask.cap)
+        kept.add(tl.event('syslog', r['id'], at, cluster=ask.cid,
+                          severity='critical' if (r['severity'] or 0) <= 2 else 'warning',
+                          title=str(r['message'] or '')[:200], node=node, what='syslog',
+                          params={'host': r['hostname'] or '', 'level': r['severity_text'] or ''},
+                          route='/api/syslog/events'))
+    return kept.result()
 
 
 def _incidents(ask):
@@ -570,14 +683,15 @@ def _incidents(ask):
         return [], _note(False, 'permission')
     if ask.vmid is not None or ask.node is not None:
         return [], _note()
-    since, until = ask.bounds()
-    rows = get_db().query(
-        'SELECT id, title, status, severity, message, components, started_at, resolved_at '
-        'FROM status_incidents WHERE started_at >= ? AND started_at < ? ORDER BY started_at DESC LIMIT ?',
-        (since, until, SCAN))
+    rows, depth = _window(ask, _select('SELECT id, title, status, severity, message, components, started_at, '
+                                       'resolved_at FROM status_incidents WHERE started_at IS NOT NULL', (),
+                                       'started_at', order=''),
+                          'started_at', SCAN)
     names = {ask.cid.lower(), ask.name.lower()} - {''}
-    out = []
+    kept = _Kept(ask, depth)
     for r in rows:
+        if kept.done(tl.stored_time(r['started_at'])):
+            break
         try:
             parts = json.loads(r['components'] or '[]')
         except (TypeError, ValueError):
@@ -594,13 +708,11 @@ def _incidents(ask):
         at = tl.stored_time(r['started_at'])
         if at is None:
             continue
-        out.append(tl.event('incident', r['id'], at, cluster=ask.cid, severity=tl.severity_of(r['severity']),
-                            title=r['title'] or '', details=r['message'] or '', what='incident',
-                            params={'status': r['status'] or '', 'resolved_at': r['resolved_at'] or ''},
-                            route='/api/plugins/status_page/api/incidents'))
-        if len(out) >= ask.cap:
-            break
-    return out, _note(capped=len(rows) >= SCAN)
+        kept.add(tl.event('incident', r['id'], at, cluster=ask.cid, severity=tl.severity_of(r['severity']),
+                          title=r['title'] or '', details=r['message'] or '', what='incident',
+                          params={'status': r['status'] or '', 'resolved_at': r['resolved_at'] or ''},
+                          route='/api/plugins/status_page/api/incidents'))
+    return kept.result()
 
 
 def _read(ask):
@@ -648,9 +760,10 @@ def _read(ask):
 
 
 def _floor(note, got):
-    """A source that hit its cap may hold older rows it did not hand over: the oldest row it
-    did is as deep as a page can go before those would be missed"""
-    if note.get('capped') and got:
+    """A source that hit its cap may hold older rows it did not hand over: how deep it read
+    (the floor it set) or else the oldest row it handed over is as deep as a page can go
+    before those would be missed"""
+    if note.get('capped') and got and note.get('_floor') is None:
         note['_floor'] = min(ev['_at'] for ev in got)
 
 
@@ -699,7 +812,8 @@ def get_timeline():
         node = None
     vmid = args.get('vmid')
     if vmid is not None and vmid != '':
-        if not vmid.isdigit() or len(vmid) > 9 or int(vmid) < 1:
+        # str.isdigit() takes a superscript two, int() does not
+        if not _DIGITS.fullmatch(vmid) or len(vmid) > 9 or int(vmid) < 1:
             return _bad('vmid must be a guest id')
         vmid = int(vmid)
     else:
@@ -707,7 +821,7 @@ def get_timeline():
     try:
         until = tl.parse_when(args['to']) if args.get('to') else datetime.now(timezone.utc)
         since = tl.parse_when(args['from']) if args.get('from') else until - tl.WINDOW_DEFAULT
-    except ValueError:
+    except (ValueError, OverflowError):
         return _bad('from and to must be ISO 8601 times or epoch seconds')
     if since >= until:
         return _bad('from must be before to')
@@ -730,7 +844,7 @@ def get_timeline():
     raw = args.get('correlate')
     if raw is None or raw == '':
         correlate = tl.CORRELATE_DEFAULT
-    elif raw.isdigit() and int(raw) <= tl.CORRELATE_MAX:
+    elif _DIGITS.fullmatch(raw) and int(raw) <= tl.CORRELATE_MAX:
         correlate = int(raw)
     else:
         return _bad(f'correlate is minutes from 0 to {tl.CORRELATE_MAX}')
@@ -739,8 +853,12 @@ def get_timeline():
     from pegaprox.utils.auth import build_authz_user
     user = build_authz_user(request.session.get('user', ''), request.session)
     window = timedelta(minutes=correlate)
-    hi = min(until, before[0]) if before else until
-    ask = _Ask(cid, mgr, user, node, vmid, since - window, hi, limit)
+    # the page before ended within the cursor's second: that second is read whole again
+    hi, edge = until, None
+    if before and before[0] <= until:
+        hi = edge = before[0].replace(microsecond=0)
+    ask = _Ask(cid, mgr, user, node, vmid, since - window, hi, limit, edge=edge, before=before,
+               kinds=kinds, severities=severities)
     if vmid is not None and not ask.sees(vmid):
         return jsonify({'error': 'Permission denied'}), 403
 
@@ -755,7 +873,14 @@ def get_timeline():
                           limit=limit, floor=floor)
     tl.link(shown, events, window)
     capped = any(n.get('capped') for k, n in notes.items() if not kinds or k in kinds)
-    nxt = tl.cursor_of(shown[-1]) if shown and (more or capped) else None
+    if len(shown) >= limit and (more or capped):
+        nxt = tl.cursor_of(shown[-1])
+    elif floor is not None and floor >= since:
+        # MK Oct 2026 - what the filters keep down to the floor is all on this page, even when
+        # that is nothing: the next one starts below the floor's second, not at the end
+        nxt = tl.cursor_below(floor)
+    else:
+        nxt = None
     return jsonify({
         'cluster': cid, 'node': node, 'vmid': vmid,
         'from': tl.iso(since), 'to': tl.iso(until), 'clipped': clipped,

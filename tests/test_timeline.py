@@ -136,6 +136,19 @@ def test_a_standby_records_nothing(db, ha_env):  # noqa: F811
     assert _rows(db) == []
 
 
+def test_a_standby_follows_the_quorum_and_a_takeover_does_not_date_it(db, monkeypatch):
+    """The quorum came back while this instance stood by: taking over later is no event."""
+    active = {'now': True}
+    monkeypatch.setattr(node_history.ha, 'is_active', lambda: active['now'])
+    node_history.observe_quorum(CID, True)
+    node_history.observe_quorum(CID, False, ['pve2'])
+    active['now'] = False
+    node_history.observe_quorum(CID, True)
+    active['now'] = True
+    node_history.observe_quorum(CID, True)
+    assert _rows(db) == [('', 'no_quorum', 'quorate', 'not seen: pve2')]
+
+
 def test_without_a_database_nothing_is_recorded(monkeypatch):
     import pegaprox.core.db as dbmod
     monkeypatch.setattr(dbmod, '_db', None)
@@ -484,7 +497,9 @@ def test_an_oversized_limit_is_capped(env):
 @pytest.mark.parametrize('query', ['', '&cluster=', '&node=bad%20name', '&vmid=abc', '&vmid=0', '&vmid=1234567890',
                                    '&from=yesterday', '&to=2026-13-40', '&kinds=audit,bogus', '&kinds=,',
                                    '&severity=loud', '&before=nope', '&before=2026-10-10T10:00:00Z|x',
-                                   '&correlate=-1', '&correlate=121', '&correlate=ten'])
+                                   '&correlate=-1', '&correlate=121', '&correlate=ten',
+                                   '&to=9999-12-31T23:59:59', '&from=0001-01-01T00:00:00&to=0001-01-01T00:00:01',
+                                   '&correlate=' + '9' * 5000, '&vmid=%EF%BC%91'])
 def test_a_malformed_query_is_a_400(env, query):
     c = _admin_client(env)
     path = '/api/timeline?' + query.lstrip('&') if query.startswith('&cluster=') or query == '' else ROUTE + query
@@ -532,6 +547,72 @@ def test_pages_lose_nothing_when_a_source_hits_its_cap(env):
     whole = [e['id'] for e in _get(c, f'&limit=500{q}')['events']]
     assert len(whole) >= 18 and len(set(seen)) == len(seen)
     assert seen == whole, (len(seen), len(whole))
+
+
+def _follow(client, query, pages=40):
+    seen, before = [], ''
+    for _ in range(pages):
+        body = _get(client, query + before)
+        seen += [e['id'] for e in body['events']]
+        if not body['next_before']:
+            return seen
+        before = '&before=' + body['next_before'].replace('+', '%2B')
+    raise AssertionError(f'{query}: still paging after {pages} pages')
+
+
+def test_a_second_a_read_cuts_through_is_read_whole(env):
+    """The audit trail stores microseconds, and a read its limit cuts inside a second keeps the
+    latest of them, which need not be the highest ids the page sorts by within the second.
+    The rest of that second is read too, so none of it falls behind the cursor."""
+    ids = []
+    for i in range(5):
+        _audit(env.db, 1, 'vm.config', f'Updated config of VM {100 + i} [lab]')
+        ids.append(env.db.query('SELECT MAX(id) AS i FROM audit_log')[0]['i'])
+        _q(env.db, 'UPDATE audit_log SET timestamp = ? WHERE id = ?', f'{_local(1)}.{900000 - i * 100000:06d}', ids[-1])
+    c = _admin_client(env)
+    whole = [e['id'] for e in _get(c, '&kinds=audit&limit=500')['events']]
+    assert len(whole) == 8 and whole[:5] == [f'audit:{i}' for i in reversed(ids)]
+    assert _follow(c, '&kinds=audit&limit=2') == whole
+
+
+@pytest.fixture
+def shallow(monkeypatch):
+    """A source the severity thins out reads no more than a page, as every source did before."""
+    import pegaprox.api.timeline as tapi
+    monkeypatch.setattr(tapi, 'SIFT', 0)
+
+
+def test_a_severity_filter_reads_past_a_page_of_info_rows(env):
+    """The newest audit rows of a busy cluster are info: a page of critical events reads on
+    past them instead of coming back empty."""
+    for i in range(10):
+        _audit(env.db, 1 + i / 10, 'vm.config', 'Updated config of VM 100 [lab]')
+    first = _get(_admin_client(env), '&kinds=audit,node&severity=critical&limit=3')
+    assert [e['kind'] for e in first['events']] == ['node']
+
+
+def test_a_page_the_floor_empties_says_where_to_go_on(env, shallow):
+    """Every row a capped source read is dropped by the filter: the page is empty, and the
+    next one starts below the second that source read down to."""
+    for i in range(3):
+        _audit(env.db, 1 + i / 10, 'vm.config', 'Updated config of VM 100 [lab]')
+    c = _admin_client(env)
+    q = '&kinds=audit,node&severity=critical'
+    first = _get(c, q + '&limit=3')
+    assert first['events'] == [] and first['next_before'].endswith('|:')
+    assert _follow(c, q + '&limit=3') == [e['id'] for e in _get(c, q + '&limit=500')['events']]
+
+
+def test_the_alerts_go_as_deep_as_each_of_their_reads(env, shallow):
+    """Fired and cleared are two reads. A clear far below a capped read of the fired ones is
+    no floor for those: the fired ones that read left out come on the next page."""
+    _q(env.db, 'DELETE FROM active_alerts')
+    for i in range(5):
+        _alert(env.db, f'f{i}', 1 + i / 10, 'vm', 100, 'web01', severity='critical' if i % 2 == 0 else 'warning')
+    _alert(env.db, 'old', 55, 'vm', 200, 'db01', severity='warning', resolved_ago=50)
+    c = _admin_client(env)
+    q = '&kinds=alert,node&severity=critical'
+    assert _follow(c, q + '&limit=3') == ['alert:f0', 'alert:f2', 'alert:f4', 'node:1']
 
 
 def test_an_unknown_cluster_is_a_404(env):
@@ -618,6 +699,8 @@ def test_a_standby_reads_the_timeline_from_its_active():
 
 
 def test_the_route_reads_no_fresh_guest_list_and_the_tasks_from_the_cache(env):
+    from pegaprox.api import reports
+    reports._AMBIGUOUS_HOSTS['at'] = 0.0       # cold, as after a minute: not filled by an earlier test
     _get(_admin_client(env))
     env.mgr.get_tasks.assert_called_with(limit=50)
     assert not env.mgr.get_vm_resources.called and not env.mgr.get_node_status.called

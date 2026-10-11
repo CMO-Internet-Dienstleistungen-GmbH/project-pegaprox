@@ -120,7 +120,19 @@ def _syslog_hostname_tokens(value):
     return tokens
 
 
-def _syslog_cluster_hostnames(cluster_id):
+def _syslog_cached_node_names(manager):
+    """The node names a manager last read (its short node status cache, else what the HA
+    monitor keeps), None when it holds none."""
+    cached = getattr(manager, '_node_status_cache', None)
+    if isinstance(cached, tuple) and len(cached) == 2 and isinstance(cached[1], dict) and cached[1]:
+        return list(cached[1])
+    nodes = getattr(manager, 'ha_node_status', None)
+    return list(nodes) if isinstance(nodes, dict) and nodes else None
+
+
+def _syslog_cluster_hostnames(cluster_id, cached_only=False):
+    """cached_only: the node names the manager already holds where it holds any, a read of
+    its nodes only where it holds none."""
     manager = cluster_managers.get(cluster_id)
     if not manager:
         return set()
@@ -134,6 +146,11 @@ def _syslog_cluster_hostnames(cluster_id):
     ):
         hostnames.update(_syslog_hostname_tokens(value))
 
+    names = _syslog_cached_node_names(manager) if cached_only else None
+    if names is not None:
+        for node_name in names:
+            hostnames.update(_syslog_hostname_tokens(node_name))
+        return hostnames
     try:
         node_status = manager.get_node_status() or {}
         for node_name in node_status.keys():
@@ -151,7 +168,7 @@ _AMBIGUOUS_HOSTS_TTL = 60.0
 _AMBIGUOUS_HOSTS_LOCK = threading.Lock()
 
 
-def _syslog_ambiguous_hostnames():
+def _syslog_ambiguous_hostnames(cached_only=False):
     """Host tokens that more than one cluster claims.
 
     MK Sep 2026 - _syslog_hostname_tokens derives a short form from every node name, so
@@ -164,6 +181,9 @@ def _syslog_ambiguous_hostnames():
 
     Memoised for a minute: node names change on the timescale of a reinstall, and
     working them out walks every cluster's node list.
+
+    MK Oct 2026 - cached_only (the timeline, which promises no read of its own): each
+    cluster's node names as its manager last read them, a read only for one that holds none.
     """
     now = time.time()
     cached = _AMBIGUOUS_HOSTS
@@ -174,7 +194,8 @@ def _syslog_ambiguous_hostnames():
             return _AMBIGUOUS_HOSTS['tokens']
         claims = {}
         for _cid in list(cluster_managers.keys()):
-            for _tok in _syslog_cluster_hostnames(_cid):
+            _toks = _syslog_cluster_hostnames(_cid, cached_only=True) if cached_only else _syslog_cluster_hostnames(_cid)
+            for _tok in _toks:
                 claims.setdefault(_tok, set()).add(_cid)
         tokens = frozenset(t for t, cids in claims.items() if len(cids) > 1)
         if tokens:
@@ -190,14 +211,14 @@ def _syslog_like_literal(value):
     return value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
 
 
-def _syslog_host_clause(values, params):
+def _syslog_host_clause(values, params, cached_only=False):
     """`(host = x OR host LIKE 'x.%' OR ...)` over the tokens that identify one cluster.
 
     NS Oct 2026 - the tokens come from the cluster name and host, which a cluster.config
     holder sets on their own cluster. A name of '%' made the LIKE half match every host
     with a dot in it, so the caller read every tenant's syslog (#1119). Only the '.%' we
     add is a wildcard now."""
-    _ambiguous = _syslog_ambiguous_hostnames()
+    _ambiguous = _syslog_ambiguous_hostnames(cached_only=cached_only)
     parts = []
     for value in sorted(set(values) - _ambiguous):
         parts.append("LOWER(logs.hostname) = ?")
