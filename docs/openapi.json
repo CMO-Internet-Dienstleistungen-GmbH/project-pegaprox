@@ -24521,7 +24521,7 @@
           }
         },
         "summary": "Read or write the auto-verify policy.",
-        "description": "Schema (in pegaprox config row 'pbs_verify_schedule'):\n  {\"enabled\": bool, \"weekly_count\": int, \"day\": \"sun\", \"hour\": 4,\n   \"scope\": \"all\"|\"latest_per_vm\", \"max_age_days\": int}\n\nMK Oct 2026 - background/restore_tests.py runs it now; until then nothing read it. A\nPUT takes what it sends on top of what is stored and answers 400 for a field out of\nrange (an int() of a word was a 500).",
+        "description": "Schema (in pegaprox config row 'pbs_verify_schedule'):\n  {\"enabled\": bool, \"weekly_count\": int, \"day\": \"sun\", \"hour\": 4,\n   \"scope\": \"all\"|\"latest_per_vm\", \"max_age_days\": int, \"max_backup_gb\": int,\n   \"confirmed_at\": epoch|null}\n\nMK Oct 2026 - background/restore_tests.py runs it now; until then nothing read it. A\nPUT takes what it sends on top of what is stored and answers 400 for a field out of\nrange (an int() of a word was a 500). max_backup_gb (1-2048, 32 where a stored policy\nhas none) is the largest backup the run restores. \"confirmed\": true with the run on\nis the dialog's yes to real restores; confirmed_at keeps it until the run is off.",
         "x-pegaprox-auth": "decorator",
         "security": [
           {
@@ -24555,7 +24555,7 @@
           }
         },
         "summary": "Read or write the auto-verify policy.",
-        "description": "Schema (in pegaprox config row 'pbs_verify_schedule'):\n  {\"enabled\": bool, \"weekly_count\": int, \"day\": \"sun\", \"hour\": 4,\n   \"scope\": \"all\"|\"latest_per_vm\", \"max_age_days\": int}\n\nMK Oct 2026 - background/restore_tests.py runs it now; until then nothing read it. A\nPUT takes what it sends on top of what is stored and answers 400 for a field out of\nrange (an int() of a word was a 500).",
+        "description": "Schema (in pegaprox config row 'pbs_verify_schedule'):\n  {\"enabled\": bool, \"weekly_count\": int, \"day\": \"sun\", \"hour\": 4,\n   \"scope\": \"all\"|\"latest_per_vm\", \"max_age_days\": int, \"max_backup_gb\": int,\n   \"confirmed_at\": epoch|null}\n\nMK Oct 2026 - background/restore_tests.py runs it now; until then nothing read it. A\nPUT takes what it sends on top of what is stored and answers 400 for a field out of\nrange (an int() of a word was a 500). max_backup_gb (1-2048, 32 where a stored policy\nhas none) is the largest backup the run restores. \"confirmed\": true with the run on\nis the dialog's yes to real restores; confirmed_at keeps it until the run is off.",
         "requestBody": {
           "required": false,
           "content": {

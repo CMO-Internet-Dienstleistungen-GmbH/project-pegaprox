@@ -615,6 +615,73 @@ def sweep(managers):
 
 
 # ---------------------------------------------------------------------------
+# room for the copy (the weekly run asks before each restore)
+# ---------------------------------------------------------------------------
+
+# the disks of a VM qmrestore writes from the archive
+_RESTORED_DISK_RE = re.compile(r'(?:scsi|virtio|sata|ide)\d+|efidisk\d+|tpmstate\d+')
+SPACE_READ_TIMEOUT = 10
+
+
+def restore_storages(pve_mgr, node, volid, vm_type, plan):
+    """The storages a restore test of `volid` on `node` writes the copy's disks to, as _run
+    sends the restore: the plan's test storage when there is one; without it a container
+    goes to 'local' (pct restore puts every volume on its default storage) and a VM's disks
+    to the storages its backup's config names (qmrestore keeps them, a disk left out of the
+    backup is not written). Raises when that config cannot be read."""
+    if plan.get('test_storage'):
+        return [plan['test_storage']]
+    if vm_type == 'lxc':
+        return ['local']
+    config = _backup_config(pve_mgr, f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json", node, volid)
+    out = set()
+    for key, value in config.items():
+        if not _RESTORED_DISK_RE.fullmatch(key):
+            continue
+        opts = _opts(value)
+        given, vol = dict((k, v) for k, v in opts), _volume(opts)
+        if given.get('media') == 'cdrom' or given.get('backup') == '0' or ':' not in vol or vol.startswith('/'):
+            continue
+        out.add(vol.split(':', 1)[0])
+    return sorted(out)
+
+
+def room_for(pve_mgr, node, volid, vm_type, plan, size):
+    """None when every storage a restore test of `volid` on `node` writes to has the
+    backup's `size` (bytes) free, else why not: {'reason', 'cause', 'storage', 'free',
+    'size'} with reason 'no_space', or 'space_unknown' where the storages or their free
+    space could not be read. What each storage gets of the backup is not known before the
+    restore, so each needs all of it. Never raises."""
+    from pegaprox.core.recovery import GIB, _STORAGE_RE
+
+    def short(reason, cause, storage='', free=None):
+        return {'reason': reason, 'cause': cause[:200], 'storage': storage, 'free': free, 'size': size}
+    if not size:
+        return short('size_unknown', 'the size of the backup is unknown')
+    try:
+        storages = restore_storages(pve_mgr, node, volid, vm_type, plan)
+    except Exception as e:
+        return short('space_unknown', f'the storages the restore writes to are unknown: {e}')
+    base = f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json"
+    for storage in storages:
+        if not _STORAGE_RE.match(storage):
+            return short('space_unknown', f'the backup names a storage that is none: {storage[:40]}')
+        try:
+            r = pve_mgr._api_get(f"{base}/nodes/{node}/storage/{storage}/status", timeout=SPACE_READ_TIMEOUT)
+            data = r.json().get('data') if r.status_code == 200 else None
+        except Exception:
+            data = None
+        avail = data.get('avail') if isinstance(data, dict) else None
+        if (not isinstance(avail, (int, float)) or isinstance(avail, bool)
+                or str(data.get('active', 1)) in ('0', 'False')):
+            return short('space_unknown', f'the free space of {storage} on {node} could not be read', storage)
+        if avail < size:
+            return short('no_space', f'{storage} on {node} has {avail / GIB:.1f} GB free, '
+                                     f'the backup is {size / GIB:.1f} GB', storage, int(avail))
+    return None
+
+
+# ---------------------------------------------------------------------------
 # isolation
 # ---------------------------------------------------------------------------
 

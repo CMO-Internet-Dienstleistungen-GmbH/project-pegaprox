@@ -74,8 +74,15 @@ SCHEDULE_KEY = 'pbs_verify_schedule'
 STATE_KEY = 'pbs_verify_schedule_state'
 DAYS = ('mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun')
 SCHEDULE_DEFAULT = {'enabled': False, 'weekly_count': 5, 'day': 'sun', 'hour': 4,
-                    'scope': 'latest_per_vm', 'max_age_days': 30}
+                    'scope': 'latest_per_vm', 'max_age_days': 30, 'max_backup_gb': 32,
+                    'confirmed_at': None}
 SCOPES = ('latest_per_vm', 'all')
+# MK Oct 2026 - the largest backup the weekly run restores, in GiB as Proxmox counts them
+GIB = 1024 ** 3
+BACKUP_GB_MIN, BACKUP_GB_MAX = 1, 2048
+SKIPPED_MAX = 100            # backups a run reports as left out for their size
+_SCHEDULE_NUMBERS = (('weekly_count', 1, 50), ('hour', 0, 23), ('max_age_days', 1, 365),
+                     ('max_backup_gb', BACKUP_GB_MIN, BACKUP_GB_MAX))
 
 _backups = {}                # cid -> {'at', 'guests': {vmid: [backup]}, 'nodes', 'partial'}
 _backup_locks = {}
@@ -479,9 +486,12 @@ def _read_backups(mgr):
                 kind = it.get('subtype') if it.get('subtype') in ('qemu', 'lxc') else backup_kind(volid)
                 if not kind:
                     continue
+                size = it.get('size')
+                if isinstance(size, bool) or not isinstance(size, (int, float)) or size <= 0:
+                    size = None         # a PBS snapshot still being written lists none
                 guests.setdefault(int(vmid), []).append({
                     'volid': volid, 'ctime': int(ctime), 'kind': kind, 'storage': storage,
-                    'node': None if shared else node,
+                    'node': None if shared else node, 'size': None if size is None else int(size),
                     'verified': ((it.get('verification') or {}).get('state') if isinstance(it.get('verification'), dict) else None),
                 })
     for vmid, items in guests.items():
@@ -505,7 +515,8 @@ def _read_backups(mgr):
 def guest_backups(cluster_id, mgr, max_age=BACKUPS_FRESH, now=None):
     """The backups of each guest of a cluster, newest first, as one read of its backup
     storages no older than max_age: {'at', 'guests': {vmid: [{volid, ctime, kind, storage,
-    node}]}, 'nodes': [online], 'partial'}. node is None for a backup on shared storage.
+    node, size}]}, 'nodes': [online], 'partial'}. node is None for a backup on shared
+    storage, size (bytes) None where the listing has none.
     None when nothing could be read and no earlier read is kept."""
     now = time.time() if now is None else now
 
@@ -713,10 +724,12 @@ def _kv_write(key, value):
 
 
 def _sane_schedule(raw):
+    """Every field in range; one the stored row does not have (max_backup_gb in a policy
+    saved before it existed) is the default."""
     out = dict(SCHEDULE_DEFAULT)
     raw = raw if isinstance(raw, dict) else {}
     out['enabled'] = raw.get('enabled') is True
-    for k, lo, hi in (('weekly_count', 1, 50), ('hour', 0, 23), ('max_age_days', 1, 365)):
+    for k, lo, hi in _SCHEDULE_NUMBERS:
         n = _whole(raw.get(k), lo, hi)
         if n is not None:
             out[k] = n
@@ -724,6 +737,9 @@ def _sane_schedule(raw):
         out['day'] = raw['day']
     if raw.get('scope') in SCOPES:
         out['scope'] = raw['scope']
+    at = raw.get('confirmed_at')
+    if out['enabled'] and isinstance(at, (int, float)) and not isinstance(at, bool):
+        out['confirmed_at'] = at
     return out
 
 
@@ -732,16 +748,26 @@ def load_schedule():
     return _sane_schedule(_kv_read(SCHEDULE_KEY))
 
 
-def clean_schedule(body, current):
-    """(policy, None) from a PUT body on top of `current`, or (None, why it is refused)."""
+def backup_cap(policy):
+    """The largest backup the weekly run restores, in bytes."""
+    gb = _whole(policy.get('max_backup_gb'), BACKUP_GB_MIN, BACKUP_GB_MAX)
+    return (gb or SCHEDULE_DEFAULT['max_backup_gb']) * GIB
+
+
+def clean_schedule(body, current, now=None):
+    """(policy, None) from a PUT body on top of `current`, or (None, why it is refused).
+    MK Oct 2026 - 'confirmed': true with the run switched on is the dialog's yes to real
+    restores, kept as confirmed_at until the run is switched off; the UI asks again for an
+    enabled policy without one (switched on before it asked)."""
     if not isinstance(body, dict):
         return None, 'the request body must be a JSON object'
     out = dict(current)
+    for k in ('enabled', 'confirmed'):
+        if k in body and not isinstance(body[k], bool):
+            return None, f'{k} is true or false'
     if 'enabled' in body:
-        if not isinstance(body['enabled'], bool):
-            return None, 'enabled is true or false'
         out['enabled'] = body['enabled']
-    for k, lo, hi in (('weekly_count', 1, 50), ('hour', 0, 23), ('max_age_days', 1, 365)):
+    for k, lo, hi in _SCHEDULE_NUMBERS:
         if k in body:
             n = _whole(body[k], lo, hi)
             if n is None:
@@ -755,6 +781,10 @@ def clean_schedule(body, current):
         if body['scope'] not in SCOPES:
             return None, "scope is 'latest_per_vm' or 'all'"
         out['scope'] = body['scope']
+    if not out['enabled']:
+        out['confirmed_at'] = None
+    elif body.get('confirmed') is True:
+        out['confirmed_at'] = time.time() if now is None else now
     return out, None
 
 
@@ -811,16 +841,22 @@ def next_slot(policy, state, now, at_wall):
     return owed if owed is not None else latest_slot(policy, now) + timedelta(days=7)
 
 
-def pick(policy, managers, now=None, busy=()):
+def pick(policy, managers, now=None, busy=(), skipped=None):
     """The backups the run tests: up to weekly_count of them over every connected Proxmox
     cluster, those of the guests whose last test is oldest first (never tested before
     all), no backup older than max_age_days. scope 'latest_per_vm' takes the newest backup
     of a guest, 'all' any backup in the window other than the one last tested, newest
     first. `busy`: (cluster_id, vmid) with a test running. A guest whose node is not
-    online is left out. One read of the guests and one of the backups per cluster."""
+    online is left out. One read of the guests and one of the backups per cluster.
+
+    MK Oct 2026 - a backup larger than max_backup_gb is not restored, nor one whose size
+    the storage does not list. `skipped`, a list, takes those of them the run would have
+    tested otherwise (ranked ahead of its last pick, or any when the picks fell short),
+    best first, at most SKIPPED_MAX, each with 'reason' 'too_large' or 'size_unknown'."""
     now = time.time() if now is None else now
     cutoff = now - policy['max_age_days'] * 86400
-    heap = []
+    cap = backup_cap(policy)
+    heap, left = [], []
     for cid, mgr in list(managers.items()):
         if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox' or not getattr(mgr, 'is_connected', False):
             continue
@@ -851,15 +887,28 @@ def pick(policy, managers, now=None, busy=()):
                 if node not in online:
                     continue
                 entry = (last, -b['ctime'], cid, vmid, b['volid'])
+                size = b.get('size')
                 item = {'cluster_id': cid, 'vmid': vmid, 'name': r.get('name') or '', 'type': r.get('type'),
                         'node': node, 'volid': b['volid'], 'backup_ts': b['ctime'], 'storage': b['storage'],
-                        'tags': sorted(guest_tags(r.get('tags')))}
-                if len(heap) < policy['weekly_count']:
-                    heapq.heappush(heap, (_Neg(entry), item))
-                elif _Neg(entry) > heap[0][0]:
-                    heapq.heapreplace(heap, (_Neg(entry), item))
+                        'size': size, 'tags': sorted(guest_tags(r.get('tags')))}
+                if not size or size > cap:
+                    if skipped is not None:
+                        _keep(left, SKIPPED_MAX, entry, dict(item, reason='too_large' if size else 'size_unknown'))
+                    continue
+                _keep(heap, policy['weekly_count'], entry, item)
     picked = sorted(heap, key=lambda h: h[0].v)
+    if skipped is not None:
+        last = picked[-1][0].v if len(picked) >= policy['weekly_count'] else None
+        skipped.extend(item for k, item in sorted(left, key=lambda h: h[0].v) if last is None or k.v < last)
     return [item for _k, item in picked]
+
+
+def _keep(heap, n, entry, item):
+    """Keep the n best entries that go by in `heap` (its worst on top)."""
+    if len(heap) < n:
+        heapq.heappush(heap, (_Neg(entry), item))
+    elif _Neg(entry) > heap[0][0]:
+        heapq.heapreplace(heap, (_Neg(entry), item))
 
 
 class _Neg:

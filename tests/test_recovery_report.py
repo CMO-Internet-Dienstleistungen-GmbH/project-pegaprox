@@ -11,7 +11,8 @@
   PUT  /api/clusters/<id>/recovery-settings           the defaults (admin)
   PUT  /api/clusters/<id>/recovery-settings/rules     a guest or tag rule (admin)
   DELETE .../recovery-settings/rules/<scope>/<key>
-  PUT  /api/pbs/verify-schedule                       400 for what is out of range (was a 500)
+  PUT  /api/pbs/verify-schedule                       400 for what is out of range (was a 500);
+                                                      the size cap, the yes to real restores
   GET  /api/pbs/verify-schedule/status                next run, last run, its results
 
 Who sees what: an admin all of it, an operator whose tenant owns the cluster the whole
@@ -414,12 +415,67 @@ def test_a_bad_schedule_is_a_400_not_a_500(routes, body, needle):
     assert recovery.load_schedule() == recovery.SCHEDULE_DEFAULT
 
 
+@pytest.mark.parametrize('body,needle', [
+    ({'max_backup_gb': 0}, 'max_backup_gb is a whole number from 1 to 2048'),
+    ({'max_backup_gb': 2049}, 'max_backup_gb'),
+    ({'max_backup_gb': 'big'}, 'max_backup_gb'),
+    ({'max_backup_gb': 12.5}, 'max_backup_gb'),
+    ({'max_backup_gb': True}, 'max_backup_gb'),
+    ({'max_backup_gb': None}, 'max_backup_gb'),
+    ({'enabled': True, 'confirmed': 'yes'}, 'confirmed is true or false'),
+])
+def test_a_bad_size_cap_or_confirmation_is_a_400(routes, body, needle):
+    routes.admin.put('/api/pbs/verify-schedule', json={'max_backup_gb': 64})
+    r = routes.admin.put('/api/pbs/verify-schedule', json=body)
+    assert r.status_code == 400 and needle in r.get_json()['error'], (body, r.data)
+    assert recovery.load_schedule() == dict(recovery.SCHEDULE_DEFAULT, max_backup_gb=64)
+
+
+def test_the_size_cap_is_stored_merged_and_32_for_an_older_policy(routes):
+    assert routes.admin.get('/api/pbs/verify-schedule').get_json()['max_backup_gb'] == 32
+    r = routes.admin.put('/api/pbs/verify-schedule', json={'max_backup_gb': 100, 'hour': 3})
+    assert r.status_code == 200 and r.get_json()['max_backup_gb'] == 100
+    routes.admin.put('/api/pbs/verify-schedule', json={'hour': 5})
+    assert recovery.load_schedule()['max_backup_gb'] == 100 and recovery.load_schedule()['hour'] == 5
+    assert routes.admin.put('/api/pbs/verify-schedule', json={'max_backup_gb': '2048'}).status_code == 200
+    assert recovery.load_schedule()['max_backup_gb'] == 2048
+    # a row the dialog stored before the cap existed
+    recovery._kv_write(recovery.SCHEDULE_KEY, {'enabled': True, 'weekly_count': 5, 'day': 'sun', 'hour': 4,
+                                               'scope': 'latest_per_vm', 'max_age_days': 30})
+    body = routes.admin.get('/api/pbs/verify-schedule').get_json()
+    assert body['max_backup_gb'] == 32 and body['enabled'] is True and body['confirmed_at'] is None
+    assert routes.admin.get('/api/pbs/verify-schedule/status').get_json()['policy']['max_backup_gb'] == 32
+
+
+def test_the_yes_to_real_restores_is_kept_until_the_run_is_switched_off(routes):
+    from pegaprox.core.db import get_db
+    r = routes.admin.put('/api/pbs/verify-schedule', json={'enabled': True})
+    assert r.status_code == 200 and r.get_json()['confirmed_at'] is None
+    r = routes.admin.put('/api/pbs/verify-schedule', json={'enabled': True, 'confirmed': True,
+                                                           'confirmed_at': 1})
+    at = r.get_json()['confirmed_at']
+    assert at and abs(at - time.time()) < 60                  # the server's clock, not the caller's
+    routes.admin.put('/api/pbs/verify-schedule', json={'hour': 6})
+    assert recovery.load_schedule()['confirmed_at'] == at
+    audit = [row[0] for row in get_db().conn.execute(
+        "SELECT details FROM audit_log WHERE action = 'pbs.verify_schedule_updated' ORDER BY id")]
+    assert [('real restores confirmed' in a) for a in audit] == [False, True, False]
+    routes.admin.put('/api/pbs/verify-schedule', json={'enabled': False})
+    assert recovery.load_schedule()['confirmed_at'] is None
+    # on again, it is asked for again
+    assert routes.admin.put('/api/pbs/verify-schedule', json={'enabled': True}).get_json()['confirmed_at'] is None
+    # a confirmation of a run left off is none
+    routes.admin.put('/api/pbs/verify-schedule', json={'enabled': False})
+    assert routes.admin.put('/api/pbs/verify-schedule', json={'confirmed': True}).get_json()['confirmed_at'] is None
+
+
 def test_a_schedule_is_stored_and_armed(routes):
     r = routes.admin.put('/api/pbs/verify-schedule', json={'enabled': True, 'day': 'sat', 'hour': 2,
                                                            'weekly_count': 3, 'scope': 'all', 'max_age_days': 14})
     assert r.status_code == 200, r.data
     assert recovery.load_schedule() == {'enabled': True, 'day': 'sat', 'hour': 2, 'weekly_count': 3,
-                                        'scope': 'all', 'max_age_days': 14}
+                                        'scope': 'all', 'max_age_days': 14, 'max_backup_gb': 32,
+                                        'confirmed_at': None}
     assert recovery.load_state()['armed_wall'] > NOW - 5
     # what the dialog leaves out stays as it was
     routes.admin.put('/api/pbs/verify-schedule', json={'hour': 6})

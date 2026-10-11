@@ -13,6 +13,11 @@ The run itself is one thread, one test after another through backup_verify.run_v
 never two runs at once; each test confirms the lease first (#625). Where it stands goes to
 the pegaprox_kv row 'pbs_verify_schedule_state' after every test, the picks and results
 with it, for the UI and for the next leader.
+
+A backup larger than the policy's max_backup_gb, or one of unknown size, is left out at
+the pick, and before each restore the storage it writes to has to have the backup's size
+free (backup_verify.room_for). Either is a result with status 'skipped' and its reason
+('too_large', 'size_unknown', 'no_space', 'space_unknown').
 """
 
 import logging
@@ -100,6 +105,17 @@ def tick(now=None, wall=None, start=True):
     return slot
 
 
+def _left_out(p, cap_gb):
+    """The result row of a backup pick() left out for its size."""
+    if p['reason'] == 'too_large':
+        cause = f"the backup is {p['size'] / recovery.GIB:.1f} GB, the schedule restores up to {cap_gb} GB"
+    else:
+        cause = 'the backup storage does not list the size of the backup'
+    return {'cluster_id': p['cluster_id'], 'vmid': p['vmid'], 'name': p['name'], 'volid': p['volid'],
+            'task_id': None, 'status': 'skipped', 'reason': p['reason'], 'cause': cause, 'size': p['size'],
+            'limit_gb': cap_gb, 'measured_seconds': None, 'rto_met': None}
+
+
 def _run_slot(slot, policy):
     """The tests of one slot, one after another."""
     from pegaprox.core import backup_verify
@@ -107,16 +123,23 @@ def _run_slot(slot, policy):
               'reason': '', 'picked': [], 'results': []}
     rules = {}
     try:
-        picks = recovery.pick(policy, cluster_managers, busy=backup_verify.running_guests())
-        report['picked'] = [{k: p[k] for k in ('cluster_id', 'vmid', 'name', 'type', 'node', 'volid', 'backup_ts')}
+        # MK Oct 2026 - a backup over the size cap, or of unknown size, is not restored: the
+        # first run put a 300 GB copy on a production node. The run says which it left out
+        skipped = []
+        picks = recovery.pick(policy, cluster_managers, busy=backup_verify.running_guests(), skipped=skipped)
+        report['picked'] = [{k: p[k] for k in ('cluster_id', 'vmid', 'name', 'type', 'node', 'volid', 'backup_ts',
+                                               'size')}
                             for p in picks]
+        cap_gb = recovery.backup_cap(policy) // recovery.GIB
+        report['results'] = [_left_out(s, cap_gb) for s in skipped]
         if not picks:
-            report['reason'] = 'no backup in the window to test'
+            report['reason'] = ('no backup in the window to test' if not skipped
+                                else 'every backup due was over the size cap or of unknown size')
         _write(report)
         for p in picks:
             cid, vmid = p['cluster_id'], p['vmid']
             entry = {'cluster_id': cid, 'vmid': vmid, 'name': p['name'], 'volid': p['volid'],
-                     'task_id': None, 'status': 'skipped', 'cause': '', 'measured_seconds': None,
+                     'task_id': None, 'status': 'skipped', 'reason': '', 'cause': '', 'measured_seconds': None,
                      'rto_met': None}
             if not ha.is_active():
                 report['state'], report['reason'] = 'stopped', 'this instance is no longer the active one'
@@ -133,6 +156,15 @@ def _run_slot(slot, policy):
                 plan = recovery.plan_for(cid, vmid, tags=set(p.get('tags') or ()), rules=rules[cid])
             except Exception as e:
                 entry['cause'] = f'the rules of the cluster could not be read: {e}'
+                report['results'].append(entry)
+                _write(report)
+                continue
+            # the storage the copy's disks go to has the backup's size free, read right before
+            # the restore; what cannot be read counts as no room
+            short = backup_verify.room_for(mgr, p['node'], p['volid'], recovery.backup_kind(p['volid']) or p['type'],
+                                           plan, p.get('size'))
+            if short:
+                entry.update(short)
                 report['results'].append(entry)
                 _write(report)
                 continue

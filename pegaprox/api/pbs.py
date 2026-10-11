@@ -4703,11 +4703,14 @@ def verify_schedule_config():
 
     Schema (in pegaprox config row 'pbs_verify_schedule'):
       {"enabled": bool, "weekly_count": int, "day": "sun", "hour": 4,
-       "scope": "all"|"latest_per_vm", "max_age_days": int}
+       "scope": "all"|"latest_per_vm", "max_age_days": int, "max_backup_gb": int,
+       "confirmed_at": epoch|null}
 
     MK Oct 2026 - background/restore_tests.py runs it now; until then nothing read it. A
     PUT takes what it sends on top of what is stored and answers 400 for a field out of
-    range (an int() of a word was a 500).
+    range (an int() of a word was a 500). max_backup_gb (1-2048, 32 where a stored policy
+    has none) is the largest backup the run restores. "confirmed": true with the run on
+    is the dialog's yes to real restores; confirmed_at keeps it until the run is off.
     """
     from pegaprox.core import recovery
     if request.method == 'GET':
@@ -4721,8 +4724,9 @@ def verify_schedule_config():
     if bad:
         return jsonify({'error': bad}), 400
     recovery.save_schedule(cleaned, before)
+    yes = cleaned['confirmed_at'] and cleaned['confirmed_at'] != before.get('confirmed_at')
     log_audit(request.session.get('user', 'system'), 'pbs.verify_schedule_updated',
-              f"Auto-verify schedule: {cleaned}")
+              f"Auto-verify schedule: {cleaned}" + (' - real restores confirmed' if yes else ''))
     return jsonify(cleaned)
 
 

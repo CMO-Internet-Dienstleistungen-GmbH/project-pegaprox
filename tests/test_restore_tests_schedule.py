@@ -12,6 +12,9 @@ ran. The loop runs it now, on the active instance only:
   * the pick: backups of the guests whose last test is oldest first, never tested before
     all, nothing older than max_age_days, nothing on a node that is not online; one read
     of the guest list and one of the backup storages per cluster, at 10k guests too
+  * nothing larger than max_backup_gb (32 for a policy stored before it), nothing of
+    unknown size, and nothing onto a storage without the backup's size free or whose
+    free space cannot be read; the run says which it left out and why
 
 MK Oct 2026
 """
@@ -163,24 +166,33 @@ class _Resp:
 
 
 NOW = _wall(SUNDAY)
+GIB = 1024 ** 3
+# what the backup holds, as extractconfig hands it out: one disk, a CD drive
+BACKUP_CONFIG = 'name: g\nscsi0: local-lvm:vm-100-disk-0,size=8G\nide2: none,media=cdrom\n'
 
 
-def _bk(vmid, hours_ago, kind='qemu', storage='pbs'):
+def _bk(vmid, hours_ago, kind='qemu', storage='pbs', size=2 * GIB):
     t = int(NOW - hours_ago * 3600)
     iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(t))
-    return {'volid': f"{storage}:backup/{'vm' if kind == 'qemu' else 'ct'}/{vmid}/{iso}", 'vmid': vmid,
-            'ctime': t, 'subtype': kind, 'content': 'backup', 'format': 'pbs-vm'}
+    out = {'volid': f"{storage}:backup/{'vm' if kind == 'qemu' else 'ct'}/{vmid}/{iso}", 'vmid': vmid,
+           'ctime': t, 'subtype': kind, 'content': 'backup', 'format': 'pbs-vm'}
+    if size is not None:
+        out['size'] = size
+    return out
 
 
 class _Mgr:
     cluster_type, is_connected = 'proxmox', True
     host, api_port = 'pve.example', 8006
 
-    def __init__(self, guests, content, nodes=('pve1', 'pve2'), offline=(), storages=None):
+    def __init__(self, guests, content, nodes=('pve1', 'pve2'), offline=(), storages=None, free=None,
+                 backup_config=BACKUP_CONFIG):
         self.config = types.SimpleNamespace(name='Testi', backup_sla_max_age_hours=24)
         self.guests, self.content = guests, content
         self.nodes, self.offline = nodes, offline
         self.storages = storages or [{'storage': 'pbs', 'type': 'pbs', 'content': 'backup'}]
+        # bytes free per storage; a storage not named has 500 GB, None does not answer
+        self.free, self.backup_config = free or {}, backup_config
         self.calls = []
 
     def get_vm_resources(self, max_age=0):
@@ -200,6 +212,14 @@ class _Mgr:
             if callable(got):
                 got = got(m.group(1))
             return _Resp(200, got) if got is not None else _Resp(500, None)
+        m = re.fullmatch(r'/nodes/([^/]+)/storage/([^/]+)/status', path)
+        if m:
+            free = self.free.get(m.group(2), 500 * GIB)
+            if free is None:
+                return _Resp(500, None)
+            return _Resp(200, {'total': 1000 * GIB, 'used': 1000 * GIB - free, 'avail': free, 'active': 1})
+        if re.fullmatch(r'/nodes/[^/]+/vzdump/extractconfig', path):
+            return _Resp(200, self.backup_config) if self.backup_config is not None else _Resp(500, None)
         return _Resp(404, None)
 
 
@@ -290,6 +310,121 @@ def test_ten_thousand_guests_cost_three_reads(clusters):
     assert len(clusters['c1'].calls) == 3
 
 
+# --- the size cap --------------------------------------------------------------------------
+
+def test_a_backup_over_the_cap_or_of_unknown_size_is_left_out_and_said_why(clusters):
+    clusters['c1'] = _Mgr([_g(100, name='db01'), _g(101), _g(102)],
+                          {'pbs': [_bk(100, 2, size=300 * GIB), _bk(101, 3), _bk(102, 4, size=None)]})
+    skipped = []
+    picks = recovery.pick(POLICY, clusters, now=NOW, skipped=skipped)
+    assert [p['vmid'] for p in picks] == [101] and picks[0]['size'] == 2 * GIB
+    assert [(s['vmid'], s['reason'], s['size']) for s in skipped] == [
+        (100, 'too_large', 300 * GIB), (102, 'size_unknown', None)]
+    assert skipped[0]['name'] == 'db01' and skipped[0]['volid'] == _bk(100, 2)['volid']
+    # the cap is the policy's: at 512 GB the large one is tested, the unknown one never is
+    skipped = []
+    picks = recovery.pick(dict(POLICY, max_backup_gb=512), clusters, now=NOW, skipped=skipped)
+    assert [p['vmid'] for p in picks] == [100, 101] and [s['vmid'] for s in skipped] == [102]
+    # exactly at the cap is within it
+    clusters['c1'].content['pbs'][0]['size'] = 32 * GIB
+    recovery.forget_backups()
+    assert [p['vmid'] for p in recovery.pick(POLICY, clusters, now=NOW)] == [100, 101]
+
+
+def test_a_policy_stored_before_the_cap_is_held_to_32_gb(clusters):
+    old = {k: v for k, v in POLICY.items() if k not in ('max_backup_gb', 'confirmed_at')}
+    recovery._kv_write(recovery.SCHEDULE_KEY, old)            # as the dialog stored it months ago
+    assert recovery.load_schedule()['max_backup_gb'] == 32
+    assert recovery.load_schedule()['enabled'] is True and recovery.load_schedule()['confirmed_at'] is None
+    clusters['c1'] = _Mgr([_g(100), _g(101)], {'pbs': [_bk(100, 2, size=33 * GIB), _bk(101, 3, size=31 * GIB)]})
+    skipped = []
+    assert [p['vmid'] for p in recovery.pick(old, clusters, now=NOW, skipped=skipped)] == [101]
+    assert [(s['vmid'], s['reason']) for s in skipped] == [(100, 'too_large')]
+    assert recovery.backup_cap(old) == 32 * GIB == recovery.backup_cap(recovery.load_schedule())
+
+
+def test_only_what_the_run_would_have_tested_is_reported_left_out(clusters):
+    # weekly_count 1: 100 (never tested, too large) ranks ahead of 101, the one picked; 102 was
+    # tested yesterday and too large, it would not have been tested this week anyway
+    clusters['c1'] = _Mgr([_g(100), _g(101), _g(102)],
+                          {'pbs': [_bk(100, 2, size=99 * GIB), _bk(101, 3), _bk(102, 1, size=99 * GIB)]})
+    _mark('c1', 102, NOW - 86400)
+    skipped = []
+    picks = recovery.pick(dict(POLICY, weekly_count=1), clusters, now=NOW, skipped=skipped)
+    assert [p['vmid'] for p in picks] == [101] and [s['vmid'] for s in skipped] == [100]
+    # with the week not full every left-out backup is said, at most SKIPPED_MAX of them
+    skipped = []
+    recovery.pick(dict(POLICY, weekly_count=5), clusters, now=NOW, skipped=skipped)
+    assert [s['vmid'] for s in skipped] == [100, 102]
+    many = [_g(1000 + i) for i in range(300)]
+    clusters['c1'] = _Mgr(many, {'pbs': [_bk(1000 + i, 1, size=99 * GIB) for i in range(300)]})
+    recovery.forget_backups()
+    skipped = []
+    assert recovery.pick(POLICY, clusters, now=NOW, skipped=skipped) == []
+    assert len(skipped) == recovery.SKIPPED_MAX
+
+
+# --- the free space ------------------------------------------------------------------------
+
+_VOL = 'pbs:backup/vm/100/2026-10-10T02:00:00Z'
+
+
+def test_room_is_read_on_each_storage_the_restore_writes_to():
+    cfg = ('scsi0: local-lvm:vm-100-disk-0,size=8G\nefidisk0: ceph:vm-100-disk-1,size=4M\n'
+           'scsi1: big:vm-100-disk-2,backup=0\nide2: local:iso/x.iso,media=cdrom\n'
+           'sata0: /dev/disk/by-id/ata-x\nnet0: virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0\n')
+    mgr = _Mgr([], {}, free={'local-lvm': 10 * GIB, 'ceph': 3 * GIB}, backup_config=cfg)
+    assert bv.room_for(mgr, 'pve1', _VOL, 'qemu', {'test_storage': ''}, 2 * GIB) is None
+    # not the disk left out of the backup, not the CD, not a disk of the node
+    assert sorted(c for c in mgr.calls if c.endswith('/status')) == [
+        '/nodes/pve1/storage/ceph/status', '/nodes/pve1/storage/local-lvm/status']
+    short = bv.room_for(mgr, 'pve1', _VOL, 'qemu', {}, 4 * GIB)
+    assert short['reason'] == 'no_space' and short['storage'] == 'ceph' and short['free'] == 3 * GIB
+    assert short['size'] == 4 * GIB and '3.0 GB free' in short['cause']
+    # the cluster's test storage is where it goes, the backup's config is not read for it
+    mgr.calls.clear()
+    assert bv.room_for(mgr, 'pve2', _VOL, 'qemu', {'test_storage': 'scratch'}, 4 * GIB) is None
+    assert mgr.calls == ['/nodes/pve2/storage/scratch/status']
+    # a container restored without one goes to 'local'
+    mgr.calls.clear()
+    mgr.free['local'] = GIB
+    assert bv.room_for(mgr, 'pve1', 'pbs:backup/ct/100/x', 'lxc', {}, 2 * GIB)['storage'] == 'local'
+    assert mgr.calls == ['/nodes/pve1/storage/local/status']
+
+
+@pytest.mark.parametrize('case', ['status_error', 'not_active', 'no_avail', 'raises', 'config_unreadable',
+                                  'odd_storage_name'])
+def test_free_space_that_cannot_be_read_is_no_room(case, monkeypatch):
+    mgr = _Mgr([], {}, backup_config='scsi0: local-lvm:vm-100-disk-0,size=8G\n')
+    if case == 'status_error':
+        mgr.free['local-lvm'] = None
+    elif case in ('not_active', 'no_avail'):
+        real = mgr._api_get
+
+        def get(url, timeout=None, params=None):
+            r = real(url, timeout, params)
+            if url.endswith('/status'):
+                data = dict(r._data, active=0) if case == 'not_active' else {'active': 1, 'total': GIB}
+                return _Resp(200, data)
+            return r
+        monkeypatch.setattr(mgr, '_api_get', get)
+    elif case == 'raises':
+        real = mgr._api_get
+
+        def get(url, timeout=None, params=None):
+            if url.endswith('/status'):
+                raise TimeoutError('read timed out')
+            return real(url, timeout, params)
+        monkeypatch.setattr(mgr, '_api_get', get)
+    elif case == 'config_unreadable':
+        mgr.backup_config = None
+    else:
+        mgr.backup_config = 'scsi0: ../../access:vm-100-disk-0\n'
+    short = bv.room_for(mgr, 'pve1', _VOL, 'qemu', {}, 2 * GIB)
+    assert short and short['reason'] == 'space_unknown', short
+    assert not any('access' in c for c in mgr.calls)
+
+
 # --- the run -------------------------------------------------------------------------------
 
 def test_the_run_tests_one_after_another_and_says_how_each_went(clusters, monkeypatch, db):
@@ -347,3 +482,60 @@ def test_a_test_running_by_hand_is_skipped_not_doubled(clusters, monkeypatch, db
     monkeypatch.setattr(bv, 'run_verification', lambda m, p: calls.append(p['vmid']) or {'id': 'x', 'status': 'passed'})
     RT._run_slot(SUNDAY, POLICY)
     assert calls == [101]
+
+
+def _runs(monkeypatch):
+    calls = []
+    monkeypatch.setattr(bv, 'run_verification',
+                        lambda m, p: calls.append(p['vmid']) or {'id': f"t{p['vmid']}", 'status': 'passed'})
+    return calls
+
+
+def test_the_run_restores_nothing_over_the_cap_and_says_so(clusters, monkeypatch, db):
+    clusters['c1'] = _Mgr([_g(100, name='db01'), _g(101), _g(102)],
+                          {'pbs': [_bk(100, 2, size=300 * GIB), _bk(101, 3), _bk(102, 4, size=None)]})
+    calls = _runs(monkeypatch)
+    RT._run_slot(SUNDAY, POLICY)
+    assert calls == [101]
+    last = recovery.load_state()['last_run']
+    assert last['state'] == 'done' and [p['vmid'] for p in last['picked']] == [101]
+    got = {r['vmid']: r for r in last['results']}
+    assert (got[100]['status'], got[100]['reason'], got[100]['size'], got[100]['limit_gb']) == (
+        'skipped', 'too_large', 300 * GIB, 32)
+    assert got[100]['cause'] == 'the backup is 300.0 GB, the schedule restores up to 32 GB'
+    assert (got[102]['status'], got[102]['reason']) == ('skipped', 'size_unknown')
+    assert got[101]['status'] == 'passed'
+    audit = db.conn.execute("SELECT details FROM audit_log WHERE action = 'backup.verify_scheduled'").fetchone()
+    assert '1 picked, 1 passed, 0 failed, 2 skipped' in audit[0]
+
+
+def test_the_run_restores_nothing_onto_a_storage_without_room(clusters, monkeypatch, db):
+    clusters['c1'] = _Mgr([_g(100), _g(101)], {'pbs': [_bk(100, 2), _bk(101, 3, size=GIB // 2)]},
+                          free={'local-lvm': GIB})
+    calls = _runs(monkeypatch)
+    RT._run_slot(SUNDAY, POLICY)
+    # 100 needs 2 GB on local-lvm, where 1 GB is free; 101 fits
+    assert calls == [101]
+    r = recovery.load_state()['last_run']['results'][0]
+    assert (r['vmid'], r['status'], r['reason'], r['storage'], r['free'], r['size']) == (
+        100, 'skipped', 'no_space', 'local-lvm', GIB, 2 * GIB)
+    assert r['task_id'] is None and 'local-lvm on pve1 has 1.0 GB free' in r['cause']
+
+
+def test_the_run_restores_nothing_where_the_free_space_is_unknown(clusters, monkeypatch, db):
+    clusters['c1'] = _Mgr([_g(100)], {'pbs': [_bk(100, 2)]}, free={'local-lvm': None})
+    calls = _runs(monkeypatch)
+    RT._run_slot(SUNDAY, POLICY)
+    assert calls == []
+    r = recovery.load_state()['last_run']['results'][0]
+    assert (r['status'], r['reason'], r['storage']) == ('skipped', 'space_unknown', 'local-lvm')
+
+
+def test_the_run_reads_the_room_of_the_clusters_test_storage(clusters, monkeypatch, db):
+    clusters['c1'] = _Mgr([_g(100)], {'pbs': [_bk(100, 2)]}, free={'local-lvm': 0, 'scratch': 50 * GIB})
+    recovery.save_rule('c1', 'cluster', '', {'test_storage': 'scratch'}, 'root')
+    calls = _runs(monkeypatch)
+    RT._run_slot(SUNDAY, POLICY)
+    assert calls == [100]
+    assert '/nodes/pve1/storage/scratch/status' in clusters['c1'].calls
+    assert not [c for c in clusters['c1'].calls if 'local-lvm' in c or 'extractconfig' in c]
