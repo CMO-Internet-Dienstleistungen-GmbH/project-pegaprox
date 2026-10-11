@@ -3,21 +3,26 @@
 
 GET  /api/clusters/<id>/whatif/options   what the scenario picker offers
 POST /api/clusters/<id>/whatif           the report of one scenario (pegaprox/core/whatif.py)
+POST /api/clusters/<id>/whatif/ranking   the single points of failure of the cluster, ranked
 
-Both only read. The POST takes its scenario in the body, so a standby with the live view
+All only read. The POST takes its scenario in the body, so a standby with the live view
 answers it from its own managers like any read (app.py _STANDBY_LOCAL_WRITES) and the
 active tells its members about nothing. A caller confined to some guests of the cluster
-gets the rows of those guests only: the counts stay, the names of the others do not.
+gets the rows of those guests only: the counts stay, the names of the others do not. The
+tenants of a report are the caller's own tenant to anyone but an administrator, and none to
+a confined caller; the ranking is a whole-cluster view and is refused to a confined caller.
 """
 
 import logging
 
 from flask import Blueprint, jsonify, request
 
-from pegaprox.api.helpers import check_cluster_access, safe_error, scope_vm_rows
+from pegaprox.api.helpers import (caller_is_scoped, check_cluster_access, require_unconfined, safe_error,
+                                  scope_vm_rows)
 from pegaprox.core import whatif
 from pegaprox.globals import cluster_managers
-from pegaprox.utils.auth import require_auth
+from pegaprox.utils.auth import build_authz_user, require_auth
+from pegaprox.utils.rbac import acting_tenant
 
 bp = Blueprint('whatif', __name__)
 
@@ -94,6 +99,16 @@ def _visible(cluster_id, report):
     for item in report.get('limits') or []:
         if item.get('guests'):
             item['guests'] = [v for v in item['guests'] if v in ids]
+    # MK Oct 2026 - the tenants a caller may see by name
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    mine = None if caller_is_scoped(user, cluster_id) else (acting_tenant(user) or True)
+    risk = report.get('risk')
+    if risk:
+        items = (risk.get('tenants') or {}).get('items') or []
+        risk['tenants']['items'] = [t for t in items if mine is True or t['id'] == mine] if mine else []
+    for r in seen:
+        if 'tenants' in r:
+            r['tenants'] = [t for t in r['tenants'] if mine is True or t == mine] if mine else []
     report['guests_hidden'] = len(rows) - len(seen)
     report['guests_truncated'] = max(0, len(seen) - GUEST_ROWS)
     report['guests'] = seen[:GUEST_ROWS]
@@ -139,3 +154,31 @@ def whatif_run(cluster_id):
         logging.error(f"[WHATIF] {cluster_id} run failed: {e}")
         return jsonify({'error': safe_error(e, 'The what-if simulation failed')}), 500
     return jsonify(_visible(cluster_id, report))
+
+
+@bp.route('/api/clusters/<cluster_id>/whatif/ranking', methods=['POST'])
+@require_auth(perms=['cluster.view'])
+def whatif_ranking(cluster_id):
+    """Every node, shared storage, PBS storage and bridge failing alone, ranked by the guests
+    it affects with critical ones weighted up. Body (optional): {critical_tags, thresholds}."""
+    mgr, err = _manager(cluster_id)
+    if err:
+        return err
+    denied = require_unconfined(cluster_id)
+    if denied:
+        return denied
+    body = request.get_json(silent=True)
+    try:
+        if body is None and request.get_data():
+            raise whatif.Invalid('The request body must be a JSON object', 'bad_body')
+        asked = whatif.parse_ranking(body)
+        out = whatif.ranking(mgr, thresholds_for(cluster_id, asked.get('thresholds')),
+                             asked.get('critical_tags'))
+    except whatif.Invalid as e:
+        return jsonify({'error': str(e), 'code': e.code}), 400
+    except whatif.Unreadable as e:
+        return jsonify({'error': str(e)}), 503
+    except Exception as e:
+        logging.error(f"[WHATIF] {cluster_id} ranking failed: {e}")
+        return jsonify({'error': safe_error(e, 'The what-if ranking failed')}), 500
+    return jsonify(out)

@@ -441,6 +441,7 @@ def create_app():
         ('POST', '/api/cross-cluster-migrate/preflight'),
         # the what-if simulator reads the cluster and takes its scenario in the body
         ('POST', '/api/clusters/<cluster_id>/whatif'),
+        ('POST', '/api/clusters/<cluster_id>/whatif/ranking'),
         # the ESXi VM detail watch: which VMs the live stream pushes details for, a dict
         # in this process like the SSE subscription (vmware.vm.view, the per-server
         # check still applies). The push only reads the VM, its guest info and its

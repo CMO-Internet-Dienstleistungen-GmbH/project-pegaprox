@@ -49273,6 +49273,61 @@
         ]
       }
     },
+    "/api/clusters/{cluster_id}/whatif/ranking": {
+      "post": {
+        "operationId": "whatif.whatif_ranking_post",
+        "tags": [
+          "whatif"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Every node, shared storage, PBS storage and bridge failing alone, ranked by the guests it affects with critical ones weighted up. Body (optional): {critical_tags, thresholds}.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "cluster.view"
+        ]
+      }
+    },
     "/api/timeline": {
       "get": {
         "operationId": "timeline.get_timeline_get",

@@ -15,6 +15,14 @@ Answers "what happens if ..." for five scenarios. It reads, it never acts:
   storage_failure  a storage fails, everywhere or on one node: the guests with a disk on it.
   network_failure  a bridge (or one VLAN on it) or an SDN VNet fails on one node or on all of
                    them: the guests with an interface on it.
+  pbs_failure      a Proxmox Backup Server storage fails: the guests that lose restore points,
+                   the jobs that write there and the restore tests that rested on it.
+
+Every report also carries the risk view (risk_view): which affected guests are critical (a
+tag, 'critical' unless the request or the recovery settings name others), which tenants they
+count for, how far a restore of each has been proven, and ranking() runs the single points
+of failure of the cluster in cheap mode and orders them by affected guests, critical ones
+weighted up.
 
 The report says per guest what becomes of it (down, restarted on X, moved to X, degraded;
 every guest not listed is unaffected), per node CPU and memory before and after against the
@@ -37,7 +45,7 @@ import time
 
 log = logging.getLogger(__name__)
 
-SCENARIOS = ('node_failure', 'maintenance', 'headroom', 'storage_failure', 'network_failure')
+SCENARIOS = ('node_failure', 'maintenance', 'headroom', 'storage_failure', 'network_failure', 'pbs_failure')
 OUTCOMES = ('down', 'degraded', 'restarted', 'moved', 'unknown')   # the order of the report
 
 CONFIG_READS = 1000     # guest configs read per run at most
@@ -47,8 +55,17 @@ READ_TTL = 60           # HA, storage and network configuration of the cluster
 PAIRS_PLACED = 60       # N+2: the heaviest pairs are placed guest by guest, the rest summed up
 MAX_NODES_PICKED = 16
 DEFAULT_CPU = 80.0
+DEFAULT_CRITICAL_TAGS = ('critical',)
+MAX_CRITICAL_TAGS = 20
+# ranking: a guest counts by what becomes of it, a critical one CRITICAL_FACTOR times
+OUTCOME_WEIGHT = {'down': 1.0, 'degraded': 0.5, 'unknown': 0.5, 'restarted': 0.25, 'moved': 0.0}
+CRITICAL_FACTOR = 3
+RANK_CAPS = {'node': 100, 'storage': 30, 'pbs': 10, 'bridge': 20}   # candidates run per kind
+RANK_SECONDS = 30       # wall time of one ranking, the candidates left are counted
+RANK_CONFIG_READS = 1000   # guest configs read for all candidates together
 DEFAULT_MEMORY = 90.0
 
+TAG_RE = re.compile(r'^[\w.+-]{1,64}$')
 NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 _VOLUME_KEY = re.compile(r'^(?:scsi|virtio|ide|sata|unused|mp)\d+$|^(?:efidisk0|tpmstate0|rootfs)$')
 _NET_KEY = re.compile(r'^net\d+$')
@@ -87,6 +104,9 @@ REASONS = {
     'all_nics': 'every network interface is on {nets}',
     'some_nics': 'interfaces {nics} are on {nets}',
     'config_unread': 'its configuration was not read in this run',
+    'pbs_only_copy': 'every restore point of it listed is on {storage}',
+    'pbs_some_copy': '{count} of its {total} restore points listed are on {storage}, the others are elsewhere',
+    'pbs_job_only': 'a backup job writes it to {storage}, no restore point of it was listed there',
 }
 LIMITS = {
     'quorum_lost': 'No quorum: {left} votes are left and {need} are needed, HA restarts nothing',
@@ -107,6 +127,10 @@ LIMITS = {
     'ha_unreadable': 'The HA configuration could not be read',
     'configs_unread': 'Guest configurations not read in this run: {count}',
     'no_ha_reaction': 'Proxmox HA reacts to node failures only, it does not restart these guests',
+    'pbs_only_copy': 'Guests whose every listed restore point is on it: {count}',
+    'pbs_tests_lost': 'Guests whose proven restore test used a restore point on it: {count}',
+    'pbs_points_unread': 'The restore points of the backup storages could not all be read, the backup jobs stand in where they are missing',
+    'pbs_jobs_unread': 'The backup jobs of the cluster could not be read, only the listed restore points are used',
 }
 ASSUMPTIONS = {
     'mem_configured': 'A restarted or moved guest uses its configured memory in full',
@@ -131,6 +155,13 @@ ASSUMPTIONS = {
     'net_down': 'A guest without a working network interface counts as down',
     'maint_evacuator': 'Guests are placed as the evacuation does: smallest first, on the node with the lowest load score',
     'maint_apart': 'Proxmox HA refuses to move a guest next to one it must stay apart from',
+    'critical_tags': 'Guests tagged {tags} count as critical',
+    'tenant_by_cluster': 'A guest has no tenant of its own: it counts for every tenant whose clusters include this one',
+    'restore_marks': 'A restore is proven by the last restore test of the guest; a guest never tested is not proven',
+    'pbs_listing': 'Restore points are what the backup storages list, the newest {n} of each guest',
+    'pbs_jobs': 'A backup job covers the guests it selects by id, by pool or all (minus its exclusions), on its node if it names one',
+    'rank_weighting': 'A guest counts {down} if down, {degraded} if degraded or unknown, {restarted} if restarted, {moved} if moved; a critical guest {factor} times that',
+    'rank_cheap': 'Candidates run in cheap mode: {reads} guest configurations are read for all of them, the guests not read count as unknown',
 }
 _KNOWN, _CALC, _ASSUMED = 'known', 'calculated', 'assumed'
 
@@ -168,6 +199,40 @@ def _percent(value, what):
     return float(value)
 
 
+def _critical_tags(body):
+    """The critical tags a body names, lower case, or None when it names none."""
+    tags = body.get('critical_tags')
+    if tags is None:
+        return None
+    if not isinstance(tags, list) or len(tags) > MAX_CRITICAL_TAGS:
+        raise Invalid(f'critical_tags is a list of up to {MAX_CRITICAL_TAGS} tags', 'bad_tags')
+    out = []
+    for t in tags:
+        if not isinstance(t, str) or not TAG_RE.match(t.strip()):
+            raise Invalid('a critical tag is a word of letters, digits, . _ + -', 'bad_tags')
+        if t.strip().lower() not in out:
+            out.append(t.strip().lower())
+    return out
+
+
+def parse_ranking(body):
+    """The ranking request: {critical_tags?, thresholds?} checked. Raises Invalid."""
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        raise Invalid('The request body must be a JSON object', 'bad_body')
+    out = {}
+    tags = _critical_tags(body)
+    if tags is not None:
+        out['critical_tags'] = tags
+    thr = body.get('thresholds')
+    if thr is not None:
+        if not isinstance(thr, dict) or not set(thr) <= {'cpu', 'memory'}:
+            raise Invalid('thresholds holds cpu and memory', 'bad_threshold')
+        out['thresholds'] = {k: _percent(v, f'thresholds.{k}') for k, v in thr.items()}
+    return out
+
+
 def parse_scenario(body):
     """The scenario of a request body, checked and normalized. Raises Invalid. Whether the
     nodes and storages it names exist is checked by run(), against the cluster."""
@@ -181,6 +246,9 @@ def parse_scenario(body):
     if memory not in ('configured', 'current'):
         raise Invalid('memory is configured or current', 'bad_memory')
     sc['memory'] = memory
+    tags = _critical_tags(body)
+    if tags is not None:
+        sc['critical_tags'] = tags
     thr = body.get('thresholds')
     if thr is not None:
         if not isinstance(thr, dict) or not set(thr) <= {'cpu', 'memory'}:
@@ -208,6 +276,8 @@ def parse_scenario(body):
         if guests not in ('all', 'ha'):
             raise Invalid('guests is all or ha', 'bad_guests')
         sc.update(depth=depth, guests=guests)
+    elif kind == 'pbs_failure':
+        sc['storage'] = _name(body.get('storage'), 'storage')
     elif kind == 'storage_failure':
         sc['storage'] = _name(body.get('storage'), 'storage')
         if body.get('node') not in (None, ''):
@@ -521,8 +591,10 @@ class _Load:
 
 
 class _Run:
-    def __init__(self, mgr, scenario, thresholds):
+    def __init__(self, mgr, scenario, thresholds, budget=None):
         self.mgr, self.sc = mgr, scenario
+        self.cluster_id = getattr(mgr, 'id', None)
+        self.budget = budget    # {'left': n}: guest configs a ranking may still read
         self.thr = thresholds or {}
         status = mgr.get_node_status() or {}
         if not status:
@@ -622,7 +694,10 @@ class _Run:
                 self.reads['configs_cached'] += 1
             else:
                 todo.append(vm)
-        reading, left = todo[:CONFIG_READS], todo[CONFIG_READS:]
+        room = CONFIG_READS if self.budget is None else max(0, min(CONFIG_READS, self.budget['left']))
+        reading, left = todo[:room], todo[room:]
+        if self.budget is not None:
+            self.budget['left'] -= len(reading)
         got = _fan_out({int(vm['vmid']): (lambda vm=vm: _get(self.mgr, f"/nodes/{vm['node']}/{vm['type']}/{vm['vmid']}/config"))
                         for vm in reading}) if reading else {}
         for vm in reading:
@@ -1392,13 +1467,359 @@ def _network_failure(run):
     return run.report()
 
 
+# --- a Proxmox Backup Server storage failing ---------------------------------------------------
+
+def backup_jobs(mgr):
+    """The backup jobs of the cluster (GET /cluster/backup), None when unreadable."""
+    def read():
+        ok, rows = _get(mgr, '/cluster/backup')
+        if not ok:
+            return None
+        return [j for j in rows or [] if isinstance(j, dict)]
+    return _cached(mgr, 'backup_jobs', READ_TTL, read)
+
+
+def _job_guests(job, vms):
+    """The vmids of `vms` one backup job selects: by id, by pool or all minus its exclusions,
+    on its node when it names one."""
+    from pegaprox.core.backup_runs import selection
+    kind, what = selection(job)
+    node = str(job.get('node') or '').strip()
+    out = set()
+    for vm in vms:
+        vmid = int(vm['vmid'])
+        if node and vm.get('node') != node:
+            continue
+        if kind == 'all' and vmid not in what:
+            out.add(vmid)
+        elif kind == 'pool' and vm.get('pool') == what:
+            out.add(vmid)
+        elif kind == 'vmid' and vmid in what:
+            out.add(vmid)
+    return out
+
+
+def _marks(cluster_id):
+    """{vmid: restore test mark} of the cluster, None when they cannot be read."""
+    if not cluster_id:
+        return None
+    try:
+        from pegaprox.core import recovery
+        return recovery.load_marks(cluster_id)
+    except Exception as e:
+        log.debug(f"[WHATIF] restore test marks of {cluster_id} unreadable: {e}")
+        return None
+
+
+def _pbs_failure(run):
+    from pegaprox.core import recovery
+    sc, mgr = run.sc, run.mgr
+    name = sc['storage']
+    storages = run.storage_cfg()
+    if storages is None:
+        raise Unreadable('The storage configuration of the cluster could not be read')
+    cfg = storages.get(name)
+    if cfg is None:
+        raise Invalid(f'{name} is not a storage of this cluster', 'unknown_storage')
+    if cfg.get('type') != 'pbs':
+        raise Invalid(f'{name} is not a Proxmox Backup Server storage', 'not_pbs')
+    jobs = backup_jobs(mgr)
+    idx = None
+    if run.cluster_id:
+        try:
+            idx = recovery.guest_backups(run.cluster_id, mgr)
+        except Exception as e:
+            log.debug(f"[WHATIF] backups of {run.cluster_id} unreadable: {e}")
+    if jobs is None and idx is None:
+        raise Unreadable('Neither the backup jobs nor the restore points of the cluster could be read')
+    run.assume('pbs_listing', n=recovery.BACKUPS_PER_GUEST)
+    run.assume('pbs_jobs')
+    if jobs is None:
+        run.limit('pbs_jobs_unread', _KNOWN)
+    if idx is None or idx.get('partial'):
+        run.limit('pbs_points_unread', _KNOWN)
+
+    targeting = [j for j in jobs or [] if str(j.get('storage') or '') == name
+                 and str(j.get('enabled', 1)).lower() not in ('0', 'false', 'no')]
+    by_job, job_rows = {}, []
+    for j in targeting:
+        ids = _job_guests(j, run.vms)
+        for vmid in ids:
+            by_job.setdefault(vmid, []).append(str(j.get('id') or ''))
+        job_rows.append({'id': str(j.get('id') or ''), 'schedule': str(j.get('schedule') or ''),
+                         'guests': len(ids)})
+    marks = _marks(run.cluster_id)
+    counts = {'only': 0, 'some': 0, 'job_only': 0}
+    tests, unmatched = [], 0
+    for vm in sorted(run.vms, key=lambda v: int(v['vmid'])):
+        vmid = int(vm['vmid'])
+        if recovery.TEST_TAG in recovery.guest_tags(vm.get('tags')):
+            continue
+        points = None if idx is None else idx['guests'].get(vmid, [])
+        on = [b for b in points or [] if b['storage'] == name]
+        off = [b for b in points or [] if b['storage'] != name]
+        if on and not off:
+            counts['only'] += 1
+            run.limit('pbs_only_copy', _KNOWN, guests=[vmid])
+            run.guest(vm, 'degraded', 'pbs_only_copy', _KNOWN, storage=name)
+        elif on:
+            counts['some'] += 1
+            run.guest(vm, 'degraded', 'pbs_some_copy', _KNOWN, storage=name, count=len(on), total=len(points))
+        elif vmid in by_job:
+            counts['job_only'] += 1
+            run.guest(vm, 'degraded', 'pbs_job_only', _KNOWN if idx is not None else _ASSUMED, storage=name)
+        else:
+            continue
+        mark = (marks or {}).get(vmid) or {}
+        ts = mark.get('ok_backup_ts') if mark.get('ok_at') else None
+        if ts is not None:
+            if any(b['ctime'] == ts for b in on) and not any(b['ctime'] == ts for b in off):
+                tests.append(vmid)
+                run.rows[vmid]['restore_test_lost'] = True
+            elif not any(b['ctime'] == ts for b in points or []):
+                unmatched += 1      # the tested restore point is older than the listing
+    if tests:
+        run.limit('pbs_tests_lost', _KNOWN, guests=tests)
+    run.extra['pbs'] = {
+        'storage': name, 'jobs': job_rows, 'jobs_read': jobs is not None,
+        'points_read': idx is not None, 'marks_read': marks is not None,
+        'guests_all_lost': counts['only'], 'guests_some_lost': counts['some'],
+        'guests_job_only': counts['job_only'],
+        'tests_lost': len(tests), 'tests_unmatched': unmatched, 'basis': _KNOWN,
+    }
+    return run.report()
+
+
+# --- the risk view: criticality, tenants, restore status ----------------------------------------
+
+def critical_tags_for(cluster_id, requested=None):
+    """(tags, source): the request's, else the critical tags of the recovery settings where
+    they define some, else the default."""
+    if requested is not None:
+        return list(requested), 'request'
+    try:
+        from pegaprox.core import recovery
+        got = recovery.cluster_settings(recovery.load_rules(cluster_id)).get('critical_tags')
+        if got:
+            return sorted({str(t).lower() for t in got}), 'recovery'
+    except Exception as e:
+        log.debug(f"[WHATIF] critical tags of {cluster_id} unreadable: {e}")
+    return list(DEFAULT_CRITICAL_TAGS), 'default'
+
+
+def _tenants(cluster_id):
+    """[{'id', 'name'}] of the tenants whose clusters include this one, None when the
+    tenants cannot be read."""
+    try:
+        from pegaprox.utils.rbac import load_tenants, tenant_counts_cluster
+        rows = load_tenants()
+        if getattr(rows, 'unavailable', False):
+            return None
+        return [{'id': tid, 'name': str((row or {}).get('name') or tid)} for tid, row in sorted(rows.items())
+                if tenant_counts_cluster(tid, cluster_id)]
+    except Exception as e:
+        log.debug(f"[WHATIF] tenants unreadable: {e}")
+        return None
+
+
+_RESTORE_OF = {'ok': 'proven', 'rto_missed': 'proven', 'stale': 'not_proven', 'never': 'not_proven',
+               'failing': 'failing'}
+
+
+class _Risk:
+    """What stands behind the guests of a cluster: their tags (critical or not), the tenants
+    and the restore marks, each read once."""
+
+    def __init__(self, cluster_id, vms, critical=None):
+        from pegaprox.core import recovery
+        self.cluster_id = cluster_id
+        self.guest_tags = recovery.guest_tags
+        self.vms = {int(v['vmid']): v for v in vms}
+        tags, self.source = critical_tags_for(cluster_id, critical)
+        self.critical = set(tags)
+        self._marks = False
+        self._tenants = False
+
+    def is_critical(self, vmid):
+        return bool(self.critical & self.guest_tags((self.vms.get(vmid) or {}).get('tags')))
+
+    @property
+    def marks(self):
+        if self._marks is False:
+            self._marks = _marks(self.cluster_id)
+        return self._marks
+
+    @property
+    def tenants(self):
+        if self._tenants is False:
+            self._tenants = _tenants(self.cluster_id) if self.cluster_id else None
+        return self._tenants
+
+    def restore_of(self, vmid, now):
+        """Whether a restore of the guest is proven: a restore test passed lately."""
+        from pegaprox.core import recovery
+        if self.marks is None:
+            return {'state': 'unknown', 'detail': None, 'last_success_at': None, 'basis': _ASSUMED}
+        row = recovery.guest_row(vmid, self.vms.get(vmid) or {}, self.marks.get(vmid), None, {}, 0, now)
+        return {'state': _RESTORE_OF.get(row['state'], 'not_proven'), 'detail': row['state'],
+                'last_success_at': row['last_success_at'], 'basis': _KNOWN}
+
+
+def _weigh(rows, ctx):
+    """Counts of the affected guests and their weight (OUTCOME_WEIGHT, a critical guest
+    CRITICAL_FACTOR times)."""
+    out = {o: 0 for o in OUTCOMES}
+    out.update(affected=0, critical_affected=0, critical_down=0, weight=0.0)
+    for r in rows:
+        out['affected'] += 1
+        out[r['outcome']] = out.get(r['outcome'], 0) + 1
+        crit = ctx.is_critical(r['vmid'])
+        w = OUTCOME_WEIGHT.get(r['outcome'], 0.5)
+        out['weight'] += w * (CRITICAL_FACTOR if crit else 1)
+        if crit:
+            out['critical_affected'] += 1
+            if r['outcome'] == 'down':
+                out['critical_down'] += 1
+    out['weight'] = round(out['weight'], 2)
+    return out
+
+
+def _assumption_row(code, **args):
+    return {'code': code, 'args': args, 'text': ASSUMPTIONS[code].format(**{k: _say(v) for k, v in args.items()})}
+
+
+# MK Oct 2026 - no table of its own: tags come from the resource rows, the restore status from
+# restore_test_marks, the tenants from the tenants table (local to each instance, nothing synced added)
+def risk_view(report, ctx):
+    """Adds to each guest row of the report its tags, whether it is critical, the tenants it
+    counts for and whether a restore of it is proven, and the report's `risk` summary."""
+    rows = report.get('guests') or []
+    now = time.time()
+    tenants = ctx.tenants
+    tstat = {t['id']: {'id': t['id'], 'name': t['name'], 'affected': 0, 'down': 0, 'critical': 0}
+             for t in tenants or []}
+    restore = {'proven': 0, 'not_proven': 0, 'failing': 0, 'unknown': 0}
+    for r in rows:
+        vmid = r['vmid']
+        crit = ctx.is_critical(vmid)
+        r['tags'] = sorted(ctx.guest_tags((ctx.vms.get(vmid) or {}).get('tags')))
+        r['critical'] = crit
+        r['tenants'] = list(tstat)
+        r['restore'] = ctx.restore_of(vmid, now)
+        restore[r['restore']['state']] += 1
+        for t in tstat.values():
+            t['affected'] += 1
+            t['down'] += 1 if r['outcome'] == 'down' else 0
+            t['critical'] += 1 if crit else 0
+    w = _weigh(rows, ctx)
+    report['risk'] = {
+        'critical': {'tags': sorted(ctx.critical), 'source': ctx.source, 'tags_basis': _KNOWN,
+                     'in_cluster': sum(1 for v in ctx.vms if ctx.is_critical(v)),
+                     'affected': w['critical_affected'], 'down': w['critical_down'], 'basis': _CALC},
+        'tenants': {'items': list(tstat.values()), 'readable': tenants is not None, 'basis': _ASSUMED},
+        'restore': dict(restore, basis=_KNOWN),
+        'weight': {'value': w['weight'], 'outcomes': dict(OUTCOME_WEIGHT), 'critical_factor': CRITICAL_FACTOR,
+                   'basis': _CALC},
+    }
+    have = {a['code'] for a in report.get('assumptions') or []}
+    extra = [_assumption_row('critical_tags', tags=sorted(ctx.critical) or '-'),
+             _assumption_row('tenant_by_cluster'), _assumption_row('restore_marks')]
+    report.setdefault('assumptions', []).extend(a for a in extra if a['code'] not in have)
+    return report
+
+
+_SCENARIO_FN = {'node_failure': _node_failure, 'maintenance': _maintenance, 'headroom': _headroom,
+                'storage_failure': _storage_failure, 'network_failure': _network_failure,
+                'pbs_failure': _pbs_failure}
+
+
 def run(mgr, scenario, thresholds=None):
-    """The report of one scenario (parse_scenario's output) on a Proxmox VE manager.
-    Raises Invalid for a node or storage the cluster does not have, Unreadable when what
-    the run needs cannot be read."""
+    """The report of one scenario (parse_scenario's output) on a Proxmox VE manager, with
+    its risk view. Raises Invalid for a node or storage the cluster does not have,
+    Unreadable when what the run needs cannot be read."""
     sim = _Run(mgr, scenario, thresholds)
-    return {'node_failure': _node_failure, 'maintenance': _maintenance, 'headroom': _headroom,
-            'storage_failure': _storage_failure, 'network_failure': _network_failure}[scenario['type']](sim)
+    report = _SCENARIO_FN[scenario['type']](sim)
+    try:
+        risk_view(report, _Risk(sim.cluster_id, sim.vms, scenario.get('critical_tags')))
+    except Exception as e:
+        log.error(f"[WHATIF] risk view failed: {e}")
+        report['risk'] = None
+    return report
+
+
+# --- single points of failure ---------------------------------------------------------------------
+
+# MK Oct 2026 - the same scenario functions as a single run, so there is no second engine; the
+# weights are a ranking aid, they say nothing about the cost of an outage
+def ranking(mgr, thresholds=None, critical_tags=None):
+    """Each node, shared storage, PBS storage and bridge failing alone, run in cheap mode
+    (RANK_CONFIG_READS guest configs for all of them, RANK_SECONDS of time, RANK_CAPS
+    candidates per kind) and ordered by the weight of the guests affected. What was capped
+    or left out is in the answer."""
+    opts = options(mgr)
+    probe = _Run(mgr, {'type': 'headroom', 'memory': 'configured'}, thresholds)
+    ctx = _Risk(probe.cluster_id, probe.vms, critical_tags)
+    on_node = {}
+    for vm in probe.running:
+        on_node[vm.get('node')] = on_node.get(vm.get('node'), 0) + 1
+    online = sorted((n['name'] for n in opts['nodes'] if n['status'] == 'online'),
+                    key=lambda n: (-on_node.get(n, 0), n))
+    cands = {
+        'node': [(n, {'type': 'node_failure', 'nodes': [n]}) for n in online],
+        'storage': [(s['storage'], {'type': 'storage_failure', 'storage': s['storage']})
+                    for s in opts['storages'] if s['shared']],
+        'pbs': [(s['storage'], {'type': 'pbs_failure', 'storage': s['storage']}) for s in opts['pbs']],
+        'bridge': [(b['name'], {'type': 'network_failure', 'bridge': b['name']}) for b in opts['bridges']],
+    }
+    capped, todo = [], []
+    for kind, items in cands.items():
+        if len(items) > RANK_CAPS[kind]:
+            capped.append({'kind': kind, 'cap': RANK_CAPS[kind], 'total': len(items)})
+        todo += [(kind, name, dict(sc, memory='configured')) for name, sc in items[:RANK_CAPS[kind]]]
+    budget = {'left': RANK_CONFIG_READS}
+    deadline = time.monotonic() + RANK_SECONDS
+    ranked, skipped, stopped, unread = [], [], None, 0
+    for i, (kind, name, sc) in enumerate(todo):
+        if time.monotonic() > deadline:
+            stopped = {'ranked': len(ranked) + len(skipped), 'left': len(todo) - i}
+            break
+        try:
+            sim = _Run(mgr, sc, thresholds, budget)
+            rep = _SCENARIO_FN[sc['type']](sim)
+        except Invalid as e:
+            skipped.append({'kind': kind, 'name': name, 'code': e.code})
+            continue
+        except Unreadable:
+            skipped.append({'kind': kind, 'name': name, 'code': 'unreadable'})
+            continue
+        except Exception as e:
+            log.error(f"[WHATIF] ranking of {kind} {name} failed: {e}")
+            skipped.append({'kind': kind, 'name': name, 'code': 'failed'})
+            continue
+        w = _weigh(rep['guests'], ctx)
+        unread += len(sim.unread)
+        ranked.append(dict(w, kind=kind, name=name, scenario=sc, unread=len(sim.unread), basis=_CALC))
+    ranked.sort(key=lambda r: (-r['weight'], -r['critical_affected'], -r['affected'], r['kind'], r['name']))
+    assumptions = [_assumption_row('critical_tags', tags=sorted(ctx.critical) or '-'),
+                   _assumption_row('rank_weighting', factor=CRITICAL_FACTOR,
+                                   **{k: OUTCOME_WEIGHT[k] for k in ('down', 'degraded', 'restarted', 'moved')}),
+                   _assumption_row('rank_cheap', reads=RANK_CONFIG_READS),
+                   _assumption_row('no_service_model')]
+    if any(r['kind'] == 'pbs' for r in ranked):
+        from pegaprox.core import recovery
+        assumptions.append(_assumption_row('pbs_listing', n=recovery.BACKUPS_PER_GUEST))
+    return {
+        'supported': True,
+        'generated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'guests': {'total': len(probe.vms), 'running': len(probe.running),
+                   'critical': sum(1 for v in ctx.vms if ctx.is_critical(v)), 'basis': _KNOWN},
+        'critical_tags': sorted(ctx.critical), 'critical_tags_source': ctx.source,
+        'weighting': {'outcomes': dict(OUTCOME_WEIGHT), 'critical_factor': CRITICAL_FACTOR, 'basis': _CALC},
+        'ranking': ranked, 'considered': sum(len(v) for v in cands.values()),
+        'capped': capped, 'skipped': skipped, 'stopped': stopped,
+        'configs_unread': unread, 'config_reads': RANK_CONFIG_READS - budget['left'],
+        'assumptions': assumptions,
+    }
 
 
 def options(mgr):
@@ -1421,6 +1842,9 @@ def options(mgr):
         stores.append({'storage': name, 'type': cfg.get('type'), 'nodes': on,
                        'shared': bool(cfg and PegaProxManager._ha_storage_shared(cfg))
                        or any(presence[n].get(name) for n in on)})
+    pbs = [{'storage': name, 'nodes': sorted(n for n, have in presence.items() if name in have)}
+           for name, cfg in sorted(storages.items()) if cfg.get('type') == 'pbs' and not cfg.get('disable')]
+    tags, tag_source = critical_tags_for(getattr(mgr, 'id', None))
     bridges = {}
     for node, rows in node_networks(mgr, online).items():
         for r in rows or []:
@@ -1434,6 +1858,8 @@ def options(mgr):
         'nodes': [{'name': n, 'status': d.get('status'), 'maintenance': bool(d.get('maintenance_mode'))}
                   for n, d in sorted(status.items())],
         'storages': stores,
+        'pbs': pbs,
+        'critical_tags': {'tags': tags, 'source': tag_source},
         'bridges': [dict(b, nodes=sorted(b['nodes'])) for _n, b in sorted(bridges.items())],
         'vnets': [{'vnet': v['vnet'], 'zone': v.get('zone'), 'tag': v.get('tag')}
                   for v in sorted(net['vnets'], key=lambda v: v['vnet'])],
