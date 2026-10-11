@@ -6325,13 +6325,13 @@
                                                         )}
                                                     </>
                                                 )}
-                                                {canAct && isAdmin && ev.category !== 'incident' && (
+                                                {canAct && ev.category !== 'incident' && (
                                                     <button data-drift-incident={ev.id} onClick={e => { e.stopPropagation(); markIncident(ev, true); }}
                                                         className="text-[11px] px-2 py-0.5 bg-red-500/20 border border-red-500/30 rounded text-red-300 hover:text-white">
                                                         {t('driftConfirmIncident') || 'Confirm as incident'}
                                                     </button>
                                                 )}
-                                                {canAct && isAdmin && ev.category === 'incident' && (
+                                                {canAct && ev.category === 'incident' && (
                                                     <button onClick={e => { e.stopPropagation(); markIncident(ev, false); }}
                                                         className="text-[11px] px-2 py-0.5 bg-proxmox-darker border border-proxmox-border rounded text-gray-300 hover:text-white">
                                                         {t('driftWithdrawIncident') || 'Withdraw incident'}

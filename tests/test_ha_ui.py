@@ -4002,7 +4002,7 @@ def test_no_console_surface_asks_the_standby_flag_any_more():
 
 # the per-instance rows that are forwarded now: they follow haReadOnly again (v6)
 FORWARDED_GATES = [
-    ('dashboard.js', 'onClick={e => { e.stopPropagation(); ack(ev.id, ', "{canAct && ev.status === 'open' && (", 700),
+    ('dashboard.js', 'onClick={e => { e.stopPropagation(); ack(ev.id, ', "{canAct && ev.status === 'open' && (", 800),
     ('dashboard.js', 'onClick={clearInbox}', '{items.length > 0 && !haReadOnly && (', 300),
     ('dashboard.js', 'onClick={() => ackAlert(a.id)}', '{!a.acked_at && !haReadOnly && (', 300),
 ]
@@ -4417,8 +4417,8 @@ def test_the_leader_only_lists_say_when_the_leader_is_away(ctx, dash):
     assert "return !!body && body.code === 'HA_ACTIVE_UNREACHABLE';" in helper
     drift = _function(dash, 'DriftTab')
     assert 'const away = (await haLeaderAway(sr)) || (await haLeaderAway(er));' in drift
-    assert 'if (away) { setStatus(null); setEvents([]); return; }' in drift
-    assert '}, [clusterId, filter, haReadOnly]);' in drift
+    assert 'if (away) { setStatus(null); setEvents([]); setPolicy([]); return; }' in drift
+    assert '}, [clusterId, filter, kindFilter, catFilter, haReadOnly]);' in drift
     assert drift.index('{leaderAway ? (') < drift.index('events.length === 0 ? (')
     bell = _function(dash, 'PushBellButton')
     assert 'const away = await haLeaderAway(r);' in bell
