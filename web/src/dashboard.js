@@ -1703,6 +1703,7 @@
             nodeConfig: 'connCheckFeatNodeConfig', syslog: 'connCheckFeatSyslog', sdn: 'connCheckFeatSdn',
             networks: 'connCheckFeatNetworks', pools: 'connCheckFeatPools', mappings: 'connCheckFeatMappings',
             replication: 'connCheckFeatReplication', haConfig: 'connCheckFeatHaConfig',
+            remoteMigration: 'connCheckFeatRemoteMigration',
         };
         const CONN_CHECK_SECTIONS = [
             ['credentials', 'connCheckSecCredentials', ['credentials']],

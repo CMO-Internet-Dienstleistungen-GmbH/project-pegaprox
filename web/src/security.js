@@ -2755,6 +2755,7 @@
             const rollQuorumText = (d) => {
                 const node = d.node || rollingUpdate?.current_node || '-';
                 if (d.reason === 'status_unreadable') return t('rollQuorumUnread').replace('{node}', node);
+                if (d.reason === 'status_incomplete') return t('rollQuorumIncomplete').replace('{node}', node);
                 if (d.reason === 'not_quorate') return t('rollQuorumNotQuorate').replace('{node}', node);
                 return t('rollQuorumHeld').replace('{node}', node).replace('{after}', String(d.after ?? '-'))
                     .replace('{expected}', String(d.expected ?? '-')).replace('{needed}', String(d.needed ?? '-'));
@@ -3399,7 +3400,10 @@
                                                         <p className="text-xs">{t('rollQuorumOffline').replace('{nodes}', rollingUpdate.paused_details.offline.join(', '))}</p>
                                                     )}
                                                     {rollingUpdate.paused_details?.qdevice?.present && !rollingUpdate.paused_details.qdevice.connected && (
-                                                        <p className="text-xs">{t('rollQuorumQdevice')}</p>
+                                                        // LW Oct 2026 - the nodes that stay up without the vote, where the server named them
+                                                        <p className="text-xs" data-testid="rolling-quorum-qdevice">{(rollingUpdate.paused_details.qdevice.not_connected || []).length > 0
+                                                            ? t('rollQuorumQdeviceNodes').replace('{nodes}', rollingUpdate.paused_details.qdevice.not_connected.join(', '))
+                                                            : t('rollQuorumQdevice')}</p>
                                                     )}
                                                     <p className="text-xs text-gray-400">{t('rollQuorumHint').replace('{node}', rollingUpdate.paused_details?.node || rollingUpdate.current_node || '-')}</p>
                                                 </div>

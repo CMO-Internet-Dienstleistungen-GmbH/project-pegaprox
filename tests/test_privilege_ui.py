@@ -23,7 +23,8 @@ from test_rolling_runs_ui import INTERRUPTED, RESUME, _paused_banner, _Server as
 
 CAPS = '/api/clusters/c1/capabilities'
 RECIPE = '/api/pve-role-recipe'
-PREFIX = r'(?:capab[A-Z]\w*|pveRole[A-Z]\w*|rollQuorum(?!Text)[A-Z]\w*|connCheckFeat(?:Networks|Pools|Mappings|Replication|HaConfig))'
+PREFIX = (r'(?:capab[A-Z]\w*|pveRole[A-Z]\w*|rollQuorum(?!Text)[A-Z]\w*'
+          r'|connCheckFeat(?:Networks|Pools|Mappings|Replication|HaConfig|RemoteMigration))')
 
 
 def _src():
@@ -360,6 +361,23 @@ def test_runtime_continue_anyway_asks_first(ui):
     app.page.wait_for_timeout(1200)
     assert app.server.bodies[RESUME] == [{'accept_quorum_risk': True}]
     assert not app.errors, app.errors
+
+
+def test_runtime_a_hold_names_the_nodes_without_the_qdevice_vote_and_an_incomplete_status(ui):
+    app = ui(layout='modern', run=dict(QUORUM, paused_details=dict(
+        QUORUM['paused_details'], qdevice={'present': True, 'connected': False, 'not_connected': ['pve2']},
+        offline=[])))
+    line = _paused_banner(app, 'modern').locator('[data-testid="rolling-quorum-qdevice"]').inner_text()
+    assert 'The QDevice vote does not count for pve2: the corosync-qdevice daemon there' in line, line
+    assert 'The QDevice is not connected.' not in line
+    assert not app.errors, app.errors
+    # what quorum_hold sends for a /cluster/status with several nodes and no cluster entry
+    held = {k: None for k in ('expected', 'needed', 'have', 'after', 'offline', 'qdevice')}
+    held.update(node='pve1', reason='status_incomplete', phase='maintenance', message='Not going on before pve1 ...')
+    app = ui(layout='modern', run=dict(QUORUM, paused_details=held))
+    text = _paused_banner(app, 'modern').locator('[data-testid="rolling-quorum"]').inner_text()
+    assert '/cluster/status names several nodes but not the cluster and its quorum, so pve1 is not taken down.' in text
+    assert 'votes' not in text and not app.errors, app.errors
 
 
 def test_runtime_only_a_quorum_hold_offers_continue_anyway_and_a_standby_none(ui):

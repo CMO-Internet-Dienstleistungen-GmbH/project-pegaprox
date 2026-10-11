@@ -2212,6 +2212,7 @@
             uploads: 'connCheckFeatUploads', nodeConfig: 'connCheckFeatNodeConfig', nodePower: 'connCheckFeatNodePower',
             syslog: 'connCheckFeatSyslog', sdn: 'connCheckFeatSdn', mappings: 'connCheckFeatMappings',
             replication: 'connCheckFeatReplication', haConfig: 'connCheckFeatHaConfig',
+            remoteMigration: 'connCheckFeatRemoteMigration',
         };
         const PVE_ROLE_NEEDS = { ssh: 'pveRoleNeedSsh', root_pam: 'pveRoleNeedRoot', password_login: 'pveRoleNeedPassword' };
         // the features of GET /api/clusters/<id>/capabilities, and why one is not there
