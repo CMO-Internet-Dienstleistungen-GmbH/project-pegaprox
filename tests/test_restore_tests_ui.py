@@ -377,6 +377,24 @@ def test_runtime_a_confined_caller_sees_its_report_without_the_settings(open_app
     assert not app.errors, app.errors
 
 
+def test_runtime_a_confined_caller_reads_its_check_command_masked(open_app):
+    """The route hands a caller who is no admin a command check without its command."""
+    confined = {'cluster': {'rto_minutes': 10}, 'guests': [], 'tags': [], 'can_edit': False, 'limits': {}}
+    guest = dict(GUEST, guest=dict(GUEST['guest'], last_checks=[
+        {'check': 'agent', 'target': '', 'ok': True, 'detail': 'answers'},
+        {'check': 'command', 'target': '', 'ok': True, 'detail': 'exit code 0'}]),
+        checks=dict(GUEST['checks'], command='', command_set=True))
+    app = open_app(_reads({('GET', '/api/clusters/c1/recovery-settings'): (200, confined),
+                           ('GET', '/api/clusters/c1/recovery-report/100'): (200, guest)}),
+                   layout='modern', admin=False, permissions=['backup.view', 'vm.view', 'storage.view'])
+    page = _open_tab(app, 'modern')
+    page.locator('[data-rtest-row="100"]').click()
+    check = page.locator('[data-rtest-detail="100"] [data-rtest-check="command"]')
+    check.wait_for(timeout=5000)
+    assert 'Command: ***' in check.inner_text() and 'exit code 0' in check.inner_text()
+    assert not app.errors, app.errors
+
+
 def test_runtime_the_tab_speaks_german(open_app):
     app = open_app(layout='modern', language='de')
     page = app.page

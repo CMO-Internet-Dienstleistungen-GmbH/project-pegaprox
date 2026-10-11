@@ -4524,8 +4524,9 @@ pre{white-space:pre-wrap;word-break:break-all;border:1px solid #ccc;padding:12px
                 stopped: t('rtestRunStopped'), missed: t('rtestRunMissed'), error: t('rtestRunError') })[s] || s;
             const field = 'w-full px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm';
             const card = isCorporate ? 'p-3 bg-proxmox-dark border border-proxmox-border' : 'p-4 bg-proxmox-dark border border-proxmox-border rounded-lg';
+            // LW Oct 2026 - a command check comes without its command for anybody but an admin, as in the settings
             const checkText = (c) => (c.check === 'agent' ? t('rtestCheckAgent') : c.check === 'port' ? bkpFill(t('rtestCheckPort'), { port: c.target })
-                : c.check === 'booted' ? t('rtestCheckBooted') : `${t('rtestCheckCommand')}: ${c.target}`);
+                : c.check === 'booted' ? t('rtestCheckBooted') : `${t('rtestCheckCommand')}: ${c.target || '***'}`);
             const fmtSlot = (iso) => { const d = new Date(iso); return isNaN(d.getTime()) ? String(iso || '') : d.toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }); };
 
             const last = schedule && schedule.last_run;
