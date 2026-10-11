@@ -5946,8 +5946,10 @@
         }
 
         // NS May 2026 — Config Drift Detection.
-        // Tracks open events grouped by kind (vm_config, storage, network, cluster_options).
+        // Tracks open events grouped by kind (vm_config, storage, network, cluster_options,
+        // firewall, ha_rules, backup_jobs, access).
         // Admin can rescan, set baseline, acknowledge/promote events.
+        const DRIFT_KINDS = ['vm_config', 'storage', 'network', 'cluster_options', 'firewall', 'ha_rules', 'backup_jobs', 'access'];
         function DriftTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin }) {
             // the admin buttons here change things: a standby hands them to the active (#625)
             const { haReadOnly } = useAuth();
@@ -5961,27 +5963,77 @@
             // #625: only the leader keeps the drift rows; a member says so while it is away
             // and drops what it showed, an ack must never name a row from elsewhere
             const [leaderAway, setLeaderAway] = React.useState(false);
+            // LW Oct 2026 - filters by kind and category, the policy checks and their allow list drafts
+            const [kindFilter, setKindFilter] = React.useState('');
+            const [catFilter, setCatFilter] = React.useState('');
+            const [policy, setPolicy] = React.useState([]);
+            const [allowDraft, setAllowDraft] = React.useState({});
 
             const refresh = async () => {
                 if (!clusterId) return;
                 setBusy(true);
                 try {
-                    const [sr, er] = await Promise.all([
+                    const q = `status=${filter}&limit=200` + (kindFilter ? `&kind=${kindFilter}` : '') + (catFilter ? `&category=${catFilter}` : '');
+                    const [sr, er, pr] = await Promise.all([
                         authFetch(`${API_URL}/clusters/${clusterId}/drift/status`),
-                        authFetch(`${API_URL}/clusters/${clusterId}/drift/events?status=${filter}&limit=200`),
+                        authFetch(`${API_URL}/clusters/${clusterId}/drift/events?${q}`),
+                        authFetch(`${API_URL}/clusters/${clusterId}/drift/policy`),
                     ]);
                     const away = (await haLeaderAway(sr)) || (await haLeaderAway(er));
                     setLeaderAway(away);
-                    if (away) { setStatus(null); setEvents([]); return; }
+                    if (away) { setStatus(null); setEvents([]); setPolicy([]); return; }
                     const s = await sr?.json().catch(() => null);
                     const e = await er?.json().catch(() => null);
+                    const pj = await pr?.json().catch(() => null);
                     if (s && !s.error) setStatus(s);
                     if (e && e.events) setEvents(e.events);
+                    if (pj && pj.checks) {
+                        setPolicy(pj.checks);
+                        setAllowDraft(d => {
+                            const next = { ...d };
+                            pj.checks.forEach(c => { if (c.allow && next[c.id] === undefined) next[c.id] = c.allow.join(', '); });
+                            return next;
+                        });
+                    }
                 } finally { setBusy(false); }
             };
 
             // again when forwarding comes or goes: the list is the leader's then, or not
-            React.useEffect(() => { refresh(); /* eslint-disable-line */ }, [clusterId, filter, haReadOnly]);
+            React.useEffect(() => { refresh(); /* eslint-disable-line */ }, [clusterId, filter, kindFilter, catFilter, haReadOnly]);
+
+            const savePolicy = async (id, patch) => {
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/drift/policy`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ checks: { [id]: patch } }),
+                    });
+                    if (r?.ok) {
+                        addToast(t('driftPolicySaved') || 'Policy saved', 'success');
+                        setAllowDraft(d => { const n = { ...d }; delete n[id]; return n; });
+                        await refresh();
+                    } else {
+                        addToast(t('driftPolicySaveFailed') || 'Policy not saved', 'error');
+                    }
+                } catch (e) { addToast(t('driftPolicySaveFailed') || 'Policy not saved', 'error'); }
+            };
+
+            const markIncident = async (ev, flag) => {
+                if (flag && !confirm(t('driftIncidentAsk') || 'Confirm this event as an incident?')) return;
+                try {
+                    const r = await authFetch(`${API_URL}/drift/events/${ev.id}/incident`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ incident: flag }),
+                    });
+                    if (r?.ok) {
+                        addToast(flag ? (t('driftIncidentConfirmed') || 'Confirmed as incident') : (t('driftIncidentWithdrawn') || 'Incident withdrawn'), 'success');
+                        await refresh();
+                    } else {
+                        addToast(t('driftIncidentFailed') || 'Could not change the event', 'error');
+                    }
+                } catch (e) { addToast(t('driftIncidentFailed') || 'Could not change the event', 'error'); }
+            };
 
             const scan = async () => {
                 setScanning(true);
@@ -6048,7 +6100,32 @@
                 'storage': t('driftKindStorage') || 'Storage',
                 'network': t('driftKindNetwork') || 'Network',
                 'cluster_options': t('driftKindCluster') || 'Cluster Options',
+                'firewall': t('driftKindFirewall') || 'Firewall',
+                'ha_rules': t('driftKindHa') || 'HA Rules',
+                'backup_jobs': t('driftKindBackup') || 'Backup Jobs',
+                'access': t('driftKindAccess') || 'Access',
             }[k] || k);
+
+            const catLabel = (c) => ({
+                'deviation': t('driftCatDeviation') || 'Deviation',
+                'policy_violation': t('driftCatPolicy') || 'Policy violation',
+                'incident': t('driftCatIncident') || 'Incident',
+            }[c] || c);
+            const catColor = (c) => ({
+                'policy_violation': 'bg-purple-500/15 text-purple-400',
+                'incident': 'bg-red-500/15 text-red-400',
+            }[c] || 'bg-gray-500/15 text-gray-400');
+            const policyColor = (st) => ({
+                'pass': 'bg-green-500/15 text-green-400',
+                'fail': 'bg-red-500/15 text-red-400',
+                'not_checked': 'bg-yellow-500/15 text-yellow-400',
+            }[st] || 'bg-gray-500/15 text-gray-400');
+            const policyStatus = (st) => ({
+                'pass': t('driftPolicyPass') || 'Passed',
+                'fail': t('driftPolicyFail') || 'Violated',
+                'not_checked': t('driftNotChecked') || 'Not checked',
+                'disabled': t('driftPolicyDisabled') || 'Off',
+            }[st] || st);
 
             // LW Oct 2026 - 'unknown' is a scope on a node that did not answer (#968):
             // not checked, so the old value is not struck through
@@ -6057,6 +6134,7 @@
                 'removed': t('driftOpRemoved') || 'removed',
                 'changed': t('driftOpChanged') || 'changed',
                 'unknown': t('nodeOffline') || 'Node offline',
+                'violation': t('driftOpViolation') || 'violation',
             }[op] || op);
 
             const fmtVal = (v) => {
@@ -6083,6 +6161,16 @@
                                 <option value="open">{t('driftOpen') || 'open'}</option>
                                 <option value="acknowledged">{t('driftAcknowledged2') || 'acknowledged'}</option>
                                 <option value="all">{t('all') || 'all'}</option>
+                            </select>
+                            <select value={kindFilter} onChange={e => setKindFilter(e.target.value)} data-drift-filter="kind"
+                                className="px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm">
+                                <option value="">{t('driftAllKinds') || 'All kinds'}</option>
+                                {DRIFT_KINDS.map(k => <option key={k} value={k}>{kindLabel(k)}</option>)}
+                            </select>
+                            <select value={catFilter} onChange={e => setCatFilter(e.target.value)} data-drift-filter="category"
+                                className="px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm">
+                                <option value="">{t('driftAllCategories') || 'All categories'}</option>
+                                {['deviation', 'policy_violation', 'incident'].map(c => <option key={c} value={c}>{catLabel(c)}</option>)}
                             </select>
                             {canAct && (
                                 <>
@@ -6119,22 +6207,77 @@
                                 { k: 'storage', l: kindLabel('storage'), c: 'border-purple-500/30' },
                                 { k: 'network', l: kindLabel('network'), c: 'border-red-500/30' },
                                 { k: 'cluster_options', l: kindLabel('cluster_options'), c: 'border-orange-500/30' },
+                                { k: 'firewall', l: kindLabel('firewall'), c: 'border-red-500/30' },
+                                { k: 'ha_rules', l: kindLabel('ha_rules'), c: 'border-blue-500/30' },
+                                { k: 'backup_jobs', l: kindLabel('backup_jobs'), c: 'border-purple-500/30' },
+                                { k: 'access', l: kindLabel('access'), c: 'border-orange-500/30' },
                             ].map(it => {
                                 const counts = (status.by_kind || {})[it.k] || {};
                                 const total = (counts.critical || 0) + (counts.warning || 0) + (counts.info || 0);
+                                // LW Oct 2026 - a kind the last scan could not read is not "0 drift"
+                                const read = (status.kinds || {})[it.k];
                                 return (
-                                    <div key={it.k} className={`bg-proxmox-card border ${it.c} rounded-xl p-3`}>
+                                    <div key={it.k} data-drift-kind={it.k} onClick={() => setKindFilter(kindFilter === it.k ? '' : it.k)}
+                                        className={`bg-proxmox-card border ${it.c} rounded-xl p-3 cursor-pointer`}>
                                         <div className="text-xs text-gray-500">{it.l}</div>
                                         <div className="text-2xl font-bold text-white mt-1">{total}</div>
                                         <div className="text-[10px] text-gray-500 mt-1">
                                             {counts.critical ? <span className="text-red-400">{counts.critical} crit · </span> : null}
                                             {counts.warning ? <span className="text-yellow-400">{counts.warning} warn · </span> : null}
                                             {counts.info ? <span className="text-blue-400">{counts.info} info</span> : null}
-                                            {!total && <span>—</span>}
+                                            {!total && <span>-</span>}
                                         </div>
+                                        {(read === 'not_checked' || read === 'partial') && (
+                                            <div data-drift-unread={read} className="text-[10px] text-yellow-400 mt-1">
+                                                {read === 'partial' ? (t('driftPartlyChecked') || 'Partly checked') : (t('driftNotChecked') || 'Not checked')}
+                                            </div>
+                                        )}
                                     </div>
                                 );
                             })}
+                        </div>
+                    )}
+
+                    {!leaderAway && policy.length > 0 && (
+                        <div data-drift-policy className="bg-proxmox-card border border-proxmox-border rounded-xl p-3 space-y-2">
+                            <div>
+                                <div className="text-sm font-semibold text-white">{t('driftPolicyTitle') || 'Policy checks'}</div>
+                                <div className="text-xs text-gray-500">{t('driftPolicyDesc') || 'Forbidden states, judged on every scan. A check that could not read its data says so and never passes.'}</div>
+                            </div>
+                            <div className="divide-y divide-proxmox-border/40">
+                                {policy.map(c => (
+                                    <div key={c.id} data-drift-check={c.id} className="py-2 flex items-start justify-between gap-3 flex-wrap">
+                                        <div className="min-w-0">
+                                            <div className="flex items-center gap-2 flex-wrap">
+                                                <span className="text-xs text-gray-300">{t('driftCheck_' + c.id) || c.id}</span>
+                                                <span className="text-[10px] text-gray-500">{kindLabel(c.kind)}</span>
+                                                <span className={`px-1.5 py-0.5 text-[10px] rounded ${policyColor(c.status)}`}>{policyStatus(c.status)}</span>
+                                            </div>
+                                            {(c.violations || []).slice(0, 5).map((v, i) => (
+                                                <div key={i} className="text-[11px] text-gray-400 font-mono break-all">{v.path}: {v.detail}</div>
+                                            ))}
+                                            {c.allow && canAct && (
+                                                <div className="flex items-center gap-2 mt-1">
+                                                    <input value={allowDraft[c.id] !== undefined ? allowDraft[c.id] : c.allow.join(', ')}
+                                                        onChange={e => setAllowDraft({ ...allowDraft, [c.id]: e.target.value })}
+                                                        placeholder={t('driftPolicyAllow') || 'Allowed names, comma separated'}
+                                                        className="px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-xs w-64 max-w-full" />
+                                                    <button onClick={() => savePolicy(c.id, { allow: (allowDraft[c.id] !== undefined ? allowDraft[c.id] : c.allow.join(',')).split(',').map(x => x.trim()).filter(Boolean) })}
+                                                        className="text-[11px] px-2 py-0.5 bg-proxmox-darker border border-proxmox-border rounded text-gray-300 hover:text-white">
+                                                        {t('save') || 'Save'}
+                                                    </button>
+                                                </div>
+                                            )}
+                                        </div>
+                                        {canAct && (
+                                            <label className="flex items-center gap-1.5 text-xs text-gray-300 cursor-pointer flex-shrink-0">
+                                                <input type="checkbox" checked={!!c.enabled} onChange={e => savePolicy(c.id, { enabled: e.target.checked })} />
+                                                {t('driftPolicyEnabled') || 'Check on every scan'}
+                                            </label>
+                                        )}
+                                    </div>
+                                ))}
+                            </div>
                         </div>
                     )}
 
@@ -6157,6 +6300,9 @@
                                              onClick={() => setExpanded({ ...expanded, [ev.id]: !open })}>
                                             <div className="flex items-center gap-2 min-w-0">
                                                 <span className={`px-1.5 py-0.5 text-[10px] rounded ${sevColor(ev.severity)} flex-shrink-0`}>{ev.severity}</span>
+                                                {ev.category && ev.category !== 'deviation' && (
+                                                    <span data-drift-category={ev.category} className={`px-1.5 py-0.5 text-[10px] rounded ${catColor(ev.category)} flex-shrink-0`}>{catLabel(ev.category)}</span>
+                                                )}
                                                 <span className="text-xs text-gray-300 truncate">
                                                     <span className="text-gray-400">{kindLabel(ev.kind)}:</span> {ev.scope}
                                                 </span>
@@ -6171,11 +6317,25 @@
                                                             className="text-[11px] px-2 py-0.5 bg-proxmox-darker border border-proxmox-border rounded text-gray-300 hover:text-white">
                                                             {t('driftAck') || 'Ack'}
                                                         </button>
-                                                        <button onClick={e => { e.stopPropagation(); ack(ev.id, true); }}
-                                                            className="text-[11px] px-2 py-0.5 bg-orange-500/80 hover:bg-orange-600 rounded text-white">
-                                                            {t('driftPromote') || 'Promote'}
-                                                        </button>
+                                                        {ev.category !== 'policy_violation' && ev.category !== 'incident' && (
+                                                            <button onClick={e => { e.stopPropagation(); ack(ev.id, true); }}
+                                                                className="text-[11px] px-2 py-0.5 bg-orange-500/80 hover:bg-orange-600 rounded text-white">
+                                                                {t('driftPromote') || 'Promote'}
+                                                            </button>
+                                                        )}
                                                     </>
+                                                )}
+                                                {canAct && isAdmin && ev.category !== 'incident' && (
+                                                    <button data-drift-incident={ev.id} onClick={e => { e.stopPropagation(); markIncident(ev, true); }}
+                                                        className="text-[11px] px-2 py-0.5 bg-red-500/20 border border-red-500/30 rounded text-red-300 hover:text-white">
+                                                        {t('driftConfirmIncident') || 'Confirm as incident'}
+                                                    </button>
+                                                )}
+                                                {canAct && isAdmin && ev.category === 'incident' && (
+                                                    <button onClick={e => { e.stopPropagation(); markIncident(ev, false); }}
+                                                        className="text-[11px] px-2 py-0.5 bg-proxmox-darker border border-proxmox-border rounded text-gray-300 hover:text-white">
+                                                        {t('driftWithdrawIncident') || 'Withdraw incident'}
+                                                    </button>
                                                 )}
                                                 <Icons.ChevronDown className={`w-3.5 h-3.5 text-gray-500 transition-transform ${open ? 'rotate-180' : ''}`} />
                                             </div>
@@ -6190,6 +6350,11 @@
                                                         <div className="col-span-4 text-green-400 font-mono break-all">{fmtVal(d.after)}</div>
                                                     </div>
                                                 ))}
+                                                {ev.confirmed_at && (
+                                                    <div className="text-gray-500 mt-2">
+                                                        {t('driftConfirmedBy') || 'Confirmed as incident by'} {ev.confirmed_by} {t('at') || 'at'} {(ev.confirmed_at || '').replace('T', ' ').slice(0, 16)}
+                                                    </div>
+                                                )}
                                                 {ev.acknowledged_at && (
                                                     <div className="text-gray-500 mt-2">
                                                         {t('driftAcknowledgedBy') || 'Acknowledged by'} {ev.acknowledged_by} {t('at') || 'at'} {(ev.acknowledged_at || '').replace('T', ' ').slice(0, 16)}
