@@ -193,12 +193,21 @@ class _TimelineServer(_FakeServer):
 
     events = EVENTS
     hidden = ()
+    # pages the filters emptied before the first with rows, each with a cursor below it
+    emptied = 0
 
     def handle(self, route):
         req = route.request
         parsed = urlparse(req.url)
         if parsed.path == ROUTE and ('GET', ROUTE) not in self.fixed:
             q = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+            if q.get('before', '').endswith('|:'):
+                q.pop('before')
+            if self.emptied and not q.get('before'):
+                self.emptied -= 1
+                self.extra[('GET', ROUTE)] = (200, {'events': [], 'next_before': f'{_iso(0)}|:', 'sources': {},
+                                                    'correlation': {'window_minutes': 10, 'note': ''}})
+                return super().handle(route)
             rows = [e for e in self.events
                     if (not q.get('kinds') or e['kind'] in q['kinds'].split(','))
                     and (not q.get('severity') or e['severity'] in q['severity'].split(','))
@@ -222,7 +231,7 @@ class _TimelineServer(_FakeServer):
 def open_app(browser):
     apps = []
 
-    def _open(events=None, hidden=(), **kw):
+    def _open(events=None, hidden=(), emptied=0, **kw):
         extra = dict(SSE_TOKEN)
         extra.update(kw.pop('extra', {}))
         kw.setdefault('role', 'standalone')
@@ -232,6 +241,7 @@ def open_app(browser):
         if events is not None:
             server.events = events
         server.hidden = hidden
+        server.emptied = emptied
         app = _App(browser, server)
         apps.append(app)
         return app
@@ -329,6 +339,32 @@ def test_runtime_filters_range_and_older_pages_ask_the_server(open_app):
     assert _wait_for(page, lambda: len(_reads(app)) >= 5)
     since = calendar.timegm(time.strptime(_reads(app)[-1]['from'][0][:19], '%Y-%m-%dT%H:%M:%S'))
     assert abs((time.time() - since) - 7 * 86400) < 120
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_page_the_filters_emptied_goes_on_by_itself(open_app):
+    """The newest rows the server read were all dropped by the filter, and more wait below:
+    the list asks for the next page itself instead of saying nothing matches."""
+    app = open_app(layout='modern', emptied=2)
+    page = _open_cluster_timeline(app)
+    _wait_for(page, lambda: page.locator('[data-tl-row]').count() == 50)
+    assert page.locator('[data-tl-row]').count() == 50 and page.locator('[data-tl-empty]').count() == 0
+    reads = _reads(app)
+    assert len(reads) == 3 and 'before' not in reads[0]
+    assert all(r['before'][0].endswith('|:') and r['from'] == reads[0]['from'] for r in reads[1:])
+    assert not app.errors, app.errors
+
+
+def test_runtime_it_follows_a_few_empty_pages_then_lets_the_reader_go_on(open_app):
+    app = open_app(layout='modern', emptied=20)
+    page = app.page
+    page.get_by_text('Testi').first.click()
+    page.get_by_role('button', name='Timeline', exact=True).first.click()
+    page.locator('[data-tl-more]').wait_for(timeout=5000)
+    page.wait_for_timeout(1000)
+    assert len(_reads(app)) == 5 and page.locator('[data-tl-row]').count() == 0
+    page.locator('[data-tl-more]').click()
+    assert _wait_for(page, lambda: len(_reads(app)) == 10)
     assert not app.errors, app.errors
 
 

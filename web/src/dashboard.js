@@ -6211,6 +6211,7 @@
         // same guest or node shortly before, and the page says so. Only reads, so a standby
         // shows it too; only the leader keeps these rows (#625).
         const TL_PAGE = 50;
+        const TL_FOLLOW = 4;
         const TL_KINDS = {
             audit: ['tlKindAudit', Icons.FileText], alert: ['tlKindAlert', Icons.Bell],
             migration: ['tlKindMigration', Icons.ArrowRight], balancer: ['tlKindBalancer', Icons.Activity],
@@ -6281,7 +6282,7 @@
             const fetchRef = React.useRef(authFetch);
             fetchRef.current = authFetch;
 
-            const load = React.useCallback(async (before) => {
+            const load = React.useCallback(async (before, hops = 0) => {
                 if (!clusterId) return;
                 const mine = before ? gen.current : ++gen.current;
                 if (!before) from.current = new Date(Date.now() - hours * 3600 * 1000).toISOString();
@@ -6300,10 +6301,13 @@
                     setLeaderAway(away);
                     setFailed(!d && !away);
                     if (!d) return;
-                    setRows(prev => before ? prev.concat(d.events || []) : (d.events || []));
-                    setNext(d.next_before || null);
+                    const got = d.events || [];
+                    setRows(prev => before ? prev.concat(got) : got);
                     setSources(d.sources || {});
                     setLinkWindow((d.correlation || {}).window_minutes ?? 10);
+                    // LW Oct 2026 - a filter can empty a page with more below it: go on by itself, a few pages at most
+                    if (!got.length && d.next_before && hops < TL_FOLLOW) return await load(d.next_before, hops + 1);
+                    setNext(d.next_before || null);
                     setLoaded(true);
                 } finally {
                     if (mine === gen.current) setLoading(false);
