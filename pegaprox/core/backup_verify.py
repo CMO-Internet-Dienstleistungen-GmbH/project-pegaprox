@@ -889,12 +889,17 @@ def _agent_ping(pve_mgr, base, node, vmid, wait):
         time.sleep(5)
 
 
-def _agent_exec(pve_mgr, base, node, vmid, argv, wait=EXEC_WAIT):
-    """(exitcode, stdout) of a command the guest agent ran, None when it could not run it."""
+def _agent_exec(pve_mgr, base, node, vmid, argv, wait=EXEC_WAIT, why=None):
+    """(exitcode, stdout) of a command the guest agent ran, None when it could not run it.
+    MK Oct 2026 - `why`, a list, gets what Proxmox said when the agent refused: a RHEL
+    family guest blocks guest-exec in its agent config by default, and the check said only
+    that it could not run."""
     try:
         # an array parameter: one 'command' per argument
         r = pve_mgr._api_post(f"{base}/nodes/{node}/qemu/{vmid}/agent/exec", data={'command': list(argv)}, timeout=15)
         if r.status_code != 200:
+            if why is not None:
+                why.append(_agent_refusal(r))
             return None
         pid = (r.json().get('data') or {}).get('pid')
     except Exception:
@@ -914,6 +919,16 @@ def _agent_exec(pve_mgr, base, node, vmid, argv, wait=EXEC_WAIT):
             pass
         time.sleep(2)
     return None
+
+
+def _agent_refusal(r):
+    """Proxmox's reason for a refused agent call, one short line"""
+    try:
+        msg = (r.json() or {}).get('message') or ''
+    except Exception:
+        msg = ''
+    msg = ' '.join(str(msg or getattr(r, 'text', '') or '').split())[:200]
+    return msg or f'HTTP {r.status_code}'
 
 
 def _ct_exec(pve_mgr, node, vmid, inner, wait=EXEC_WAIT):
@@ -942,28 +957,29 @@ def run_checks(pve_mgr, base, node, vm_type, test_vmid, plan, config, log):
             checks.append({'check': 'agent', 'target': '', 'ok': bool(up),
                            'detail': 'answers' if up else f'no answer within {AGENT_WAIT}s'})
         if ports:
-            listening = None
+            listening, why = None, []
             if up:
-                got = _agent_exec(pve_mgr, base, node, test_vmid, LINUX_LISTENERS)
+                got = _agent_exec(pve_mgr, base, node, test_vmid, LINUX_LISTENERS, why=why)
                 if got is None or (got[0] != 0 and not got[1].strip()):
-                    got = _agent_exec(pve_mgr, base, node, test_vmid, WINDOWS_LISTENERS) or got
+                    got = _agent_exec(pve_mgr, base, node, test_vmid, WINDOWS_LISTENERS, why=why) or got
                 listening = parse_listening(got[1]) if got else None
             for p in ports:
                 if listening is None:
                     checks.append({'check': 'port', 'target': str(p), 'ok': False,
-                                   'detail': 'the listening ports could not be read through the guest agent'})
+                                   'detail': 'the listening ports could not be read through the guest agent'
+                                             + (f': {why[0]}' if why else '')})
                 else:
                     checks.append({'check': 'port', 'target': str(p), 'ok': p in listening,
                                    'detail': 'listening' if p in listening else 'nothing listens'})
         if command:
-            got = None
+            got, why = None, []
             if up:
-                got = _agent_exec(pve_mgr, base, node, test_vmid, ['sh', '-c', command])
+                got = _agent_exec(pve_mgr, base, node, test_vmid, ['sh', '-c', command], why=why)
                 if got is None:
-                    got = _agent_exec(pve_mgr, base, node, test_vmid, ['cmd.exe', '/c', command])
+                    got = _agent_exec(pve_mgr, base, node, test_vmid, ['cmd.exe', '/c', command], why=why)
             if got is None:
                 checks.append({'check': 'command', 'target': command, 'ok': False,
-                               'detail': 'the guest agent could not run it'})
+                               'detail': 'the guest agent could not run it' + (f': {why[0]}' if why else '')})
             else:
                 checks.append({'check': 'command', 'target': command, 'ok': got[0] == 0,
                                'detail': f'exit code {got[0]}'})

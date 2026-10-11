@@ -310,6 +310,22 @@ def test_agent_ports_and_command_through_the_guest_agent(clock, db):
     assert ['sh', '-c', 'systemctl is-active nginx'] in pve.exec_cmds
 
 
+def test_a_refused_agent_command_says_why(clock, db):
+    """A RHEL family guest blocks guest-exec in its agent config by default. The checks said
+    only that the agent could not run it; they carry what Proxmox answered now."""
+    class _Blocked(_PVE):
+        def _api_post(self, url, data=None, timeout=None, **kw):
+            if self._path(url).endswith('/agent/exec'):
+                return _Resp(500, None, 'Agent error: The command guest-exec has been disabled for this instance')
+            return super()._api_post(url, data=data, timeout=timeout, **kw)
+    st = bv.run_verification(_Blocked(), _params(plan=_plan(ports=[22], command='systemctl is-active sshd')))
+    checks = {c['check']: c for c in st['checks']}
+    assert checks['port']['ok'] is False and checks['command']['ok'] is False
+    assert checks['port']['detail'].endswith(': Agent error: The command guest-exec has been disabled for this instance')
+    assert checks['command']['detail'] == ('the guest agent could not run it: '
+                                           'Agent error: The command guest-exec has been disabled for this instance')
+
+
 def test_a_windows_guest_answers_through_netstat(clock, db):
     pve = _PVE(linux=False, listeners=WIN_OUT)
     st = bv.run_verification(pve, _params(plan=_plan(ports=[3389], command='sc query Spooler')))
