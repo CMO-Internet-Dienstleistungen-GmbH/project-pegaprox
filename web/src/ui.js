@@ -4456,6 +4456,196 @@ pre{white-space:pre-wrap;word-break:break-all;border:1px solid #ccc;padding:12px
             return String(text || '').split(/[\s,;]+/).filter(Boolean).map(p => (/^\d+$/.test(p) ? parseInt(p, 10) : p));
         }
 
+        // LW Oct 2026 - recovery assurance under the restore tests: how much of the cluster is
+        // proven recoverable (restore test + agent check + application check), the gaps behind
+        // the rest, the signed evidence, and manual confirmations that sit beside the proof
+        const RASR_PAGE = 25;
+        const RASR_KINDS = ['restore_failing', 'app_failing', 'agent_failing', 'never_tested', 'no_agent_check', 'no_app_checks',
+                            'rto_missed', 'test_stale', 'backup_old', 'no_backup', 'plan_target_unreachable', 'plan_no_replication'];
+        const rasrKindKey = (k) => 'rasrGap' + k.charAt(0).toUpperCase() + k.slice(1);
+        function RecoveryAssurance({ clusterId, base, call, days, stamp, canWrite, canTags, say, card, haServing }) {
+            const { t } = useTranslation();
+            const [data, setData] = useState(null);
+            const [error, setError] = useState('');
+            const [kind, setKind] = useState('all');
+            const [shown, setShown] = useState(RASR_PAGE);
+            const [tags, setTags] = useState('');
+            const [dialog, setDialog] = useState(null);
+            const [busy, setBusy] = useState('');
+            const [verdict, setVerdict] = useState(null);
+            const look = useRef(0);
+            const field = 'w-full px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm';
+
+            const load = useCallback(async () => {
+                const mine = ++look.current;
+                try {
+                    const res = await call(`${base}/recovery-assurance?days=${days}`);
+                    if (mine !== look.current) return;
+                    if (res.ok) {
+                        const body = await res.json();
+                        setData(body);
+                        setTags((body.critical_tags || []).join(', '));
+                        setError('');
+                    } else { setData(null); setError(await PegaProxApiErrors.message(res, t('rtestLoadFailed'))); }
+                } catch (e) { if (mine === look.current) setError(t('rtestLoadFailed')); }
+            }, [base, days, call]);  // eslint-disable-line react-hooks/exhaustive-deps
+            useEffect(() => { load(); }, [load, stamp]);
+
+            const send = async (key, method, url, body, done) => {
+                setBusy(key);
+                try {
+                    const res = await call(url, { method, headers: { 'Content-Type': 'application/json' },
+                                                  body: body === undefined ? undefined : JSON.stringify(body) });
+                    if (res.ok) { say(done, 'success'); setDialog(null); await load(); }
+                    else say(await bkpError(res, t, haServing), 'error');
+                } catch (e) { say(t('connectionError'), 'error'); }
+                setBusy('');
+            };
+            const saveTags = () => send('tags', 'PUT', `${base}/recovery-settings`,
+                { critical_tags: tags.split(',').map(s => s.trim()).filter(Boolean) }, t('rtestSaved'));
+            const saveConfirm = () => {
+                const body = { vmid: Number(dialog.vmid) || dialog.vmid, text: dialog.text.trim() };
+                if (String(dialog.days).trim() !== '') body.expires_days = Number(dialog.days);
+                send('confirm', 'POST', `${base}/recovery-confirmations`, body, t('rasrConfirmSaved'));
+            };
+            const verifyFile = async (file) => {
+                setVerdict(null);
+                if (!file) return;
+                try {
+                    const res = await call(`${API_URL}/recovery-evidence/verify`, { method: 'POST',
+                        headers: { 'Content-Type': 'application/json' }, body: await file.text() });
+                    if (!res.ok) { setVerdict({ bad: true, text: t('rasrVerifyFailed') }); return; }
+                    const v = await res.json();
+                    setVerdict(!v.signature_valid ? { bad: true, text: t('rasrVerifyBad') }
+                        : v.audit_chain === 'absent' ? { bad: true, text: t('rasrVerifyChainAbsent') }
+                        : { bad: false, text: t('rasrVerifyOk') });
+                } catch (e) { setVerdict({ bad: true, text: t('rasrVerifyFailed') }); }
+            };
+
+            if (!data) return error ? <div className="text-sm text-red-400" data-rasr-error>{error}</div> : null;
+            const cov = data.coverage || {};
+            const counts = data.gap_counts || {};
+            const all = [...(data.gaps || []), ...(data.plan_gaps || []).map(p => ({ kind: p.kind, vmid: p.vmid, name: p.name || '', plan: p.plan, plan_id: p.plan_id }))];
+            const list = kind === 'all' ? all : all.filter(g => g.kind === kind);
+            const kinds = RASR_KINDS.filter(k => counts[k]);
+            const confirmed = (data.guests || []).filter(g => g.confirmation);
+            const pct = (p) => (p == null ? '-' : `${p}%`);
+            const tile = (key, label, c) => (
+                <div className={card} data-rasr-tile={key} data-proven={c.proven} data-total={c.total}>
+                    <div className="text-xs text-gray-400">{label}</div>
+                    <div className={`text-2xl font-bold ${c.percent == null ? 'text-gray-500' : c.percent >= 90 ? 'text-green-400' : c.percent >= 60 ? 'text-yellow-400' : 'text-red-400'}`}>{pct(c.percent)}</div>
+                    <div className="text-xs text-gray-500 mt-1">{c.total ? bkpFill(t('rasrProvenOf'), { proven: c.proven, total: c.total }) : (key === 'critical' ? t('rasrNoCritical') : '-')}</div>
+                </div>
+            );
+            return (
+                <div className="space-y-3" data-rasr-panel={clusterId}>
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                        <div>
+                            <div className="text-sm font-medium text-white flex items-center gap-2"><Icons.Shield className="w-4 h-4" /> {t('rasrTitle')}</div>
+                            <p className="text-xs text-gray-500 mt-1">{t('rasrDesc')}</p>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                            <a href={`${base}/recovery-evidence?days=${days}&format=json`} download data-rasr-export="json"
+                                className="flex items-center gap-1 px-3 py-1.5 text-sm text-gray-300 hover:text-white border border-proxmox-border rounded"><Icons.Download className="w-4 h-4" /> {t('rasrExportJson')}</a>
+                            <a href={`${base}/recovery-evidence?days=${days}&format=csv`} download data-rasr-export="csv"
+                                className="flex items-center gap-1 px-3 py-1.5 text-sm text-gray-300 hover:text-white border border-proxmox-border rounded"><Icons.Download className="w-4 h-4" /> {t('rasrExportCsv')}</a>
+                            <label className="flex items-center gap-1 px-3 py-1.5 text-sm text-gray-300 hover:text-white border border-proxmox-border rounded cursor-pointer">
+                                <Icons.Check className="w-4 h-4" /> {t('rasrVerify')}
+                                <input type="file" accept="application/json,.json" className="hidden" data-rasr-verify
+                                    onChange={e => { verifyFile(e.target.files && e.target.files[0]); e.target.value = ''; }} />
+                            </label>
+                        </div>
+                    </div>
+                    {verdict && <div className={`text-xs ${verdict.bad ? 'text-red-400' : 'text-green-400'}`} data-rasr-verdict={verdict.bad ? 'bad' : 'ok'}>{verdict.text}</div>}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        {tile('critical', t('rasrCritical'), cov.critical || {})}
+                        {tile('all', t('rasrAll'), cov.all || {})}
+                    </div>
+                    {canTags && (
+                        <div className="flex flex-wrap items-end gap-2">
+                            <label className="text-xs text-gray-400 flex-1" style={{ minWidth: '200px' }}>{t('rasrCriticalTags')}
+                                <input value={tags} onChange={e => setTags(e.target.value)} placeholder={t('rasrCriticalTagsHint')} className={`${field} font-mono`} data-rasr-tags />
+                            </label>
+                            <button onClick={saveTags} disabled={busy === 'tags'} data-rasr-save-tags
+                                className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded text-sm font-medium disabled:opacity-50">{t('save')}</button>
+                        </div>
+                    )}
+
+                    <div className={card} data-rasr-gaps={all.length}>
+                        <div className="flex flex-wrap items-center gap-2 mb-2">
+                            <span className="text-sm font-medium text-white">{t('rasrGaps')}</span>
+                            <button onClick={() => { setKind('all'); setShown(RASR_PAGE); }} data-rasr-kind="all"
+                                className={`px-2 py-0.5 rounded text-xs border ${kind === 'all' ? 'border-proxmox-orange text-white' : 'border-proxmox-border text-gray-400'}`}>{t('all')} ({all.length})</button>
+                            {kinds.map(k => (
+                                <button key={k} onClick={() => { setKind(k); setShown(RASR_PAGE); }} data-rasr-kind={k}
+                                    className={`px-2 py-0.5 rounded text-xs border ${kind === k ? 'border-proxmox-orange text-white' : 'border-proxmox-border text-gray-400'}`}>{t(rasrKindKey(k))} ({counts[k]})</button>
+                            ))}
+                        </div>
+                        {!list.length && <div className="text-sm text-gray-400" data-rasr-nogaps>{t('rasrNoGaps')}</div>}
+                        <div className="space-y-1">
+                            {list.slice(0, shown).map((g, i) => (
+                                <div key={`${g.kind}-${g.plan_id || ''}-${g.vmid}-${i}`} className="flex items-center gap-3 text-xs" data-rasr-gap={g.kind} data-vmid={g.vmid ?? ''}>
+                                    <span className="font-mono text-gray-400 w-16">{g.vmid ?? '-'}</span>
+                                    <span className="text-gray-300 truncate flex-1">{g.name || ''}{g.plan ? ` ${bkpFill(t('rasrPlanOf'), { plan: g.plan })}` : ''}</span>
+                                    {g.critical && <span className="px-1.5 py-0.5 rounded bg-red-500/20 text-red-400">{t('rasrCritical')}</span>}
+                                    <span className="text-yellow-400">{t(rasrKindKey(g.kind))}</span>
+                                    {canWrite && g.vmid != null && (
+                                        <button onClick={() => setDialog({ vmid: g.vmid, name: g.name, text: '', days: '' })} data-rasr-confirm-open={g.vmid}
+                                            className="text-blue-400 hover:text-blue-300">{t('rasrConfirm')}</button>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                        {list.length > shown && (
+                            <button onClick={() => setShown(n => n + RASR_PAGE)} className="mt-2 text-xs text-blue-400 hover:text-blue-300" data-rasr-more>
+                                {bkpFill(t('bkpRunsShowMore'), { shown, total: list.length })}
+                            </button>
+                        )}
+                    </div>
+
+                    {confirmed.length > 0 && (
+                        <div className={card} data-rasr-confirmations={confirmed.length}>
+                            <div className="text-sm font-medium text-white mb-2">{t('rasrConfirmations')}</div>
+                            {confirmed.map(g => (
+                                <div key={g.vmid} className="flex items-center gap-3 text-xs py-0.5" data-rasr-confirmation={g.vmid} data-proof={g.proof}>
+                                    <span className="font-mono text-gray-400 w-16">{g.vmid}</span>
+                                    <span className="text-gray-300 truncate flex-1" title={g.confirmation.text}>{g.name} - {g.confirmation.text}</span>
+                                    <span className="text-gray-500">{bkpFill(t('rasrConfirmBy'), { who: g.confirmation.confirmed_by, when: new Date(g.confirmation.confirmed_at).toLocaleDateString() })}
+                                        {g.confirmation.expires_at ? ` ${bkpFill(t('rasrConfirmUntil'), { when: new Date(g.confirmation.expires_at).toLocaleDateString() })}` : ''}</span>
+                                    <span className="px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-400">{g.proof === 'proven' ? t('rasrProven') : t('rasrNotProven')}</span>
+                                    {canWrite && <button onClick={() => send('revoke', 'DELETE', `${base}/recovery-confirmations/${g.confirmation.id}`, undefined, t('rasrWithdrawn'))}
+                                        disabled={busy === 'revoke'} data-rasr-withdraw={g.vmid} className="text-red-400 hover:text-red-300">{t('rasrWithdraw')}</button>}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
+                    {dialog && (
+                        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={() => setDialog(null)} data-rasr-dialog>
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-md p-5 space-y-3" onClick={e => e.stopPropagation()}>
+                                <div className="text-base font-semibold text-white">{t('rasrConfirmTitle')}</div>
+                                <p className="text-xs text-gray-400">{t('rasrConfirmNote')}</p>
+                                <label className="text-xs text-gray-400 block">{t('rasrConfirmGuest')}
+                                    <input value={dialog.vmid} onChange={e => setDialog({ ...dialog, vmid: e.target.value })} className={`${field} font-mono`} data-rasr-field="vmid" />
+                                </label>
+                                <label className="text-xs text-gray-400 block">{t('rasrConfirmText')}
+                                    <textarea value={dialog.text} maxLength={500} rows={3} onChange={e => setDialog({ ...dialog, text: e.target.value })} className={field} data-rasr-field="text" />
+                                </label>
+                                <label className="text-xs text-gray-400 block">{t('rasrConfirmExpiry')}
+                                    <input type="number" min="1" max="3650" value={dialog.days} onChange={e => setDialog({ ...dialog, days: e.target.value })} className={field} data-rasr-field="days" />
+                                </label>
+                                <div className="flex justify-end gap-2">
+                                    <button onClick={() => setDialog(null)} className="px-3 py-1.5 text-sm text-gray-300 border border-proxmox-border rounded">{t('cancel')}</button>
+                                    <button onClick={saveConfirm} disabled={busy === 'confirm' || !dialog.text.trim()} data-rasr-save-confirm
+                                        className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded text-sm font-medium disabled:opacity-50">{t('save')}</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         function RestoreTestsPanel({ clusterId, addToast }) {
             const { t } = useTranslation();
             const { getAuthHeaders, isAdmin, haReadOnly, haServing } = useAuth();
@@ -4671,6 +4861,10 @@ pre{white-space:pre-wrap;word-break:break-all;border:1px solid #ccc;padding:12px
                             </div>
                         )}
                     </div>
+
+                    {/* how much of the cluster is proven recoverable */}
+                    <RecoveryAssurance clusterId={clusterId} base={base} call={call} days={days} stamp={report} card={card} say={say}
+                        canWrite={isAdmin && !haReadOnly} canTags={canEdit} haServing={haServing} />
 
                     {/* what the tests do on this cluster */}
                     {settings && settings.cluster && draft && 'isolation' in settings.cluster && (

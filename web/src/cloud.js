@@ -1372,6 +1372,10 @@
         const CLOUD_RT_PAGE = 25;
         function CloudRestoreTests({ clusterId, t }) {
             const { data, loading, err, reload } = useCloudData(clusterId ? `/api/clusters/${clusterId}/recovery-report` : null);
+            // LW Oct 2026 - the share of critical and of all guests proven recoverable, from the assurance read
+            const asr = useCloudData(clusterId ? `/api/clusters/${clusterId}/recovery-assurance` : null);
+            const cov = (asr.data && asr.data.coverage) || null;
+            const gapTotal = asr.data ? Object.values(asr.data.gap_counts || {}).reduce((x, y) => x + y, 0) : 0;
             const [page, setPage] = React.useState(0);
             const rows = ((data && data.guests) || []).filter(g => g.state !== 'ok');
             const sum = (data && data.summary) || {};
@@ -1384,15 +1388,20 @@
                 { icon: 'CheckCircle', value: sum.ok ?? 0, label: t('rtestStateOk'), accent: '#22c55e' },
                 { icon: 'XCircle', value: sum.failing ?? 0, label: t('rtestStateFailing'), accent: sum.failing ? '#ef4444' : '#14b8a6' },
                 { icon: 'AlertTriangle', value: (sum.never ?? 0) + (sum.stale ?? 0), label: t('rtestCloudNotRecent'), accent: '#f59e0b' },
+                ...(cov ? [
+                    { icon: 'Shield', value: cov.critical.percent == null ? '-' : `${cov.critical.percent}%`, label: t('rasrCloudCritical'), accent: cov.critical.percent == null ? '#6b7280' : cov.critical.percent >= 90 ? '#22c55e' : '#ef4444', attr: 'critical' },
+                    { icon: 'AlertTriangle', value: gapTotal, label: t('rasrCloudGaps'), accent: gapTotal ? '#f59e0b' : '#14b8a6', attr: 'gaps' },
+                ] : []),
             ];
             return (
                 <div data-rtest-cloud={clusterId}>
                     <CloudSectionTitle right={<span style={{ display: 'flex', gap: 8 }}>
                         <a className="cloud-link-btn" href={`/api/clusters/${clusterId}/recovery-report?format=csv`} download data-rtest-csv><Icons.Download /> {t('rtestExportCsv')}</a>
+                        <a className="cloud-link-btn" href={`/api/clusters/${clusterId}/recovery-evidence`} download data-rasr-export="json"><Icons.Download /> {t('rasrExportJson')}</a>
                         <button type="button" className="cloud-link-btn" onClick={reload}><Icons.RefreshCw /> {t('refresh') || 'Refresh'}</button>
                     </span>}>{t('rtestTitle')}</CloudSectionTitle>
                     <CloudSectionState loading={loading} err={err} empty={!!data && !(data.guests || []).length} emptyIcon="LifeBuoy" emptyTitle={t('rtestNoGuests')} t={t}>
-                        <div className="cloud-kpi-grid">{kpis.map((k, i) => <CloudKpiCard key={i} icon={k.icon} value={k.value} label={k.label} accent={k.accent} />)}</div>
+                        <div className="cloud-kpi-grid">{kpis.map((k, i) => <div key={i} style={{ display: 'contents' }} data-rasr-cloud-kpi={k.attr || ''}><CloudKpiCard icon={k.icon} value={k.value} label={k.label} accent={k.accent} /></div>)}</div>
                         {rows.length > 0 && (
                             <div className="cloud-card cloud-table-card">
                                 {cloudHead({ icon: <Icons.LifeBuoy />, title: t('rtestCloudAttention'), count: rows.length })}
