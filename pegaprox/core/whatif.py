@@ -25,7 +25,7 @@ of failure of the cluster in cheap mode and orders them by affected guests, crit
 weighted up.
 
 The report says per guest what becomes of it (down, restarted on X, moved to X, degraded;
-every guest not listed is unaffected), per node CPU and memory before and after against the
+every running guest not listed is unaffected, a stopped one is counted apart), per node CPU and memory before and after against the
 thresholds, the HA limits hit and the reserve that is left. Each statement carries what it
 rests on - known (configuration and what PVE reports now), calculated (capacity math on
 that) or assumed - and the assumptions are listed with the report.
@@ -131,6 +131,7 @@ LIMITS = {
     'pbs_tests_lost': 'Guests whose proven restore test used a restore point on it: {count}',
     'pbs_points_unread': 'The restore points of the backup storages could not all be read, the backup jobs stand in where they are missing',
     'pbs_jobs_unread': 'The backup jobs of the cluster could not be read, only the listed restore points are used',
+    'pbs_inactive': '{storage} is not active on any node right now (offline or not reachable), its restore points could not be listed',
 }
 ASSUMPTIONS = {
     'mem_configured': 'A restarted or moved guest uses its configured memory in full',
@@ -162,6 +163,10 @@ ASSUMPTIONS = {
     'pbs_jobs': 'A backup job covers the guests it selects by id, by pool or all (minus its exclusions), on its node if it names one',
     'rank_weighting': 'A guest counts {down} if down, {degraded} if degraded or unknown, {restarted} if restarted, {moved} if moved; a critical guest {factor} times that',
     'rank_cheap': 'Candidates run in cheap mode: {reads} guest configurations are read for all of them, the guests not read count as unknown',
+    'stopped_guests': 'Stopped guests ({count}) are not counted as affected or unaffected, they are not running',
+    'stopped_backups': 'Stopped guests ({count}) count as affected only where restore points or a backup job tie them to the storage, the unaffected count holds running guests only',
+    'rank_stopped': 'Stopped guests ({count}) are not counted as affected, they are not running; a backup storage counts them only where restore points or a backup job tie them to it',
+    'rank_shared_only': 'Only shared storages are ranked: a local storage fails with its node, which the node rows cover',
 }
 _KNOWN, _CALC, _ASSUMED = 'known', 'calculated', 'assumed'
 
@@ -617,6 +622,7 @@ class _Run:
         self.vms = [v for v in vms or [] if v.get('type') in ('qemu', 'lxc') and not v.get('template')
                     and v.get('vmid') is not None]
         self.running = [v for v in self.vms if v.get('status') == 'running']
+        self.stopped = sum(1 for v in self.vms if v.get('status') == 'stopped')
         self.online = sorted(n for n, d in status.items() if d.get('status') == 'online')
         self.in_maintenance = {n for n, d in status.items() if d.get('maintenance_mode')}
         self.load = _Load(self)
@@ -793,6 +799,10 @@ class _Run:
             counts[r['outcome']] = counts.get(r['outcome'], 0) + 1
         affected_running = sum(1 for vm in self.running if int(vm['vmid']) in self.rows)
         counts['unaffected'] = max(0, len(self.running) - affected_running)
+        # MK Oct 2026 - a stopped guest is in none of the counts above: say how many there are
+        if self.stopped:
+            self.assume('stopped_backups' if self.sc.get('type') == 'pbs_failure' else 'stopped_guests',
+                        count=self.stopped)
         limits = []
         for item in self.limits.values():
             args = dict(item['args'])
@@ -808,7 +818,7 @@ class _Run:
             'supported': True,
             'scenario': self.sc,
             'generated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-            'summary': dict(counts, running=len(self.running), guests=len(self.vms)),
+            'summary': dict(counts, running=len(self.running), stopped=self.stopped, guests=len(self.vms)),
             'guests': guests,
             'nodes': node_rows,
             'limits': limits,
@@ -1534,10 +1544,21 @@ def _pbs_failure(run):
         raise Unreadable('Neither the backup jobs nor the restore points of the cluster could be read')
     run.assume('pbs_listing', n=recovery.BACKUPS_PER_GUEST)
     run.assume('pbs_jobs')
+    # MK Oct 2026 - what was read of THIS storage, not of the backup storages as a whole
+    if idx is None:
+        points_read = False
+    elif idx.get('listed') is None:
+        points_read = not idx.get('partial')
+    else:
+        points_read = name in idx['listed']
+    presence = storage_presence(mgr)
+    active_on = None if presence is None else sorted(n for n, have in presence.items() if name in have)
     if jobs is None:
         run.limit('pbs_jobs_unread', _KNOWN)
-    if idx is None or idx.get('partial'):
+    if idx is None or idx.get('partial') or not points_read:
         run.limit('pbs_points_unread', _KNOWN)
+    if active_on == []:
+        run.limit('pbs_inactive', _KNOWN, storage=name)
 
     targeting = [j for j in jobs or [] if str(j.get('storage') or '') == name
                  and str(j.get('enabled', 1)).lower() not in ('0', 'false', 'no')]
@@ -1567,7 +1588,7 @@ def _pbs_failure(run):
             run.guest(vm, 'degraded', 'pbs_some_copy', _KNOWN, storage=name, count=len(on), total=len(points))
         elif vmid in by_job:
             counts['job_only'] += 1
-            run.guest(vm, 'degraded', 'pbs_job_only', _KNOWN if idx is not None else _ASSUMED, storage=name)
+            run.guest(vm, 'degraded', 'pbs_job_only', _KNOWN if points_read else _ASSUMED, storage=name)
         else:
             continue
         mark = (marks or {}).get(vmid) or {}
@@ -1582,7 +1603,8 @@ def _pbs_failure(run):
         run.limit('pbs_tests_lost', _KNOWN, guests=tests)
     run.extra['pbs'] = {
         'storage': name, 'jobs': job_rows, 'jobs_read': jobs is not None,
-        'points_read': idx is not None, 'marks_read': marks is not None,
+        'points_read': points_read, 'marks_read': marks is not None,
+        'active': None if active_on is None else bool(active_on), 'active_on': active_on or [],
         'guests_all_lost': counts['only'], 'guests_some_lost': counts['some'],
         'guests_job_only': counts['job_only'],
         'tests_lost': len(tests), 'tests_unmatched': unmatched, 'basis': _KNOWN,
@@ -1779,10 +1801,10 @@ def ranking(mgr, thresholds=None, critical_tags=None):
         todo += [(kind, name, dict(sc, memory='configured')) for name, sc in items[:RANK_CAPS[kind]]]
     budget = {'left': RANK_CONFIG_READS}
     deadline = time.monotonic() + RANK_SECONDS
-    ranked, skipped, stopped, unread = [], [], None, 0
+    ranked, skipped, cut, unread = [], [], None, 0
     for i, (kind, name, sc) in enumerate(todo):
         if time.monotonic() > deadline:
-            stopped = {'ranked': len(ranked) + len(skipped), 'left': len(todo) - i}
+            cut = {'ranked': len(ranked) + len(skipped), 'left': len(todo) - i}
             break
         try:
             sim = _Run(mgr, sc, thresholds, budget)
@@ -1805,22 +1827,30 @@ def ranking(mgr, thresholds=None, critical_tags=None):
                    _assumption_row('rank_weighting', factor=CRITICAL_FACTOR,
                                    **{k: OUTCOME_WEIGHT[k] for k in ('down', 'degraded', 'restarted', 'moved')}),
                    _assumption_row('rank_cheap', reads=RANK_CONFIG_READS),
+                   _assumption_row('rank_shared_only'),
                    _assumption_row('no_service_model')]
+    # MK Oct 2026 - stopped guests are not running, so no candidate affects them (a backup
+    # storage apart, where the restore points count)
+    if probe.stopped:
+        assumptions.append(_assumption_row('rank_stopped', count=probe.stopped))
     if any(r['kind'] == 'pbs' for r in ranked):
         from pegaprox.core import recovery
         assumptions.append(_assumption_row('pbs_listing', n=recovery.BACKUPS_PER_GUEST))
-    return {
+    out = {
         'supported': True,
         'generated_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-        'guests': {'total': len(probe.vms), 'running': len(probe.running),
+        'guests': {'total': len(probe.vms), 'running': len(probe.running), 'stopped': probe.stopped,
                    'critical': sum(1 for v in ctx.vms if ctx.is_critical(v)), 'basis': _KNOWN},
         'critical_tags': sorted(ctx.critical), 'critical_tags_source': ctx.source,
         'weighting': {'outcomes': dict(OUTCOME_WEIGHT), 'critical_factor': CRITICAL_FACTOR, 'basis': _CALC},
         'ranking': ranked, 'considered': sum(len(v) for v in cands.values()),
-        'capped': capped, 'skipped': skipped, 'stopped': stopped,
+        'capped': capped, 'skipped': skipped,
         'configs_unread': unread, 'config_reads': RANK_CONFIG_READS - budget['left'],
         'assumptions': assumptions,
     }
+    if cut:
+        out['stopped'] = cut     # the time limit ended the run early
+    return out
 
 
 def options(mgr):

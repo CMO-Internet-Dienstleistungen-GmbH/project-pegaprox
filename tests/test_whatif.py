@@ -135,6 +135,7 @@ def test_a_node_failure_restarts_what_ha_manages_and_leaves_the_rest_down():
     assert rows[106]['reason']['code'] == 'passthrough' and rows[106]['basis'] == 'assumed'
     assert 105 not in rows and 104 not in rows          # stopped / on a node that stays up
     assert r['summary']['unaffected'] == 1 and r['summary']['down'] == 4
+    assert r['summary']['stopped'] == 1 and r['summary']['running'] == 6
     assert _limit(r, 'not_ha')['guests'] == [101]
     assert _limit(r, 'local_disks')['args']['count'] == 1
     nodes = {n['node']: n for n in r['nodes']}
@@ -146,6 +147,21 @@ def test_a_node_failure_restarts_what_ha_manages_and_leaves_the_rest_down():
     codes = [a['code'] for a in r['assumptions']]
     for code in ('no_service_model', 'votes', 'ha_choice', 'mem_configured', 'cpu_now', 'fence_delay'):
         assert code in codes, codes
+
+
+def test_stopped_guests_are_counted_apart_and_the_report_says_they_are_not_affected():
+    guests = [_vm(100, 'pve1', status='stopped'), _vm(101, 'pve1', status='stopped'), _vm(102, 'pve2', status='stopped')]
+    api = _cluster(guests, {v['vmid']: _cfg() for v in guests}, ha=[('vm:100', 'started')])
+    r = _run(_manager(api, guests), type='node_failure', nodes=['pve1'])
+    assert r['summary'] == {'down': 0, 'degraded': 0, 'restarted': 0, 'moved': 0, 'unknown': 0, 'unaffected': 0,
+                            'running': 0, 'stopped': 3, 'guests': 3}
+    note = next(a for a in r['assumptions'] if a['code'] == 'stopped_guests')
+    assert note['args'] == {'count': 3}
+    assert note['text'] == 'Stopped guests (3) are not counted as affected or unaffected, they are not running'
+    # a cluster with none says nothing about them
+    guests = [_vm(100, 'pve1')]
+    r = _run(_manager(_cluster(guests, {100: _cfg()}), guests), type='node_failure', nodes=['pve1'])
+    assert r['summary']['stopped'] == 0 and not any(a['code'].startswith('stopped') for a in r['assumptions'])
 
 
 def test_the_memory_basis_can_be_what_the_guest_uses_now():

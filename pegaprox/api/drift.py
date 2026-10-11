@@ -737,6 +737,27 @@ def _supersede_events(ids):
         logging.warning(f"[drift] superseding events failed: {e}")
 
 
+def _diff_digest(text):
+    return hashlib.sha256(str(text).encode('utf-8', 'replace')).digest()
+
+
+def _open_deviation_diffs(cluster_id):
+    """{(kind, scope, digest of the diff text)} of the deviations still open. A scan that finds
+    the same unchanged diff again records nothing new; a changed diff does. An incident is a
+    deviation an admin confirmed, so it counts as the same row. Failing to read them means
+    every deviation is recorded as before. MK Oct 2026"""
+    out = set()
+    try:
+        c = get_db().conn.cursor()
+        c.execute("SELECT kind, scope, diff FROM drift_events WHERE cluster_id=? AND status='open' "
+                  "AND category IN (?, ?)", (cluster_id, CATEGORY_DEVIATION, CATEGORY_INCIDENT))
+        for r in c.fetchall():
+            out.add((r['kind'], r['scope'], _diff_digest(r['diff'])))
+    except Exception as e:
+        logging.debug(f"[drift] open deviations read failed: {e}")
+    return out
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Policy checks and what the last scan could read - MK Oct 2026
 # ──────────────────────────────────────────────────────────────────────────
@@ -779,8 +800,12 @@ def _policy_settings(cluster_id):
     return out
 
 
-def _kinds_state(state):
-    """Per kind: 'checked', 'partial' (some scopes did not answer) or 'not_checked'."""
+def _kinds_state(state, baselines=None):
+    """Per kind: 'checked', 'partial' (some scopes did not answer), 'no_baseline' (read, but
+    none of its scopes has a baseline, so there is nothing to compare with) or 'not_checked'.
+
+    baselines is anything that answers `(kind, scope) in baselines`; None means the caller
+    has no record of them and no kind is judged on that."""
     read = getattr(state, 'read_kinds', None)
     if read is None:
         # a plain list (no record of what was read): a kind is checked when it has rows
@@ -788,15 +813,43 @@ def _kinds_state(state):
     bad_kinds = getattr(state, 'unread_kinds', set())
     unread = {k for k, _ in getattr(state, 'unread_scopes', set())} | \
              {k for k, _ in getattr(state, 'unread_prefixes', set())}
+    cover = _baseline_coverage(state, baselines) if baselines is not None else {}
     out = {}
     for kind in KINDS:
         if kind in bad_kinds or kind not in read:
             out[kind] = 'not_checked'
+        elif kind in cover and cover[kind]['baselined'] == 0:
+            out[kind] = 'no_baseline'
         elif kind in unread or (kind == 'network' and getattr(state, 'unread_nodes', None)):
             out[kind] = 'partial'
         else:
             out[kind] = 'checked'
     return out
+
+
+def _baseline_coverage(state, baselines):
+    """{kind: {'scopes': n, 'baselined': m}} for the kinds that have a scope in this read.
+    A kind with no scope at all has nothing to compare and nothing missing, so it is left out."""
+    out = {}
+    for kind, scope, _ in state:
+        c = out.setdefault(kind, {'scopes': 0, 'baselined': 0})
+        c['scopes'] += 1
+        if (kind, scope) in baselines:
+            c['baselined'] += 1
+    return out
+
+
+def _refresh_last_scan(cluster_id, state, baselined):
+    """A reset gave the kinds their baselines: what the last scan said about them is no longer
+    'no baseline'. Nothing else of that scan is touched."""
+    last = _last_scan.get(cluster_id)
+    if not last:
+        return
+    now = _kinds_state(state, baselined)
+    for kind, was in list(last.get('kinds', {}).items()):
+        if was == 'no_baseline':
+            last['kinds'][kind] = now.get(kind, was)
+    last['coverage'] = _baseline_coverage(state, baselined)
 
 
 def _check_access_admin_role(idx, state, params):
@@ -937,6 +990,12 @@ def _scan_cluster(cluster_id, autobaseline=False):
 
     state = _fetch_state(mgr, cluster_id)
     baselines = _load_baselines(cluster_id)
+    # what the baseline holds, the seeding of this scan included, says which kinds could be
+    # compared at all
+    have_baseline = set(baselines)
+    # the same diff against the same baseline is one event, not one per scan
+    open_diffs = _open_deviation_diffs(cluster_id)
+    already_open = 0
 
     new_events = []
     seeded = 0
@@ -947,10 +1006,14 @@ def _scan_cluster(cluster_id, autobaseline=False):
         if not bk:
             if autobaseline:
                 _set_baseline(cluster_id, kind, scope, snap, 'system')
+                have_baseline.add((kind, scope))
                 seeded += 1
             continue
         diffs = _flat_diff(bk['snapshot'], snap)
         if not diffs: continue
+        if (kind, scope, _diff_digest(json.dumps(diffs))) in open_diffs:
+            already_open += 1
+            continue
         sev = _severity_for(kind, diffs, scope)
         summary = _short_summary(kind, scope, diffs)
         eid = _record_event(cluster_id, kind, scope, diffs, sev, summary)
@@ -1006,22 +1069,27 @@ def _scan_cluster(cluster_id, autobaseline=False):
             not_read.add((kind, scope))
             continue
         diffs = [{'path': '*', 'op': 'removed', 'before': bk['snapshot'], 'after': None}]
+        removed.append(scope)
+        if (kind, scope, _diff_digest(json.dumps(diffs))) in open_diffs:
+            already_open += 1
+            continue
         summary = f"{kind} {scope}: object removed"
         sev = 'warning' if kind in ('vm_config', 'storage', 'firewall', 'access', 'backup_jobs') else 'info'
         eid = _record_event(cluster_id, kind, scope, diffs, sev, summary)
         new_events.append({'id': eid, 'kind': kind, 'scope': scope,
                            'severity': sev, 'summary': summary})
-        removed.append(scope)
 
     # MK Oct 2026 - policy checks judge this scan's snapshot, and the result of the scan
     # says per kind what was read: a kind that was not is "not checked", not "no drift"
-    kinds = _kinds_state(state)
+    kinds = _kinds_state(state, have_baseline)
+    coverage = _baseline_coverage(state, have_baseline)
     results = _evaluate_policy(state, _policy_settings(cluster_id))
     try:
         new_events.extend(_apply_policy(cluster_id, results))
     except Exception as e:
         logging.warning(f"[drift] policy events failed: {e}")
-    _last_scan[cluster_id] = {'at': datetime.now().isoformat(), 'kinds': kinds, 'policy': results}
+    _last_scan[cluster_id] = {'at': datetime.now().isoformat(), 'kinds': kinds,
+                              'coverage': coverage, 'policy': results}
 
     unread = sorted({kind for kind, _ in not_read})
     if not_read:
@@ -1082,7 +1150,9 @@ def _scan_cluster(cluster_id, autobaseline=False):
         'suppressed_offline': len(masked),
         'suppressed_unread': len(not_read),
         'unread': unread,
+        'already_open': already_open,
         'kinds': kinds,
+        'coverage': coverage,
         'not_checked': sorted(k for k, v in kinds.items() if v != 'checked'),
         'policy_failed': [r['id'] for r in results if r['status'] == 'fail'],
         'events': new_events,
@@ -1133,6 +1203,15 @@ def start_scanner():
 # Endpoints
 # ──────────────────────────────────────────────────────────────────────────
 
+def _no_such_cluster(cluster_id):
+    """404 for an id no manager serves, else None. Asked after the access gates, so a caller who
+    may not reach the cluster still gets the refusal and learns nothing about which ids exist.
+    MK Oct 2026"""
+    if cluster_id in cluster_managers:
+        return None
+    return jsonify({'error': 'cluster not found'}), 404
+
+
 @bp.route('/api/clusters/<cluster_id>/drift/status', methods=['GET'])
 @require_auth(perms=['cluster.view'])
 def drift_status(cluster_id):
@@ -1148,6 +1227,8 @@ def drift_status(cluster_id):
     # never usable for these callers anyway.
     _cerr = require_unconfined(cluster_id)
     if _cerr: return _cerr
+    _gone = _no_such_cluster(cluster_id)
+    if _gone: return _gone
     try:
         c = get_db().conn.cursor()
         c.execute('''
@@ -1185,6 +1266,8 @@ def drift_status(cluster_id):
             'last_event_at': last_event_t,
             # what the last scan could read per kind; empty until this instance has scanned
             'kinds': (_last_scan.get(cluster_id) or {}).get('kinds', {}),
+            # scopes read and scopes holding a baseline, per kind: 'no_baseline' in numbers
+            'coverage': (_last_scan.get(cluster_id) or {}).get('coverage', {}),
             'last_scan_at': (_last_scan.get(cluster_id) or {}).get('at'),
         })
     except Exception as e:
@@ -1207,8 +1290,17 @@ def list_events(cluster_id):
     # drift as whole-cluster; reading it is the same scope.
     _cerr = require_unconfined(cluster_id)
     if _cerr: return _cerr
+    _gone = _no_such_cluster(cluster_id)
+    if _gone: return _gone
     status = request.args.get('status', 'open')
-    limit = max(1, min(int(request.args.get('limit', '100')), 500))
+    try:
+        limit = int(request.args.get('limit', '100'))
+    except ValueError:
+        limit = 0
+    if limit < 1:
+        return jsonify({'error': 'limit must be a whole number from 1 to 500'}), 400
+    # above the cap it is the cap, as before: API clients asked for more and got 500
+    limit = min(limit, 500)
     # MK Oct 2026 - optional filters; a value that is no kind or category is a 400, not an
     # empty list that reads as "nothing drifted"
     kind = request.args.get('kind', '')
@@ -1326,6 +1418,9 @@ def manual_scan(cluster_id):
         _werr = _refuse_baseline_write()
         if _werr:
             return _werr
+    _gone = _no_such_cluster(cluster_id)
+    if _gone:
+        return _gone
     return jsonify(_scan_cluster(cluster_id, autobaseline=seed))
 
 
@@ -1369,6 +1464,7 @@ def reset_baseline(cluster_id):
             ''', (uuid.uuid4().hex[:12], cluster_id, kind, scope,
                   json.dumps(snap), datetime.now().isoformat(), user))
         get_db().conn.commit()
+        _refresh_last_scan(cluster_id, state, {(k, sc) for k, sc, _ in state} | keep)
         return jsonify({'ok': True, 'baselines': len(state), 'kept_unread': len(keep),
                         'unread': sorted({kind for kind, _ in keep})})
     except Exception as e:
@@ -1447,6 +1543,8 @@ def get_policy(cluster_id):
     if not ok: return err
     _cerr = require_unconfined(cluster_id)
     if _cerr: return _cerr
+    _gone = _no_such_cluster(cluster_id)
+    if _gone: return _gone
     checks, at = _policy_view(cluster_id)
     return jsonify({'checks': checks, 'last_scan_at': at})
 
@@ -1463,6 +1561,8 @@ def set_policy(cluster_id):
     if _cerr: return _cerr
     _werr = _refuse_baseline_write()
     if _werr: return _werr
+    _gone = _no_such_cluster(cluster_id)
+    if _gone: return _gone
     body = request.get_json(silent=True)
     checks = body.get('checks') if isinstance(body, dict) else None
     if not isinstance(checks, dict) or not checks:

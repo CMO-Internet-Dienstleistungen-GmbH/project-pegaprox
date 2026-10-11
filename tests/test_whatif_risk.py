@@ -38,12 +38,15 @@ def _pve(guests=None, configs=None, tags=None, jobs=None, pbs_points=None, nfs_p
     api['/storage'] = STORAGES + [{'storage': 'pbs1', 'type': 'pbs', 'content': 'backup'},
                                   {'storage': 'nfs1', 'type': 'nfs', 'content': 'backup'}]
     api['/nodes'] = [{'node': n, 'status': 'online'} for n in NODES]
+    api[('/cluster/resources', 'storage')] = api[('/cluster/resources', 'storage')] + [
+        {'node': n, 'storage': s, 'status': 'available', 'shared': 1} for n in NODES for s in ('pbs1', 'nfs1')]
     if jobs is not None:
         api['/cluster/backup'] = jobs
     api[('/nodes/pve1/storage/pbs1/content', 'backup')] = pbs_points if pbs_points is not None else [
         _bk(100, 'pbs1:backup/vm/100/%s' % time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(T_PBS)), T_PBS, 'pbs1'),
         _bk(101, 'pbs1:backup/vm/101/2026-10-10T01:00:00Z', T_PBS - 100, 'pbs1'),
     ]
+    api[('/nodes/pve1/storage/backups/content', 'backup')] = []
     api[('/nodes/pve1/storage/nfs1/content', 'backup')] = nfs_points if nfs_points is not None else [
         _bk(101, 'nfs1:backup/vzdump-qemu-101-2026_10_10-01_00_00.vma.zst', T_PBS - 50, 'nfs1'),
     ]
@@ -94,6 +97,9 @@ def test_a_pbs_failure_names_the_guests_that_lose_restore_points(env):
     assert [j['id'] for j in pbs['jobs']] == ['job-a'] and pbs['jobs'][0]['guests'] == 4
     assert (pbs['guests_all_lost'], pbs['guests_some_lost'], pbs['guests_job_only']) == (1, 1, 2)
     assert pbs['tests_lost'] == 1 and rows[100]['restore_test_lost'] is True
+    # read in full and active: nothing to say about the storage itself
+    assert pbs['points_read'] is True and pbs['active'] is True and pbs['active_on'] == list(NODES)
+    assert _limit(r, 'pbs_inactive') is None and _limit(r, 'pbs_points_unread') is None
     assert _limit(r, 'pbs_tests_lost')['guests'] == [100]
     assert _limit(r, 'pbs_only_copy')['guests'] == [100]
     assert {a['code'] for a in r['assumptions']} >= {'pbs_listing', 'pbs_jobs', 'critical_tags'}
@@ -109,6 +115,16 @@ def test_a_test_older_than_the_listing_is_counted_apart(env):
     _mark_passed(100, backup_ts=T_PBS - 99999)
     r = _pbs(env)
     assert r['pbs']['tests_lost'] == 0 and r['pbs']['tests_unmatched'] == 1
+
+
+def test_stopped_guests_of_a_pbs_failure_are_counted_apart_with_their_own_statement(env):
+    r = _pbs(env)
+    assert r['summary']['stopped'] == 1 and r['summary']['guests'] == 5
+    a = next(x for x in r['assumptions'] if x['code'] == 'stopped_backups')
+    assert a['args'] == {'count': 1} and a['text'].startswith('Stopped guests (1) count as affected only where')
+    # 104 is stopped and tied to the storage by the job: listed, not counted as unaffected
+    assert _rows(r)[104]['reason']['code'] == 'pbs_job_only'
+    assert not any(x['code'] == 'stopped_guests' for x in r['assumptions'])
 
 
 def test_only_a_pbs_storage_can_fail_this_way(env):
@@ -142,6 +158,47 @@ def test_jobs_unread_leave_the_listed_restore_points(env):
     r = _pbs(env)
     assert _limit(r, 'pbs_jobs_unread') is not None
     assert sorted(_rows(r)) == [100, 101] and r['pbs']['jobs_read'] is False
+
+
+def _unreadable():
+    return types.SimpleNamespace(status_code=500, json=lambda: {}, text='')
+
+
+def test_an_offline_pbs_storage_is_not_reported_as_read_and_is_said_to_be_inactive(env):
+    # PVE lists it as not available and its content cannot be read
+    env.pve[('/cluster/resources', 'storage')] = [x for x in env.pve[('/cluster/resources', 'storage')]
+                                                  if x['storage'] != 'pbs1']
+    env.pve[('/nodes/pve1/storage/pbs1/content', 'backup')] = _unreadable()
+    whatif._cache(env.mgr).clear()
+    recovery.forget_backups()
+    r = _pbs(env)
+    assert r['pbs']['points_read'] is False
+    assert r['pbs']['active'] is False and r['pbs']['active_on'] == []
+    assert r['limits'][0]['code'] == 'pbs_points_unread'
+    inactive = _limit(r, 'pbs_inactive')
+    assert inactive['basis'] == 'known' and inactive['args'] == {'storage': 'pbs1'}
+    assert inactive['text'].startswith('pbs1 is not active on any node') and 'listed' in inactive['text']
+    # the other backup storage was listed, the jobs stand in for this one and say they are assumed
+    assert recovery.guest_backups(CID, env.mgr)['listed'] == ['backups', 'nfs1']
+    assert {row['reason']['code'] for row in _rows(r).values()} == {'pbs_job_only'}
+    assert {row['basis'] for row in _rows(r).values()} == {'assumed'}
+
+
+def test_another_storage_failing_to_list_does_not_unread_this_one(env):
+    env.pve[('/nodes/pve1/storage/nfs1/content', 'backup')] = _unreadable()
+    whatif._cache(env.mgr).clear()
+    recovery.forget_backups()
+    r = _pbs(env)
+    assert r['pbs']['points_read'] is True and r['pbs']['active'] is True
+    assert _limit(r, 'pbs_points_unread') is not None and _limit(r, 'pbs_inactive') is None
+    assert _rows(r)[100]['reason']['code'] == 'pbs_only_copy' and _rows(r)[100]['basis'] == 'known'
+
+
+def test_nothing_is_claimed_about_a_storage_whose_state_cannot_be_read(env):
+    env.pve[('/cluster/resources', 'storage')] = _unreadable()
+    whatif._cache(env.mgr).clear()
+    r = _pbs(env)
+    assert r['pbs']['active'] is None and _limit(r, 'pbs_inactive') is None
 
 
 def test_a_job_selecting_a_pool_covers_its_guests(env):
@@ -273,9 +330,40 @@ def test_the_ranking_orders_by_weight_with_critical_guests_counted_up(rank_env):
     assert by[('pbs', 'pbs1')]['affected'] == 1 and by[('pbs', 'pbs1')]['weight'] == 0.5
     assert all(r['basis'] == 'calculated' for r in out['ranking'])
     assert out['weighting']['critical_factor'] == 3 and out['weighting']['outcomes']['down'] == 1.0
-    assert out['guests'] == {'total': 3, 'running': 3, 'critical': 1, 'basis': 'known'}
+    assert out['guests'] == {'total': 3, 'running': 3, 'stopped': 0, 'critical': 1, 'basis': 'known'}
     assert {a['code'] for a in out['assumptions']} >= {'rank_weighting', 'rank_cheap', 'critical_tags'}
-    assert out['capped'] == [] and out['skipped'] == [] and out['stopped'] is None
+    # no time limit hit: no key for it either
+    assert out['capped'] == [] and out['skipped'] == [] and 'stopped' not in out
+
+
+def test_the_ranking_ranks_shared_storages_only_and_says_so(rank_env):
+    out = whatif.ranking(rank_env.mgr, dict(THR))
+    # local-lvm is a storage of its guests' nodes: it fails with them, the node rows cover it
+    assert [r['name'] for r in out['ranking'] if r['kind'] == 'storage'] == ['ceph']
+    note = next(a for a in out['assumptions'] if a['code'] == 'rank_shared_only')
+    assert note['text'] == ('Only shared storages are ranked: a local storage fails with its node, '
+                            'which the node rows cover')
+
+
+def test_the_ranking_says_where_stopped_guests_stand(rank_env):
+    out = whatif.ranking(rank_env.mgr, dict(THR))
+    assert not any(a['code'] == 'rank_stopped' for a in out['assumptions'])
+    for g in rank_env.guests:
+        g['status'] = 'stopped'
+    whatif._cache(rank_env.mgr).clear()
+    out = whatif.ranking(rank_env.mgr, dict(THR))
+    assert out['guests'] == {'total': 3, 'running': 0, 'stopped': 3, 'critical': 1, 'basis': 'known'}
+    note = next(a for a in out['assumptions'] if a['code'] == 'rank_stopped')
+    assert note['args'] == {'count': 3} and 'not counted as affected' in note['text']
+    # the weights are what they are: nothing running is affected
+    assert {r['weight'] for r in out['ranking'] if r['kind'] != 'pbs'} == {0.0}
+
+
+def test_the_critical_tags_of_the_ranking_are_a_list_like_those_of_a_report(rank_env):
+    out = whatif.ranking(rank_env.mgr, dict(THR))
+    r = whatif.run(rank_env.mgr, whatif.parse_scenario({'type': 'node_failure', 'nodes': ['pve1']}), dict(THR))
+    assert out['critical_tags'] == ['critical'] and out['critical_tags'] == r['risk']['critical']['tags']
+    assert isinstance(out['critical_tags'], list)
 
 
 def test_the_ranking_takes_its_critical_tags_from_the_request(rank_env):
@@ -297,6 +385,7 @@ def test_the_ranking_stops_at_its_time_limit_and_counts_what_is_left(rank_env, m
     monkeypatch.setattr(whatif, 'RANK_SECONDS', -1)
     out = whatif.ranking(rank_env.mgr, dict(THR))
     assert out['ranking'] == [] and out['stopped'] == {'ranked': 0, 'left': out['considered']}
+    assert out['guests']['stopped'] == 0     # the guests that are stopped, not the run
 
 
 def test_the_ranking_reads_guest_configs_up_to_its_budget_only(rank_env, monkeypatch):

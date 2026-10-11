@@ -325,7 +325,7 @@ def build_evidence(scope_kind, scope_id, days, clusters, rows, gaps, plan_gap_ro
         'audit_head': get_db().audit_chain_head(),
         'notes': ['automatic holds what PegaProx measured, manual what an administrator confirmed; '
                   'a confirmation does not make a guest proven',
-                  'verify with POST /api/clusters/<id>/recovery-evidence/verify on the instance that '
+                  'verify with POST /api/recovery-evidence/verify on the instance that '
                   'signed it; a field key rotation voids earlier signatures'],
     }
     return sign(doc)

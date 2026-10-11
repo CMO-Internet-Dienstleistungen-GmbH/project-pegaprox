@@ -14,6 +14,7 @@ MK Oct 2026
 import csv
 import io
 import json
+import re
 import time
 
 import pytest
@@ -272,6 +273,14 @@ def test_evidence_is_signed_and_tied_to_the_audit_chain(routes):
     assert doc['signature']['value']
     v = routes.admin.post('/api/recovery-evidence/verify', json=doc)
     assert v.status_code == 200 and v.get_json() == {'signature_valid': True, 'audit_chain': 'present'}
+
+
+def test_the_evidence_notes_name_the_route_that_verifies_it(routes):
+    doc = routes.admin.get('/api/clusters/c1/recovery-evidence').get_json()
+    named = re.search(r'POST (/api/\S+)', ' '.join(doc['notes']))
+    assert named and named.group(1) == '/api/recovery-evidence/verify'
+    # the route the note names answers, with the document it came with
+    assert routes.admin.post(named.group(1), json=doc).get_json()['signature_valid'] is True
 
 
 def test_a_changed_document_fails_verification(routes):

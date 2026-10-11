@@ -486,6 +486,7 @@ def _read_backups(mgr):
         return _get(mgr, f'/nodes/{node}/storage/{storage}/content', timeout=BACKUP_READ_TIMEOUT,
                     params={'content': 'backup'})
     guests, failed = {}, 0
+    failed_storages = set()
     for i in range(0, len(reads), BACKUP_READS_PARALLEL):
         chunk = reads[i:i + BACKUP_READS_PARALLEL]
         results = run_concurrent([lambda n=n, s=s: one(n, s) for n, s, _sh in chunk],
@@ -493,6 +494,7 @@ def _read_backups(mgr):
         for (node, storage, shared), items in zip(chunk, results):
             if not isinstance(items, list):
                 failed += 1
+                failed_storages.add(storage)
                 continue
             for it in items:
                 vmid, volid = str(it.get('vmid') or ''), str(it.get('volid') or '')
@@ -524,16 +526,19 @@ def _read_backups(mgr):
         guests[vmid] = kept
     if reads and failed == len(reads):
         return None
+    # MK Oct 2026 - which storages were listed in full, so a caller can tell one that failed
+    # from the others when the read as a whole is only partial
+    listed = {s for _n, s, _sh in reads} - failed_storages
     return {'guests': guests, 'nodes': online, 'partial': failed > 0,
-            'storages': len({s for _n, s, _sh in reads})}
+            'storages': len({s for _n, s, _sh in reads}), 'listed': sorted(listed)}
 
 
 def guest_backups(cluster_id, mgr, max_age=BACKUPS_FRESH, now=None):
     """The backups of each guest of a cluster, newest first, as one read of its backup
     storages no older than max_age: {'at', 'guests': {vmid: [{volid, ctime, kind, storage,
     node, size}]}, 'nodes': [online], 'partial'}. node is None for a backup on shared
-    storage, size (bytes) None where the listing has none.
-    None when nothing could be read and no earlier read is kept."""
+    storage, size (bytes) None where the listing has none; 'listed' names the backup storages
+    read in full. None when nothing could be read and no earlier read is kept."""
     now = time.time() if now is None else now
 
     def fresh():
