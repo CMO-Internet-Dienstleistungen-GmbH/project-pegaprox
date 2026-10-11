@@ -43,6 +43,8 @@ KEEP_DONE = 300
 
 AGENT_WAIT = 90         # seconds the guest agent gets to answer after boot
 EXEC_WAIT = 60          # a check command
+SETTLE_WAIT = 180       # a port or command check the guest still fails is asked again this long
+SETTLE_STEP = 15
 RESTORE_WAIT = 600      # the restore; one that takes longer is stopped and removed
 UNLOCK_WAIT = 300       # a stopped restore, until Proxmox lets go of the guest
 _NET_RE = re.compile(r'net\d+')
@@ -939,6 +941,81 @@ def _ct_exec(pve_mgr, node, vmid, inner, wait=EXEC_WAIT):
     return _pve_node_exec(pve_mgr, node, cmd, timeout=wait)
 
 
+def _qemu_app_checks(pve_mgr, base, node, test_vmid, ports, command, up):
+    """One round of the port and command checks of a VM, through its guest agent. 'again'
+    marks a check the guest itself failed, which may pass once its service is up."""
+    checks = []
+    if ports:
+        listening, why = None, []
+        if up:
+            got = _agent_exec(pve_mgr, base, node, test_vmid, LINUX_LISTENERS, why=why)
+            if got is None or (got[0] != 0 and not got[1].strip()):
+                got = _agent_exec(pve_mgr, base, node, test_vmid, WINDOWS_LISTENERS, why=why) or got
+            listening = parse_listening(got[1]) if got else None
+        for p in ports:
+            if listening is None:
+                checks.append({'check': 'port', 'target': str(p), 'ok': False,
+                               'detail': 'the listening ports could not be read through the guest agent'
+                                         + (f': {why[0]}' if why else '')})
+            else:
+                checks.append({'check': 'port', 'target': str(p), 'ok': p in listening,
+                               'detail': 'listening' if p in listening else 'nothing listens', 'again': True})
+    if command:
+        got, why = None, []
+        if up:
+            got = _agent_exec(pve_mgr, base, node, test_vmid, ['sh', '-c', command], why=why)
+            if got is None:
+                got = _agent_exec(pve_mgr, base, node, test_vmid, ['cmd.exe', '/c', command], why=why)
+        if got is None:
+            checks.append({'check': 'command', 'target': command, 'ok': False,
+                           'detail': 'the guest agent could not run it' + (f': {why[0]}' if why else '')})
+        else:
+            checks.append({'check': 'command', 'target': command, 'ok': got[0] == 0,
+                           'detail': f'exit code {got[0]}', 'again': True})
+    return checks
+
+
+def _ct_app_checks(pve_mgr, node, test_vmid, ports, command):
+    """One round of the port and command checks of a container, through pct exec."""
+    checks = []
+    if ports:
+        rc, out, _err = _ct_exec(pve_mgr, node, test_vmid, LINUX_LISTENERS[2])
+        listening = parse_listening(out) if rc == 0 or str(out or '').strip() else None
+        for p in ports:
+            if listening is None:
+                checks.append({'check': 'port', 'target': str(p), 'ok': False,
+                               'detail': 'the listening ports could not be read in the container'})
+            else:
+                checks.append({'check': 'port', 'target': str(p), 'ok': p in listening,
+                               'detail': 'listening' if p in listening else 'nothing listens', 'again': True})
+    if command:
+        rc, _out, _err = _ct_exec(pve_mgr, node, test_vmid, command)
+        checks.append({'check': 'command', 'target': command, 'ok': rc == 0, 'detail': f'exit code {rc}',
+                       'again': True})
+    return checks
+
+
+def _settled(attempt, log):
+    """The port and command checks of a guest that just booted, asked again for up to
+    SETTLE_WAIT while the guest fails them itself. MK Oct 2026 - the live restore test of an
+    isolated RHEL guest had its agent answer seconds after boot and sshd come up much later,
+    so the first look failed a guest that was fine. A check that could not be made at all
+    (the agent refused, the ports were unreadable) ends the wait: asking again changes
+    nothing there."""
+    deadline = time.time() + SETTLE_WAIT
+    while True:
+        checks = attempt()
+        failed = [c for c in checks if c.get('ok') is False]
+        if not failed or not all(c.get('again') for c in failed) or time.time() + SETTLE_STEP > deadline:
+            break
+        log(f"{', '.join(c['check'] + ' ' + c['target'] for c in failed)} not up yet, "
+            f"checking again in {SETTLE_STEP}s")
+        time.sleep(SETTLE_STEP)
+    for c in checks:
+        c.pop('again', None)
+    return checks
+
+
 def run_checks(pve_mgr, base, node, vm_type, test_vmid, plan, config, log):
     """The checks of a booted test guest: [{check, target, ok, detail}]. ok is None for a
     check that could not be made where that is no failure of the guest (a container whose
@@ -956,33 +1033,8 @@ def run_checks(pve_mgr, base, node, vm_type, test_vmid, plan, config, log):
         if wanted:
             checks.append({'check': 'agent', 'target': '', 'ok': bool(up),
                            'detail': 'answers' if up else f'no answer within {AGENT_WAIT}s'})
-        if ports:
-            listening, why = None, []
-            if up:
-                got = _agent_exec(pve_mgr, base, node, test_vmid, LINUX_LISTENERS, why=why)
-                if got is None or (got[0] != 0 and not got[1].strip()):
-                    got = _agent_exec(pve_mgr, base, node, test_vmid, WINDOWS_LISTENERS, why=why) or got
-                listening = parse_listening(got[1]) if got else None
-            for p in ports:
-                if listening is None:
-                    checks.append({'check': 'port', 'target': str(p), 'ok': False,
-                                   'detail': 'the listening ports could not be read through the guest agent'
-                                             + (f': {why[0]}' if why else '')})
-                else:
-                    checks.append({'check': 'port', 'target': str(p), 'ok': p in listening,
-                                   'detail': 'listening' if p in listening else 'nothing listens'})
-        if command:
-            got, why = None, []
-            if up:
-                got = _agent_exec(pve_mgr, base, node, test_vmid, ['sh', '-c', command], why=why)
-                if got is None:
-                    got = _agent_exec(pve_mgr, base, node, test_vmid, ['cmd.exe', '/c', command], why=why)
-            if got is None:
-                checks.append({'check': 'command', 'target': command, 'ok': False,
-                               'detail': 'the guest agent could not run it' + (f': {why[0]}' if why else '')})
-            else:
-                checks.append({'check': 'command', 'target': command, 'ok': got[0] == 0,
-                               'detail': f'exit code {got[0]}'})
+        checks.extend(_settled(lambda: _qemu_app_checks(pve_mgr, base, node, test_vmid, ports, command, up),
+                               log))
         for c in checks:
             log(f"Check {c['check']} {c['target']}: {'ok' if c['ok'] else 'FAILED'} ({c['detail']})")
         return checks
@@ -1000,19 +1052,7 @@ def run_checks(pve_mgr, base, node, vm_type, test_vmid, plan, config, log):
         if command:
             checks.append({'check': 'command', 'target': command, 'ok': None, 'detail': why})
         return checks
-    if ports:
-        rc, out, _err = _ct_exec(pve_mgr, node, test_vmid, LINUX_LISTENERS[2])
-        listening = parse_listening(out) if rc == 0 or str(out or '').strip() else None
-        for p in ports:
-            if listening is None:
-                checks.append({'check': 'port', 'target': str(p), 'ok': False,
-                               'detail': 'the listening ports could not be read in the container'})
-            else:
-                checks.append({'check': 'port', 'target': str(p), 'ok': p in listening,
-                               'detail': 'listening' if p in listening else 'nothing listens'})
-    if command:
-        rc, _out, _err = _ct_exec(pve_mgr, node, test_vmid, command)
-        checks.append({'check': 'command', 'target': command, 'ok': rc == 0, 'detail': f'exit code {rc}'})
+    checks.extend(_settled(lambda: _ct_app_checks(pve_mgr, node, test_vmid, ports, command), log))
     for c in checks:
         log(f"Check {c['check']} {c['target']}: {'skipped' if c['ok'] is None else 'ok' if c['ok'] else 'FAILED'}"
             f" ({c['detail']})")

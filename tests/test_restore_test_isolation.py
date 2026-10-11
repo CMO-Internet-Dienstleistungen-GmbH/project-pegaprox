@@ -326,6 +326,63 @@ def test_a_refused_agent_command_says_why(clock, db):
                                            'Agent error: The command guest-exec has been disabled for this instance')
 
 
+def test_a_service_that_comes_up_late_passes_once_it_is_up(clock, db):
+    """The live restore test of an isolated RHEL guest: the agent answered seconds after boot,
+    sshd only later. The checks ask again while the guest itself fails them."""
+    class _Late(_PVE):
+        reads = 0
+
+        def _api_post(self, url, data=None, timeout=None, **kw):
+            if self._path(url).endswith('/agent/exec'):
+                self.reads += 1
+                late = self.reads <= 4
+                self.listeners = 'LISTEN 0 511 [::]:80 [::]:*\n' if late else SS_OUT
+                self.exit_code = 3 if late else 0
+            return super()._api_post(url, data=data, timeout=timeout, **kw)
+    st = bv.run_verification(_Late(), _params(plan=_plan(ports=[22], command='systemctl is-active sshd')))
+    assert st['status'] == 'passed', st['checks']
+    assert all(set(c) == {'check', 'target', 'ok', 'detail'} for c in st['checks'])
+    assert sum('not up yet' in line for line in st['logs']) == 2
+
+
+def test_a_service_that_never_comes_up_fails_after_the_settle_wait(clock, db):
+    pve = _PVE(exit_code=3)
+    start = clock.now
+    st = bv.run_verification(pve, _params(plan=_plan(command='systemctl is-active sshd')))
+    assert st['status'] == 'failed' and st['cause'] == 'check command: exit code 3'
+    asked = pve.exec_cmds.count(['sh', '-c', 'systemctl is-active sshd'])
+    assert asked >= bv.SETTLE_WAIT // bv.SETTLE_STEP
+    assert clock.now - start >= bv.SETTLE_WAIT
+
+
+def test_a_check_that_cannot_be_made_is_not_asked_again(clock, db):
+    class _Blocked(_PVE):
+        def _api_post(self, url, data=None, timeout=None, **kw):
+            if self._path(url).endswith('/agent/exec'):
+                self.exec_cmds.append(list(data['command']))
+                return _Resp(500, None, 'Agent error: guest-exec has been disabled')
+            return super()._api_post(url, data=data, timeout=timeout, **kw)
+    pve = _Blocked()
+    st = bv.run_verification(pve, _params(plan=_plan(ports=[22], command='true')))
+    assert st['status'] == 'failed'
+    # one round: ss, then netstat, then sh, then cmd.exe
+    assert len(pve.exec_cmds) == 4 and not any('not up yet' in line for line in st['logs'])
+
+
+def test_a_container_service_that_comes_up_late_passes(clock, db, monkeypatch):
+    asked = []
+
+    def ct_exec(pve_mgr, node, vmid, inner, wait=bv.EXEC_WAIT):
+        if inner == 'true':
+            return 0, '', ''
+        asked.append(inner)
+        return (3 if len(asked) < 3 else 0), '', ''
+    monkeypatch.setattr(bv, '_ct_exec', ct_exec)
+    st = bv.run_verification(_PVE(kind='lxc'), _params('lxc', vm_type='lxc', plan=_plan(command='systemctl is-active nginx')))
+    assert st['status'] == 'passed', st['checks']
+    assert asked == ['systemctl is-active nginx'] * 3
+
+
 def test_a_windows_guest_answers_through_netstat(clock, db):
     pve = _PVE(linux=False, listeners=WIN_OUT)
     st = bv.run_verification(pve, _params(plan=_plan(ports=[3389], command='sc query Spooler')))
