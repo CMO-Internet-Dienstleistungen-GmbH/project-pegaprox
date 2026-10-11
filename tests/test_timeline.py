@@ -492,12 +492,46 @@ def test_a_malformed_query_is_a_400(env, query):
     assert r.status_code == 400, (query, r.get_data(as_text=True))
 
 
-def test_a_window_back_to_front_or_too_wide_is_a_400(env):
+def test_a_window_back_to_front_is_a_400_a_too_wide_one_is_cut(env):
+    """The UI's 30 days reach a few milliseconds further by the time they arrive: such a
+    window is cut to the newest 30 days, and the answer says from where."""
     c = _admin_client(env)
     frm, to = (NOW - timedelta(days=31)).isoformat(), NOW.isoformat()
-    assert c.get(f"{ROUTE}&from={frm.replace('+', '%2B')}&to={to.replace('+', '%2B')}").status_code == 400
+    r = c.get(f"{ROUTE}&from={frm.replace('+', '%2B')}&to={to.replace('+', '%2B')}")
+    assert r.status_code == 200 and r.get_json()['clipped'] is True
+    assert r.get_json()['from'].startswith((NOW - timedelta(days=30)).strftime('%Y-%m-%dT%H:%M'))
     assert c.get(f"{ROUTE}&from={_epoch(1)}&to={_epoch(5)}").status_code == 400
-    assert c.get(f"{ROUTE}&from={_epoch(60 * 24 * 29)}&to={_epoch(0)}").status_code == 200
+    r = c.get(f"{ROUTE}&from={_epoch(60 * 24 * 29)}&to={_epoch(0)}")
+    assert r.status_code == 200 and r.get_json()['clipped'] is False
+
+
+def test_pages_lose_nothing_when_a_source_hits_its_cap(env):
+    """A source reads at most a page worth of rows. With a severity asked for, most of what it
+    read is dropped, and the page reached older events of other sources below the oldest row
+    it read: its warnings in between were skipped for good. Every third audit row is a
+    warning, failed migrations (warnings too) come in between, read 7 at a time."""
+    for i in range(30):
+        _audit(env.db, 10 + 2 * i, f'test.cap_{i}', 'x', severity='warning' if i % 3 == 0 else 'info')
+        env.db.add_migration_event(CID, 3000 + i, '', 'pve1', 'pve2', 'failed' if i % 5 == 0 else 'success',
+                                   timestamp=_local(11 + 2 * i))
+    # a source with a few old events only, not capped: it fills a page from far below
+    for minutes in (100, 120):
+        env.db.add_migration_event(CID, 4000 + minutes, '', 'pve1', 'pve2', 'failed', trigger='balance',
+                                   timestamp=_local(minutes))
+    c = _admin_client(env)
+    q = '&kinds=audit,migration,balancer&severity=warning'
+    seen, before, pages = [], '', 0
+    while True:
+        body = _get(c, f'&limit=7{q}{before}')
+        seen += [e['id'] for e in body['events']]
+        pages += 1
+        if not body['next_before']:
+            break
+        before = '&before=' + body['next_before'].replace('+', '%2B')
+        assert pages < 60
+    whole = [e['id'] for e in _get(c, f'&limit=500{q}')['events']]
+    assert len(whole) >= 18 and len(set(seen)) == len(seen)
+    assert seen == whole, (len(seen), len(whole))
 
 
 def test_an_unknown_cluster_is_a_404(env):

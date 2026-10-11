@@ -792,6 +792,9 @@ def intra(cluster_id, mgr, vmids, target=None, online=True, with_local_disks=Fal
         if gv.row['to']:
             _intra_after(side, gv, gv.row['to'], backups)
 
+    if target:
+        # MK Oct 2026 - a named target shows its figures even when no running guest goes there
+        sim.node(target)
     rows = [gv.finish(override) for gv in all_gv]
     out['steps'] = _intra_steps(rows, target, online, mode, parallel)
     out['abort'] = ['Cancelling the run starts no further guest: migrations already running finish, '
@@ -1161,6 +1164,8 @@ def cross(src_id, src_mgr, tgt_id, tgt_mgr, vmids, target_node, storage_map=None
         gv.row['abort'] = (f"Aborted, it stays on {src.name}; a half-copied guest {tv} on {tgt.name} has to "
                            f"be removed there, and PegaProx removes its temporary token")
 
+    if target_ok and target_node:
+        sim.node(target_node)
     rows = [gv.finish(override) for gv in all_gv]
     out['steps'] = _cross_steps(rows, src, tgt, target_node, route, delete_source)
     out['abort'] = ['The source guest is deleted only once the migration has succeeded.' if delete_source

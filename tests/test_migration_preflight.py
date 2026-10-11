@@ -777,3 +777,13 @@ def test_no_em_dash_in_the_new_module():
     import inspect
     text = inspect.getsource(pf)
     assert '\u2014' not in text and '\u2013' not in text
+
+
+def test_a_named_target_shows_its_figures_with_stopped_guests_only(api, seed):
+    """Only a running guest touches the placement: with a target named and every guest
+    stopped, the answer had no figures of the target at all."""
+    _Pve(api, guests=[_guest(100, status='stopped'), _guest(101, status='stopped')], configs={100: CFG, 101: CFG})
+    c = api.as_user(seed.user('root', role='admin'))
+    r = c.post(PF, json={'vms': [100, 101], 'target': 'pve2'})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    assert [row['node'] for row in r.get_json()['capacity']] == ['pve2']

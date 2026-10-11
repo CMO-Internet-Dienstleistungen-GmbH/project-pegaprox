@@ -614,6 +614,7 @@ def _read(ask):
             logging.warning(f"[Timeline] {ask.cid}: the {kind} events could not be read: {e}")
             got, note = [], _note(True, 'unread')
         note['count'] = len(got)
+        _floor(note, got)
         notes[kind] = note
         events.extend(got)
 
@@ -632,6 +633,7 @@ def _read(ask):
             got = by_kind.get(kind, [])
             note = task_notes.get(kind) if isinstance(task_notes, dict) else None
             notes[kind] = dict(note or _note(), count=len(got))
+            _floor(notes[kind], got)
             events.extend(got)
     else:
         for kind in ('task', 'backup'):
@@ -643,6 +645,13 @@ def _read(ask):
     take('syslog', _syslog, ask)
     take('incident', _incidents, ask)
     return events, notes
+
+
+def _floor(note, got):
+    """A source that hit its cap may hold older rows it did not hand over: the oldest row it
+    did is as deep as a page can go before those would be missed"""
+    if note.get('capped') and got:
+        note['_floor'] = min(ev['_at'] for ev in got)
 
 
 def _bad(msg):
@@ -702,8 +711,11 @@ def get_timeline():
         return _bad('from and to must be ISO 8601 times or epoch seconds')
     if since >= until:
         return _bad('from must be before to')
-    if until - since > tl.WINDOW_MAX:
-        return _bad(f'the window is at most {tl.WINDOW_MAX.days} days')
+    # MK Oct 2026 - a longer window is cut to the newest 30 days (the 30 days the UI asks for
+    # reach a few milliseconds further by the time they arrive); 'from' in the answer says where
+    clipped = until - since > tl.WINDOW_MAX
+    if clipped:
+        since = until - tl.WINDOW_MAX
     try:
         kinds = _listed(args.get('kinds'), tl.KINDS, 'kinds')
         severities = _listed(args.get('severity'), tl.SEVERITIES, 'severity')
@@ -733,14 +745,20 @@ def get_timeline():
         return jsonify({'error': 'Permission denied'}), 403
 
     events, notes = _read(ask)
+    # MK Oct 2026 - a page goes no deeper than the oldest row of a source that hit its cap,
+    # else the rows that source left out fell between this page and the next
+    floor = max((n['_floor'] for k, n in notes.items()
+                 if n.get('_floor') is not None and (not kinds or k in kinds)), default=None)
+    for n in notes.values():
+        n.pop('_floor', None)
     shown, more = tl.page(events, since, until, before=before, kinds=kinds, severities=severities,
-                          limit=limit)
+                          limit=limit, floor=floor)
     tl.link(shown, events, window)
     capped = any(n.get('capped') for k, n in notes.items() if not kinds or k in kinds)
     nxt = tl.cursor_of(shown[-1]) if shown and (more or capped) else None
     return jsonify({
         'cluster': cid, 'node': node, 'vmid': vmid,
-        'from': tl.iso(since), 'to': tl.iso(until),
+        'from': tl.iso(since), 'to': tl.iso(until), 'clipped': clipped,
         'events': [tl.public(e) for e in shown],
         'next_before': nxt,
         'sources': notes,

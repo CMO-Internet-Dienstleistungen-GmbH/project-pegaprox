@@ -151,6 +151,11 @@ def get_datacenter_status(cluster_id):
     if error:
         return error
 
+    # MK Oct 2026 - an ESXi connection has no datacenter status; it ran into the Proxmox
+    # branch below and answered 500 on every overview poll
+    if getattr(manager, 'cluster_type', 'proxmox') not in ('proxmox', 'xcpng'):
+        return jsonify({'error': 'This connection has no datacenter status', 'code': 'UNSUPPORTED'}), 400
+
     # MK: XCP-ng clusters build status from their own cached data
     if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
         try:
@@ -13972,6 +13977,10 @@ def _cross_preflight_args(data, storage_map, bridge_map):
         flags[name] = data.get(name, default)
     if not isinstance(flags['dry_run'], bool):
         return None, 'dry_run is true or false'
+    # MK Oct 2026 - a map in another shape was dropped without a word
+    for value, name in ((storage_map, 'target_storage_map'), (bridge_map, 'target_bridge_map')):
+        if value not in (None, '', {}) and not isinstance(value, dict):
+            return None, f'{name} must be an object of source to target names'
     smap, err = preflight.map_arg(storage_map if isinstance(storage_map, dict) else None, 'target_storage_map')
     if err:
         return None, err

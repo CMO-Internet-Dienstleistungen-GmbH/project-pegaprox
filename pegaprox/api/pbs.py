@@ -3093,7 +3093,7 @@ def _report_format():
 def _csv_response(rows, name):
     from flask import Response
     from pegaprox.core import recovery
-    return Response(recovery.csv_text(rows), mimetype='text/csv; charset=utf-8',
+    return Response(recovery.csv_text(rows), mimetype='text/csv',
                     headers={'Content-Disposition': f'attachment; filename="{name}.csv"'})
 
 

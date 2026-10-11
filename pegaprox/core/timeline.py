@@ -124,10 +124,12 @@ def cursor_of(ev):
     return f"{ev['time']}|{ev['id']}"
 
 
-def page(events, since, until, *, before=None, kinds=None, severities=None, limit=LIMIT_DEFAULT):
+def page(events, since, until, *, before=None, kinds=None, severities=None, limit=LIMIT_DEFAULT,
+         floor=None):
     """The events of [since, until], older than `before` when given, of the kinds and
-    severities asked, newest first: (the first `limit`, whether more were left over)."""
-    inside, seen = [], set()
+    severities asked, newest first: (the first `limit`, whether more were left over).
+    Nothing older than `floor` (a time) goes on this page; what was held back counts as more."""
+    inside, seen, held = [], set(), False
     for ev in sorted(events, key=order, reverse=True):
         if ev['id'] in seen:
             continue
@@ -140,8 +142,11 @@ def page(events, since, until, *, before=None, kinds=None, severities=None, limi
             continue
         if severities and ev['severity'] not in severities:
             continue
+        if floor is not None and ev['_at'] < floor:
+            held = True
+            continue
         inside.append(ev)
-    return inside[:limit], len(inside) > limit
+    return inside[:limit], len(inside) > limit or held
 
 
 def link(anchors, candidates, window):
