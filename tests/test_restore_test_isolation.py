@@ -79,6 +79,7 @@ class _PVE:
         self.listeners, self.linux, self.exit_code, self.boot = listeners, linux, exit_code, boot
         self.clock, self.restore_takes = clock, restore_takes
         self.config = dict(config if config is not None else (QEMU_CONFIG if kind == 'qemu' else LXC_CONFIG))
+        self.backup = dict(self.config)
         self.calls = []
         self.config_at_start = None
         self.execs = {}
@@ -94,6 +95,8 @@ class _PVE:
             return _Resp(200, str(TEST_VMID))
         if path == '/cluster/ha/resources':
             return _Resp(200, [{'sid': s} for s in self.ha])
+        if path == '/nodes/pve1/vzdump/extractconfig':
+            return _Resp(200, ''.join(f'{k}: {v}\n' for k, v in self.backup.items()))
         if path.endswith(f'/{TEST_VMID}/config'):
             return _Resp(200, dict(self.config))
         if path.endswith('/status/current'):
@@ -109,6 +112,14 @@ class _PVE:
         if path == f'/nodes/pve1/{self.kind}':
             if self.clock:
                 self.clock.now += self.restore_takes
+            # what the restore call sets wins over the backup's config; a NIC without its
+            # MAC gets a new one
+            for k, v in data.items():
+                if k in ('vmid', 'archive', 'ostemplate', 'restore', 'force', 'unique', 'start', 'storage'):
+                    continue
+                if k.startswith('net') and '=' not in str(v).split(',')[0]:
+                    v = f"{str(v).split(',')[0]}=BC:24:11:AA:00:{k[3:]:0>2}," + ','.join(str(v).split(',')[1:])
+                self.config[k] = str(v)
             return _Resp(200, 'UPID:pve1:0001:0002:00000003:restore::root@pam:')
         if path.endswith('/status/start'):
             self.config_at_start = dict(self.config)
@@ -267,7 +278,10 @@ def test_the_cluster_test_bridge(clock, db):
     pve = _PVE()
     st = bv.run_verification(pve, _params(plan=_plan(isolation='bridge', test_bridge='vmbr99')))
     assert st['status'] == 'passed'
-    assert pve.config_at_start['net0'] == 'virtio=BC:24:11:00:00:01,bridge=vmbr99,firewall=1'
+    # a MAC of its own, not the original's
+    model, rest = pve.config_at_start['net0'].split(',', 1)
+    assert model.startswith('virtio=') and model != 'virtio=BC:24:11:00:00:01'
+    assert rest == 'bridge=vmbr99,firewall=1'
 
 
 def test_a_container_is_restored_as_one(clock, db, monkeypatch):

@@ -969,6 +969,8 @@ CONFIRM_SITES = [
     ('pegaprox/api/storage.py', 'run_auto_storage_balance', ['post']),
     ('pegaprox/background/scheduler.py', 'run_scheduled_tasks', ['execute_scheduled_task']),
     ('pegaprox/background/restore_tests.py', '_run_slot', ['run_verification']),
+    # a test guest a run left behind, removed from the schedule loop
+    ('pegaprox/core/backup_verify.py', 'sweep', ['remove_test_guest']),
     ('pegaprox/api/schedules.py', 'check_schedules', ['execute_scheduled_action']),
     ('pegaprox/api/schedules.py', 'execute_scheduled_rolling_update.run_scheduled_update',
      ['enter_maintenance_mode', 'start_node_update']),

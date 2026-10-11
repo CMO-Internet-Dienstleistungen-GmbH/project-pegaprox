@@ -32,17 +32,24 @@ class _PVE:
     def __init__(self, restore_ok=True):
         self.restore_ok = restore_ok
         self.calls = []
+        self.restored = None
 
     def _api_get(self, url, **kw):
         self.calls.append(('GET', url))
         if url.endswith('/cluster/nextid'):
             return _Resp(200, str(TEST_VMID))
+        if url.endswith('/vzdump/extractconfig'):
+            return _Resp(200, 'name: web01\nnet0: virtio=BC:24:11:00:00:01,bridge=vmbr0\n')
+        if url.endswith(f'/qemu/{TEST_VMID}/config') and self.restored:
+            # the guest our restore made: what the restore call set on top of the backup
+            return _Resp(200, {k: v for k, v in self.restored.items() if k not in ('vmid', 'archive', 'force')})
         return _Resp(200, {})
 
     def _api_post(self, url, data=None, **kw):
         self.calls.append(('POST', url))
         if url.endswith('/nodes/pve1/qemu'):
             if self.restore_ok:
+                self.restored = dict(data)
                 return _Resp(200, 'UPID:restore')
             return _Resp(500, None, f'unable to restore VM {TEST_VMID} - VM {TEST_VMID} already exists')
         if url.endswith('/status/start'):
@@ -79,7 +86,8 @@ def _verify(pve):
     for t in threading.enumerate():
         if t.name == f'verify-{task_id}':
             t.join(10)
-    return next(row for row in _SAVED if row['id'] == task_id)
+    # the run is on record before its restore; the result is its last row
+    return [row for row in _SAVED if row['id'] == task_id][-1]
 
 
 def test_a_refused_restore_leaves_the_guest_on_that_vmid_alone():

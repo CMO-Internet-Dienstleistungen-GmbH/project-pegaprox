@@ -2765,6 +2765,24 @@ def start_backup_verification(cluster_id):
     if not pve_mgr.is_connected:
         return jsonify({'error': 'Cluster not connected'}), 503
 
+    # MK Oct 2026 - a test guest kept for inspection is a restore in test mode: the same
+    # checks, and the tenant quota counts it (backup-restore mode 'test')
+    _qwarn = None
+    if data.get('auto_cleanup') is False:
+        _u = build_authz_user(request.session.get('user', ''), request.session)
+        _refused = _restore_refusal(cluster_id, _u, _volid, data['node'], _vmid, 'test')
+        if _refused:
+            return _refused
+        from pegaprox.core.batch_restore import restore_adds
+        _src = next((r.search(_volid) for r in _SOURCE_RES if r.search(_volid)), None)
+        _qerr, _qwarn = tenant_quota_gate(
+            _u, f'restore test of {_volid}',
+            lambda: restore_adds(pve_mgr, data['node'], _volid, int(_src.group(1)) if _src else 0, _vmid, False),
+            cluster=getattr(getattr(pve_mgr, 'config', None), 'name', cluster_id),
+            hold={'cluster_id': cluster_id, 'vmid': _vmid, 'grow': False})
+        if _qerr:
+            return _qerr
+
     try:
         task_id = start_verification(pve_mgr, data)
     except Exception as e:
@@ -2774,7 +2792,7 @@ def start_backup_verification(cluster_id):
     log_audit(user, 'backup.verify_started',
               f"Backup verification started for VM {data.get('vmid')} on {data.get('node')}")
 
-    return jsonify({'success': True, 'task_id': task_id})
+    return jsonify({'success': True, 'task_id': task_id, **({'quota_warning': _qwarn} if _qwarn else {})})
 
 
 _VERIFY_NODE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9.-]{0,62}')
@@ -2845,7 +2863,7 @@ def get_backup_verification_status(cluster_id, task_id):
             return jsonify({'error': 'Verification not found'}), 404
         if not _verification_rows_visible(cluster_id, [status]):
             return jsonify({'error': 'Verification not found'}), 404
-        return jsonify(status)
+        return jsonify(_mask_run(status, caller_acts_as_admin()))
 
     # check database
     db = get_db()
@@ -2859,7 +2877,7 @@ def get_backup_verification_status(cluster_id, task_id):
             result['logs'] = result['details'].get('logs', [])
             if not _verification_rows_visible(cluster_id, [result]):
                 return jsonify({'error': 'Verification not found'}), 404
-            return jsonify(result)
+            return jsonify(_mask_run(result, caller_acts_as_admin()))
     except Exception:
         pass
 
@@ -2882,7 +2900,8 @@ def get_backup_verification_history(cluster_id):
     limit = bounded_limit(request.args.get('limit'), 50, 1000)
 
     results = get_verification_history(cluster_id, vmid, limit)
-    return jsonify(_verification_rows_visible(cluster_id, results))
+    admin = caller_acts_as_admin()
+    return jsonify([_mask_run(r, admin) for r in _verification_rows_visible(cluster_id, results)])
 
 
 @bp.route('/api/clusters/<cluster_id>/backup-verify/active', methods=['GET'])
@@ -2901,7 +2920,8 @@ def get_active_verifications(cluster_id):
     # a scoped caller sees only their own guests' runs (see _verification_rows_visible)
     _keys = [k for k, v in cluster_active.items()
              if _verification_rows_visible(cluster_id, [v])]
-    return jsonify({k: cluster_active[k] for k in _keys})
+    admin = caller_acts_as_admin()
+    return jsonify({k: _mask_run(cluster_active[k], admin) for k in _keys})
 
 
 # ============================================================================
@@ -2940,6 +2960,54 @@ def _mask_command(row, admin):
     if not admin and row.get('command'):
         row = dict(row, command='', command_set=True)
     return row
+
+
+# MK Oct 2026 - the check command is masked in the settings for anybody but an admin (it
+# may carry a secret); the checks and the log of a test that ran it are masked the same
+_CHECK_LINE_RES = (re.compile(r'(Check command ).*(: (?:ok|FAILED|skipped) \()'),
+                   re.compile(r'(Check failed: command ).*( - )'))
+
+
+def _mask_checks(checks, admin):
+    if admin or not isinstance(checks, list):
+        return checks
+    return [dict(c, target='') if isinstance(c, dict) and c.get('check') == 'command' and c.get('target') else c
+            for c in checks]
+
+
+def _mask_run(run, admin):
+    """A verification (a status of the registry, or a row with its details as a dict or as
+    the stored text) as a caller who is no admin sees it: no check command in its checks
+    or its log. A copy."""
+    import json as _json
+    if admin or not isinstance(run, dict):
+        return run
+    out = dict(run)
+    details, packed = out.get('details'), isinstance(out.get('details'), str)
+    if packed:
+        try:
+            details = _json.loads(details or '{}')
+        except (TypeError, ValueError):
+            details = {}
+    parts = [out] + ([dict(details)] if isinstance(details, dict) else [])
+    commands = {str(c['target']) for p in parts for c in (p.get('checks') or [])
+                if isinstance(c, dict) and c.get('check') == 'command' and c.get('target')}
+    for p in parts:
+        if 'checks' in p:
+            p['checks'] = _mask_checks(p['checks'], False)
+        if isinstance(p.get('logs'), list):
+            lines = []
+            for line in p['logs']:
+                line = str(line)
+                for cmd in commands:
+                    line = line.replace(cmd, '***')
+                for rx in _CHECK_LINE_RES:
+                    line = rx.sub(r'\1***\2', line)
+                lines.append(line)
+            p['logs'] = lines
+    if len(parts) > 1:
+        out['details'] = _json.dumps(parts[1]) if packed else parts[1]
+    return out
 
 
 @bp.route('/api/clusters/<cluster_id>/recovery-settings', methods=['GET'])
@@ -3172,6 +3240,8 @@ def get_guest_recovery(cluster_id, vmid):
         row = recovery.guest_row(vmid, r, mark, backups, plan, sla, _time.time())
     except Exception as e:
         return jsonify({'error': safe_error(e, 'The recovery report could not be made')}), 500
+    admin = caller_acts_as_admin()
+    row['last_checks'] = _mask_checks(row.get('last_checks'), admin)
     history = []
     for h in get_verification_history(cluster_id, vmid, 10):
         try:
@@ -3181,10 +3251,10 @@ def get_guest_recovery(cluster_id, vmid):
         history.append({'id': h.get('id'), 'started_at': h.get('started_at'), 'completed_at': h.get('completed_at'),
                         'status': h.get('status'), 'backup_time': h.get('backup_time'),
                         'duration_seconds': h.get('duration_seconds'), 'measured_seconds': d.get('measured_seconds'),
-                        'rto_met': d.get('rto_met'), 'checks': d.get('checks') or [], 'source': d.get('source') or 'manual',
-                        'cause': d.get('cause') or h.get('error') or ''})
+                        'rto_met': d.get('rto_met'), 'checks': _mask_checks(d.get('checks') or [], admin),
+                        'source': d.get('source') or 'manual', 'cause': d.get('cause') or h.get('error') or ''})
     plan = {k: plan[k] for k in ('agent', 'ports', 'command', 'rto_seconds', 'source')}
-    plan = _mask_command(plan, caller_acts_as_admin())
+    plan = _mask_command(plan, admin)
     row['cluster_id'], row['cluster_name'] = cluster_id, _cluster_label(cluster_id, mgr)
     return jsonify({'guest': row, 'checks': plan, 'history': history,
                     'backups': [{'volid': b['volid'], 'ctime': b['ctime'], 'storage': b['storage']}

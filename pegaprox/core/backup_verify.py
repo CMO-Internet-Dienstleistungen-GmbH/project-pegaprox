@@ -13,6 +13,15 @@ disks are left out of backup jobs and it is tagged pegaprox-verify. The checks a
 (guest agent, listening ports, a command) run through the guest agent, in a container
 through pct exec on its node, and what restore, boot and checks took is held against the
 RTO. core/recovery.py says what each guest is checked for and keeps the last result.
+
+MK Oct 2026 - the copy is isolated from its first moment: the restore call itself sets its
+NICs down with new MACs, onboot and protection off, the test tag and this run's mark (read
+from the backup's config first), and the run is in the database before Proxmox gets the
+restore. A virtiofs share, ivshmem, raw QEMU args and a hookscript go before the boot; a
+container whose raw lxc.* lines reach the node never boots. The cleanup removes only a
+guest that still carries the tag and this run's mark, stops a restore it gave up on, waits
+for the stop and counts a removal Proxmox refused as a failed test. sweep() removes what a
+run cut off by a restart, or refused, left behind.
 """
 
 import logging
@@ -34,12 +43,26 @@ KEEP_DONE = 300
 
 AGENT_WAIT = 90         # seconds the guest agent gets to answer after boot
 EXEC_WAIT = 60          # a check command
+RESTORE_WAIT = 600      # the restore; one that takes longer is stopped and removed
+UNLOCK_WAIT = 300       # a stopped restore, until Proxmox lets go of the guest
 _NET_RE = re.compile(r'net\d+')
 _QEMU_DISK_RE = re.compile(r'(?:scsi|virtio|sata|ide)\d+')
 _PASSTHROUGH_RE = re.compile(r'(?:hostpci|usb|parallel)\d+')
+# a node directory (virtiofs), shared memory with the original (ivshmem), raw QEMU
+# arguments (a NIC no netN names, a device) and the original's host-side hookscript
+_QEMU_HOST_RE = re.compile(r'virtiofs\d+|ivshmem|args|hookscript')
 _SERIAL_RE = re.compile(r'serial\d+')
 _LXC_MP_RE = re.compile(r'mp\d+')
 _LXC_DEV_RE = re.compile(r'dev\d+')
+# raw lxc.* lines that stay inside the container; any other one (mounts, NICs, namespaces
+# of the node, device access, hooks, includes, a console or log on a node path) keeps the
+# copy from booting, the API cannot remove them
+_RAW_LXC_INSIDE = ('lxc.apparmor.', 'lxc.cap.', 'lxc.idmap', 'lxc.environment', 'lxc.prlimit.',
+                   'lxc.sysctl.', 'lxc.seccomp.profile', 'lxc.tty.', 'lxc.pty.', 'lxc.signal.',
+                   'lxc.start.', 'lxc.init.', 'lxc.uts.', 'lxc.arch', 'lxc.autodev', 'lxc.no_new_privs',
+                   'lxc.keyring.')
+# what a qemu NIC says besides its model: 'virtio=<MAC>' is the model with its MAC
+_QEMU_NET_OPTS = ('model', 'macaddr', 'bridge', 'firewall', 'link_down', 'mtu', 'queues', 'rate', 'tag', 'trunks')
 LINUX_LISTENERS = ['sh', '-c', 'ss -Hltn 2>/dev/null || netstat -ltn 2>/dev/null']
 WINDOWS_LISTENERS = ['cmd.exe', '/c', 'netstat -an -p tcp']
 
@@ -178,6 +201,7 @@ def _run(pve_mgr, params, status):
     start_time = time.time()
     test_vmid = None
     restore_accepted = False
+    restore_running = None
     host, port = pve_mgr.host, pve_mgr.api_port
     base = f"https://{host}:{port}/api2/json"
     node = params.get('node', '')
@@ -216,6 +240,9 @@ def _run(pve_mgr, params, status):
         # before it is isolated
         if _ha_resource(pve_mgr, base, test_vmid):
             raise Exception(f"VMID {test_vmid} has a Proxmox HA resource - not restoring there")
+        # what the restore call sets on top of the backup's config wins: the copy is
+        # isolated from the moment Proxmox creates it, not only once the restore is over
+        backup_config = _backup_config(pve_mgr, base, node, volid)
 
         # Phase 2: Restore backup
         status['phase'] = 'restoring'
@@ -230,6 +257,9 @@ def _run(pve_mgr, params, status):
                             'start': 0}  # don't start yet
         if storage:
             restore_data['storage'] = storage
+        restore_data.update(restore_isolation(backup_config, vm_type, plan, mark_of(task_id)))
+        # on record before Proxmox has it: a restart from here on leaves a row sweep() finds
+        _save_result(status)
 
         restore_resp = pve_mgr._api_post(f"{base}/nodes/{node}/{vm_type}", data=restore_data)
 
@@ -240,11 +270,15 @@ def _run(pve_mgr, params, status):
         restore_accepted = True
 
         restore_upid = restore_resp.json().get('data')
+        restore_running = restore_upid
+        status['restore_upid'] = restore_upid
+        _save_result(status)
         _log(f"Restore task started: {restore_upid}")
 
         # Wait for restore to complete
-        if not _wait_task(pve_mgr, restore_upid, timeout=600):
-            raise Exception("Restore task failed or timed out")
+        if not _wait_task(pve_mgr, restore_upid, timeout=RESTORE_WAIT):
+            raise Exception(f"Restore task failed or did not finish within {RESTORE_WAIT}s")
+        restore_running = None
 
         status['restore_ok'] = True
         _log("Restore completed successfully")
@@ -298,38 +332,31 @@ def _run(pve_mgr, params, status):
         status['measured_seconds'] = round(time.time() - measured_from, 1)
 
         # Phase 7: Cleanup
+        left = None
         if auto_cleanup:
             status['phase'] = 'cleanup'
             _log("Cleaning up test VM...")
-
-            # stop first
-            try:
-                pve_mgr._api_post(f"{base}/nodes/{node}/{vm_type}/{test_vmid}/status/stop", data={'timeout': 30})
-                time.sleep(5)
-            except Exception:
-                pass
-
-            # delete
-            try:
-                del_resp = pve_mgr._api_delete(f"{base}/nodes/{node}/{vm_type}/{test_vmid}",
-                                               params={'purge': 1, 'destroy-unreferenced-disks': 1})
-                if del_resp.status_code == 200:
-                    del_upid = del_resp.json().get('data')
-                    if del_upid:
-                        _wait_task(pve_mgr, del_upid, timeout=120)
-                    status['cleanup_ok'] = True
-                    _log("Test VM deleted")
-                else:
-                    _log(f"Cleanup failed: {del_resp.text[:100]}")
-            except Exception as e:
-                _log(f"Cleanup error: {e}")
+            gone, why, again = remove_test_guest(pve_mgr, base, node, vm_type, test_vmid, task_id, _log)
+            if gone:
+                status['cleanup_ok'] = True
+                _log("Test VM deleted")
+            else:
+                left, status['_left'] = why, again
+                _log(f"Cleanup failed: {why}")
         else:
             _log(f"Auto-cleanup disabled - test VM {test_vmid} kept for inspection, isolated")
             status['cleanup_ok'] = True
 
         # Final status
         failed_checks = [c for c in status['checks'] if c.get('ok') is False]
-        if status['restore_ok'] and status['boot_ok'] and not failed_checks:
+        for c in failed_checks:
+            _log(f"Check failed: {c['check']} {c.get('target') or ''} - {c.get('detail') or ''}")
+        if left is not None:
+            # a copy left behind is no test that passed: the run and the report say so
+            status['status'] = 'error'
+            status['error'] = f"test guest {test_vmid} was not removed: {left}"
+            _log(f"✗ {status['error']}")
+        elif status['restore_ok'] and status['boot_ok'] and not failed_checks:
             status['status'] = 'passed'
             rto = status['rto_seconds']
             if rto:
@@ -339,8 +366,6 @@ def _run(pve_mgr, params, status):
             _log("✓ Verification PASSED")
         else:
             status['status'] = 'failed'
-            for c in failed_checks:
-                _log(f"Check failed: {c['check']} {c.get('target') or ''} - {c.get('detail') or ''}")
             _log("✗ Verification FAILED")
 
     except Exception as e:
@@ -355,20 +380,24 @@ def _run(pve_mgr, params, status):
         if test_vmid and not restore_accepted:
             _log(f"Restore to VMID {test_vmid} was not accepted - a guest there is not ours, left alone")
         elif test_vmid:
-            try:
-                pve_mgr._api_post(f"{base}/nodes/{node}/{vm_type}/{test_vmid}/status/stop")
-                time.sleep(3)
-                pve_mgr._api_delete(f"{base}/nodes/{node}/{vm_type}/{test_vmid}",
-                                    params={'purge': 1, 'destroy-unreferenced-disks': 1})
+            # a restore that ran past its wait still holds the guest: it is stopped first
+            gone, why, again = remove_test_guest(pve_mgr, base, node, vm_type, test_vmid, task_id, _log,
+                                                 restore_upid=restore_running)
+            if gone:
+                status['cleanup_ok'] = True
                 _log(f"Emergency cleanup: deleted test VM {test_vmid}")
-            except Exception:
-                _log(f"Emergency cleanup failed for VM {test_vmid}")
+            else:
+                status['_left'] = again
+                status['error'] = f"{status['error']}; test guest {test_vmid} was not removed: {why}"
+                _log(f"Emergency cleanup failed for VM {test_vmid}: {why}")
 
     finally:
         status['completed_at'] = datetime.now().isoformat()
         status['duration_seconds'] = round(time.time() - start_time, 1)
-        status['phase'] = 'done'
-        if status['status'] != 'passed':
+        if status['status'] != 'running':
+            # 'leftover': sweep() tries the removal again later
+            status['phase'] = 'leftover' if status.get('_left') else 'done'
+        if status['status'] in ('failed', 'error'):
             from pegaprox.core.recovery import failure_cause
             status['cause'] = failure_cause(status)
 
@@ -388,16 +417,201 @@ def _iso_epoch(text):
 
 
 def _ha_resource(pve_mgr, base, vmid):
-    """Whether Proxmox HA manages a guest on `vmid`. An unreadable list says no: a cluster
-    without HA answers it too, and the check is about a stale entry, not a lock."""
+    """Whether Proxmox HA manages a guest on `vmid`. Raises when the list cannot be read:
+    a cluster without HA answers it with an empty list, and a stale entry would have HA
+    start the copy the moment its restore is over, before it is isolated."""
     try:
         r = pve_mgr._api_get(f"{base}/cluster/ha/resources", timeout=10)
-        if r.status_code != 200:
-            return False
-        sids = {str(x.get('sid') or '') for x in (r.json().get('data') or []) if isinstance(x, dict)}
-    except Exception:
-        return False
+        data = r.json().get('data') if r.status_code == 200 else None
+    except Exception as e:
+        raise Exception(f"the Proxmox HA resources could not be read: {e}")
+    if r.status_code != 200 or not isinstance(data or [], list):
+        raise Exception(f"the Proxmox HA resources could not be read (HTTP {r.status_code}) - not restoring")
+    sids = {str(x.get('sid') or '') for x in (data or []) if isinstance(x, dict)}
     return f'vm:{vmid}' in sids or f'ct:{vmid}' in sids
+
+
+def _backup_config(pve_mgr, base, node, volid):
+    """The config inside the backup, as Proxmox reads it out (PBS snapshots too), as a
+    dict. Raises when it cannot be read: the restore call isolates the copy from it."""
+    try:
+        r = pve_mgr._api_get(f"{base}/nodes/{node}/vzdump/extractconfig", params={'volume': volid}, timeout=30)
+        text = r.json().get('data') if r.status_code == 200 else None
+    except Exception as e:
+        raise Exception(f"the config in the backup could not be read: {e}")
+    if not isinstance(text, str) or not text.strip():
+        raise Exception(f"the config in the backup could not be read (HTTP {r.status_code}) - not restoring")
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith('['):
+            break           # a snapshot's section, not the guest
+        if not line or line.startswith('#') or ':' not in line:
+            continue
+        k, v = line.split(':', 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def mark_of(task_id):
+    """The note a test guest carries as its description: the cleanup removes a guest only
+    with this run's note and the test tag."""
+    return f'PegaProx restore test {task_id}'
+
+
+def _isolated_nic(opts, bridge):
+    if bridge:
+        opts = [o for o in opts if o[0] not in ('tag', 'trunks')]
+        return _set(opts, 'bridge', bridge)
+    return _set(opts, 'link_down', '1')
+
+
+def restore_isolation(config, vm_type, plan, mark):
+    """What the restore call sets on top of the backup's `config`: every NIC down (or on
+    the test bridge) without its MAC, so Proxmox gives it a new one, onboot and protection
+    off, the test tag and `mark` as the description."""
+    from pegaprox.core.recovery import TEST_TAG, guest_tags
+    bridge = plan.get('test_bridge') if plan.get('isolation') == 'bridge' else None
+    out = {'onboot': 0, 'protection': 0, 'description': mark,
+           'tags': ';'.join(sorted(guest_tags(config.get('tags')) | {TEST_TAG}))}
+    for key, value in config.items():
+        if not _NET_RE.fullmatch(key):
+            continue
+        opts = [o for o in _opts(value) if o[0] not in ('macaddr', 'hwaddr')]
+        if vm_type == 'qemu' and opts and opts[0][1] is not None and opts[0][0] not in _QEMU_NET_OPTS:
+            opts[0][1] = None           # 'virtio=<MAC>': the model alone
+        out[key] = _joined(_isolated_nic(opts, bridge))
+    return out
+
+
+def _ours(config, mark):
+    from pegaprox.core.recovery import TEST_TAG, guest_tags
+    return TEST_TAG in guest_tags(config.get('tags')) and mark in str(config.get('description') or '')
+
+
+def _guest_config(pve_mgr, url):
+    """(config, '') of the guest at `url`, (None, 'gone') when Proxmox has none there,
+    (None, why) when it could not be read."""
+    try:
+        r = pve_mgr._api_get(f"{url}/config")
+    except Exception as e:
+        return None, f'its config could not be read: {e}'
+    if r.status_code == 200:
+        data = r.json().get('data')
+        return (data, '') if isinstance(data, dict) and data else (None, 'its config came back empty')
+    # Proxmox says it in the status line, newer versions in the body's message too
+    if 'does not exist' in f"{getattr(r, 'text', '') or ''} {getattr(r, 'reason', '') or ''}":
+        return None, 'gone'
+    return None, f'its config could not be read (HTTP {r.status_code})'
+
+
+def remove_test_guest(pve_mgr, base, node, vm_type, vmid, task_id, log, restore_upid=None, wait=UNLOCK_WAIT):
+    """Remove the test guest of run `task_id`: (gone, why not, whether to try again later).
+    A restore given up on is stopped first and the guest waited for while Proxmox holds it
+    locked; then protection is cleared, a running guest stopped and the stop waited for,
+    and the guest destroyed. A guest on that VMID without the test tag and this run's mark
+    is left alone: nextid hands the VMID of a removed test guest to the next create.
+    Never raises."""
+    url = f"{base}/nodes/{node}/{vm_type}/{vmid}"
+    try:
+        if restore_upid:
+            try:
+                r = pve_mgr._api_delete(f"{base}/nodes/{node}/tasks/{restore_upid}")
+                log("Restore task stopped" if r.status_code == 200 else f"Stopping the restore task: {str(r.text)[:120]}")
+            except Exception as e:
+                log(f"Stopping the restore task: {e}")
+        deadline = time.time() + wait
+        while True:
+            config, why = _guest_config(pve_mgr, url)
+            if why == 'gone':
+                return True, '', False
+            if config is None:
+                return False, why, True
+            if not config.get('lock'):
+                break
+            if time.time() >= deadline:
+                return False, f"Proxmox holds it locked ({config.get('lock')})", True
+            time.sleep(5)
+        if not _ours(config, mark_of(task_id)):
+            return False, ("the guest on that VMID no longer carries the test tag and this run's mark,"
+                           " left alone"), False
+        if str(config.get('protection') or '0') == '1':
+            r = pve_mgr._api_put(f"{url}/config", data={'delete': 'protection'})
+            if r.status_code != 200:
+                return False, f"its protection could not be cleared: {str(r.text)[:120]}", True
+        r = pve_mgr._api_get(f"{url}/status/current")
+        if r.status_code != 200 or (r.json().get('data') or {}).get('status') != 'stopped':
+            # a container's stop has no timeout parameter, Proxmox refuses the call with one
+            r = pve_mgr._api_post(f"{url}/status/stop", data={'timeout': 30} if vm_type == 'qemu' else {})
+            upid = r.json().get('data') if r.status_code == 200 else None
+            if upid and not _wait_task(pve_mgr, upid, timeout=120):
+                log(f"The stop of {vmid} did not finish in time")
+        r = pve_mgr._api_delete(url, params={'purge': 1, 'destroy-unreferenced-disks': 1})
+        if r.status_code != 200:
+            return False, f"Proxmox refused to remove it: {str(r.text)[:160]}", True
+        upid = r.json().get('data')
+        if upid and not _wait_task(pve_mgr, upid, timeout=300):
+            if _guest_config(pve_mgr, url)[1] != 'gone':
+                return False, 'its removal did not finish', True
+        return True, '', False
+    except Exception as e:
+        return False, f'the removal failed: {e}', True
+
+
+def sweep(managers):
+    """Remove the test guests runs left behind: a run a restart cut off (its row still says
+    running and no run of this process is it) and one whose removal Proxmox refused (phase
+    'leftover'). Each removal is a step of its own (#625); a guest Proxmox still holds
+    locked is tried again next time. Returns how many rows it settled. Never raises."""
+    from pegaprox.core import ha
+    try:
+        rows = [dict(r) for r in get_db().query(
+            "SELECT * FROM backup_verifications WHERE test_vmid IS NOT NULL "
+            "AND (status = 'running' OR phase = 'leftover') ORDER BY started_at LIMIT 50") or []]
+    except Exception as e:
+        logging.debug(f"[VERIFY] leftovers unreadable: {e}")
+        return 0
+    with _verify_lock:
+        mine = {k for k, v in _active_verifications.items() if v.get('status') == 'running'}
+    settled = 0
+    for row in rows:
+        mgr = managers.get(row['cluster_id'])
+        if row['id'] in mine or mgr is None or not getattr(mgr, 'is_connected', False):
+            continue
+        try:
+            details = json.loads(row.get('details') or '{}')
+        except (TypeError, ValueError):
+            details = {}
+        cut_off = row['status'] == 'running'
+        vmid = int(row['test_vmid'])
+        if not ha.confirm_step(f'the removal of test guest {vmid}'):
+            break
+        said = []
+        gone, why, again = remove_test_guest(
+            mgr, f"https://{mgr.host}:{mgr.api_port}/api2/json", row.get('node') or '',
+            details.get('vm_type') or 'qemu', vmid, row['id'], said.append,
+            restore_upid=details.get('restore_upid') if cut_off else None, wait=0)
+        if not gone and again:
+            continue
+        note = f"Test VM {vmid} removed afterwards" if gone else f"Test VM {vmid} not removed: {why}"
+        logging.info(f"[VERIFY {row['id']}] {note}")
+        details['logs'] = list(details.get('logs') or []) + said + [f"[{time.strftime('%H:%M:%S')}] {note}"]
+        try:
+            if cut_off:
+                from pegaprox.core.recovery import failure_cause
+                status = dict(row, **{k: details[k] for k in _DETAIL_KEYS if k in details})
+                status.update(logs=details['logs'], phase='done', status='error', cleanup_ok=gone,
+                              completed_at=datetime.now().isoformat(),
+                              error='PegaProx stopped while the test ran' + ('' if gone else f'; {note}'))
+                status['cause'] = failure_cause(status)
+                _save_result(status)
+            else:
+                get_db().execute('UPDATE backup_verifications SET phase = ?, cleanup_ok = ?, details = ? WHERE id = ?',
+                                 ('done', int(gone), json.dumps(details), row['id']))
+            settled += 1
+        except Exception as e:
+            logging.error(f"[VERIFY] could not settle {row['id']}: {e}")
+    return settled
 
 
 # ---------------------------------------------------------------------------
@@ -436,32 +650,55 @@ def _volume(opts):
     return k if v is None else (v if k in ('volume', 'file') else '')
 
 
+def host_ties(config, vm_type):
+    """The keys of `config` that tie a guest to its node or to the original: passthrough
+    devices, a serial line on a host device, a virtiofs share, ivshmem, raw QEMU args, a
+    hookscript, in a container its devices and bind mounts."""
+    out = []
+    for key, value in config.items():
+        if key == 'hookscript':
+            out.append(key)
+        elif vm_type == 'qemu':
+            if (_PASSTHROUGH_RE.fullmatch(key) or _QEMU_HOST_RE.fullmatch(key)
+                    or (_SERIAL_RE.fullmatch(key) and str(value) != 'socket')):
+                out.append(key)
+        elif _LXC_DEV_RE.fullmatch(key) or (_LXC_MP_RE.fullmatch(key) and _volume(_opts(value)).startswith('/')):
+            # a bind mount: a directory of the node, production data
+            out.append(key)
+    return sorted(out)
+
+
+def raw_lxc_reach(config):
+    """The raw lxc.* lines of a container config (Proxmox lists them under 'lxc' as
+    [key, value] pairs) that reach past the container."""
+    raw = config.get('lxc')
+    if not raw:
+        return []
+    out = set()
+    for entry in raw if isinstance(raw, list) else [raw]:
+        key = str(entry[0] if isinstance(entry, (list, tuple)) and entry else entry).strip().lower()
+        if key.startswith(_RAW_LXC_INSIDE):
+            continue
+        if key.startswith(('lxc.cgroup.', 'lxc.cgroup2.')) and '.devices.' not in key:
+            continue            # a limit, not a device
+        out.add(key)
+    return sorted(out)
+
+
 def isolation_changes(config, vm_type, plan):
     """What makes a restored guest safe to boot: (changes, deletes, disk_changes).
     changes and deletes go in one config write that has to succeed; disk_changes (leave
     the disks out of backup jobs) are best effort."""
-    changes, deletes, disks = {}, [], {}
+    changes, deletes, disks = {}, host_ties(config, vm_type), {}
     bridge = plan.get('test_bridge') if plan.get('isolation') == 'bridge' else None
     for key, value in config.items():
         if _NET_RE.fullmatch(key):
-            opts = _opts(value)
-            if bridge:
-                opts = [o for o in opts if o[0] not in ('tag', 'trunks')]
-                _set(opts, 'bridge', bridge)
-            else:
-                _set(opts, 'link_down', '1')
-            changes[key] = _joined(opts)
-        elif vm_type == 'qemu' and (_PASSTHROUGH_RE.fullmatch(key)
-                                    or (_SERIAL_RE.fullmatch(key) and str(value) != 'socket')):
-            deletes.append(key)
-        elif vm_type == 'lxc' and _LXC_DEV_RE.fullmatch(key):
-            deletes.append(key)
+            changes[key] = _joined(_isolated_nic(_opts(value), bridge))
+        elif key in deletes:
+            continue
         elif vm_type == 'lxc' and _LXC_MP_RE.fullmatch(key):
             opts = _opts(value)
-            if _volume(opts).startswith('/'):
-                # a bind mount: a directory of the node, production data
-                deletes.append(key)
-            elif dict((k, v) for k, v in opts).get('backup') != '0':
+            if dict((k, v) for k, v in opts).get('backup') != '0':
                 disks[key] = _joined(_set(opts, 'backup', '0'))
         elif vm_type == 'qemu' and _QEMU_DISK_RE.fullmatch(key):
             opts = _opts(value)
@@ -475,7 +712,7 @@ def isolation_changes(config, vm_type, plan):
     tags = guest_tags(config.get('tags'))
     if TEST_TAG not in tags:
         changes['tags'] = ';'.join(sorted(tags | {TEST_TAG}))
-    return changes, sorted(deletes), disks
+    return changes, deletes, disks
 
 
 def unisolated_nics(config, plan):
@@ -501,7 +738,9 @@ def _isolate(pve_mgr, base, node, vm_type, test_vmid, plan, log):
     r = pve_mgr._api_get(url)
     if r.status_code != 200:
         raise Exception(f"could not read the test guest's config (HTTP {r.status_code})")
-    config = r.json().get('data') or {}
+    config = r.json().get('data')
+    if not isinstance(config, dict) or not config:
+        raise Exception("the test guest's config came back empty")
     changes, deletes, disks = isolation_changes(config, vm_type, plan)
     body = dict(changes)
     if deletes:
@@ -516,15 +755,26 @@ def _isolate(pve_mgr, base, node, vm_type, test_vmid, plan, log):
                 log(f"Disks stay in the backup jobs' reach: {r.text[:120]}")
         except Exception as e:
             log(f"Disks stay in the backup jobs' reach: {e}")
+    # the proof is what Proxmox holds now: a read-back that leaves a NIC out proves nothing
     r = pve_mgr._api_get(url)
-    if r.status_code != 200:
+    after = r.json().get('data') if r.status_code == 200 else None
+    if not isinstance(after, dict) or not after:
         raise Exception('could not read the test guest back after isolating it')
-    after = r.json().get('data') or {}
+    missing = sorted(k for k in config if _NET_RE.fullmatch(k) and k not in after)
+    if missing:
+        raise Exception(f"the test guest read back without {', '.join(missing)}")
     bad = unisolated_nics(after, plan)
     if bad:
         raise Exception(f"the test guest would boot on the network: {', '.join(bad)} not isolated")
     if str(after.get('onboot', '0')) not in ('0', ''):
         raise Exception('onboot is still set on the test guest')
+    ties = host_ties(after, vm_type)
+    if ties:
+        raise Exception(f"the test guest would boot with {', '.join(ties)} of the original")
+    raw = raw_lxc_reach(after) if vm_type == 'lxc' else []
+    if raw:
+        raise Exception(f"the container has raw entries that reach the node ({', '.join(raw)}); "
+                        "the API cannot remove them, so its copy does not boot")
     nics = len([k for k in after if _NET_RE.fullmatch(k)])
     how = f"on bridge {plan['test_bridge']}" if plan.get('isolation') == 'bridge' else 'link down'
     log(f"Isolated: {nics} NIC(s) {how}, onboot off"
@@ -718,13 +968,17 @@ def _wait_task(pve_mgr, upid, timeout=600):
     return False
 
 
+_DETAIL_KEYS = ('checks', 'measured_seconds', 'rto_seconds', 'rto_met', 'backup_ts', 'isolation',
+                'isolated', 'vm_type', 'source', 'cause', 'restore_upid')
+
+
 def _save_result(status):
-    """Save verification result to SQLite, and the guest's mark (core/recovery.py)."""
+    """Save verification result to SQLite, and the guest's mark (core/recovery.py). A run
+    still going is saved too, before its restore: sweep() finds it after a restart."""
     try:
         db = get_db()
         details = {'logs': status.get('logs', [])}
-        for k in ('checks', 'measured_seconds', 'rto_seconds', 'rto_met', 'backup_ts', 'isolation',
-                  'isolated', 'vm_type', 'source', 'cause'):
+        for k in _DETAIL_KEYS:
             if status.get(k) is not None:
                 details[k] = status[k]
         db.execute('''

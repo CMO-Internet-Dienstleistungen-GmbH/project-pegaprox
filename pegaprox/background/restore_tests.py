@@ -198,6 +198,14 @@ def _loop():
                 tick()
         except Exception as e:
             logging.error(f"[RESTORE-TESTS] {e}")
+        # MK Oct 2026 - test guests a run left behind: cut off by a restart, or their
+        # removal refused
+        try:
+            if ha.is_active():
+                from pegaprox.core import backup_verify
+                backup_verify.sweep(cluster_managers)
+        except Exception as e:
+            logging.error(f"[RESTORE-TESTS] leftovers: {e}")
         time.sleep(TICK)
 
 

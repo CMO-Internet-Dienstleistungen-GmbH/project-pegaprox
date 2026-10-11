@@ -2491,6 +2491,7 @@ class PegaProxManager:
         affinity_groups, anti_groups = {}, {}
         ignored, pins = set(), {}
         unresolved = []
+        from pegaprox.core.recovery import TEST_TAG
 
         for res in (vms or []):
             if res.get('type') not in ('qemu', 'lxc'):
@@ -2503,6 +2504,10 @@ class PegaProxManager:
             except (TypeError, ValueError):
                 continue
             tags = [t.strip().lower() for t in re.split(r'[;,\s]+', str(raw)) if t.strip()]
+            if TEST_TAG in tags:
+                # MK Oct 2026 - a restore test's copy carries the original's tags; it is in
+                # no group and pinned nowhere, the pin reconcile would move it mid-test
+                continue
             for tag in tags:
                 if tag.startswith('plb_affinity_'):
                     g = tag[len('plb_affinity_'):]
@@ -3363,6 +3368,11 @@ class PegaProxManager:
         else:
             self.logger.debug("[BAL] cluster CRS not active — balancer runs full set (compat path)")
 
+        # MK Oct 2026 - a restore test's copy stays on the node its run addresses for the
+        # checks, the stop and the removal
+        from pegaprox.core.recovery import TEST_TAG, guest_tags
+        test_guests = {vm.get('vmid') for vm in vms if TEST_TAG in guest_tags(vm.get('tags'))}
+
         candidates = [
             vm for vm in vms
             if vm.get('node') == source_node and
@@ -3374,6 +3384,7 @@ class PegaProxManager:
             vm.get('vmid') not in cooled_vmids and  # NS: Skip recently migrated VMs
             vm.get('vmid') not in pve_crs_managed_vmids and  # MK: PVE CRS owns these (9.2+)
             vm.get('vmid') not in proxlb_ignored and  # #426: ProxLB plb_ignore tag
+            vm.get('vmid') not in test_guests and
             (vm.get('vmid') not in proxlb_pins or target_node in proxlb_pins.get(vm.get('vmid'), set()))  # #426: plb_pin — only if target is a pinned node
         ]
 
