@@ -7575,7 +7575,16 @@
             { id: 'headroom', label: 'whatifHeadroom', desc: 'whatifHeadroomDesc' },
             { id: 'storage_failure', label: 'whatifStorageFailure', desc: 'whatifStorageFailureDesc' },
             { id: 'network_failure', label: 'whatifNetworkFailure', desc: 'whatifNetworkFailureDesc' },
+            { id: 'pbs_failure', label: 'whatifPbsFailure', desc: 'whatifPbsFailureDesc' },
         ];
+        // LW Oct 2026 - risk view: restore status badges, the kinds the ranking lists
+        const WHATIF_RESTORE = {
+            proven: ['whatifRestoreProven', 'bg-green-500/10 text-green-400 border-green-500/30'],
+            not_proven: ['whatifRestoreNotProven', 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30'],
+            failing: ['whatifRestoreFailing', 'bg-red-500/10 text-red-400 border-red-500/30'],
+            unknown: ['whatifRestoreUnknown', 'bg-gray-500/20 text-gray-300 border-proxmox-border'],
+        };
+        const WHATIF_KINDS = { node: 'whatifKindNode', storage: 'whatifKindStorage', pbs: 'whatifKindPbs', bridge: 'whatifKindBridge' };
         const WHATIF_REASONS = {
             not_ha: 'whatifRsnNotHa', ha_state: 'whatifRsnHaState', ha_unreadable: 'whatifRsnHaUnreadable',
             local_disks: 'whatifRsnLocalDisks', storage_unknown: 'whatifRsnStorageUnknown',
@@ -7590,7 +7599,8 @@
             disk_on_storage: 'whatifRsnDiskOnStorage', data_disk_on_storage: 'whatifRsnDataDisk',
             cdrom_on_storage: 'whatifRsnCdrom', volumes_on_storage: 'whatifRsnVolumes',
             copy_on_storage: 'whatifRsnCopy', all_nics: 'whatifRsnAllNics', some_nics: 'whatifRsnSomeNics',
-            config_unread: 'whatifRsnConfigUnread',
+            config_unread: 'whatifRsnConfigUnread', pbs_only_copy: 'whatifRsnPbsOnlyCopy',
+            pbs_some_copy: 'whatifRsnPbsSomeCopy', pbs_job_only: 'whatifRsnPbsJobOnly',
         };
         const WHATIF_LIMITS = {
             quorum_lost: 'whatifLimQuorumLost', fence_reset: 'whatifLimFenceReset', not_ha: 'whatifLimNotHa',
@@ -7601,6 +7611,8 @@
             local_disks_stay: 'whatifLimLocalStay', over_threshold: 'whatifLimOverThreshold',
             overcommitted: 'whatifLimOvercommitted', ha_unreadable: 'whatifLimHaUnreadable',
             configs_unread: 'whatifLimConfigsUnread', no_ha_reaction: 'whatifLimNoHaReaction',
+            pbs_only_copy: 'whatifLimPbsOnlyCopy', pbs_tests_lost: 'whatifLimPbsTestsLost',
+            pbs_points_unread: 'whatifLimPbsPointsUnread', pbs_jobs_unread: 'whatifLimPbsJobsUnread',
         };
         const WHATIF_ASSUMPTIONS = {
             mem_configured: 'whatifAsmMemConfigured', mem_current: 'whatifAsmMemCurrent', cpu_now: 'whatifAsmCpuNow',
@@ -7613,6 +7625,9 @@
             storage_disks: 'whatifAsmStorageDisks', storage_content: 'whatifAsmStorageContent',
             net_underlay: 'whatifAsmNetUnderlay', net_down: 'whatifAsmNetDown',
             maint_evacuator: 'whatifAsmMaintEvacuator', maint_apart: 'whatifAsmMaintApart',
+            critical_tags: 'whatifAsmCriticalTags', tenant_by_cluster: 'whatifAsmTenantByCluster',
+            restore_marks: 'whatifAsmRestoreMarks', pbs_listing: 'whatifAsmPbsListing', pbs_jobs: 'whatifAsmPbsJobs',
+            rank_weighting: 'whatifAsmRankWeighting', rank_cheap: 'whatifAsmRankCheap',
         };
         const WHATIF_OUTCOMES = [
             { id: 'down', label: 'whatifDown', cls: 'bg-red-500/10 text-red-400 border-red-500/30' },
@@ -7650,6 +7665,12 @@
             const [error, setError] = React.useState('');
             const [filter, setFilter] = React.useState('all');
             const [shown, setShown] = React.useState(WHATIF_PAGE);
+            const [view, setView] = React.useState('scenario');
+            const [pbsStorage, setPbsStorage] = React.useState('');
+            const [tagsText, setTagsText] = React.useState('');
+            const [rank, setRank] = React.useState(null);
+            const [ranking, setRanking] = React.useState(false);
+            const [rankError, setRankError] = React.useState('');
 
             // t() hands back the key on a miss: the server's English stands in then
             const say = (key, args, fallback) => {
@@ -7668,6 +7689,7 @@
                 let gone = false;
                 setOpts(null); setReport(null); setError(''); setOptsError('');
                 setNodes([]); setStorage(''); setWhere(''); setBridge(''); setVnet('');
+                setPbsStorage(''); setRank(null); setRankError(''); setTagsText('');
                 if (!clusterId) return;
                 (async () => {
                     try {
@@ -7676,6 +7698,7 @@
                         if (gone) return;
                         if (!r || !r.ok || !d) { setOptsError((d && d.error) || t('whatifOptionsFailed')); return; }
                         setOpts(d);
+                        setTagsText(((d.critical_tags && d.critical_tags.tags) || []).join(', '));
                         if (d.thresholds) {
                             setCpuThr(String(d.thresholds.cpu ?? ''));
                             setMemThr(String(d.thresholds.memory ?? ''));
@@ -7692,8 +7715,17 @@
             const pickedStorage = (opts?.storages || []).find(s => s.storage === storage);
             const pickedBridge = (opts?.bridges || []).find(b => b.name === bridge);
 
+            // the critical tags typed in, sent only where they differ from what the cluster uses
+            const tagList = () => [...new Set(tagsText.split(/[\s,;]+/).map(x => x.trim().toLowerCase()).filter(Boolean))];
+            const tagsChanged = () => {
+                const now = tagList().sort().join(','), was = [...((opts?.critical_tags?.tags) || [])].sort().join(',');
+                return now !== was;
+            };
+            const tagSource = (src) => src === 'request' ? t('whatifTagsRequest') : src === 'recovery' ? t('whatifTagsRecovery') : t('whatifTagsDefault');
+
             const body = () => {
                 const out = { type: kind, memory };
+                if (tagsChanged()) out.critical_tags = tagList();
                 const thr = {};
                 const c = parseFloat(cpuThr), m = parseFloat(memThr);
                 if (!isNaN(c) && opts?.thresholds && c !== opts.thresholds.cpu) thr.cpu = c;
@@ -7703,6 +7735,7 @@
                 if (kind === 'maintenance') { out.allow_local_disks = allowLocal; out.relax_anti_affinity = relax; }
                 if (kind === 'headroom') { out.depth = depth; out.guests = guestsMode; }
                 if (kind === 'storage_failure') { out.storage = storage; if (where) out.node = where; }
+                if (kind === 'pbs_failure') out.storage = pbsStorage;
                 if (kind === 'network_failure') {
                     if (netKind === 'bridge') out.bridge = bridge; else out.vnet = vnet;
                     if (vlan !== '' && !isNaN(parseInt(vlan, 10))) out.vlan = parseInt(vlan, 10);
@@ -7712,6 +7745,7 @@
             };
             const missing = (kind === 'node_failure' || kind === 'maintenance') && !nodes.length ? 'whatifPickNode'
                 : kind === 'storage_failure' && !storage ? 'whatifPickStorage'
+                : kind === 'pbs_failure' && !pbsStorage ? 'whatifPickPbs'
                 : kind === 'network_failure' && !(netKind === 'bridge' ? bridge : vnet) ? 'whatifPickNetwork' : '';
 
             const simulate = async () => {
@@ -7729,6 +7763,22 @@
                 } finally { setRunning(false); }
             };
 
+            const runRanking = async () => {
+                if (ranking) return;
+                setRanking(true); setRankError('');
+                try {
+                    const payload = tagsChanged() ? { critical_tags: tagList() } : {};
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/whatif/ranking`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+                    });
+                    const d = r ? await r.json().catch(() => null) : null;
+                    if (!r || !r.ok || !d || d.error) { setRankError((d && d.error) || t('whatifRunFailed')); return; }
+                    setRank(d);
+                } catch (e) {
+                    setRankError(t('whatifRunFailed'));
+                } finally { setRanking(false); }
+            };
+
             const Basis = ({ b }) => {
                 const map = { known: ['whatifKnown', 'bg-blue-500/10 text-blue-400'],
                               calculated: ['whatifCalculated', 'bg-purple-500/10 text-purple-400'],
@@ -7738,12 +7788,21 @@
             };
             const field = 'bg-proxmox-dark border border-proxmox-border rounded-lg px-2 py-1.5 text-sm text-white focus:outline-none focus:border-proxmox-orange';
             const label = 'block text-xs text-gray-400 mb-1';
+            const tagsField = (
+                <div>
+                    <div className={label}>{t('whatifCriticalTags')} <span className="text-gray-500">({tagSource(opts?.critical_tags?.source)})</span></div>
+                    <input type="text" value={tagsText} onChange={e => setTagsText(e.target.value)} className={`${field} w-full`} data-whatif-field="tags" />
+                    <div className="text-[10px] text-gray-500 mt-1">{t('whatifCriticalTagsHint')}</div>
+                </div>
+            );
 
             if (opts && opts.supported === false) {
                 return <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 text-sm text-gray-400">{t('whatifNotSupported')}</div>;
             }
 
             const rows = (report?.guests || []).filter(g => filter === 'all' || g.outcome === filter);
+            const tenantName = {};
+            ((report?.risk?.tenants?.items) || []).forEach(x => { tenantName[x.id] = x.name; });
             const outcomeOf = (id) => WHATIF_OUTCOMES.find(o => o.id === id) || WHATIF_OUTCOMES[4];
             const thrSource = (src) => src === 'alert_rule' ? t('whatifThrFromRule') : src === 'request' ? t('whatifThrFromRun') : t('whatifThrDefault');
 
@@ -7757,6 +7816,93 @@
                         <p className="text-xs text-gray-500 mt-1">{t('whatifDesc')}</p>
                     </div>
 
+                    <div className="flex gap-2">
+                        {['scenario', 'ranking'].map(v => (
+                            <button key={v} type="button" data-whatif-view={v} onClick={() => setView(v)}
+                                className={`px-3 py-1.5 rounded-lg text-sm border ${view === v
+                                    ? 'border-proxmox-orange bg-proxmox-orange/10 text-white'
+                                    : 'border-proxmox-border text-gray-400 hover:text-white hover:bg-proxmox-hover'}`}>
+                                {t(v === 'scenario' ? 'whatifViewScenario' : 'whatifViewRanking')}
+                            </button>
+                        ))}
+                    </div>
+
+                    {view === 'ranking' && (
+                        <div className="space-y-4" data-whatif="ranking-view">
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 space-y-3" data-whatif="rank-picker">
+                                <p className="text-xs text-gray-500">{t('whatifRankIntro')}</p>
+                                {optsError && <div className="text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg p-3">{optsError}</div>}
+                                {!opts && !optsError && <div className="text-sm text-gray-500">{t('whatifLoading')}</div>}
+                                {opts && <div className="grid grid-cols-1 md:grid-cols-2 gap-3">{tagsField}</div>}
+                                <button type="button" onClick={runRanking} disabled={!opts || ranking} data-whatif="rank-run"
+                                    className="px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm text-white flex items-center gap-2 disabled:opacity-50">
+                                    {ranking ? <Icons.RotateCw className="w-4 h-4 animate-spin" /> : <Icons.Play className="w-4 h-4" />}
+                                    {ranking ? t('whatifRankRunning') : t('whatifRankRun')}
+                                </button>
+                            </div>
+                            {rankError && <div className="text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg p-3" data-whatif="rank-error">{rankError}</div>}
+                            {rank && (
+                                <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 space-y-3" data-whatif="rank">
+                                    <div className="text-xs text-gray-400 flex flex-wrap items-center gap-2" data-whatif="rank-weighting">
+                                        <span>{say('whatifRankWeighting', Object.assign({ factor: rank.weighting.critical_factor }, rank.weighting.outcomes))}</span>
+                                        <Basis b={rank.weighting.basis} />
+                                    </div>
+                                    <div className="text-xs text-gray-500">{say('whatifRiskTagsFrom', { tags: (rank.critical_tags || []).join(', ') || '-', source: tagSource(rank.critical_tags_source) })}</div>
+                                    {(rank.capped || []).map(c => (
+                                        <div key={c.kind} data-whatif-rank-capped={c.kind} className="text-xs text-yellow-400">{say('whatifRankCapped', { kind: t(WHATIF_KINDS[c.kind]), cap: c.cap, total: c.total })}</div>
+                                    ))}
+                                    {(rank.skipped || []).length > 0 && (
+                                        <div data-whatif="rank-skipped" className="text-xs text-yellow-400">{say('whatifRankSkipped', { names: rank.skipped.map(x => `${x.name} (${x.code})`) })}</div>
+                                    )}
+                                    {rank.stopped && <div data-whatif="rank-stopped" className="text-xs text-yellow-400">{say('whatifRankStopped', rank.stopped)}</div>}
+                                    {rank.configs_unread > 0 && <div className="text-xs text-yellow-400">{say('whatifRankUnread', { n: rank.configs_unread })}</div>}
+                                    {!(rank.ranking || []).length && <div className="text-sm text-gray-500">{t('whatifRankEmpty')}</div>}
+                                    {(rank.ranking || []).length > 0 && (
+                                        <div className="overflow-x-auto">
+                                            <table className="w-full text-sm">
+                                                <thead className="text-xs text-gray-400">
+                                                    <tr>
+                                                        <th className="text-left p-2">{t('whatifRankKind')}</th>
+                                                        <th className="text-left p-2">{t('whatifRankName')}</th>
+                                                        <th className="text-right p-2">{t('whatifRankAffected')}</th>
+                                                        <th className="text-right p-2">{t('whatifDown')}</th>
+                                                        <th className="text-right p-2">{t('whatifDegraded')} / {t('whatifUnknown')}</th>
+                                                        <th className="text-right p-2">{t('whatifRestarted')}</th>
+                                                        <th className="text-right p-2">{t('whatifRankCritical')}</th>
+                                                        <th className="text-right p-2">{t('whatifRankWeight')}</th>
+                                                        <th className="text-left p-2">{t('whatifBasis')}</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {rank.ranking.map(r => (
+                                                        <tr key={`${r.kind}:${r.name}`} data-whatif-rank-row={`${r.kind}:${r.name}`} className="border-t border-proxmox-border">
+                                                            <td className="p-2 text-gray-400">{t(WHATIF_KINDS[r.kind] || 'whatifRankKind')}</td>
+                                                            <td className="p-2 text-white font-mono">{r.name}</td>
+                                                            <td className="p-2 text-right font-mono text-gray-300">{r.affected}</td>
+                                                            <td className="p-2 text-right font-mono text-gray-300">{r.down}</td>
+                                                            <td className="p-2 text-right font-mono text-gray-300">{r.degraded + r.unknown}</td>
+                                                            <td className="p-2 text-right font-mono text-gray-300">{r.restarted}</td>
+                                                            <td className={`p-2 text-right font-mono ${r.critical_affected ? 'text-red-400' : 'text-gray-500'}`}>{r.critical_affected}</td>
+                                                            <td className="p-2 text-right font-mono text-white" data-whatif-rank-weight>{r.weight}</td>
+                                                            <td className="p-2"><Basis b={r.basis} /></td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    )}
+                                    <ul className="list-disc pl-5 space-y-1 text-sm text-gray-300" data-whatif="rank-assumptions">
+                                        {(rank.assumptions || []).map(a => (
+                                            <li key={a.code} data-whatif-assumption={a.code}>{say(WHATIF_ASSUMPTIONS[a.code], a.args, a.text)}</li>
+                                        ))}
+                                    </ul>
+                                    <div className="flex items-center gap-1 text-xs text-gray-500"><Basis b="assumed" /> {t('whatifBasisHelp')}</div>
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {view === 'scenario' && (<>
                     <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 space-y-4" data-whatif="picker">
                         <div>
                             <div className={label}>{t('whatifScenario')}</div>
@@ -7845,6 +7991,16 @@
                             </div>
                         )}
 
+                        {opts && kind === 'pbs_failure' && (
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3"><div>
+                                <div className={label}>{t('whatifPbsStorage')}</div>
+                                <select value={pbsStorage} onChange={e => setPbsStorage(e.target.value)} className={`${field} w-full`} data-whatif-field="pbs">
+                                    <option value="">-</option>
+                                    {(opts.pbs || []).map(p => <option key={p.storage} value={p.storage}>{p.storage}</option>)}
+                                </select>
+                            </div></div>
+                        )}
+
                         {opts && kind === 'network_failure' && (
                             <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
                                 <div>
@@ -7883,7 +8039,7 @@
                         )}
 
                         {opts && (
-                            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 border-t border-proxmox-border pt-3">
+                            <div className="grid grid-cols-1 md:grid-cols-4 gap-3 border-t border-proxmox-border pt-3">
                                 <div>
                                     <div className={label}>{t('whatifMemoryBasis')}</div>
                                     <select value={memory} onChange={e => setMemory(e.target.value)} className={`${field} w-full`}>
@@ -7899,6 +8055,7 @@
                                     <div className={label}>{t('whatifMemThreshold')} <span className="text-gray-500">({thrSource(opts.thresholds?.memory_source)})</span></div>
                                     <input type="number" min="1" max="100" value={memThr} onChange={e => setMemThr(e.target.value)} className={`${field} w-full`} data-whatif-field="memory" />
                                 </div>
+                                {tagsField}
                             </div>
                         )}
 
@@ -7946,6 +8103,58 @@
                                     ))}
                                 </ul>
                             </div>
+
+                            {report.risk && (
+                                <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 space-y-3" data-whatif="risk">
+                                    <h3 className="text-sm font-semibold text-white">{t('whatifRiskTitle')}</h3>
+                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                                        <div className="bg-proxmox-dark border border-proxmox-border rounded-lg p-3 text-sm" data-whatif-risk="critical">
+                                            <div className="text-xs text-gray-400 flex items-center justify-between gap-2">{t('whatifColCritical')} <Basis b={report.risk.critical.basis} /></div>
+                                            <div className="text-white mt-1">{say('whatifRiskCritical', { n: report.risk.critical.affected, total: report.risk.critical.in_cluster, down: report.risk.critical.down })}</div>
+                                            <div className="text-[10px] text-gray-500 mt-1 flex items-center gap-1">
+                                                {say('whatifRiskTagsFrom', { tags: (report.risk.critical.tags || []).join(', ') || '-', source: tagSource(report.risk.critical.source) })}
+                                                <Basis b={report.risk.critical.tags_basis} />
+                                            </div>
+                                        </div>
+                                        <div className="bg-proxmox-dark border border-proxmox-border rounded-lg p-3 text-sm" data-whatif-risk="restore">
+                                            <div className="text-xs text-gray-400 flex items-center justify-between gap-2">{t('whatifRiskRestore')} <Basis b={report.risk.restore.basis} /></div>
+                                            <div className="flex flex-wrap gap-2 mt-2">
+                                                {Object.keys(WHATIF_RESTORE).map(k => (
+                                                    <span key={k} data-whatif-restore-count={k} className={`px-1.5 py-0.5 rounded border text-xs ${WHATIF_RESTORE[k][1]}`}>{t(WHATIF_RESTORE[k][0])}: {report.risk.restore[k] ?? 0}</span>
+                                                ))}
+                                            </div>
+                                        </div>
+                                        <div className="bg-proxmox-dark border border-proxmox-border rounded-lg p-3 text-sm" data-whatif-risk="weight">
+                                            <div className="text-xs text-gray-400 flex items-center justify-between gap-2">{t('whatifRankWeight')} <Basis b={report.risk.weight.basis} /></div>
+                                            <div className="text-white font-mono mt-1">{say('whatifRiskWeight', { value: report.risk.weight.value })}</div>
+                                            <div className="text-[10px] text-gray-500 mt-1">{say('whatifRankWeighting', Object.assign({ factor: report.risk.weight.critical_factor }, report.risk.weight.outcomes))}</div>
+                                        </div>
+                                    </div>
+                                    <div className="bg-proxmox-dark border border-proxmox-border rounded-lg p-3 text-sm" data-whatif-risk="tenants">
+                                        <div className="text-xs text-gray-400 flex items-center justify-between gap-2">{t('whatifRiskTenants')} <Basis b={report.risk.tenants.basis} /></div>
+                                        {!(report.risk.tenants.items || []).length && <div className="text-gray-500 mt-1">{t('whatifRiskNoTenants')}</div>}
+                                        <ul className="mt-1 space-y-1">
+                                            {(report.risk.tenants.items || []).map(x => (
+                                                <li key={x.id} data-whatif-tenant={x.id} className="text-gray-300">
+                                                    <span className="text-white">{x.name}</span>: {say('whatifRiskTenantRow', { n: x.affected, down: x.down, critical: x.critical })}
+                                                </li>
+                                            ))}
+                                        </ul>
+                                    </div>
+                                </div>
+                            )}
+
+                            {report.pbs && (
+                                <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 space-y-2" data-whatif="pbs">
+                                    <h3 className="text-sm font-semibold text-white flex items-center gap-2">{say('whatifPbsTitle', { storage: report.pbs.storage })} <Basis b={report.pbs.basis} /></h3>
+                                    {report.pbs.jobs_read && !report.pbs.jobs.length && <div className="text-sm text-gray-400">{t('whatifPbsNoJobs')}</div>}
+                                    <ul className="text-sm text-gray-300 space-y-1">
+                                        {report.pbs.jobs.map(j => <li key={j.id} data-whatif-pbs-job={j.id}>{say('whatifPbsJobRow', { id: j.id, schedule: j.schedule || '-', n: j.guests })}</li>)}
+                                    </ul>
+                                    <div className="text-sm text-gray-300" data-whatif-pbs="counts">{say('whatifPbsCounts', { all: report.pbs.guests_all_lost, some: report.pbs.guests_some_lost, job: report.pbs.guests_job_only })}</div>
+                                    <div className="text-sm text-gray-300" data-whatif-pbs="tests">{say('whatifPbsTests', { n: report.pbs.tests_lost, unmatched: report.pbs.tests_unmatched })}</div>
+                                </div>
+                            )}
 
                             {report.headroom && (
                                 <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4" data-whatif="headroom">
@@ -8059,6 +8268,8 @@
                                                         <th className="text-left p-2">{t('whatifOutcome')}</th>
                                                         <th className="text-left p-2">{t('whatifTarget')}</th>
                                                         <th className="text-left p-2">{t('whatifReason')}</th>
+                                                        <th className="text-left p-2">{t('whatifColRestore')}</th>
+                                                        <th className="text-left p-2">{t('whatifColTenant')}</th>
                                                         <th className="text-left p-2">{t('whatifBasis')}</th>
                                                     </tr>
                                                 </thead>
@@ -8068,6 +8279,7 @@
                                                             <td className="p-2">
                                                                 <span className="text-white">{g.name || g.vmid}</span>
                                                                 <span className="text-xs text-gray-500 ml-2 font-mono">{g.vmid}</span>
+                                                                {g.critical && <span data-whatif-critical className="ml-2 px-1.5 py-0.5 rounded border text-[10px] bg-red-500/10 text-red-400 border-red-500/30">{t('whatifCriticalBadge')}</span>}
                                                             </td>
                                                             <td className="p-2 text-gray-400">{g.node}</td>
                                                             <td className="p-2">
@@ -8078,7 +8290,19 @@
                                                                 {g.target && g.target_basis && <span className="ml-1"><Basis b={g.target_basis} /></span>}
                                                                 {g.risk === 'overcommitted' && <div className="text-[10px] text-red-400">{t('whatifRiskOvercommitted')}</div>}
                                                             </td>
-                                                            <td className="p-2 text-gray-300">{say(WHATIF_REASONS[g.reason?.code], g.reason?.args, g.text)}</td>
+                                                            <td className="p-2 text-gray-300">
+                                                                {say(WHATIF_REASONS[g.reason?.code], g.reason?.args, g.text)}
+                                                                {g.restore_test_lost && <div className="text-[10px] text-yellow-400">{t('whatifRestoreTestLost')}</div>}
+                                                            </td>
+                                                            <td className="p-2">
+                                                                {g.restore ? (
+                                                                    <span className="flex items-center gap-1">
+                                                                        <span data-whatif-restore={g.restore.state} className={`px-1.5 py-0.5 rounded border text-xs ${(WHATIF_RESTORE[g.restore.state] || WHATIF_RESTORE.unknown)[1]}`}>{t((WHATIF_RESTORE[g.restore.state] || WHATIF_RESTORE.unknown)[0])}</span>
+                                                                        <Basis b={g.restore.basis} />
+                                                                    </span>
+                                                                ) : '-'}
+                                                            </td>
+                                                            <td className="p-2 text-gray-400 text-xs" data-whatif-tenants>{(g.tenants || []).map(id => tenantName[id] || id).join(', ') || '-'}</td>
                                                             <td className="p-2"><Basis b={g.basis} /></td>
                                                         </tr>
                                                     ))}
@@ -8110,6 +8334,7 @@
                             </div>
                         </div>
                     )}
+                    </>)}
                 </div>
             );
         }
