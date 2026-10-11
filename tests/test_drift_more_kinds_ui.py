@@ -16,7 +16,7 @@ from test_ha_ui import CLUSTER, SSE_TOKEN, VM, _App, _FakeServer, browser  # noq
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KEY_PREFIXES = ('driftKind', 'driftCat', 'driftPolicy', 'driftCheck_', 'driftIncident', 'driftAll',
-                'driftNotChecked', 'driftPartlyChecked', 'driftOpViolation', 'driftConfirm', 'driftWithdraw')
+                'driftNotChecked', 'driftPartlyChecked', 'driftNoBaselineYet', 'driftOpViolation', 'driftConfirm', 'driftWithdraw')
 
 
 def _read(*parts):
@@ -71,7 +71,7 @@ READS = {
         'by_severity': {'critical': 2, 'warning': 0, 'info': 0},
         'by_category': {'deviation': 1, 'policy_violation': 1, 'incident': 0},
         'kinds': {'vm_config': 'checked', 'storage': 'checked', 'network': 'checked', 'cluster_options': 'checked',
-                  'firewall': 'not_checked', 'ha_rules': 'checked', 'backup_jobs': 'checked', 'access': 'partial'}}),
+                  'firewall': 'not_checked', 'ha_rules': 'no_baseline', 'backup_jobs': 'checked', 'access': 'partial'}}),
     ('GET', '/api/clusters/c1/drift/events'): (200, {'events': [DEVIATION, VIOLATION]}),
     ('GET', '/api/clusters/c1/drift/policy'): (200, {'checks': CHECKS, 'last_scan_at': '2026-10-05T10:00:00'}),
     ('POST', '/api/drift/events/21/incident'): (200, {'ok': True, 'category': 'incident'}),
@@ -117,6 +117,8 @@ def test_runtime_new_kinds_policy_and_what_was_not_read(open_app, layout):
     assert page.locator('[data-drift-kind="firewall"] [data-drift-unread="not_checked"]').inner_text().strip() == 'Not checked'
     assert page.locator('[data-drift-kind="access"] [data-drift-unread="partial"]').inner_text().strip() == 'Partly checked'
     assert page.locator('[data-drift-kind="storage"] [data-drift-unread]').count() == 0
+    # read but nothing to compare with: neither a zero nor "checked"
+    assert page.locator('[data-drift-kind="ha_rules"] [data-drift-unread="no_baseline"]').inner_text().strip() == 'No baseline yet'
 
     checks = {c: page.locator(f'[data-drift-check="{c}"]').inner_text() for c in
               ('access_admin_role', 'access_token_expiry', 'firewall_cluster_enabled', 'backup_none_disabled')}
@@ -190,5 +192,6 @@ def test_runtime_the_new_text_is_translated(open_app):
     page = _open_drift(app, 'pl')
     assert 'Kontrole polityki' in page.locator('[data-drift-policy]').inner_text()
     assert page.locator('[data-drift-kind="firewall"] [data-drift-unread]').inner_text().strip() == 'Niesprawdzone'
+    assert page.locator('[data-drift-kind="ha_rules"] [data-drift-unread]').inner_text().strip() == 'Brak jeszcze konfiguracji bazowej'
     assert page.locator('[data-drift-category="policy_violation"]').inner_text().strip() == 'Naruszenie polityki'
     assert not app.errors, app.errors

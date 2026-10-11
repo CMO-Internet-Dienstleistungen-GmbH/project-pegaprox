@@ -9,6 +9,7 @@ LW Oct 2026
 import json
 import re
 import time
+import types
 
 import pytest
 
@@ -74,18 +75,40 @@ def _pbs_report():
     return dict(json.loads(json.dumps(out)), guests_hidden=0, guests_truncated=0)
 
 
+def _pbs_offline_report():
+    """The storage is listed as not available and its content cannot be read."""
+    guests, pve = _pve(tags={100: 'critical', 101: 'db'},
+                       jobs=[{'id': 'job-a', 'storage': 'pbs1', 'all': 1, 'exclude': '103', 'schedule': '01:00'}])
+    pve[('/cluster/resources', 'storage')] = [x for x in pve[('/cluster/resources', 'storage')]
+                                              if x['storage'] != 'pbs1']
+    pve[('/nodes/pve1/storage/pbs1/content', 'backup')] = types.SimpleNamespace(status_code=500, json=lambda: {}, text='')
+    recovery.forget_backups()
+    out = whatif.run(_manager(pve, guests), whatif.parse_scenario({'type': 'pbs_failure', 'storage': 'pbs1'}),
+                     dict(THR))
+    return dict(json.loads(json.dumps(out)), guests_hidden=0, guests_truncated=0)
+
+
+def _stopped_report():
+    guests = [_vm(100, 'pve1', status='stopped'), _vm(101, 'pve1', status='stopped'),
+              _vm(102, 'pve2', status='stopped')]
+    m = _manager(_cluster(guests, {v['vmid']: _cfg() for v in guests}, ha=[('vm:100', 'started')], extra=NETS),
+                 guests)
+    out = whatif.run(m, whatif.parse_scenario({'type': 'node_failure', 'nodes': ['pve1']}), dict(THR))
+    return dict(json.loads(json.dumps(out)), guests_hidden=0, guests_truncated=0)
+
+
 def _options():
     out = json.loads(json.dumps(whatif.options(_pbs_cluster())))
     out['thresholds'] = {'cpu': 80.0, 'memory': 90.0, 'cpu_source': 'default', 'memory_source': 'default'}
     return out
 
 
-def _ranking():
-    return json.loads(json.dumps(whatif.ranking(_rank_env_manager(), dict(THR))))
+def _ranking(status='running'):
+    return json.loads(json.dumps(whatif.ranking(_rank_env_manager(status), dict(THR))))
 
 
-def _rank_env_manager():
-    guests = [_vm(100, 'pve1'), _vm(101, 'pve1'), _vm(102, 'pve2')]
+def _rank_env_manager(status='running'):
+    guests = [_vm(100, 'pve1', status=status), _vm(101, 'pve1', status=status), _vm(102, 'pve2', status=status)]
     guests[1]['tags'] = 'critical'
     api = _cluster(guests, {100: _cfg(), 101: _cfg(), 102: _cfg(bridge='vmbr1')}, ha=[('vm:100', 'started')], extra=NETS)
     api[('/nodes/pve1/storage/ceph/content', 'images')] = [{'vmid': 100}, {'vmid': 101}, {'vmid': 102}]
@@ -305,3 +328,95 @@ def test_runtime_a_standby_ranks_too(browser):  # noqa: F811
         assert not app.errors, app.errors
     finally:
         app.ctx.close()
+
+
+# -- what the report says about stopped guests, an inactive backup storage and what is ranked ------
+
+def _run_node(page, node='pve1'):
+    page.locator(f'[data-whatif-node="{node}"]').check()
+    page.locator('[data-whatif="run"]').click()
+    page.locator('[data-whatif="report"]').wait_for(timeout=5000)
+
+
+def test_runtime_stopped_guests_are_stated_next_to_the_counts(open_risk, risk_data):
+    app = open_risk('modern', report=_stopped_report())
+    page = app.page
+    _run_node(page)
+    note = page.locator('[data-whatif="stopped-note"]')
+    assert note.inner_text().startswith('Stopped guests (3) are not counted as affected or unaffected, they are not running')
+    assert note.locator('[data-whatif-basis="assumed"]').count() == 1
+    assert page.locator('[data-whatif-count="unaffected"]').inner_text().split()[0] == '0'
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_report_without_stopped_guests_has_no_such_line(open_risk, risk_data):
+    app = open_risk('modern')
+    _run_node(app.page)
+    assert app.page.locator('[data-whatif="stopped-note"]').count() == 0
+    # and keeps the HA heading of its limits
+    assert app.page.locator('[data-whatif="limits"] h3').inner_text().strip() == 'HA limits and constraints hit'
+    assert not app.errors, app.errors
+
+
+def test_runtime_an_offline_backup_storage_is_said_to_be_inactive_under_a_fitting_heading(open_risk, risk_data):
+    app = open_risk('corporate', report=_pbs_offline_report())
+    page = app.page
+    page.locator('[data-whatif-scenario="pbs_failure"]').click()
+    page.locator('[data-whatif-field="pbs"]').select_option('pbs1')
+    page.locator('[data-whatif="run"]').click()
+    page.locator('[data-whatif="pbs"]').wait_for(timeout=5000)
+    limits = page.locator('[data-whatif="limits"]')
+    assert limits.locator('h3').inner_text().strip() == 'Backup limits and gaps found'
+    assert 'HA limits' not in limits.inner_text()
+    inactive = limits.locator('[data-whatif-limit="pbs_inactive"]')
+    assert inactive.inner_text().startswith('pbs1 is not active on any node right now (offline or not reachable)')
+    assert inactive.locator('[data-whatif-basis="known"]').count() == 1
+    assert limits.locator('[data-whatif-limit="pbs_points_unread"]').count() == 1
+    # the stopped guest 104 is tied to the storage by the job: the line says how stopped guests count here
+    assert page.locator('[data-whatif="stopped-note"]').inner_text().startswith(
+        'Stopped guests (1) count as affected only where restore points or a backup job tie them')
+    assert not app.errors, app.errors
+
+
+def test_runtime_the_ranking_says_it_ranks_shared_storages_only(open_risk):
+    app = open_risk('modern')
+    page = app.page
+    page.locator('[data-whatif-view="ranking"]').click()
+    page.locator('[data-whatif="rank-run"]').click()
+    page.locator('[data-whatif="rank"]').wait_for(timeout=5000)
+    note = page.locator('[data-whatif-rank-note="rank_shared_only"]')
+    assert note.inner_text().startswith('Only shared storages are ranked: a local storage fails with its node')
+    assert page.locator('[data-whatif-rank-note="rank_stopped"]').count() == 0
+    # said once, up top, not again in the list of assumptions
+    assert page.locator('[data-whatif="rank-assumptions"] [data-whatif-assumption="rank_shared_only"]').count() == 0
+    assert page.locator('[data-whatif="rank-assumptions"] [data-whatif-assumption="rank_cheap"]').is_visible()
+    assert not app.errors, app.errors
+
+
+def test_runtime_the_ranking_of_a_cluster_of_stopped_guests_says_why_everything_is_zero(open_risk):
+    app = open_risk('modern', ranking=_ranking('stopped'))
+    page = app.page
+    page.locator('[data-whatif-view="ranking"]').click()
+    page.locator('[data-whatif="rank-run"]').click()
+    page.locator('[data-whatif="rank"]').wait_for(timeout=5000)
+    note = page.locator('[data-whatif-rank-note="rank_stopped"]')
+    assert note.inner_text().startswith('Stopped guests (3) are not counted as affected, they are not running')
+    assert note.locator('[data-whatif-basis="assumed"]').count() == 1
+    weights = {r.get_attribute('data-whatif-rank-row'): r.locator('[data-whatif-rank-weight]').inner_text()
+               for r in page.locator('[data-whatif-rank-row]').all()}
+    assert weights['node:pve1'] == '0' and weights['storage:ceph'] == '0'
+    assert not app.errors, app.errors
+
+
+def test_runtime_the_new_statements_speak_german(open_risk, risk_data):
+    app = open_risk('modern', language='de', report=_stopped_report(), ranking=_ranking('stopped'))
+    page = app.page
+    _run_node(page)
+    assert page.locator('[data-whatif="stopped-note"]').inner_text().startswith(
+        'Gestoppte Gäste (3) zählen weder als betroffen noch als nicht betroffen, sie laufen nicht')
+    page.locator('[data-whatif-view="ranking"]').click()
+    page.locator('[data-whatif="rank-run"]').click()
+    page.locator('[data-whatif="rank"]').wait_for(timeout=5000)
+    assert page.locator('[data-whatif-rank-note="rank_shared_only"]').inner_text().startswith(
+        'Nur gemeinsame Speicher kommen in die Rangfolge')
+    assert not app.errors, app.errors

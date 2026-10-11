@@ -6214,7 +6214,8 @@
                             ].map(it => {
                                 const counts = (status.by_kind || {})[it.k] || {};
                                 const total = (counts.critical || 0) + (counts.warning || 0) + (counts.info || 0);
-                                // LW Oct 2026 - a kind the last scan could not read is not "0 drift"
+                                // LW Oct 2026 - a kind the last scan could not read is not "0 drift",
+                                // and neither is one it read but had no baseline to compare with
                                 const read = (status.kinds || {})[it.k];
                                 return (
                                     <div key={it.k} data-drift-kind={it.k} onClick={() => setKindFilter(kindFilter === it.k ? '' : it.k)}
@@ -6227,9 +6228,11 @@
                                             {counts.info ? <span className="text-blue-400">{counts.info} info</span> : null}
                                             {!total && <span>-</span>}
                                         </div>
-                                        {(read === 'not_checked' || read === 'partial') && (
+                                        {(read === 'not_checked' || read === 'partial' || read === 'no_baseline') && (
                                             <div data-drift-unread={read} className="text-[10px] text-yellow-400 mt-1">
-                                                {read === 'partial' ? (t('driftPartlyChecked') || 'Partly checked') : (t('driftNotChecked') || 'Not checked')}
+                                                {read === 'no_baseline' ? (t('driftNoBaselineYet') || 'No baseline yet')
+                                                    : read === 'partial' ? (t('driftPartlyChecked') || 'Partly checked')
+                                                    : (t('driftNotChecked') || 'Not checked')}
                                             </div>
                                         )}
                                     </div>
@@ -7778,6 +7781,7 @@
             configs_unread: 'whatifLimConfigsUnread', no_ha_reaction: 'whatifLimNoHaReaction',
             pbs_only_copy: 'whatifLimPbsOnlyCopy', pbs_tests_lost: 'whatifLimPbsTestsLost',
             pbs_points_unread: 'whatifLimPbsPointsUnread', pbs_jobs_unread: 'whatifLimPbsJobsUnread',
+            pbs_inactive: 'whatifLimPbsInactive',
         };
         const WHATIF_ASSUMPTIONS = {
             mem_configured: 'whatifAsmMemConfigured', mem_current: 'whatifAsmMemCurrent', cpu_now: 'whatifAsmCpuNow',
@@ -7793,7 +7797,12 @@
             critical_tags: 'whatifAsmCriticalTags', tenant_by_cluster: 'whatifAsmTenantByCluster',
             restore_marks: 'whatifAsmRestoreMarks', pbs_listing: 'whatifAsmPbsListing', pbs_jobs: 'whatifAsmPbsJobs',
             rank_weighting: 'whatifAsmRankWeighting', rank_cheap: 'whatifAsmRankCheap',
+            stopped_guests: 'whatifAsmStoppedGuests', stopped_backups: 'whatifAsmStoppedBackups',
+            rank_stopped: 'whatifAsmRankStopped', rank_shared_only: 'whatifAsmRankSharedOnly',
         };
+        // LW Oct 2026 - assumptions the report states next to its counts, not only in the list below
+        const WHATIF_STOPPED_NOTES = ['stopped_guests', 'stopped_backups'];
+        const WHATIF_RANK_NOTES = ['rank_stopped', 'rank_shared_only'];
         const WHATIF_OUTCOMES = [
             { id: 'down', label: 'whatifDown', cls: 'bg-red-500/10 text-red-400 border-red-500/30' },
             { id: 'degraded', label: 'whatifDegraded', cls: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30' },
@@ -7966,6 +7975,8 @@
             }
 
             const rows = (report?.guests || []).filter(g => filter === 'all' || g.outcome === filter);
+            const stoppedNote = (report?.assumptions || []).find(a => WHATIF_STOPPED_NOTES.includes(a.code));
+            const rankNotes = (rank?.assumptions || []).filter(a => WHATIF_RANK_NOTES.includes(a.code));
             const tenantName = {};
             ((report?.risk?.tenants?.items) || []).forEach(x => { tenantName[x.id] = x.name; });
             const outcomeOf = (id) => WHATIF_OUTCOMES.find(o => o.id === id) || WHATIF_OUTCOMES[4];
@@ -8013,6 +8024,12 @@
                                         <Basis b={rank.weighting.basis} />
                                     </div>
                                     <div className="text-xs text-gray-500">{say('whatifRiskTagsFrom', { tags: (rank.critical_tags || []).join(', ') || '-', source: tagSource(rank.critical_tags_source) })}</div>
+                                    {rankNotes.map(a => (
+                                        <div key={a.code} data-whatif-rank-note={a.code} className="text-xs text-gray-400 flex flex-wrap items-center gap-2">
+                                            <span>{say(WHATIF_ASSUMPTIONS[a.code], a.args, a.text)}</span>
+                                            <Basis b="assumed" />
+                                        </div>
+                                    ))}
                                     {(rank.capped || []).map(c => (
                                         <div key={c.kind} data-whatif-rank-capped={c.kind} className="text-xs text-yellow-400">{say('whatifRankCapped', { kind: t(WHATIF_KINDS[c.kind]), cap: c.cap, total: c.total })}</div>
                                     ))}
@@ -8057,7 +8074,7 @@
                                         </div>
                                     )}
                                     <ul className="list-disc pl-5 space-y-1 text-sm text-gray-300" data-whatif="rank-assumptions">
-                                        {(rank.assumptions || []).map(a => (
+                                        {(rank.assumptions || []).filter(a => !WHATIF_RANK_NOTES.includes(a.code)).map(a => (
                                             <li key={a.code} data-whatif-assumption={a.code}>{say(WHATIF_ASSUMPTIONS[a.code], a.args, a.text)}</li>
                                         ))}
                                     </ul>
@@ -8249,6 +8266,12 @@
                                     </button>
                                 ))}
                             </div>}
+                            {stoppedNote && !report.headroom && (
+                                <div data-whatif="stopped-note" className="text-xs text-gray-400 flex flex-wrap items-center gap-2">
+                                    <span>{say(WHATIF_ASSUMPTIONS[stoppedNote.code], stoppedNote.args, stoppedNote.text)}</span>
+                                    <Basis b="assumed" />
+                                </div>
+                            )}
                             {report.stopped_affected > 0 && (
                                 <div className="text-xs text-gray-400">{say('whatifStoppedAffected', { n: report.stopped_affected })}</div>
                             )}
@@ -8256,7 +8279,8 @@
                             <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4" data-whatif="limits">
                                 <h3 className="text-sm font-semibold text-white mb-3 flex items-center gap-2">
                                     <Icons.AlertTriangle />
-                                    {t('whatifLimits')}
+                                    {/* LW Oct 2026 - a backup storage failure hits no HA limit, its heading says what it does list */}
+                                    {t(report.scenario?.type === 'pbs_failure' ? 'whatifLimitsPbs' : 'whatifLimits')}
                                 </h3>
                                 {!(report.limits || []).length && <div className="text-sm text-green-400">{t('whatifNoLimits')}</div>}
                                 <ul className="space-y-2">
