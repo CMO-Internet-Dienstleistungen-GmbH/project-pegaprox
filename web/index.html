@@ -9030,7 +9030,8 @@ fetchClusterDatastores(selectedCluster.id);// NS: storage figures went stale —
 // the read comes from here and adds nothing
 useEffect(()=>{setLeaderNodeProgress(null);const clusterId=selectedCluster?.id;if(!clusterId||!haStandby||haReadOnly)return;let gone=false;const poll=async()=>{const r=await authFetch(`${API_URL}/clusters/${clusterId}/node-progress`,{timeout:POLL_TIMEOUT_MS});if(gone||!r||!r.ok)return;const data=await r.json().catch(()=>null);if(!gone&&data&&data.nodes&&typeof data.nodes==='object'){setLeaderNodeProgress({cluster:clusterId,nodes:data.nodes});}};poll();const timer=setInterval(poll,5000);return()=>{gone=true;clearInterval(timer);};},[selectedCluster?.id,haStandby,haReadOnly]);const fetchClusters=async()=>{try{const response=await authFetch(`${API_URL}/clusters`);if(response&&response.ok){const data=await response.json();setClusters(data);// NS: Use ref to avoid stale closure overriding "Alle Cluster" (null) selection
 const currentSelected=selectedClusterRef.current;if(currentSelected){const updated=data.find(c=>c.id===currentSelected.id);if(updated)setSelectedCluster(updated);}// fetch status for all clusters (overview)
-const connectedClusters=data.filter(c=>c.connected);const allGuests=[];// NS #594 — this used to be a serial await-loop: one slow cluster
+// LW Oct 2026 - an ESXi connection has no datacenter status to poll
+const connectedClusters=data.filter(c=>c.connected&&c.cluster_type!=='esxi');const allGuests=[];// NS #594 — this used to be a serial await-loop: one slow cluster
 // stalled every cluster behind it and made the whole overview lag.
 // Run the clusters concurrently (each still does its two reads in order).
 await Promise.allSettled(connectedClusters.map(async cluster=>{// NS May 2026 — skip clusters that recently 503'd/timed out until cooldown

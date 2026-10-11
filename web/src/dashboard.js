@@ -16870,7 +16870,8 @@
                         }
                         
                         // fetch status for all clusters (overview)
-                        const connectedClusters = data.filter(c => c.connected);
+                        // LW Oct 2026 - an ESXi connection has no datacenter status to poll
+                        const connectedClusters = data.filter(c => c.connected && c.cluster_type !== 'esxi');
                         const allGuests = [];
                         
                         // NS #594 — this used to be a serial await-loop: one slow cluster
