@@ -1593,13 +1593,14 @@ def _pbs_failure(run):
 # --- the risk view: criticality, tenants, restore status ----------------------------------------
 
 def critical_tags_for(cluster_id, requested=None):
-    """(tags, source): the request's, else the critical tags of the recovery settings where
-    they define some, else the default."""
+    """(tags, source): the request's, else the critical tags an admin set in the recovery
+    settings, else the default. The settings fill in the same default when none are set;
+    the row itself says whether someone chose them."""
     if requested is not None:
         return list(requested), 'request'
     try:
         from pegaprox.core import recovery
-        got = recovery.cluster_settings(recovery.load_rules(cluster_id)).get('critical_tags')
+        got = (recovery.load_rules(cluster_id).get('cluster') or {}).get('critical_tags')
         if got:
             return sorted({str(t).lower() for t in got}), 'recovery'
     except Exception as e:

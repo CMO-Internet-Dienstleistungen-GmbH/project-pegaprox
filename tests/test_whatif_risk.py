@@ -175,8 +175,10 @@ def test_the_critical_tags_come_from_the_request_the_recovery_settings_or_the_de
     r = whatif.run(env.mgr, whatif.parse_scenario(dict(body, critical_tags=[])), dict(THR))
     assert r['risk']['critical']['affected'] == 0
 
-    real = recovery.cluster_settings
-    monkeypatch.setattr(recovery, 'cluster_settings', lambda rules: dict(real(rules), critical_tags=['web']))
+    # the recovery settings fill in the default tag; that is no choice of an admin
+    r = whatif.run(env.mgr, whatif.parse_scenario(body), dict(THR))
+    assert r['risk']['critical']['source'] == 'default'
+    recovery.save_rule(CID, 'cluster', None, {'critical_tags': ['web']}, 'admin')
     r = whatif.run(env.mgr, whatif.parse_scenario(body), dict(THR))
     assert r['risk']['critical']['source'] == 'recovery' and _rows(r)[100]['critical'] is True
 

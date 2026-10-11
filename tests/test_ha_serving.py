@@ -1160,6 +1160,7 @@ LEADER_VIEWS = {
     '/api/clusters/<cluster_id>/active-alerts': f'/api/clusters/{CID}/active-alerts',
     '/api/clusters/<cluster_id>/drift/status': f'/api/clusters/{CID}/drift/status',
     '/api/clusters/<cluster_id>/drift/events': f'/api/clusters/{CID}/drift/events?status=all',
+    '/api/clusters/<cluster_id>/drift/policy': f'/api/clusters/{CID}/drift/policy',
     '/api/push/inbox': '/api/push/inbox?unread=1',
     '/api/migration-history': f'/api/migration-history?cluster_id={CID}',
     '/api/clusters/<cluster_id>/vms/<int:vmid>/migration-history':
