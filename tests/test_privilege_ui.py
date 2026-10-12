@@ -264,7 +264,8 @@ def test_runtime_adding_a_cluster_offers_the_least_privilege_setup(open_app, lay
         page.get_by_role('button', name=re.compile(r'^Proxmox VE')).first.click()
     toggle = page.locator('[data-pve-role-toggle]')
     toggle.wait_for(timeout=5000)
-    assert 'recommended in production' in toggle.inner_text()
+    # the role narrows the API only; the toggle says so instead of promising more
+    assert 'role for the API' in toggle.inner_text()
     assert not _gets(app, RECIPE)
     toggle.click()
     pre = page.locator('[data-pve-commands="token"]')
