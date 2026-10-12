@@ -2,14 +2,16 @@
 
 PegaProx talks to a Proxmox VE cluster over its API, and to the nodes over SSH for the
 features that need a shell. `root@pam` with its password is the simple way to connect a
-cluster: everything works. For production the recommended setup is an account or an API
-token of its own with a role that holds only what PegaProx uses.
+cluster: everything works. To keep the API access narrow, give PegaProx an account or an
+API token of its own with a role that holds only what PegaProx uses. That role narrows the
+API only: the features that need a shell still log in to the nodes over SSH as root or as a
+user with `sudo` (see [What no role gives](#what-no-role-gives)).
 
 The role is built from the same table the connection check compares a cluster's
 privileges against (`pegaprox/core/conncheck.py`, `PRIVILEGE_NEEDS`). PegaProx shows it,
 ready to copy, in two places:
 
-- **Add Cluster**, Proxmox VE tab: *Least-privilege account or token*;
+- **Add Cluster**, Proxmox VE tab: *Least-privilege role for the API*;
 - **Check connection** of a cluster: *Least-privilege role for PegaProx*.
 
 Over the API it is `GET /api/pve-role-recipe` (permission `cluster.add` or
