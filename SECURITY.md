@@ -40,6 +40,18 @@ We will keep you informed throughout the process and credit you in the advisory 
 
 We strongly recommend always running the latest version of PegaProx.
 
+## Software Bill of Materials (SBOM)
+
+Every release carries a CycloneDX SBOM as a release asset (`pegaprox-<version>.cdx.json`),
+built in CI when the release is published. It lists the Python packages a fresh install of
+the release resolves from `requirements.txt` and the browser libraries the web interface
+loads, each with its version. Security advisories are published at
+https://github.com/PegaProx/project-pegaprox/security/advisories.
+
+The SBOM is provided as is, for your own inventory and compliance work, for example under
+the EU Cyber Resilience Act. Like the software itself, it comes without warranty and creates
+no support obligation.
+
 ## Scope
 
 The following areas are **in scope** for security reports:
