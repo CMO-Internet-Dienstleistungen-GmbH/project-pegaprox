@@ -383,6 +383,18 @@ def test_a_container_service_that_comes_up_late_passes(clock, db, monkeypatch):
     assert asked == ['systemctl is-active nginx'] * 3
 
 
+def test_an_ha_list_without_a_list_is_unreadable():
+    """A 200 whose data is no list was read as an empty HA list, so "not HA managed"."""
+    class _Bare:
+        status_code = 200
+
+        def json(self):
+            return {'data': None}
+    mgr = types.SimpleNamespace(_api_get=lambda url, timeout=None, params=None: _Bare())
+    with pytest.raises(Exception, match='could not be read'):
+        bv._ha_resource(mgr, 'https://10.0.0.1:8006/api2/json', 100)
+
+
 def test_a_windows_guest_answers_through_netstat(clock, db):
     pve = _PVE(linux=False, listeners=WIN_OUT)
     st = bv.run_verification(pve, _params(plan=_plan(ports=[3389], command='sc query Spooler')))

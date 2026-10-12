@@ -40,6 +40,9 @@ class _PVE:
             return _Resp(200, str(TEST_VMID))
         if url.endswith('/vzdump/extractconfig'):
             return _Resp(200, 'name: web01\nnet0: virtio=BC:24:11:00:00:01,bridge=vmbr0\n')
+        if url.endswith('/cluster/ha/resources'):
+            # Proxmox answers a list, an empty one without HA
+            return _Resp(200, [])
         if url.endswith(f'/qemu/{TEST_VMID}/config') and self.restored:
             # the guest our restore made: what the restore call set on top of the backup
             return _Resp(200, {k: v for k, v in self.restored.items() if k not in ('vmid', 'archive', 'force')})

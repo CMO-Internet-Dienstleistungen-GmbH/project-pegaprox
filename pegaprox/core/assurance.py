@@ -169,9 +169,13 @@ def load_confirmations(cluster_id, now=None):
     now = time.time() if now is None else now
     rows = get_db().conn.execute(
         'SELECT * FROM recovery_confirmations WHERE cluster_id = ? AND revoked_at IS NULL '
-        'AND (expires_at IS NULL OR expires_at > ?) ORDER BY confirmed_at ASC LIMIT ?',
+        'AND (expires_at IS NULL OR expires_at > ?) ORDER BY confirmed_at DESC LIMIT ?',
         (cluster_id, now, CONFIRM_ROWS_MAX)).fetchall()
-    return {int(r['vmid']): _conf_view(r, now) for r in rows}
+    # newest first: past the cap the oldest drop out, and each guest keeps its newest
+    out = {}
+    for r in rows:
+        out.setdefault(int(r['vmid']), _conf_view(r, now))
+    return out
 
 
 def clean_confirmation(body, now=None):

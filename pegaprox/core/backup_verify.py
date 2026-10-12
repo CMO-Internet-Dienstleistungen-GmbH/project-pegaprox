@@ -427,7 +427,8 @@ def _ha_resource(pve_mgr, base, vmid):
         data = r.json().get('data') if r.status_code == 200 else None
     except Exception as e:
         raise Exception(f"the Proxmox HA resources could not be read: {e}")
-    if r.status_code != 200 or not isinstance(data or [], list):
+    # a 200 without a list is no answer either: read as empty it would say "not HA"
+    if r.status_code != 200 or not isinstance(data, list):
         raise Exception(f"the Proxmox HA resources could not be read (HTTP {r.status_code}) - not restoring")
     sids = {str(x.get('sid') or '') for x in (data or []) if isinstance(x, dict)}
     return f'vm:{vmid}' in sids or f'ct:{vmid}' in sids

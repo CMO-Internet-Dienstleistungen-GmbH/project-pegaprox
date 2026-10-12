@@ -72,6 +72,23 @@ def test_a_node_seen_offline_first_is_written(db):
     assert _rows(db) == [('pve2', 'offline', '', '')]
 
 
+def test_a_change_whose_write_failed_is_written_on_the_next_read(db, monkeypatch):
+    """What is known moved on before the write. A failed write lost the change for good:
+    the next read saw nothing new."""
+    node_history.observe(CID, _ns(pve1='online', pve2='online'))
+    real = db.add_node_states
+
+    def broken(*a, **kw):
+        raise RuntimeError('database is locked')
+    monkeypatch.setattr(db, 'add_node_states', broken)
+    node_history.observe(CID, _ns(pve1='online', pve2='offline'))
+    assert _rows(db) == []
+    monkeypatch.setattr(db, 'add_node_states', real)
+    node_history.observe(CID, _ns(pve1='online', pve2='offline'))
+    # seeded again from the rows written, which never held pve2 online
+    assert _rows(db) == [('pve2', 'offline', '', '')]
+
+
 def test_a_node_going_away_and_back_is_two_rows(db):
     node_history.observe(CID, _ns(pve1='online', pve2='online'))
     node_history.observe(CID, _ns(pve1='online', pve2='offline'))

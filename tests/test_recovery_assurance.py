@@ -193,6 +193,18 @@ def test_an_expired_or_revoked_confirmation_is_gone(routes):
     assert old
 
 
+def test_past_the_row_cap_each_guest_keeps_its_newest_confirmation(routes, monkeypatch):
+    """The read is capped. Oldest first, the cap cut off the newest rows, and a guest
+    confirmed twice showed the older confirmation."""
+    now = time.time()
+    monkeypatch.setattr(assurance, 'CONFIRM_ROWS_MAX', 2)
+    assurance.add_confirmation('c1', {'vmid': 100, 'text': 'first', 'expires_at': None}, 'root', now=now - 30)
+    assurance.add_confirmation('c1', {'vmid': 101, 'text': 'other', 'expires_at': None}, 'root', now=now - 20)
+    assurance.add_confirmation('c1', {'vmid': 100, 'text': 'newest', 'expires_at': None}, 'root', now=now - 10)
+    got = assurance.load_confirmations('c1', now=now)
+    assert got[100]['text'] == 'newest' and got[101]['text'] == 'other'
+
+
 @pytest.mark.parametrize('body', [
     {'text': 'x'}, {'vmid': 'abc', 'text': 'x'}, {'vmid': 101}, {'vmid': 101, 'text': '  '},
     {'vmid': 101, 'text': 'x' * 501}, {'vmid': 101, 'text': 'x', 'expires_days': 0},

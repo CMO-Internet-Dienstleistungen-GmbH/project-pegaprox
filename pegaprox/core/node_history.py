@@ -132,7 +132,13 @@ def observe(cluster_id, node_status):
         rows = changes(cluster_id, node_status)
         if rows and _recording():
             from pegaprox.core.db import get_db
-            get_db().add_node_states(cluster_id, rows)
+            try:
+                get_db().add_node_states(cluster_id, rows)
+            except Exception:
+                # MK Oct 2026 - what is known moved on before the write: forgotten, the next
+                # read seeds from the rows that were written and finds the change again
+                forget(cluster_id)
+                raise
     except Exception as e:
         logging.debug(f"[NodeHistory] {cluster_id}: could not note the node states: {e}")
 
