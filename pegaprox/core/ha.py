@@ -316,6 +316,8 @@ SYNC_TABLES = (
     'suspended_ha_rules',
     # node recoveries an automatic leader left half done (5.6); made on its first write
     'ha_recovery_journal',
+    # who asked for each snapshot: it is the active instance's record, and a standby that takes over keeps it
+    'snapshot_authors',
 )
 LOCAL_TABLES = (
     'sessions', 'audit_log', 'task_users', 'migration_history', 'metrics_history',
