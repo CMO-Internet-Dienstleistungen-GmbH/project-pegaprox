@@ -67,7 +67,32 @@ def test_the_venv_installer_is_no_dependency():
     assert 'flask==3.1.3' in top['dependsOn'] and 'pip==24.0' not in top['dependsOn']
 
 
-@pytest.mark.parametrize('tag', ['', 'latest', "v1.4.0'; rm -rf /", 'v1'])
+@pytest.mark.parametrize('tag', ['', 'latest', "v1.4.0'; rm -rf /", 'v1', 'v1.4.0\n'])
 def test_only_a_release_tag_names_a_bill(tag):
     with pytest.raises(ValueError):
         sbom.build(PY_BOM, tag, ROOT)
+
+
+def _tag_step(tag, tmp_path):
+    """Runs the workflow's tag step as bash with the release tag set, returns (rc, output file)."""
+    import subprocess
+    import yaml
+    flow = yaml.safe_load((ROOT / '.github' / 'workflows' / 'sbom.yml').read_text())
+    steps = next(iter(flow['jobs'].values()))['steps']
+    script = next(s for s in steps if s.get('id') == 'tag')['run']
+    out = tmp_path / 'output'
+    out.write_text('')
+    env = {'PATH': '/usr/bin:/bin', 'RELEASE_TAG_NAME': tag, 'INPUT_TAG': '', 'GITHUB_OUTPUT': str(out)}
+    rc = subprocess.run(['bash', '-c', script], env=env, capture_output=True).returncode
+    return rc, out.read_text()
+
+
+def test_the_workflow_hands_on_a_release_tag(tmp_path):
+    assert _tag_step('v1.4.0', tmp_path) == (0, 'tag=v1.4.0\n')
+
+
+def test_a_second_line_in_the_tag_sets_no_output(tmp_path):
+    # the line after a valid first one would be read as an output of its own
+    rc, written = _tag_step('v1.4.0\ntag=../../outside', tmp_path)
+    assert rc != 0
+    assert written == ''

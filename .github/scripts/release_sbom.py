@@ -72,7 +72,7 @@ def frontend_components(root):
 def build(python_bom, tag, root, now=None):
     """The release bill: the Python bill with PegaProx as its subject and the browser
     libraries added."""
-    if not _TAG.match(tag or ''):
+    if not _TAG.fullmatch(tag or ''):
         raise ValueError(f'not a release tag: {tag!r}')
     version = tag[1:] if tag.startswith('v') else tag
     bom = dict(python_bom)
