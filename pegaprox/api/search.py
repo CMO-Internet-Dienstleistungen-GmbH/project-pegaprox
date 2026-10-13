@@ -25,6 +25,16 @@ from pegaprox.background import guest_index
 
 bp = Blueprint('search', __name__)
 
+#: How old a cluster's VM snapshot may be when one of these routes reads it.
+#:
+#: A global search is a lookup, not a live view: a name, a VMID, a node and a tag do not
+#: change inside this window. Reading with `max_age=0` — which is what these routes did —
+#: means one live `/cluster/resources` walk per cluster per request, run one after the
+#: other, each with a ten-second timeout. That is the heaviest query PegaProx makes of a
+#: Proxmox cluster, the broadcast loop already makes it once a second for every watched
+#: cluster, and the search was firing it again for every keystroke.
+SEARCH_MAX_AGE_S = 15
+
 # ============================================
 # User favorites: the star next to a global search result.
 #
@@ -229,7 +239,8 @@ def global_search():
                 # per-VM check as get_cluster_tags / scope_vm_rows. Admins/plain operators keep all.
                 # MK Oct 2026 - max_age: the command palette asks while the user types, a
                 # few seconds old is plenty for a search and spares PVE the walk per keystroke
-                resources = scope_vm_rows(cluster_id, mgr.get_vm_resources(max_age=6))
+                resources = scope_vm_rows(cluster_id,
+                                          mgr.get_vm_resources(max_age=SEARCH_MAX_AGE_S))
                 indexed = guest_index.snapshot(cluster_id)
                 for r in resources:
                     name = (r.get('name') or '').lower()
@@ -460,7 +471,8 @@ def global_summary():
                     # sec (private disclosure Sep 2026) — scope the per-VM enumeration so a
                     # pool-/ACL-scoped caller's VM/CT totals reflect only their grant, not the whole
                     # cluster (node + resource aggregates below stay cluster-level infra, as elsewhere).
-                    resources = scope_vm_rows(cluster_id, mgr.get_vm_resources() or [])
+                    resources = scope_vm_rows(
+                        cluster_id, mgr.get_vm_resources(max_age=SEARCH_MAX_AGE_S) or [])
                     for r in resources:
                         if not r:
                             continue
@@ -702,7 +714,7 @@ def get_cluster_tags(cluster_id):
     try:
         mgr = cluster_managers.get(cluster_id)
         if mgr:
-            for r in (mgr.get_vm_resources() or []):
+            for r in (mgr.get_vm_resources(max_age=SEARCH_MAX_AGE_S) or []):
                 raw = r.get('tags')
                 if not raw:
                     continue
@@ -915,6 +927,19 @@ def search_vms_by_tag():
         mgr = cluster_managers.get(cluster_id)
         cluster_name = mgr.config.name if mgr else cluster_id
         
+        # Once per cluster, keyed by VMID. This read used to sit inside the loop below,
+        # so a cluster with fifty VMs carrying the tag paid for fifty full
+        # `/cluster/resources` walks in one request — each of them the heaviest query
+        # PegaProx makes of a cluster, and each able to wait out its own ten-second
+        # timeout.
+        by_vmid = {}
+        if mgr and mgr.is_connected:
+            try:
+                for row in (mgr.get_vm_resources(max_age=SEARCH_MAX_AGE_S) or []):
+                    by_vmid[str(row.get('vmid'))] = row
+            except Exception as exc:                             # noqa: BLE001
+                logging.debug(f"[tags] could not read {cluster_id} for the tag search: {exc}")
+
         for vm_key, vm_tags in cluster_tags.items():
             # sec (private disclosure Sep 2026) — don't reveal tagged VMs outside the caller's
             # grant. Same per-VM gate as get_cluster_tags; a pool-/ACL-scoped user is confined,
@@ -935,19 +960,14 @@ def search_vms_by_tag():
                 # Try to get VM details
                 vm_info = {'vmid': vm_key, 'cluster_id': cluster_id, 'cluster_name': cluster_name}
                 
-                if mgr and mgr.is_connected:
-                    try:
-                        resources = mgr.get_vm_resources()
-                        vm_data = next((r for r in resources if str(r.get('vmid')) == vm_key), None)
-                        if vm_data:
-                            vm_info.update({
-                                'name': vm_data.get('name'),
-                                'node': vm_data.get('node'),
-                                'status': vm_data.get('status'),
-                                'type': vm_data.get('type')
-                            })
-                    except:
-                        pass
+                vm_data = by_vmid.get(str(vm_key))
+                if vm_data:
+                    vm_info.update({
+                        'name': vm_data.get('name'),
+                        'node': vm_data.get('node'),
+                        'status': vm_data.get('status'),
+                        'type': vm_data.get('type')
+                    })
                 
                 vm_info['tags'] = vm_tags
                 results.append(vm_info)
