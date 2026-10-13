@@ -76,10 +76,19 @@ def test_only_a_release_tag_names_a_bill(tag):
 def _tag_step(tag, tmp_path):
     """Runs the workflow's tag step as bash with the release tag set, returns (rc, output file)."""
     import subprocess
-    import yaml
-    flow = yaml.safe_load((ROOT / '.github' / 'workflows' / 'sbom.yml').read_text())
-    steps = next(iter(flow['jobs'].values()))['steps']
-    script = next(s for s in steps if s.get('id') == 'tag')['run']
+    import textwrap
+    # no YAML parser in the CI venv: the `run: |` block under `- id: tag` is cut out by indent
+    lines = (ROOT / '.github' / 'workflows' / 'sbom.yml').read_text().splitlines()
+    at = next(i for i, ln in enumerate(lines) if ln.strip() == '- id: tag')
+    at = next(i for i in range(at, len(lines)) if lines[i].strip() == 'run: |')
+    key = len(lines[at]) - len(lines[at].lstrip())
+    block = []
+    for ln in lines[at + 1:]:
+        if ln.strip() and len(ln) - len(ln.lstrip()) <= key:
+            break
+        block.append(ln)
+    script = textwrap.dedent('\n'.join(block))
+    assert 'GITHUB_OUTPUT' in script
     out = tmp_path / 'output'
     out.write_text('')
     env = {'PATH': '/usr/bin:/bin', 'RELEASE_TAG_NAME': tag, 'INPUT_TAG': '', 'GITHUB_OUTPUT': str(out)}
