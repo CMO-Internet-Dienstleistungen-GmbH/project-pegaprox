@@ -1395,6 +1395,7 @@ def main(debug_mode=False):
     from pegaprox.core.config import load_config
     from pegaprox.background.broadcast import start_broadcast_thread
     from pegaprox.background.alerts import start_alert_thread
+    from pegaprox.background.health import start_health_broadcast_thread
     from pegaprox.background.scheduler import start_scheduler_thread
     from pegaprox.background.password_expiry import start_password_expiry_thread
     from pegaprox.background.cross_cluster_lb import start_cross_cluster_lb_thread
@@ -1646,6 +1647,11 @@ def main(debug_mode=False):
 
     start_alert_thread()
     print("Started alert monitoring thread")
+
+    # Computes the cluster health rollup once per watched cluster and pushes it
+    # over SSE, so the cost stops scaling with the number of open tabs.
+    start_health_broadcast_thread()
+    print("Started health broadcast thread")
 
     start_scheduler_thread()
     print("Started task scheduler thread")

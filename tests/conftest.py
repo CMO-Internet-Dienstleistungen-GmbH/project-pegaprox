@@ -219,6 +219,22 @@ def _reset_api_rate_window():
         pass
 
 
+def _reset_health_caches():
+    """The health rollup and the storage read under it are cached per cluster id at module
+    scope, and the next test's cluster_1 is another cluster."""
+    try:
+        from pegaprox.core.health import invalidate_cluster_health
+        invalidate_cluster_health()
+    except Exception:
+        pass
+    try:
+        import pegaprox.api.clusters as clusters_mod
+        from pegaprox.core.cache import StorageDataCache
+        clusters_mod._health_storage_cache = StorageDataCache()
+    except Exception:
+        pass
+
+
 def _reset_guest_index():
     """The guest search index keeps what every config read handed it, by cluster id, and
     the next test's cluster_1 is another cluster."""
@@ -430,6 +446,7 @@ def api(_integration_app, db):
     # already the method the unlock endpoints use.
     _reset_api_rate_window()
     _reset_guest_index()
+    _reset_health_caches()
 
     client = _integration_app.test_client()
 
@@ -462,6 +479,8 @@ def api(_integration_app, db):
             getattr(ppglobals, _registry, {}).clear()
         _reset_api_rate_window()
         _reset_guest_index()
+        _reset_health_caches()
+    _reset_health_caches()
 
 
 @pytest.fixture
