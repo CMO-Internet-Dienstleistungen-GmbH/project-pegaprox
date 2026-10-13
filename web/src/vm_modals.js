@@ -1561,7 +1561,12 @@
         }
 
         // LW: Feb 2026 - Corporate VM Detail View (experimental)
-        function CorporateVmDetailView({ vm, clusterId, onAction, onOpenConsole, onOpenSpice, onOpenConfig, onBack, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
+        function CorporateVmDetailView({ vm, clusterId, clusters, onAction, onOpenConsole, onOpenSpice, onOpenConfig, onBack, onMigrate, onClone, onForceStop, onDelete, onCrossClusterMigrate, onHypervMigrate, showCrossCluster, actionLoading, onShowMetrics, addToast }) {
+            // Fork patch #15 — a Hyper-V guest is moved to Proxmox, not between Proxmox
+            // nodes. It gets one entry here in place of the ones below, which address an
+            // API its host does not have.
+            const isHypervSource = typeof hvType === 'function'
+                && hvType((clusters || []).find(c => c.id === clusterId)) === 'hyperv';
             const { t } = useTranslation();
             const { getAuthHeaders, haReadOnly, haStandby, haConsolesElsewhere } = useAuth();
             // #625 v2 - on a standby: no power, console, SPICE, snapshot or HA changes, and no
@@ -2031,8 +2036,13 @@
                                                 <Icons.BarChart className="w-3.5 h-3.5" /> {t('performanceMetrics')}
                                             </button>
                                         )}
+                                        {acts && isHypervSource && onHypervMigrate && (
+                                            <button onClick={() => { onHypervMigrate(vm); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
+                                                <Icons.FolderInput className="w-3.5 h-3.5" /> {t('hvMigrateToProxmox') || 'Migrate to Proxmox'}
+                                            </button>
+                                        )}
                                         {acts && (<>
-                                        <button onClick={() => { onMigrate(vm); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
+                                        <button onClick={() => { onMigrate(vm); setShowActionsMenu(false); }} style={{color: 'var(--corp-text-secondary)', display: isHypervSource ? 'none' : undefined}} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2">
                                             <Icons.ArrowRight className="w-3.5 h-3.5" /> {t('migrate')}
                                         </button>
                                         {showCrossCluster && (
@@ -2040,7 +2050,7 @@
                                                 <Icons.Globe className="w-3.5 h-3.5" /> {t('crossClusterMigrate')}
                                             </button>
                                         )}
-                                        <button onClick={() => { onClone(vm); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: 'var(--corp-text-secondary)'}}>
+                                        <button onClick={() => { onClone(vm); setShowActionsMenu(false); }} style={{color: 'var(--corp-text-secondary)', display: isHypervSource ? 'none' : undefined}} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2">
                                             <Icons.Copy className="w-3.5 h-3.5" /> {t('clone')}
                                         </button>
                                         {isRunning && isQemu && (
@@ -2069,7 +2079,7 @@
                                         )}
                                         {acts && (<>
                                         <div className="my-1" style={{borderTop: '1px solid var(--corp-border-medium)'}}></div>
-                                        <button onClick={() => { onDelete(vm); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: '#f54f47'}}>
+                                        <button onClick={() => { onDelete(vm); setShowActionsMenu(false); }} className="w-full text-left px-3 py-1.5 text-[13px] flex items-center gap-2" style={{color: '#f54f47', display: isHypervSource ? 'none' : undefined}}>
                                             <Icons.Trash className="w-3.5 h-3.5" /> {t('delete')}
                                         </button>
                                         </>)}
@@ -2650,9 +2660,17 @@
                                                             </span>
                                                         )}
                                                     </div>
+                                                    {/* fork patch (issue #39): who took it, and the full description */}
                                                     <div className="text-[11px] mt-0.5" style={{color: 'var(--corp-text-muted, #728b9a)'}}>
                                                         {node.snaptime ? fmtDate(node.snaptime) : ''}
-                                                        {node.description && <span className="ml-2" style={{color: '#5a7a8a'}}>— {node.description}</span>}
+                                                        <span className="ml-2">
+                                                            {t('snapshotAuthor') || 'Author'}:{' '}
+                                                            <SnapshotAuthor snap={node} t={t} />
+                                                        </span>
+                                                    </div>
+                                                    <div className="text-[11px] mt-0.5" style={{color: '#5a7a8a'}}>
+                                                        {t('description') || 'Description'}:{' '}
+                                                        <SnapshotDescription text={node.description} t={t} />
                                                     </div>
                                                 </div>
                                             </div>
@@ -2714,8 +2732,17 @@
                                                             </span>
                                                         )}
                                                     </div>
+                                                    {/* fork patch (issue #39): same two facts as a PVE snapshot */}
                                                     <div className="text-[11px] mt-0.5" style={{color: 'var(--corp-text-muted, #728b9a)'}}>
                                                         {snap.created ? new Date(snap.created).toLocaleString() : ''}
+                                                        <span className="ml-2">
+                                                            {t('snapshotAuthor') || 'Author'}:{' '}
+                                                            <SnapshotAuthor snap={snap} t={t} />
+                                                        </span>
+                                                    </div>
+                                                    <div className="text-[11px] mt-0.5" style={{color: '#5a7a8a'}}>
+                                                        {t('description') || 'Description'}:{' '}
+                                                        <SnapshotDescription text={snap.description} t={t} />
                                                     </div>
                                                 </div>
                                                 <div className="flex gap-1">

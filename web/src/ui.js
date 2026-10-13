@@ -385,7 +385,7 @@
                     <img
                         src={user.avatar_url}
                         alt={`${user?.display_name || user?.username || 'User'} avatar`}
-                        className={`${classes} object-cover border border-proxmox-border/60`}
+                        className={`${classes} object-cover border border-proxmox-border`}
                     />
                 );
             }
@@ -985,23 +985,37 @@
         // Notification Toast
         // LW: Simple toast - auto-closes after 3s
         // tried 5s but users complained it was too long
-        function Toast({ message, type = 'success', onClose }) {
+        function Toast({ title, message, type = 'success', onClose }) {
+            // An error waits for a person. Three seconds is long enough to notice that
+            // something went wrong and far too short to read why — and why is the only
+            // part worth showing. Everything else still clears itself.
             useEffect(() => {
-                const timer = setTimeout(onClose, 3000);  // 3000ms = 3s
+                if (type === 'error') return;
+                const timer = setTimeout(onClose, 5000);
                 return() => clearTimeout(timer);
-            }, [onClose]);
+            }, [onClose, type]);
 
             // NS: ternary hell but it works lol
             return(
-                <div className={`toast-enter flex items-center gap-3 px-4 py-3 rounded-lg border ${
-                    type === 'success' 
-                        ? 'bg-green-500/10 border-green-500/30 text-green-400' 
+                <div className={`toast-enter flex items-start gap-3 px-4 py-3 rounded-lg border max-w-md ${
+                    type === 'success'
+                        ? 'bg-green-500/10 border-green-500/30 text-green-400'
                         : type === 'error'
                         ? 'bg-red-500/10 border-red-500/30 text-red-400'
                         : 'bg-proxmox-orange/10 border-proxmox-orange/30 text-proxmox-orange'
                 }`}>
-                    {type === 'success' ? <Icons.Check /> : type === 'error' ? <Icons.X /> : <Icons.Activity />}
-                    <span className="text-sm font-medium">{message}</span>
+                    <span className="shrink-0 mt-0.5">
+                        {type === 'success' ? <Icons.Check /> : type === 'error' ? <Icons.X /> : <Icons.Activity />}
+                    </span>
+                    <span className="text-sm min-w-0">
+                        {title && <span className="font-medium block">{title}</span>}
+                        {/* Wrapped rather than truncated: a reason that is cut off
+                            is a reason nobody can act on, and these run to a sentence. */}
+                        <span className={`block break-all${title ? ' opacity-90' : ' font-medium'}`}>{message}</span>
+                    </span>
+                    <button onClick={onClose}
+                            aria-label="Dismiss"
+                            className="shrink-0 ml-1 opacity-60 hover:opacity-100 leading-none">×</button>
                 </div>
             );
         }
@@ -2252,7 +2266,7 @@
 
         // NS May 2026 — single-number cluster health pill. Polls /health every 60s.
         // Hover for factor breakdown, click for full modal.
-        function ClusterHealthBadge({ clusterId, authFetch, apiUrl }) {
+        function ClusterHealthBadge({ clusterId, authFetch, apiUrl, health }) {
             const [data, setData] = React.useState(null);
             const [loading, setLoading] = React.useState(false);
             const [showDetails, setShowDetails] = React.useState(false);
@@ -2272,9 +2286,37 @@
                 finally { setLoading(false); }
             }, [clusterId, authFetch, apiUrl]);
 
+            // `health` arrives over SSE, computed once per cluster for everyone
+            // watching it. Feeding it into the same state the poll writes keeps the
+            // whole render path below unchanged — the badge does not care which of
+            // the two produced the number.
             React.useEffect(() => {
+                if (health) setData(health);
+            }, [health]);
+
+            // How long a pushed rollup counts as current. Three broadcast intervals:
+            // long enough that a single missed round is not treated as a failure,
+            // short enough that a stream which stops feeding us is noticed quickly.
+            const PUSH_FRESH_MS = 180000;
+            const lastPushRef = React.useRef(0);
+            if (health && health._receivedAt && health._receivedAt > lastPushRef.current) {
+                lastPushRef.current = health._receivedAt;
+            }
+
+            React.useEffect(() => {
+                // The first read still goes over REST: without it the badge stays
+                // empty until the next broadcast, which can be a whole interval away.
                 fetchHealth();
-                const id = setInterval(fetchHealth, 60000);
+                // The timer keeps its old one-minute cadence and SKIPS the request
+                // while pushed data is fresh, rather than running on a slow cadence.
+                // The difference matters after a server restart: the rollup cache is
+                // empty, the broadcaster only refreshes clusters already in it, and
+                // nothing would refill it until the next poll. Skipping means that
+                // poll is at most a minute away instead of ten.
+                const id = setInterval(() => {
+                    if (Date.now() - lastPushRef.current < PUSH_FRESH_MS) return;
+                    fetchHealth();
+                }, 60000);
                 return () => clearInterval(id);
             }, [fetchHealth]);
 

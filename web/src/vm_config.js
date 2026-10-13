@@ -797,6 +797,13 @@
         function ConfigModal({ vm, clusterId, allClusters = [], dashboardAuthFetch, onClose, addToast, isCorporate = false }) {
             const { t } = useTranslation();
             const { getAuthHeaders, haReadOnly, haStandby } = useAuth();
+            // Fork patch #15 — a Hyper-V guest is a migration source, not a machine this
+            // product manages. Its hardware is shown so the operator can see what a
+            // migration has to reproduce; changing it would address a Proxmox API the host
+            // does not have. Read-only is enforced on the form as a whole rather than field
+            // by field, so a field added later cannot quietly become editable here.
+            const isReadOnlySource = typeof hvType === 'function'
+                && hvType((allClusters || []).find(c => c.id === clusterId)) === 'hyperv';
             const [config, setConfig] = useState(null);
             const [configError, setConfigError] = useState(null);  // MK: Track config load errors
             const [loading, setLoading] = useState(true);
@@ -1958,6 +1965,7 @@
             };
 
             const handleSave = async () => {
+                if (isReadOnlySource) return;
                 if (Object.keys(changes).length === 0) return;
 
                 // Validate VM name format (DNS-compatible)
@@ -2418,6 +2426,7 @@
                                     {hasChanges && !haReadOnly && (
                                         <button
                                             onClick={handleSave}
+                                            hidden={isReadOnlySource}
                                             disabled={saving}
                                             className="corp-vm-btn corp-vm-btn-primary"
                                             title={t('save') || 'Apply changes'}
@@ -2497,6 +2506,18 @@
 
                         {/* Content */}
                         <div className={isCorporate ? 'corp-vm-modal-body' : 'flex-1 overflow-y-auto p-6'}>
+                            {/* Fork patch #15 — one fieldset around the whole form rather than a
+                                disabled attribute on every input: a field added later is covered
+                                without anybody remembering to cover it. `contents` keeps the
+                                element out of the layout. */}
+                            {isReadOnlySource && (
+                                <div className="mb-4 rounded-lg border border-proxmox-border bg-proxmox-dark px-3 py-2
+                                                text-xs text-gray-400">
+                                    {t('hvSourceReadOnly')
+                                        || 'This is a migration source. Its hardware is shown as it is on the Hyper-V host and cannot be changed from here.'}
+                                </div>
+                            )}
+                            <fieldset disabled={isReadOnlySource} className="contents">
                             {loading ? (
                                 isCorporate ? (
                                     <div className="corp-vm-modal-state">
@@ -3768,9 +3789,15 @@
                                                                             {snap.snaptime ? fmtDate(snap.snaptime) : t('unknown')}
                                                                             {snap.vmstate && <span className="ml-2 text-blue-400">+ RAM</span>}
                                                                         </div>
-                                                                        {snap.description && (
-                                                                            <div className="text-sm text-gray-500 mt-1">{snap.description}</div>
-                                                                        )}
+                                                                        {/* fork patch (issue #39): author and description, same rules everywhere */}
+                                                                        <div className="text-xs text-gray-400 mt-0.5">
+                                                                            {t('snapshotAuthor') || 'Author'}:{' '}
+                                                                            <SnapshotAuthor snap={snap} t={t} />
+                                                                        </div>
+                                                                        <div className="text-sm text-gray-500 mt-1">
+                                                                            {t('description') || 'Description'}:{' '}
+                                                                            <SnapshotDescription text={snap.description} t={t} />
+                                                                        </div>
                                                                     </div>
                                                                 </div>
                                                                 <div className="flex items-center gap-2">
@@ -3836,7 +3863,15 @@
                                                                                         {snap.total_snap_alloc_gb?.toFixed(1)} GB / {snap.total_disk_size_gb?.toFixed(1)} GB
                                                                                     </span>
                                                                                 </div>
-                                                                                {snap.description && <div className="text-sm text-gray-500 mt-1">{snap.description}</div>}
+                                                                                {/* fork patch (issue #39): author and description, same rules everywhere */}
+                                                                                <div className="text-xs text-gray-400 mt-0.5">
+                                                                                    {t('snapshotAuthor') || 'Author'}:{' '}
+                                                                                    <SnapshotAuthor snap={snap} t={t} />
+                                                                                </div>
+                                                                                <div className="text-sm text-gray-500 mt-1">
+                                                                                    {t('description') || 'Description'}:{' '}
+                                                                                    <SnapshotDescription text={snap.description} t={t} />
+                                                                                </div>
                                                                                 {isInvalidated && <div className="text-xs text-red-400 mt-1">{t('snapshotInvalidated')}</div>}
                                                                             </div>
                                                                         </div>
@@ -6138,6 +6173,7 @@
                                     Konfiguration konnte nicht geladen werden
                                 </div>
                             )}
+                            </fieldset>
                         </div>
 
                         {/* Footer */}
@@ -6159,6 +6195,7 @@
                                 {!haReadOnly && <button
                                     onClick={handleSave}
                                     disabled={!hasChanges || saving}
+                                    hidden={isReadOnlySource}
                                     className="flex items-center gap-2 px-4 py-2 bg-proxmox-orange rounded-lg text-white font-medium hover:bg-orange-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                                 >
                                     {saving ? (

@@ -30368,6 +30368,1438 @@
         ]
       }
     },
+    "/api/hyperv/hosts": {
+      "get": {
+        "operationId": "hyperv.list_hyperv_hosts_get",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Every registered host, without credentials.",
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.view"
+        ]
+      },
+      "post": {
+        "operationId": "hyperv.create_hyperv_host_post",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Register a host, after proving it answers.",
+        "description": "The connection is tested before anything is written. Saving a source that was never\nreachable only moves the failure to a place where it is harder to connect to what the\noperator just typed.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.config"
+        ]
+      }
+    },
+    "/api/hyperv/hosts/{host_id}": {
+      "put": {
+        "operationId": "hyperv.update_hyperv_host_put",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Change a host's settings. An empty password field keeps the stored one.",
+        "parameters": [
+          {
+            "name": "host_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.config"
+        ]
+      },
+      "delete": {
+        "operationId": "hyperv.delete_hyperv_host_delete",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Unregister a host.",
+        "description": "Its VMID mapping and migration record stay. Those describe what was done to targets\nthat still exist, and unregistering a source undoes none of it.",
+        "parameters": [
+          {
+            "name": "host_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.config"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/host": {
+      "get": {
+        "operationId": "hyperv.get_hyperv_host_get",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "What the host is, and which of the properties this product reads it actually has.",
+        "description": "The property report is part of the answer rather than a log line. Hyper-V documents\nits cmdlets' parameters but almost never the objects they return, so a property that\nwas renamed or is absent on an older host reads as null instead of raising — and a\nVM would then look like it had no generation and no checkpoints. Naming the missing\nproperties here is what turns that into something an operator can see.\n\nFacts and property report come from the same background read as the VM list, for the\nsame reason: connecting to a host that does not answer costs a full WinRM timeout,\nand the page that shows this must not spend it before it renders.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.view"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/transfer-check": {
+      "post": {
+        "operationId": "hyperv.check_hyperv_transfer_post",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Ask a target node whether it can read this host's disk share, and remember.",
+        "description": "A host fact, measured once: cifs-utils on the node, a route to TCP 445, and an account\nthe share lets read. The preflight used to put the same unanswerable question in front\nof every VM and ask for a confirmation it could not inform. Now it reports what this\nfound, with the date it found it.\n\nRead-only throughout — mount, list, unmount. `hyperv.config` rather than a view\npermission because it opens a connection from a Proxmox node to a customer's host\nusing the stored credentials, which is a configuration act, not a look.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.config"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/isos": {
+      "get": {
+        "operationId": "hyperv.list_hyperv_isos_get",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The ISOs this host can offer a VM, from the library paths its config names.",
+        "description": "PegaProx does not upload an ISO to a customer's Hyper-V host and does not browse its\nfilesystem. It reads the paths an administrator configured for this source and\nnothing else.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.media"
+        ]
+      }
+    },
+    "/api/hyperv/target-virtio-isos": {
+      "get": {
+        "operationId": "hyperv.list_target_virtio_isos_get",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Every ISO a Proxmox node can see, and the driver releases it could fetch.",
+        "description": "All of them, not only the ones whose name says virtio-win: an operator has to be able\nto point at a file this product would not have recognised. Which release each one is\ncomes from its name, and where the name says nothing, the entry says that too.",
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.media"
+        ]
+      }
+    },
+    "/api/hyperv/target-cpu": {
+      "get": {
+        "operationId": "hyperv.target_cpu_choice_get",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The CPU type the import suggests for a node, and the types it offers.",
+        "description": "Asked per node, like the ISO list: whether x86-64-v3 is safe depends on the processor\nof the node the operator has just picked.",
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.view"
+        ]
+      }
+    },
+    "/api/hyperv/target-virtio-isos/download": {
+      "post": {
+        "operationId": "hyperv.download_target_virtio_iso_post",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Have a Proxmox node fetch a virtio-win release onto one of its ISO storages.",
+        "description": "The node downloads it. Nothing passes through this process or the browser, which is\nwhat makes it usable for a 700 MB file on a cluster that is not next to the operator.\nThe answer is the Proxmox task id; the wizard follows it like any other node task.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.media"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/vms": {
+      "get": {
+        "operationId": "hyperv.list_hyperv_vms_get",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Every VM on the host the caller is allowed to see, as last read.",
+        "description": "The answer comes from `hyperv_inventory` and therefore comes back immediately, with\nthe age of what it contains. Reading a host takes tens of seconds, so doing it inside\nthis request meant the view showing the previous host's VMs for that whole time; the\nread now runs in the background and announces itself over SSE (frame\n`hyperv_inventory`), and this route is what the client then asks again.\n\nThe list is filtered per VM rather than gated only at the host, because reaching a\nhost through a single VM-ACL entry must not hand back the whole inventory. That\nfilter is why the SSE frame carries no VMs: it would have to be repeated there.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.view"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/vms/{vmid}": {
+      "get": {
+        "operationId": "hyperv.get_hyperv_vm_get",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "One VM's migration-relevant hardware, normalised.",
+        "description": "Everything this returns is what somebody needs to decide whether the VM can move:\ngeneration and firmware, CPU and the three memory figures, disks with their\ncontroller positions, adapters with their MACs and switches, and the checkpoints.\nA value the host did not report stays null — never a zero, never an empty list that\nwould read as \"none\".",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "vmid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.view"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/vms/{vmid}/disks": {
+      "get": {
+        "operationId": "hyperv.get_hyperv_vm_disks_get",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The disk chain behind each of a VM's disks.",
+        "description": "A differencing chain is the reason a VHDX that looks complete is not: the file the VM\nattaches may hold only the changes since a parent it points at by path. The chain is\nread so preflight can refuse it rather than copying one link and calling it a disk.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "vmid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.view"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/vms/{vmid}/state": {
+      "get": {
+        "operationId": "hyperv.get_hyperv_vm_state_get",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The VM's power state, and whether its disks are settled enough to be read.",
+        "description": "Deleting a checkpoint returns immediately and the merge runs on afterwards in the\nbackground, so a VM that reports \"Off\" with no checkpoints can still be rewriting its\nown disk files. This asks the host's own WMI view for that, which is the only place\nit is visible, and `safe_to_read` is the answer a migration is allowed to act on.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "vmid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.view"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/vms/{vmid}/preflight": {
+      "post": {
+        "operationId": "hyperv.hyperv_vm_preflight_post",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Every migration check for one VM against one chosen target.",
+        "description": "It is a POST because the verdict depends on choices the caller makes — which target,\nwhich storage, which network each adapter lands on — not because it changes anything.\nNothing on either side is modified.\n\nAll checks run; none short-circuits. Somebody preparing a VM wants the whole list of\nwhat is wrong, not one item per attempt across four rounds.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "vmid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.view"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/vms/{vmid}/start": {
+      "post": {
+        "operationId": "hyperv.start_hyperv_vm_post",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Start the VM, so a guest can be prepared before it is migrated.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "vmid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.power"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/vms/{vmid}/shutdown": {
+      "post": {
+        "operationId": "hyperv.shutdown_hyperv_vm_post",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Ask the guest to shut itself down, and wait for it to finish.",
+        "description": "Only the orderly shutdown exists here. Hyper-V can also cut the power, and that would\nleave the disks in the state an unexpected outage leaves them in — the one state a\nmigration must not start from. A guest that refuses is reported as refusing; it is\nnot overruled.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "vmid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.power"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/vms/{vmid}/checkpoints": {
+      "delete": {
+        "operationId": "hyperv.remove_hyperv_checkpoints_delete",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Delete checkpoints so the VM's disks become a single readable file per disk.",
+        "description": "This is destructive on the customer's source: the states those checkpoints could be\nrolled back to are gone afterwards, and Hyper-V offers no undo. The route therefore\nrequires its own permission and writes an audit entry naming what was removed.\n\nIt returns as soon as Hyper-V accepts the request. The merge that follows runs in the\nbackground on the host, and whether it has finished is what the state route reports.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "vmid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.checkpoint"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/vms/{vmid}/iso": {
+      "post": {
+        "operationId": "hyperv.mount_hyperv_iso_post",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Attach an ISO from the host's configured library to the VM's DVD drive.",
+        "description": "The path has to be one the library paths already contain. Taking an arbitrary path\nfrom the request would let a caller mount any file the service account can reach on\nthe customer's host, which is a filesystem read primitive, not a media action.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "vmid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.media"
+        ]
+      },
+      "delete": {
+        "operationId": "hyperv.eject_hyperv_iso_delete",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Empty the VM's DVD drive again.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "vmid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.media"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/migrations": {
+      "get": {
+        "operationId": "hyperv.list_hyperv_migrations_get",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Every migration started from this host, from the database rather than from memory.",
+        "description": "The shared migration list is process-local, so a restart empties it while the half-built\ntarget it describes is still there. This one answers from the durable record and says,\nper migration, what it created and whether that is still lying around.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.view"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/migrations/{migration_id}/cleanup": {
+      "post": {
+        "operationId": "hyperv.cleanup_hyperv_migration_post",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Remove what one failed migration created on the target, after confirmation.",
+        "description": "Three gates, and each of them has a failure it prevents. The confirmation has to name\nthis migration, so a click on the wrong row cannot delete a VM. The caller must reach\nthe target cluster in their own right, because deleting a guest there is a target-side\naction that a Hyper-V permission has no business granting. And the runner must be gone,\nwhich the core checks again against the claim table.\n\nThe Hyper-V source is never touched by any of this.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "migration_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.migrate"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/migrations/{migration_id}/post-import": {
+      "get": {
+        "operationId": "hyperv.get_hyperv_post_import_state_get",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "What is true about the imported VM's drivers and hardware right now.",
+        "description": "Reports the attached ISO and the recorded driver confirmation as two separate facts,\nbecause they are two separate facts: nothing outside a guest can see what is installed\ninside it.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "migration_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.view"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/migrations/{migration_id}/virtio-iso": {
+      "post": {
+        "operationId": "hyperv.attach_hyperv_virtio_iso_post",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Put the VirtIO driver ISO in the imported VM's CD drive. The source is not touched.",
+        "description": "Needs no guest network and no guest agent, and installs nothing: it makes the drivers\nreachable from inside the guest and stops there.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "migration_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.migrate"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/migrations/{migration_id}/drivers": {
+      "post": {
+        "operationId": "hyperv.confirm_hyperv_drivers_post",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Record that somebody installed the VirtIO drivers in the guest.",
+        "description": "Deliberately a statement and not a check. The alternative would be to guess from the\noutside — an attached ISO, an elapsed time, a successful boot — and every one of those\nguesses is wrong for some guest, in the direction that leaves it unbootable.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "migration_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.migrate"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/migrations/{migration_id}/retry-injection": {
+      "post": {
+        "operationId": "hyperv.retry_hyperv_driver_injection_post",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Run the offline driver injection again, once whatever made it fail is fixed.",
+        "description": "Writes into the imported guest's disk, so it asks for the migration id as confirmation,\nand the core refuses while that VM runs. The source is not touched.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "migration_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.migrate"
+        ]
+      }
+    },
+    "/api/hyperv/{cluster_id}/migrations/{migration_id}/profile": {
+      "post": {
+        "operationId": "hyperv.apply_hyperv_vm_profile_post",
+        "tags": [
+          "hyperv"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Switch the imported VM to the VM standard, after confirmation.",
+        "description": "Without `confirm` this answers with the preview and changes nothing, so the differences\nand the required downtime are on screen before anybody agrees to them. The VM is never\npowered off to make the change, and a guest whose drivers nobody confirmed is refused.",
+        "parameters": [
+          {
+            "name": "cluster_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "migration_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "hyperv.vm.migrate"
+        ]
+      }
+    },
     "/api/schedules": {
       "get": {
         "operationId": "schedules.get_schedules_get",
@@ -39358,9 +40790,87 @@
         "x-pegaprox-permissions": [
           "vm.migrate"
         ]
+      },
+      "delete": {
+        "operationId": "xhm.xhm_dismiss_finished_delete",
+        "tags": [
+          "xhm"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Take every finished migration off the list. Running ones are left alone.",
+        "description": "The list is where an operator reads what happened, and the log of the one they picked\nis rendered under it. An entry they have already read and acted on is in the way of\nthe next one, and nothing in the product could put it away — it left on a timer, six\nhours later.\n\nThis removes a record of a run that is over. It removes nothing on either hypervisor:\nno VM, no disk, no volume. What a failed run left behind on the target is a separate\nquestion with its own answer, and dropping the entry here does not touch it.",
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "vm.migrate"
+        ]
       }
     },
     "/api/xhm/migrations/{mid}": {
+      "delete": {
+        "operationId": "xhm.xhm_dismiss_delete",
+        "tags": [
+          "xhm"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Take one finished migration off the list.",
+        "description": "A running migration is refused rather than ignored: dropping its record would leave a\ntransfer writing to a target with nothing on screen saying so.",
+        "parameters": [
+          {
+            "name": "mid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "vm.migrate"
+        ]
+      },
       "get": {
         "operationId": "xhm.xhm_detail_get",
         "tags": [
@@ -39380,6 +40890,52 @@
             "description": "Insufficient permissions"
           }
         },
+        "parameters": [
+          {
+            "name": "mid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "vm.migrate"
+        ]
+      }
+    },
+    "/api/xhm/migrations/{mid}/log": {
+      "get": {
+        "operationId": "xhm.xhm_log_get",
+        "tags": [
+          "xhm"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The whole log of one migration.",
+        "description": "to_dict() carries the last 30 lines, which is enough for the list and its live frames.\nAn opened row is where an operator reads what happened, and after a reload it showed\nonly what the last phase had written. A route of its own rather than a change to the\ndetail route, whose last line other patches build on.",
         "parameters": [
           {
             "name": "mid",
