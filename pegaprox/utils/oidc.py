@@ -82,6 +82,14 @@ ENTRA_CLOUD_ENDPOINTS = {
     },
 }
 
+# NS Oct 2026 (#1149) - the claims an admin may pick to name the account. unique_name is not
+# among them: AD FS fills it with DOMAIN\user, and the name filter would drop the backslash
+# and run domain and user together.
+OIDC_USERNAME_CLAIMS = ('preferred_username', 'email', 'upn')
+# what a picked claim may hold, after lower-casing; anything else refuses the sign-in
+_OIDC_NAME_CHARS = frozenset('abcdefghijklmnopqrstuvwxyz0123456789._-@+')
+
+
 def get_oidc_settings() -> dict:
     """Load OIDC/Entra ID configuration from server settings
 
@@ -127,6 +135,9 @@ def get_oidc_settings() -> dict:
         # for the OIDC discovery URL only. Metadata-IP blocklist (169.254.x.x
         # etc.) still binds. See helpers.py default-block for rationale.
         'oidc_allow_private_ip': settings.get('oidc_allow_private_ip', False),
+        # NS Oct 2026 (#1149) - the claim that names the account, '' = the old order
+        'username_claim': (settings.get('oidc_username_claim') or '')
+                          if settings.get('oidc_username_claim') in OIDC_USERNAME_CLAIMS else '',
     }
 
 
@@ -544,6 +555,7 @@ def oidc_get_user_info(config: dict, access_token: str) -> dict:
                 user_info = {
                     'sub': graph_data.get('id', ''),
                     'preferred_username': graph_data.get('userPrincipalName', ''),
+                    'upn': graph_data.get('userPrincipalName', ''),
                     'name': graph_data.get('displayName', ''),
                     'email': graph_data.get('mail') or graph_data.get('userPrincipalName', ''),
                     'given_name': graph_data.get('givenName', ''),
@@ -592,6 +604,57 @@ def oidc_name_from_id_token(user_info: dict, id_claims: dict) -> dict:
         if isinstance(value, str) and value:
             named[claim] = value
     return named
+
+
+def _claim_text(value):
+    # as it came: padding is the name check's to refuse, not something to strip away here
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _email_unverified(source):
+    flag = source.get('email_verified')
+    return flag is False or (isinstance(flag, str) and flag.strip().lower() == 'false')
+
+
+def oidc_username_claim_value(userinfo: dict, id_claims: dict, claim: str):
+    """The value of the username claim the admin picked, None when this sign-in has none.
+
+    NS Oct 2026 (#1149) - AD FS answers userinfo with the sub alone and puts its claims in
+    the tokens, so the claim is looked up in the userinfo answer first and then in the ID
+    token. The ID token only counts when its signature was checked in this sign-in and,
+    if userinfo answered, when it is about the same subject (as oidc_name_from_id_token).
+    `userinfo` is the endpoint's answer itself, never the ID token standing in for it.
+    """
+    if claim not in OIDC_USERNAME_CLAIMS:
+        return None
+    userinfo = userinfo if isinstance(userinfo, dict) else {}
+    value = _claim_text(userinfo.get(claim))
+    if value:
+        return None if claim == 'email' and _email_unverified(userinfo) else value
+    if not isinstance(id_claims, dict) or not oidc_id_token_verified(id_claims):
+        return None
+    if userinfo:
+        sub = userinfo.get('sub')
+        if not sub or id_claims.get('sub') != sub:
+            return None
+    if claim == 'email' and _email_unverified(id_claims):
+        return None
+    return _claim_text(id_claims.get(claim))
+
+
+def oidc_username_claim_refusal(userinfo: dict, id_claims: dict, claim: str) -> str:
+    """Why oidc_username_claim_value had no value, for the log: the user only sees that
+    the sign-in has no usable claim."""
+    userinfo = userinfo if isinstance(userinfo, dict) else {}
+    for source, label in ((userinfo, 'userinfo answer'), (id_claims or {}, 'ID token')):
+        if claim == 'email' and _claim_text(source.get('email')) and _email_unverified(source):
+            return f'the {label} marks the email as not verified'
+    if _claim_text((id_claims or {}).get(claim)) and not oidc_id_token_verified(id_claims):
+        return 'the ID token carries it, but its signature was not checked'
+    if userinfo and _claim_text((id_claims or {}).get(claim)) and \
+            userinfo.get('sub') != (id_claims or {}).get('sub'):
+        return 'the ID token carries it, but is about another subject than the userinfo answer'
+    return 'neither the userinfo answer nor the ID token carries it'
 
 
 def oidc_get_user_groups(config: dict, access_token: str) -> list:
@@ -907,7 +970,7 @@ def _oidc_is_fallback_row(username: str, row: dict) -> bool:
     return username in (_oidc_fallback_key(sub), f"oidc_{sub[:12]}")
 
 
-def oidc_derive_username(user_info: dict, users: dict = None) -> str:
+def oidc_derive_username(user_info: dict, users: dict = None, name: str = None) -> str:
     """Derive the local username key from OIDC claims.
 
     LW: keep the full preferred_username including the domain. Truncating at
@@ -919,17 +982,33 @@ def oidc_derive_username(user_info: dict, users: dict = None) -> str:
 
     None when the claims carry no name and the fallback key cannot be this
     identity's (see _oidc_fallback_username); the sign-in is refused then.
+
+    `name` is the value of the username claim the admin picked (#1149). It replaces the
+    claim order, and a name that filters down to nothing is None: no fallback key then.
     """
     from pegaprox.utils.auth import load_users
 
-    raw_username = (user_info.get('preferred_username')
-                    or user_info.get('email', ''))
+    if name is not None:
+        # NS Oct 2026 (#1149) - the filter below drops or folds what it does not know (a
+        # dotted capital I, a zero-width space, an apostrophe), and lower() turns the Kelvin
+        # sign into a k, so two people at the IdP could come out as one name here. A picked
+        # claim is plain ASCII without padding and goes through whole, or not at all.
+        raw_username = name.lower() if name.isascii() and name == name.strip() else ''
+        if not raw_username or any(c not in _OIDC_NAME_CHARS for c in raw_username):
+            logging.warning("[OIDC] Sign-in refused: the picked username claim holds characters "
+                            "a PegaProx username cannot carry")
+            return None
+    else:
+        raw_username = (user_info.get('preferred_username')
+                        or user_info.get('email', ''))
 
     # Char set matches sanitize_username()'s allowlist. '+' belongs here for the
     # same reason '@' does: dropping it silently merges identities, so
     # a+b@example.com would derive onto a real ab@example.com account.
     username = ''.join(c for c in raw_username.lower()
                        if c.isalnum() or c in '._-@+')
+    if not username and name is not None:
+        return None
     if not username:
         return _oidc_fallback_username(user_info.get('sub'),
                                        users if users is not None else load_users())
@@ -957,7 +1036,8 @@ def oidc_derive_username(user_info: dict, users: dict = None) -> str:
     return username
 
 
-def oidc_build_user_row(user_info: dict, role_mapping: dict, auth_source: str, users: dict):
+def oidc_build_user_row(user_info: dict, role_mapping: dict, auth_source: str, users: dict,
+                        name: str = None, subjects=None):
     """The row an OIDC sign-in would store for this user, without storing it.
 
     `users` is the users table as loaded. Returns (username, row), or None where an
@@ -969,9 +1049,13 @@ def oidc_build_user_row(user_info: dict, role_mapping: dict, auth_source: str, u
     """
     # Derive username from OIDC claims
     email = user_info.get('email') or user_info.get('preferred_username', '')
-    username = oidc_derive_username(user_info, users)
+    username = oidc_derive_username(user_info, users, name=name)
     if username is None:
         return None  # no name, and the fallback key is not this identity's (#1141)
+    if name is not None and not user_info.get('sub'):
+        logging.warning(f"[OIDC] Rejected login for '{username}' - the sign-in has no sub, "
+                        f"so the account cannot be tied to it")
+        return None
 
     display_name = user_info.get('name') or user_info.get('given_name', '')
     if not display_name:
@@ -997,6 +1081,23 @@ def oidc_build_user_row(user_info: dict, role_mapping: dict, auth_source: str, u
             logging.warning(f"[OIDC] Rejected login for '{username}' - that account was made "
                             f"for another subject's sign-in without a name")
             return None
+        # NS Oct 2026 (#1149) - with a claim the admin picked, the account stays with the
+        # subject it was made for. Claims like email can be changed or handed on at some
+        # identity providers, and the update below would give the row and its role to
+        # whoever carries the value now.
+        # `subjects` are the ids this one sign-in goes by: with Entra the Graph id when /me
+        # answered and the token's sub and oid, so a Graph hiccup does not lock anyone out.
+        # A row with no subject stored is not taken either: an admin binds or deletes it.
+        bound = users[username].get('oidc_sub')
+        if name is not None:
+            own = {s for s in (set(subjects or ()) | {user_info.get('sub')}) if s}
+            if not bound or bound not in own:
+                logging.warning(f"[OIDC] Rejected login for '{username}' - the account "
+                                + ("has no identity provider subject stored; an admin can "
+                                   "delete it to let the sign-in create it again" if not bound else
+                                   "belongs to another subject of the identity provider; an "
+                                   "admin can delete it if that person is gone"))
+                return None
 
         # Update existing OIDC user - on a copy, so the table the caller handed in
         # stays what it was
@@ -1082,7 +1183,8 @@ def oidc_build_user_row(user_info: dict, role_mapping: dict, auth_source: str, u
     return username, user
 
 
-def oidc_provision_user(user_info: dict, role_mapping: dict, auth_source: str = 'oidc') -> dict:
+def oidc_provision_user(user_info: dict, role_mapping: dict, auth_source: str = 'oidc',
+                        name: str = None, subjects=None) -> dict:
     from pegaprox.utils.auth import load_users, save_users
     """Create or update local user from OIDC authentication
     
@@ -1090,7 +1192,8 @@ def oidc_provision_user(user_info: dict, role_mapping: dict, auth_source: str = 
     MK: username derived from email or preferred_username
     """
     users = load_users()
-    built = oidc_build_user_row(user_info, role_mapping, auth_source, users)
+    built = oidc_build_user_row(user_info, role_mapping, auth_source, users, name=name,
+                                subjects=subjects)
     if built is None:
         return None  # Caller should handle None return
     username, user = built

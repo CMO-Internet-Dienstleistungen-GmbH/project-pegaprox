@@ -1498,6 +1498,27 @@ def update_server_settings():
         # check if JSON or form-data
         if request.is_json:
             data = request.get_json() or {}
+            # NS Oct 2026 (#1149) - a username claim outside the list is refused before anything
+            # is saved, rather than stored as the old order without a word
+            if 'oidc_username_claim' in data:
+                from pegaprox.utils.oidc import OIDC_USERNAME_CLAIMS
+                _claim = str(data.get('oidc_username_claim') or '').strip()
+                if _claim and _claim not in OIDC_USERNAME_CLAIMS:
+                    return jsonify({'error': 'oidc_username_claim is empty or one of '
+                                             + ', '.join(OIDC_USERNAME_CLAIMS)}), 400
+            # email from Entra is the mail attribute, which any admin of a tenant can set and
+            # Entra does not verify: it never names an Entra account, whichever of the two
+            # this save changes
+            if 'oidc_username_claim' in data or 'oidc_provider' in data:
+                _claim = (str(data.get('oidc_username_claim') or '').strip()
+                          if 'oidc_username_claim' in data else settings.get('oidc_username_claim') or '')
+                _provider = ((data['oidc_provider'] if data['oidc_provider'] in ('entra', 'okta', 'generic')
+                              else 'entra') if 'oidc_provider' in data
+                             else settings.get('oidc_provider', 'entra'))
+                if _claim == 'email' and _provider == 'entra':
+                    return jsonify({'error': 'email cannot name Entra accounts: it is the mail '
+                                             'attribute, which Entra does not verify. Pick '
+                                             'preferred_username or upn.'}), 400
             
             # server config
             if 'domain' in data:
@@ -1808,6 +1829,7 @@ def update_server_settings():
                     logging.warning(f"[LDAP] DB verification failed: {ve}")
             
             # NS: Feb 2026 - OIDC / Entra ID settings
+            from pegaprox.utils.oidc import OIDC_USERNAME_CLAIMS
             oidc_keys = {
                 'oidc_enabled': lambda v: bool(v),
                 'oidc_provider': lambda v: str(v) if v in ('entra', 'okta', 'generic') else 'entra',
@@ -1831,8 +1853,11 @@ def update_server_settings():
                 # NS May 2026 (PVE 9.2 parity) — extra audiences accepted on
                 # JWT verify, comma-separated. Empty = client_id only.
                 'oidc_audiences': lambda v: str(v or '').strip(),
+                # NS Oct 2026 (#1149) - only a claim from the list, anything else is the old order
+                'oidc_username_claim': lambda v: str(v or '').strip() if str(v or '').strip() in OIDC_USERNAME_CLAIMS else '',
             }
             
+            _old_claim = settings.get('oidc_username_claim') or ''
             for key, transform in oidc_keys.items():
                 if key in data:
                     settings[key] = transform(data[key])
@@ -1864,7 +1889,8 @@ def update_server_settings():
             
             if any(k in data for k in oidc_keys):
                 log_audit(request.session.get('user', 'admin'), 'settings.oidc', 
-                         f"OIDC settings updated (enabled={settings.get('oidc_enabled', False)}, provider={settings.get('oidc_provider', 'entra')})")
+                         f"OIDC settings updated (enabled={settings.get('oidc_enabled', False)}, provider={settings.get('oidc_provider', 'entra')}, "
+                         f"username_claim={_old_claim or 'auto'}->{settings.get('oidc_username_claim') or 'auto'})")
             
         else:
             # form-data (for file uploads)
