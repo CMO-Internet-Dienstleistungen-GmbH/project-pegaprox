@@ -2041,10 +2041,12 @@ def test_compliance_stays_a_reading_tab_on_a_standby(dash):
     its acting buttons still ask the flag."""
     assert ('const holds = (permission) => isAdmin || (Array.isArray(user?.permissions) '
             '&& user.permissions.includes(permission));') in dash
-    assert "if (tab.id === 'compliance') return holds('admin.audit') || holds('node.maintenance');" in dash
-    # holds() decides this tab, whether a standby offers a console on the active, and the
-    # console entries of a member that opens them itself
-    assert len(re.findall(r'\bholds\(', dash)) == 4
+    assert ("if (tab.id === 'compliance') return holds('admin.audit') || holds('node.maintenance') "
+            "|| holds('changes.view');") in dash
+    # holds() decides this tab (and the sub tabs of it, with the change plans' request button),
+    # whether a standby offers a console on the active, and the console entries of a member
+    # that opens them itself
+    assert len(re.findall(r'\bholds\(', dash)) == 9
     assert 'const onActiveItems = (permission, search, disabled = false) => !holds(permission) ? [] : [{' in dash
     assert 'const menuAllows = (i) => !i.perm || (i.console ? holds(i.perm) : can(i.perm));' in dash
     drift = _function(dash, 'DriftTab')

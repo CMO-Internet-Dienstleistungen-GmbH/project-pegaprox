@@ -6252,6 +6252,12 @@
                         </div>
                     )}
 
+                    {status && status.planned > 0 && (
+                        <div data-drift-planned-count className="text-xs text-green-400">
+                            {chgFill(t, 'driftPlannedCount', { n: status.planned })}
+                        </div>
+                    )}
+
                     {!leaderAway && policy.length > 0 && (
                         <div data-drift-policy className="bg-proxmox-card border border-proxmox-border rounded-xl p-3 space-y-2">
                             <div>
@@ -6316,6 +6322,12 @@
                                                 <span className={`px-1.5 py-0.5 text-[10px] rounded ${sevColor(ev.severity)} flex-shrink-0`}>{ev.severity}</span>
                                                 {ev.category && ev.category !== 'deviation' && (
                                                     <span data-drift-category={ev.category} className={`px-1.5 py-0.5 text-[10px] rounded ${catColor(ev.category)} flex-shrink-0`}>{catLabel(ev.category)}</span>
+                                                )}
+                                                {ev.change_id && (
+                                                    <span data-drift-planned={ev.change_id} title={ev.change_title}
+                                                        className="px-1.5 py-0.5 text-[10px] rounded bg-green-500/15 text-green-400 flex-shrink-0 max-w-xs truncate">
+                                                        {chgFill(t, 'driftPlanned', { title: ev.change_title || '' })}
+                                                    </span>
                                                 )}
                                                 <span className="text-xs text-gray-300 truncate">
                                                     <span className="text-gray-400">{kindLabel(ev.kind)}:</span> {ev.scope}
@@ -6450,6 +6462,311 @@
                     {verdict && (
                         <span className={`text-xs ${verdict.bad ? 'text-red-400' : 'text-green-400'}`}
                             data-tl-verdict={verdict.bad ? 'bad' : 'ok'}>{verdict.text}</span>
+                    )}
+                </div>
+            );
+        }
+
+        // NS Oct 2026 - change plans (GET/POST /api/changes): a planned change with a scope and a
+        // window, approved by a second administrator. Nothing here runs a change. Which buttons a
+        // plan gets, and why Approve is off, is the server's answer (`can`, `approve_blocked`),
+        // not a guess made from the role. Writes ask for the active, like the other tabs (#625).
+        const CHG_KINDS = ['guests', 'nodes', 'storage', 'network', 'firewall', 'ha', 'backup', 'access', 'cluster'];
+        const CHG_KIND_KEYS = {
+            guests: 'chgKindGuests', nodes: 'chgKindNodes', storage: 'chgKindStorage', network: 'chgKindNetwork',
+            firewall: 'chgKindFirewall', ha: 'chgKindHa', backup: 'chgKindBackup', access: 'chgKindAccess',
+            cluster: 'chgKindCluster',
+        };
+        const CHG_STATES = ['draft', 'submitted', 'approved', 'rejected', 'cancelled', 'done', 'expired'];
+        const CHG_STATE_KEYS = {
+            draft: 'chgStDraft', submitted: 'chgStSubmitted', approved: 'chgStApproved', rejected: 'chgStRejected',
+            cancelled: 'chgStCancelled', done: 'chgStDone', expired: 'chgStExpired',
+        };
+        const CHG_STATE_COLORS = {
+            draft: 'bg-gray-500/15 text-gray-300', submitted: 'bg-yellow-500/15 text-yellow-400',
+            approved: 'bg-green-500/15 text-green-400', rejected: 'bg-red-500/15 text-red-400',
+            cancelled: 'bg-gray-500/15 text-gray-400', done: 'bg-blue-500/15 text-blue-400',
+            expired: 'bg-orange-500/15 text-orange-400',
+        };
+
+        function chgFill(t, key, vals) {
+            return Object.keys(vals).reduce((s, k) => s.split(`{${k}}`).join(String(vals[k] ?? '')), t(key));
+        }
+
+        // the window is typed in local time and travels as UTC
+        function chgToIso(local) {
+            if (!local) return null;
+            const d = new Date(local);
+            return isNaN(d.getTime()) ? null : d.toISOString().replace(/\.\d+Z$/, 'Z');
+        }
+
+        function chgToLocal(iso) {
+            if (!iso) return '';
+            const d = new Date(iso);
+            if (isNaN(d.getTime())) return '';
+            const p = (n) => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+        }
+
+        function chgShow(iso) {
+            if (!iso) return '';
+            const d = new Date(iso);
+            return isNaN(d.getTime()) ? iso : d.toLocaleString();
+        }
+
+        const CHG_EMPTY_FORM = { id: null, title: '', description: '', kind: 'guests', targets: '', start: '', end: '' };
+
+        function ChangesTab({ clusterId, authFetch, addToast, t, canRequest }) {
+            const { haReadOnly } = useAuth();
+            const [plans, setPlans] = React.useState([]);
+            const [filter, setFilter] = React.useState('');
+            const [busy, setBusy] = React.useState(false);
+            const [form, setForm] = React.useState(null);
+            const [rejecting, setRejecting] = React.useState(null);
+            const [reason, setReason] = React.useState('');
+
+            const refresh = async () => {
+                if (!clusterId) { setPlans([]); return; }
+                setBusy(true);
+                try {
+                    const q = `cluster=${encodeURIComponent(clusterId)}` + (filter ? `&status=${filter}` : '');
+                    const r = await authFetch(`${API_URL}/changes?${q}`);
+                    const j = await r?.json().catch(() => null);
+                    if (j && j.changes) setPlans(j.changes);
+                } finally { setBusy(false); }
+            };
+            React.useEffect(() => { setForm(null); setRejecting(null); }, [clusterId]);
+            React.useEffect(() => { refresh(); /* eslint-disable-line */ }, [clusterId, filter]);
+
+            const send = async (path, method, body) => {
+                const r = await authFetch(`${API_URL}/changes${path}`, {
+                    method, headers: { 'Content-Type': 'application/json' },
+                    body: body ? JSON.stringify(body) : undefined,
+                });
+                const j = await r?.json().catch(() => null);
+                if (!r?.ok) {
+                    addToast((j && j.error) || t('chgFailed'), 'error');
+                    return null;
+                }
+                return j;
+            };
+
+            const act = async (p, action, body) => {
+                if (action === 'cancel' && !confirm(t('chgCancelAsk'))) return;
+                const j = await send(`/${p.id}/${action}`, 'POST', body);
+                if (j) { addToast(t('chgMoved'), 'success'); setRejecting(null); setReason(''); await refresh(); }
+            };
+
+            const targetsOf = (f) => {
+                const parts = f.targets.split(',').map(x => x.trim()).filter(Boolean);
+                return f.kind === 'guests' ? parts.map(x => (/^\d+$/.test(x) ? parseInt(x, 10) : x)) : parts;
+            };
+
+            const save = async (andSubmit) => {
+                const body = {
+                    title: form.title, description: form.description,
+                    scope: { kind: form.kind, targets: form.kind === 'cluster' ? [] : targetsOf(form) },
+                    window_start: chgToIso(form.start), window_end: chgToIso(form.end),
+                };
+                const j = form.id ? await send(`/${form.id}`, 'PUT', body)
+                                  : await send('', 'POST', Object.assign({ cluster_id: clusterId }, body));
+                if (!j) return;
+                if (andSubmit) {
+                    const s = await send(`/${j.id}/submit`, 'POST');
+                    if (!s) { await refresh(); return; }
+                }
+                addToast(t('chgSaved'), 'success');
+                setForm(null);
+                await refresh();
+            };
+
+            const edit = (p) => setForm({
+                id: p.id, title: p.title, description: p.description || '',
+                kind: (p.scope || {}).kind || 'guests', targets: ((p.scope || {}).targets || []).join(', '),
+                start: chgToLocal(p.window_start), end: chgToLocal(p.window_end),
+            });
+
+            const kindText = (k) => t(CHG_KIND_KEYS[k] || 'chgKindGuests');
+            const blockedText = (p) => {
+                const key = 'chgBlocked' + (p.approve_blocked || '').replace(/^./, c => c.toUpperCase());
+                const txt = t(key);
+                return txt !== key ? txt : (p.approve_blocked_reason || '');
+            };
+            const input = 'w-full px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm';
+            const writable = !haReadOnly;
+
+            return (
+                <div className="space-y-4" data-changes-tab>
+                    <div className="flex items-center justify-between flex-wrap gap-2">
+                        <div>
+                            <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+                                <Icons.ClipboardList className="w-5 h-5 text-orange-400" />
+                                {t('chgTitle')}
+                            </h2>
+                            <p className="text-xs text-gray-500 mt-0.5">{t('chgDesc')}</p>
+                        </div>
+                        <div className="flex gap-2">
+                            <select value={filter} onChange={e => setFilter(e.target.value)} data-change-filter
+                                className="px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm">
+                                <option value="">{t('chgAllStatus')}</option>
+                                {CHG_STATES.map(s => <option key={s} value={s}>{t(CHG_STATE_KEYS[s])}</option>)}
+                            </select>
+                            {canRequest && writable && (
+                                <button data-change-new onClick={() => setForm(Object.assign({}, CHG_EMPTY_FORM))} disabled={!clusterId}
+                                    className="px-3 py-1.5 bg-orange-500 hover:bg-orange-600 rounded-lg text-sm text-white flex items-center gap-1.5 disabled:opacity-50">
+                                    <Icons.Plus className="w-3.5 h-3.5" />
+                                    {t('chgNew')}
+                                </button>
+                            )}
+                            <button onClick={refresh} disabled={busy}
+                                className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm text-white flex items-center gap-1.5 disabled:opacity-50">
+                                {busy ? <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" /> : <Icons.RefreshCw className="w-3.5 h-3.5" />}
+                                {t('refresh')}
+                            </button>
+                        </div>
+                    </div>
+
+                    {!clusterId && (
+                        <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-6 text-center text-sm text-gray-500">{t('chgNeedCluster')}</div>
+                    )}
+
+                    {form && (
+                        <div data-change-form className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 space-y-3">
+                            <div className="text-sm font-semibold text-white">{form.id ? t('chgFormEdit') : t('chgFormNew')}</div>
+                            <div>
+                                <label className="text-xs text-gray-400">{t('chgFieldTitle')}</label>
+                                <input data-change-field="title" value={form.title} maxLength={200} className={input}
+                                    onChange={e => setForm({ ...form, title: e.target.value })} />
+                            </div>
+                            <div>
+                                <label className="text-xs text-gray-400">{t('chgFieldDesc')}</label>
+                                <textarea data-change-field="description" value={form.description} rows={3} className={input}
+                                    onChange={e => setForm({ ...form, description: e.target.value })} />
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div>
+                                    <label className="text-xs text-gray-400">{t('chgFieldKind')}</label>
+                                    <select data-change-field="kind" value={form.kind} className={input}
+                                        onChange={e => setForm({ ...form, kind: e.target.value })}>
+                                        {CHG_KINDS.map(k => <option key={k} value={k}>{kindText(k)}</option>)}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="text-xs text-gray-400">{t('chgFieldTargets')}</label>
+                                    {form.kind === 'cluster' ? (
+                                        <div className="text-xs text-gray-500 py-2">{t('chgTargetsCluster')}</div>
+                                    ) : (
+                                        <input data-change-field="targets" value={form.targets} className={input}
+                                            placeholder={form.kind === 'guests' ? t('chgTargetsGuests') : t('chgTargetsNames')}
+                                            onChange={e => setForm({ ...form, targets: e.target.value })} />
+                                    )}
+                                </div>
+                                <div>
+                                    <label className="text-xs text-gray-400">{t('chgFieldStart')}</label>
+                                    <input type="datetime-local" data-change-field="start" value={form.start} className={input}
+                                        onChange={e => setForm({ ...form, start: e.target.value })} />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-gray-400">{t('chgFieldEnd')}</label>
+                                    <input type="datetime-local" data-change-field="end" value={form.end} className={input}
+                                        onChange={e => setForm({ ...form, end: e.target.value })} />
+                                </div>
+                            </div>
+                            <div className="text-[11px] text-gray-500">{t('chgWindowHint')}</div>
+                            <div className="flex gap-2 justify-end flex-wrap">
+                                <button data-change-close onClick={() => setForm(null)}
+                                    className="px-3 py-1.5 bg-proxmox-darker border border-proxmox-border rounded-lg text-sm text-gray-300 hover:text-white">
+                                    {t('chgClose')}
+                                </button>
+                                <button data-change-save onClick={() => save(false)} disabled={!form.title.trim()}
+                                    className="px-3 py-1.5 bg-proxmox-darker border border-proxmox-border rounded-lg text-sm text-gray-300 hover:text-white disabled:opacity-50">
+                                    {t('chgSaveDraft')}
+                                </button>
+                                <button data-change-save-submit onClick={() => save(true)} disabled={!form.title.trim()}
+                                    className="px-3 py-1.5 bg-orange-500 hover:bg-orange-600 rounded-lg text-sm text-white disabled:opacity-50">
+                                    {t('chgSaveSubmit')}
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {clusterId && plans.length === 0 ? (
+                        <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-6 text-center text-sm text-gray-500">{t('chgNone')}</div>
+                    ) : (
+                        <div className="space-y-3">
+                            {plans.map(p => {
+                                const can = p.can || {};
+                                const sc = p.scope || {};
+                                const showApprove = p.status === 'submitted' && (can.approve || (p.approve_blocked && p.approve_blocked !== 'no_permission'));
+                                return (
+                                    <div key={p.id} data-change={p.id} data-change-state={p.display_status}
+                                         className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 space-y-2">
+                                        <div className="flex items-start justify-between gap-2 flex-wrap">
+                                            <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                                                <span className="text-sm font-semibold text-white break-words">{p.title}</span>
+                                                <span data-change-badge className={`px-1.5 py-0.5 text-[10px] rounded ${CHG_STATE_COLORS[p.display_status] || CHG_STATE_COLORS.draft}`}>
+                                                    {t(CHG_STATE_KEYS[p.display_status] || 'chgStDraft')}
+                                                </span>
+                                                <span className="px-1.5 py-0.5 text-[10px] rounded bg-blue-500/15 text-blue-400">{kindText(sc.kind)}</span>
+                                                {(sc.targets || []).length > 0 && (
+                                                    <span className="text-[11px] text-gray-400 font-mono break-all">{(sc.targets || []).join(', ')}</span>
+                                                )}
+                                            </div>
+                                            <div className="flex items-center gap-2 flex-wrap">
+                                                {writable && can.edit && (
+                                                    <button data-change-action="edit" onClick={() => edit(p)}
+                                                        className="text-[11px] px-2 py-0.5 bg-proxmox-darker border border-proxmox-border rounded text-gray-300 hover:text-white">{t('chgEdit')}</button>
+                                                )}
+                                                {writable && can.submit && (
+                                                    <button data-change-action="submit" onClick={() => act(p, 'submit')}
+                                                        className="text-[11px] px-2 py-0.5 bg-orange-500/80 hover:bg-orange-600 rounded text-white">{t('chgSubmit')}</button>
+                                                )}
+                                                {writable && showApprove && (
+                                                    <button data-change-action="approve" disabled={!can.approve}
+                                                        title={can.approve ? undefined : blockedText(p)} onClick={() => act(p, 'approve')}
+                                                        className="text-[11px] px-2 py-0.5 bg-green-600/80 hover:bg-green-600 rounded text-white disabled:opacity-40 disabled:cursor-not-allowed">{t('chgApprove')}</button>
+                                                )}
+                                                {writable && showApprove && (
+                                                    <button data-change-action="reject" disabled={!can.reject}
+                                                        title={can.reject ? undefined : blockedText(p)} onClick={() => { setRejecting(p.id); setReason(''); }}
+                                                        className="text-[11px] px-2 py-0.5 bg-red-500/20 border border-red-500/30 rounded text-red-300 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed">{t('chgReject')}</button>
+                                                )}
+                                                {writable && can.done && (
+                                                    <button data-change-action="done" onClick={() => act(p, 'done')}
+                                                        className="text-[11px] px-2 py-0.5 bg-blue-500/20 border border-blue-500/30 rounded text-blue-300 hover:text-white">{t('chgDone')}</button>
+                                                )}
+                                                {writable && can.cancel && (
+                                                    <button data-change-action="cancel" onClick={() => act(p, 'cancel')}
+                                                        className="text-[11px] px-2 py-0.5 bg-proxmox-darker border border-proxmox-border rounded text-gray-300 hover:text-white">{t('chgCancel')}</button>
+                                                )}
+                                            </div>
+                                        </div>
+                                        {p.description && <div className="text-xs text-gray-400 whitespace-pre-wrap break-words">{p.description}</div>}
+                                        <div className="text-[11px] text-gray-500 flex flex-wrap gap-x-4 gap-y-1">
+                                            <span data-change-window>{p.window_start && p.window_end
+                                                ? chgFill(t, 'chgWindowText', { start: chgShow(p.window_start), end: chgShow(p.window_end) })
+                                                : t('chgNoWindow')}</span>
+                                            <span>{chgFill(t, 'chgBy', { name: p.requested_by })}</span>
+                                            {p.approved_by && <span>{chgFill(t, 'chgApprovedBy', { name: p.approved_by })}</span>}
+                                            {p.rejected_by && <span>{chgFill(t, 'chgRejectedBy', { name: p.rejected_by, reason: p.reject_reason })}</span>}
+                                        </div>
+                                        {p.status === 'submitted' && !can.approve && p.approve_blocked && p.approve_blocked !== 'no_permission' && (
+                                            <div data-change-blocked={p.approve_blocked} className="text-[11px] text-yellow-400">{blockedText(p)}</div>
+                                        )}
+                                        {rejecting === p.id && (
+                                            <div data-change-reject-form className="flex items-center gap-2 flex-wrap">
+                                                <input data-change-reason value={reason} maxLength={500} onChange={e => setReason(e.target.value)}
+                                                    placeholder={t('chgRejectReason')} className={input + ' md:w-96'} />
+                                                <button data-change-reject-confirm disabled={!reason.trim()} onClick={() => act(p, 'reject', { reason })}
+                                                    className="text-[11px] px-2 py-1 bg-red-500/80 hover:bg-red-600 rounded text-white disabled:opacity-50">{t('chgReject')}</button>
+                                                <button onClick={() => setRejecting(null)}
+                                                    className="text-[11px] px-2 py-1 bg-proxmox-darker border border-proxmox-border rounded text-gray-300 hover:text-white">{t('chgClose')}</button>
+                                            </div>
+                                        )}
+                                    </div>
+                                );
+                            })}
+                        </div>
                     )}
                 </div>
             );
@@ -13010,6 +13327,17 @@
             const [topVms, setTopVms] = useState([]);
             const [reportSubTab, setReportSubTab] = useState('summary');
             const [complianceSubTab, setComplianceSubTab] = useState('hardening');
+            // NS Oct 2026 - hardening and drift read with admin.audit or node.maintenance, the change
+            // plans with changes.view; each account gets the sub tabs it can read
+            const complianceSubs = [
+                ...((holds('admin.audit') || holds('node.maintenance')) ? [
+                    { id: 'hardening', label: t('compliance') || 'Compliance', icon: Icons.Lock },
+                    { id: 'drift', label: t('driftDetection') || 'Drift Detection', icon: Icons.Shield },
+                ] : []),
+                ...(holds('changes.view') ? [{ id: 'changes', label: t('chgTab'), icon: Icons.ClipboardList }] : []),
+            ];
+            const complianceSub = complianceSubs.some(x => x.id === complianceSubTab)
+                ? complianceSubTab : ((complianceSubs[0] || {}).id || '');
 
             // MK: CVE Scanner state
             const [cveResults, setCveResults] = useState(null);
@@ -20389,7 +20717,7 @@
                                                 if (tab.id === 'site-recovery') return can('site_recovery.view');
                                                 if (tab.id === 'plugins') return can('plugins.view');
                                                 // compliance only reads, so a standby keeps it (#625)
-                                                if (tab.id === 'compliance') return holds('admin.audit') || holds('node.maintenance');
+                                                if (tab.id === 'compliance') return holds('admin.audit') || holds('node.maintenance') || holds('changes.view');
                                                 if (typeof tab.id === 'string' && tab.id.startsWith('plugin:')) return can('plugins.view');
                                                 return true;
                                             }).map(tab => (
@@ -23488,17 +23816,15 @@
                                                     ? 'corp-tab-strip'
                                                     : 'flex items-center gap-1 border-b border-proxmox-border pb-2'
                                                 }>
-                                                    {[
-                                                        { id: 'hardening', label: t('compliance') || 'Compliance', icon: Icons.Lock },
-                                                        { id: 'drift', label: t('driftDetection') || 'Drift Detection', icon: Icons.Shield },
-                                                    ].map(sub => (
+                                                    {complianceSubs.map(sub => (
                                                         <button
                                                             key={sub.id}
+                                                            data-compliance-sub={sub.id}
                                                             onClick={() => setComplianceSubTab(sub.id)}
                                                             className={isCorporate
-                                                                ? `flex items-center gap-1 ${complianceSubTab === sub.id ? 'active' : ''}`
+                                                                ? `flex items-center gap-1 ${complianceSub === sub.id ? 'active' : ''}`
                                                                 : `flex items-center gap-2 px-4 py-2 rounded-lg text-sm transition-colors ${
-                                                                    complianceSubTab === sub.id
+                                                                    complianceSub === sub.id
                                                                         ? 'bg-proxmox-orange text-white'
                                                                         : 'text-gray-400 hover:text-white hover:bg-proxmox-hover'
                                                                   }`
@@ -23509,7 +23835,7 @@
                                                     ))}
                                                 </div>
 
-                                                {complianceSubTab === 'hardening' && (
+                                                {complianceSub === 'hardening' && (
                                                     <ComplianceDashboardTab
                                                         clusters={clusters}
                                                         selectedCluster={selectedCluster}
@@ -23520,7 +23846,16 @@
                                                         user={user}
                                                     />
                                                 )}
-                                                {complianceSubTab === 'drift' && (
+                                                {complianceSub === 'changes' && (
+                                                    <ChangesTab
+                                                        clusterId={selectedCluster?.id}
+                                                        authFetch={authFetch}
+                                                        addToast={addToast}
+                                                        t={t}
+                                                        canRequest={holds('changes.request')}
+                                                    />
+                                                )}
+                                                {complianceSub === 'drift' && (
                                                     <DriftTab
                                                         clusterId={selectedCluster?.id}
                                                         clusterName={selectedCluster?.name}

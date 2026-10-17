@@ -383,7 +383,7 @@
         }
 
         // ── side nav (collapsible, grouped) ────────────────────────
-        function CloudSideNav({ active, onSelect, isAdmin, canAutoInstall, collapsed, onToggle }) {
+        function CloudSideNav({ active, onSelect, isAdmin, canAutoInstall, canChanges, collapsed, onToggle }) {
             const { t } = useTranslation();
             const groups = [
                 { label: 'DASHBOARD', items: [{ id: 'overview', label: 'Overview', icon: 'Grid' }] },
@@ -441,6 +441,8 @@
                     { id: 'tasks', label: 'Tasks', icon: 'ClipboardList' },
                     // LW Oct 2026 - the flight recorder of the selected cluster
                     { id: 'timeline', label: t('tlTab'), icon: 'Clock' },
+                    // NS Oct 2026 - change plans of the selected cluster, for whoever may see them
+                    ...(canChanges ? [{ id: 'changes', label: t('chgTab'), icon: 'ClipboardList' }] : []),
                 ] },
             ];
             if (isAdmin) {
@@ -2422,6 +2424,8 @@
             // even a forwarding one: the answer URL it would show is this instance's own.
             const { ha, haStandby, haConsolesElsewhere } = useAuth();
             const canAutoInstall = !!(currentUser && currentUser.autoinstall_access) && !haStandby;
+            const holdsPerm = (perm) => !!isAdmin || (Array.isArray(currentUser && currentUser.permissions) && currentUser.permissions.includes(perm));
+            const canChanges = holdsPerm('changes.view');
 
             // PegaProx t() ECHOES the key back on a miss, so `t('cloud.x') || 'Fallback'`
             // would render the raw key. treat key-echo as "no translation". -- NS
@@ -2517,6 +2521,7 @@
                 cve: T('cveScanner') || 'CVE Scanner',
                 tasks: T('cloud.tasks') || 'Tasks',
                 timeline: T('tlTab') || 'Timeline',
+                changes: T('chgTab') || 'Changes',
                 users: T('cloud.users') || 'Users',
                 settings: T('cloud.settings') || 'Settings',
             };
@@ -2653,6 +2658,11 @@
                     case 'timeline':
                         body = <div className="cloud-mounted"><TimelineView key={cid} clusterId={cid} authFetch={authFetch} t={t} /></div>;
                         break;
+                    case 'changes':
+                        body = canChanges
+                            ? <div className="cloud-mounted"><ChangesTab clusterId={cid} authFetch={authFetch} addToast={addToast} t={t} canRequest={holdsPerm('changes.request')} /></div>
+                            : <CloudDashboard clusters={safeClusters} resources={safeResources} metrics={clusterMetrics} dcStatus={dcStatus} tasks={tasks} onNav={selectSection} t={T} />;
+                        break;
                     case 'drift':
                         body = <div className="cloud-mounted"><DriftTab clusterId={cid} clusterName={selectedCluster && selectedCluster.name} authFetch={authFetch} addToast={addToast} t={T} isAdmin={isAdmin} /></div>;
                         break;
@@ -2700,7 +2710,7 @@
 
             return (
                 <div className="cloud-shell">
-                    <CloudSideNav active={section} onSelect={selectSection} isAdmin={!!isAdmin} canAutoInstall={canAutoInstall} collapsed={collapsed} onToggle={() => setCollapsed(c => !c)} />
+                    <CloudSideNav active={section} onSelect={selectSection} isAdmin={!!isAdmin} canAutoInstall={canAutoInstall} canChanges={canChanges} collapsed={collapsed} onToggle={() => setCollapsed(c => !c)} />
                     <div className="cloud-content">
                         <CloudTopbar
                             crumbs={crumbs}
