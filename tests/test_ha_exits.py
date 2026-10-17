@@ -499,6 +499,7 @@ def test_the_count_of_each_exit_is_the_one_listed():
 
 
 def test_the_inventory_counts_what_the_report_says():
+    """Keep the documented exit totals aligned with the audited inventory."""
     assert {v for _n, v in EXITS.values()} <= VERDICTS
     by = Counter()
     for (_f, _q, kind), (n, verdict) in EXITS.items():
