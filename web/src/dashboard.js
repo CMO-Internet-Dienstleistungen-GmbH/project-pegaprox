@@ -8,6 +8,101 @@
         // backups) deliberately don't pass a timeout and are therefore unaffected.
         const POLL_TIMEOUT_MS = 12000;
 
+        /**
+         * Combine a datastore's GC schedule with only the PBS jobs targeting that store.
+         * All inputs come from the PBS datastore and jobs reads already used by this view.
+         * @param {string} store - The selected datastore name.
+         * @param {Object|undefined} datastore - Its PBS configuration and status.
+         * @param {Object|undefined} jobs - PBS sync, verify and prune job lists.
+         * @returns {Array<{kind: string, id: string, schedule: string, lastRun: number|null, disabled: boolean}>}
+         */
+        function pbsDatastoreScheduleRows(store, datastore, jobs) {
+            if (!store || !datastore) return [];
+            const gcJob = datastore['gc-job'] || {};
+            const rows = [{
+                kind: 'gc', id: '', schedule: gcJob.schedule ?? datastore['gc-schedule'] ?? '',
+                lastRun: gcJob['last-run-endtime'] ?? null, disabled: false,
+            }];
+            for (const kind of ['sync', 'verify', 'prune']) {
+                const list = Array.isArray(jobs?.[kind]) ? jobs[kind] : [];
+                for (const job of list) {
+                    if (!job || job.store !== store) continue;
+                    rows.push({
+                        kind, id: job.id || '', schedule: job.schedule || '',
+                        lastRun: job['last-run-endtime'] ?? null,
+                        disabled: Boolean(job.disable),
+                    });
+                }
+            }
+            return rows;
+        }
+
+        function PbsJobReadError({ kind }) {
+            const { t } = useTranslation();
+            const labels = {
+                sync: t('pbsSyncJobs') || 'Sync Jobs',
+                verify: t('pbsVerifyJobs') || 'Verify Jobs',
+                prune: t('pbsPruneJobs') || 'Prune Jobs',
+            };
+            return <div role="alert" className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3 mb-3 text-sm text-yellow-300">
+                {t('pbsLoadAllDataError') || 'Could not load all data:'} {labels[kind]}
+            </div>;
+        }
+
+        /**
+         * Show the selected PBS datastore's configured schedules and last run times.
+         * @param {{store: string, datastore: Object|undefined, jobs: Object|undefined, error: boolean}} props
+         * @returns {JSX.Element|null}
+         */
+        function PbsDatastoreSchedules({ store, datastore, jobs, error }) {
+            const { t } = useTranslation();
+            const rows = pbsDatastoreScheduleRows(store, datastore, jobs);
+            if (!rows.length) return null;
+            const labels = {
+                gc: t('pbsGarbageCollection') || 'Garbage Collection',
+                sync: t('sync') || 'Sync',
+                verify: t('pbsVerify') || 'Verify',
+                prune: t('pbsPruneAction') || 'Prune',
+            };
+            return (
+                <div data-pbs-datastore-schedules={store}>
+                    <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
+                        {t('pbsJobsTab') || 'Jobs'} - {store}
+                    </h3>
+                    {error && <div role="alert" className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3 mb-3 text-sm text-yellow-300">
+                        {t('pbsLoadAllDataError') || 'Could not load all data:'} {t('pbsJobsTab') || 'Jobs'}
+                    </div>}
+                    {['sync', 'verify', 'prune'].filter(kind => jobs?.errors?.[kind]).map(kind => (
+                        <PbsJobReadError key={kind} kind={kind} />
+                    ))}
+                    <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-auto">
+                        <table className="w-full text-sm">
+                            <thead><tr className="border-b border-proxmox-border text-gray-500 text-xs">
+                                <th scope="col" className="text-left p-3">{t('type') || 'Type'}</th>
+                                <th scope="col" className="text-left p-3">{t('id') || 'ID'}</th>
+                                <th scope="col" className="text-left p-3">{t('schedule') || 'Schedule'}</th>
+                                <th scope="col" className="text-left p-3">{t('lastRun') || 'Last Run'}</th>
+                            </tr></thead>
+                            <tbody>
+                                {rows.map((row, i) => (
+                                    <tr key={`${row.kind}:${row.id}:${i}`} data-pbs-schedule-kind={row.kind}
+                                        className="border-b border-proxmox-border/50">
+                                        <td className="p-3 text-white font-medium">{labels[row.kind]}</td>
+                                        <td className="p-3 text-gray-300">{row.id || '-'}</td>
+                                        <td className="p-3 text-gray-400">
+                                            {row.schedule || (t('manual') || 'Manual')}
+                                            {row.disabled && <> <span className="text-yellow-400">({t('disabled') || 'Disabled'})</span></>}
+                                        </td>
+                                        <td className="p-3 text-gray-500">{row.lastRun ? fmtDate(row.lastRun * 1000) : '-'}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            );
+        }
+
         // LW Oct 2026 - PBS keeps a datastore's GC counters (gc-status, in the usage list) apart
         // from when GC ran (gc-job, from /admin/gc). Neither has a dedup factor: PBS shows the
         // index size over the bytes on disk, so we do the same
@@ -12740,7 +12835,12 @@
             const [pbsSnapshots, setPbsSnapshots] = useState([]);
             const [pbsGroups, setPbsGroups] = useState([]);
             const [pbsTasks, setPbsTasks] = useState([]);
-            const [pbsJobs, setPbsJobs] = useState({});
+            const [pbsJobsResult, setPbsJobsResult] = useState({ id: null, data: {}, error: false });
+            const pbsJobsSeq = React.useRef(0);
+            const selectedPBSIdRef = React.useRef(null);
+            selectedPBSIdRef.current = selectedPBS?.id ?? null;
+            const pbsJobs = pbsJobsResult.id === selectedPBS?.id ? pbsJobsResult.data : {};
+            const pbsJobsError = pbsJobsResult.id === selectedPBS?.id && pbsJobsResult.error;
             const [pbsActiveTab, setPbsActiveTab] = useState('dashboard');
             // NS May 2026 — VM backup status map (vmid -> {status, last_age, ...})
             const [vmsBackupStatus, setVmsBackupStatus] = useState({});
@@ -16443,11 +16543,29 @@
                 } catch (e) { console.warn('PBS tasks error:', e); }
             };
             
+            /**
+             * Read PBS jobs with status, keeping late replies from a previous server out of view.
+             * @param {string} pbsId - The PBS server whose jobs are requested.
+             * @returns {Promise<void>}
+             */
             const fetchPBSJobs = async (pbsId) => {
+                const seq = ++pbsJobsSeq.current;
                 try {
                     const resp = await authFetch(`${API_URL}/pbs/${pbsId}/jobs`);
-                    if (resp && resp.ok) setPbsJobs(await resp.json());
-                } catch (e) { console.warn('PBS jobs error:', e); }
+                    if (resp && resp.ok) {
+                        const jobs = await resp.json();
+                        if (seq === pbsJobsSeq.current) {
+                            setPbsJobsResult({ id: pbsId, data: jobs, error: false });
+                        }
+                    } else if (seq === pbsJobsSeq.current) {
+                        setPbsJobsResult({ id: pbsId, data: {}, error: true });
+                    }
+                } catch (e) {
+                    console.warn('PBS jobs error:', e);
+                    if (seq === pbsJobsSeq.current) {
+                        setPbsJobsResult({ id: pbsId, data: {}, error: true });
+                    }
+                }
             };
 
             // MK Apr 2026: #273 — PBS Reports fetchers
@@ -16695,6 +16813,7 @@
                     const interval = setInterval(() => {
                         fetchPBSStatus(selectedPBS.id);
                         fetchPBSDatastores(selectedPBS.id);
+                        fetchPBSJobs(selectedPBS.id);
                     }, 30000);
                     return () => clearInterval(interval);
                 }
@@ -16848,15 +16967,26 @@
                 } catch (e) { addToast(`${action} error: ${e.message}`, 'error'); }
             };
             
+            /**
+             * Start a PBS job and refresh its server's tasks and last-run status.
+             * @param {'sync'|'verify'|'prune'} jobType - PBS job kind.
+             * @param {string} jobId - Job to run.
+             * @returns {Promise<void>}
+             */
             const pbsRunJob = async (jobType, jobId) => {
                 if (!selectedPBS) return;
+                const pbsId = selectedPBS.id;
                 try {
-                    const resp = await authFetch(`${API_URL}/pbs/${selectedPBS.id}/jobs/${jobType}/${jobId}/run`, {
+                    const resp = await authFetch(`${API_URL}/pbs/${pbsId}/jobs/${jobType}/${jobId}/run`, {
                         method: 'POST',
                     });
                     if (resp && resp.ok) {
                         addToast(`${jobType} job '${jobId}' started`, 'success');
-                        setTimeout(() => fetchPBSTasks(selectedPBS.id), 1000);
+                        setTimeout(() => {
+                            if (selectedPBSIdRef.current !== pbsId) return;
+                            fetchPBSTasks(pbsId);
+                            fetchPBSJobs(pbsId);
+                        }, 1000);
                     } else {
                         const err = resp ? await resp.json().catch(() => ({})) : {};
                         addToast(`Job failed: ${err.error || 'unknown'}`, 'error');
@@ -16876,7 +17006,7 @@
             };
             
             
-            // PBS prune dialog  
+            // PBS prune dialog
             const [showPbsPrune, setShowPbsPrune] = useState(null);
             
             // ============================================================
@@ -25180,6 +25310,13 @@
                                                                 );
                                                             })()}
 
+                                                            <PbsDatastoreSchedules
+                                                                store={pbsSelectedStore}
+                                                                datastore={pbsDatastores.find(d => (d.name || d.store) === pbsSelectedStore)}
+                                                                jobs={pbsJobs}
+                                                                error={pbsJobsError}
+                                                            />
+
                                                             {/* Backup Groups */}
                                                             <div>
                                                                 <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">{t('pbsBackupGroups') || 'Backup Groups'} ({pbsGroups.length})</h3>
@@ -25412,10 +25549,13 @@
                                         {/* Jobs Tab */}
                                         {pbsActiveTab === 'jobs' && (
                                             <div className="space-y-6">
+                                                {pbsJobsError && <div role="alert" className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3 text-sm text-yellow-300">
+                                                    {t('pbsLoadAllDataError') || 'Could not load all data:'} {t('pbsJobsTab') || 'Jobs'}
+                                                </div>}
                                                 {/* Sync Jobs */}
                                                 <div>
                                                     <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">{t('pbsSyncJobs') || 'Sync Jobs'} ({(pbsJobs.sync || []).length})</h3>
-                                                    {(pbsJobs.sync || []).length > 0 ? (
+                                                    {pbsJobs.errors?.sync ? <PbsJobReadError kind="sync" /> : (pbsJobs.sync || []).length > 0 ? (
                                                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                             <table className="w-full text-sm">
                                                                 <thead><tr className="border-b border-proxmox-border text-gray-500 text-xs">
@@ -25448,7 +25588,7 @@
                                                 {/* Verify Jobs */}
                                                 <div>
                                                     <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">{t('pbsVerifyJobs') || 'Verify Jobs'} ({(pbsJobs.verify || []).length})</h3>
-                                                    {(pbsJobs.verify || []).length > 0 ? (
+                                                    {pbsJobs.errors?.verify ? <PbsJobReadError kind="verify" /> : (pbsJobs.verify || []).length > 0 ? (
                                                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                             <table className="w-full text-sm">
                                                                 <thead><tr className="border-b border-proxmox-border text-gray-500 text-xs">
@@ -25481,7 +25621,7 @@
                                                 {/* Prune Jobs */}
                                                 <div>
                                                     <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">{t('pbsPruneJobs') || 'Prune Jobs'} ({(pbsJobs.prune || []).length})</h3>
-                                                    {(pbsJobs.prune || []).length > 0 ? (
+                                                    {pbsJobs.errors?.prune ? <PbsJobReadError kind="prune" /> : (pbsJobs.prune || []).length > 0 ? (
                                                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                             <table className="w-full text-sm">
                                                                 <thead><tr className="border-b border-proxmox-border text-gray-500 text-xs">
