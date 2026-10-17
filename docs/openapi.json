@@ -21109,7 +21109,8 @@
             "description": "Insufficient permissions"
           }
         },
-        "summary": "List all PBS jobs (sync, verify, prune)",
+        "summary": "List PBS sync, verify and prune jobs with schedule and last-run status.",
+        "description": "A failed PBS read must not look like an empty configured-job list.",
         "parameters": [
           {
             "name": "pbs_id",
