@@ -1749,13 +1749,13 @@ def test_the_node_handlers_refuse_on_a_standby(dash):
     """Anything left that still reaches them: refused with the toast, before a question
     is asked or a request goes out."""
     guard = 'if (haReadOnly) { haRefusedRef.current?.(); return; }'
-    for head in ('const handleMaintenanceToggle = async (nodeName, enable, options) => {',
+    for head in ('const handleMaintenanceToggle = async (nodeName, enable, options, forCluster) => {',
                  'const handleStartUpdate = async (nodeName, reboot) => {',
                  'const handleNodeAction = async (nodeName, action) => {',
                  'const handleForceStop = async (resource) => {'):
         body = _block(dash, head, '\n            };')
         assert guard in body, head
-        later = [i for i in (body.find('confirm('), body.find('authFetch(')) if i >= 0]
+        later = [i for i in (body.find('confirm('), body.find('authFetch('), body.find('setMaintDialog(')) if i >= 0]
         assert later and body.index(guard) < min(later), head
 
 
