@@ -2162,6 +2162,12 @@
             );
         }
 
+        // NS Oct 2026 - "1 guests": a wording about a count of one has its own key, <key>_one,
+        // in every language (where a language has no singular form it says the same)
+        function countKey(t, key, n) {
+            return String(n) === '1' && t(key + '_one') !== key + '_one' ? key + '_one' : key;
+        }
+
         // NS Oct 2026 - what a reason of the server says in the user's language. The preflight
         // (prefix 'pf_') and the what-if verdict ('wiv_') send {code, args, text}: the wording of
         // the code comes from t(prefix + code) with {name} filled from args. The English text of
@@ -2170,7 +2176,7 @@
         // A reason with a variant has its own key, pf_<code>_<variant>.
         function sayReason(t, prefix, r) {
             const args = r.args || {};
-            const key = prefix + r.code + (r.variant ? '_' + r.variant : '');
+            const key = countKey(t, prefix + r.code + (r.variant ? '_' + r.variant : ''), args.count);
             const wording = t(key);
             if (!wording || wording === key) return r.text || '';
             const need = (wording.match(/\{\w+\}/g) || []).map(m => m.slice(1, -1));
@@ -2305,8 +2311,8 @@
                             )}
                             {report && (<>
                                 <WhatIfVerdictLine verdict={report.verdict} />
-                                <p className={line} data-testid="maint-moves">{fill(t('maintDlgMoves'), { n: moving })}</p>
-                                {down.length > 0 && <p className="text-xs text-red-400" data-testid="maint-down">{fill(t('maintDlgStay'), { n: down.length })}: {named(down)}</p>}
+                                <p className={line} data-testid="maint-moves">{fill(t(countKey(t, 'maintDlgMoves', moving)), { n: moving })}</p>
+                                {down.length > 0 && <p className="text-xs text-red-400" data-testid="maint-down">{fill(t(countKey(t, 'maintDlgStay', down.length)), { n: down.length })}: {named(down)}</p>}
                                 {crit.length > 0 && (
                                     <p className={line} data-testid="maint-critical">
                                         <span className="text-white">{t('maintDlgCritical')}:</span> {named(crit)}
@@ -2314,7 +2320,7 @@
                                 )}
                                 {unproven.length > 0 && (
                                     <p className={line} data-testid="maint-unproven">
-                                        <span className="text-white">{fill(t('maintDlgUnproven'), { n: unproven.length })}:</span> {named(unproven)}
+                                        <span className="text-white">{fill(t(countKey(t, 'maintDlgUnproven', unproven.length)), { n: unproven.length })}:</span> {named(unproven)}
                                     </p>
                                 )}
                                 {tenants.length > 0 && (

@@ -1783,12 +1783,22 @@ VERDICT_TEXT = {
     'headroom_over': '{count} failure combinations leave nodes over their threshold',
     'tenants_assumed': 'Tenants are counted per cluster, not per guest: {tenants}',
 }
+# the same lines for a count of one
+VERDICT_TEXT_ONE = {
+    'guests_down': '1 guest cannot be placed anywhere and stays down',
+    'headroom_unplaced': 'In 1 failure combination guests cannot be placed on the nodes left',
+    'headroom_quorum': 'In 1 failure combination the cluster loses quorum',
+    'critical_affected': '1 critical guest is affected: {names}',
+    'restore_unproven': '1 affected guest has no proven restore',
+    'headroom_over': '1 failure combination leaves nodes over its threshold',
+}
 VERDICT_NAMES = 5       # critical guests named in the line, the rest is a count
 
 
 def _vreason(level, code, **args):
+    text = VERDICT_TEXT_ONE.get(code) if args.get('count') == 1 else None
     return {'level': level, 'code': code, 'args': args,
-            'text': VERDICT_TEXT[code].format(**{k: _say(v) for k, v in args.items()})}
+            'text': (text or VERDICT_TEXT[code]).format(**{k: _say(v) for k, v in args.items()})}
 
 
 def verdict(report):

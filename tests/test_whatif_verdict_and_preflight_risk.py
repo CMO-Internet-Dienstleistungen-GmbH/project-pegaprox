@@ -64,7 +64,7 @@ def test_a_guest_that_stays_down_blocks(lab):
     v = r['verdict']
     assert v['level'] == 'blocked' and v['reasons'][0]['code'] == 'guests_down'
     assert v['reasons'][0]['args'] == {'count': 1} and v['reasons'][0]['level'] == 'blocked'
-    assert v['reasons'][0]['text'] == '1 guests cannot be placed anywhere and stay down'
+    assert v['reasons'][0]['text'] == '1 guest cannot be placed anywhere and stays down'
 
 
 def test_a_critical_guest_warns_and_is_named(lab):
@@ -365,3 +365,18 @@ def test_the_codes_have_translations_in_every_language():
         assert len(re.findall(rf"\b{key}:", text)) == 9, key
     for code in whatif.VERDICT_TEXT:
         assert len(re.findall(rf"\bwiv_{code}:", text)) == 9, code
+
+
+def test_a_count_of_one_reads_as_one():
+    # "1 guests": every counted line has a wording of its own for one, on the server and in
+    # each of the nine languages (where a language has no singular it says the same)
+    for code in whatif.VERDICT_TEXT_ONE:
+        one = whatif._vreason('warning', code, count=1, names='a', nodes='n', tenants='t')['text']
+        many = whatif._vreason('warning', code, count=2, names='a', nodes='n', tenants='t')['text']
+        assert one.startswith(('1 ', 'In 1 ')) and one != many.replace('2', '1', 1), (code, one)
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            'web', 'src', 'translations.js'), encoding='utf-8').read()
+    for key in ("wiv_" + c for c in whatif.VERDICT_TEXT_ONE):
+        assert len(re.findall(r"^ +%s_one: '" % key, src, re.M)) == 9, key
+    for key in ('maintDlgMoves', 'maintDlgStay', 'maintDlgUnproven'):
+        assert len(re.findall(r"^ +%s_one: '" % key, src, re.M)) == 9, key

@@ -34,12 +34,12 @@ def _report(level, reasons=(), guests=None, over=()):
 
 WARN = _report('warning', [
     {'level': 'warning', 'code': 'critical_affected', 'args': {'count': 1, 'names': 'billing-db'},
-     'text': '1 critical guests are affected: billing-db'},
+     'text': '1 critical guest is affected: billing-db'},
     {'level': 'warning', 'code': 'restore_unproven', 'args': {'count': 1},
-     'text': '1 affected guests have no proven restore'}], over=('pve1',))
+     'text': '1 affected guest has no proven restore'}], over=('pve1',))
 BLOCKED = _report('blocked', [
     {'level': 'blocked', 'code': 'guests_down', 'args': {'count': 1},
-     'text': '1 guests cannot be placed anywhere and stay down'}],
+     'text': '1 guest cannot be placed anywhere and stays down'}],
     guests=[_row(100, 'billing-db', critical=True), _row(102, 'legacy', outcome='down', target=None)])
 
 
@@ -97,7 +97,7 @@ def test_runtime_the_dialog_shows_the_verdict_and_the_critical_guest(opened, lay
     verdict.wait_for(timeout=5000)
     assert verdict.get_attribute('data-verdict') == 'warning'
     assert 'Warning' in verdict.inner_text()
-    assert '1 critical guests are affected: billing-db' in verdict.inner_text()
+    assert '1 critical guest is affected: billing-db' in verdict.inner_text()
     assert 'billing-db' in dialog.locator('[data-testid="maint-critical"]').inner_text()
     assert dialog.locator('[data-testid="maint-moves"]').inner_text().startswith('2 guests move')
     assert 'web01' in dialog.locator('[data-testid="maint-unproven"]').inner_text()
