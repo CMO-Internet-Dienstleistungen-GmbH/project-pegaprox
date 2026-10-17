@@ -6385,6 +6385,76 @@
             );
         }
 
+        // NS Oct 2026 - the evidence bundle of the cluster timeline: download what the page shows
+        // (window and filters) as a signed file, or hand such a file back and see whether this
+        // instance signed it unchanged. Shown on the cluster timeline only; a node or a guest
+        // view has no bundle of its own.
+        function TimelineEvidence({ clusterId, authFetch, t, getQuery }) {
+            const [busy, setBusy] = React.useState(false);
+            const [verdict, setVerdict] = React.useState(null);
+            const fetchRef = React.useRef(authFetch);
+            fetchRef.current = authFetch;
+
+            const download = async () => {
+                setBusy(true); setVerdict(null);
+                try {
+                    const q = new URLSearchParams({ clusters: clusterId });
+                    const want = getQuery();
+                    if (want.from) q.set('from', want.from);
+                    if (want.kinds) q.set('kinds', want.kinds);
+                    if (want.severity) q.set('severity', want.severity);
+                    const r = await fetchRef.current(`${API_URL}/timeline/evidence?${q.toString()}`);
+                    if (!r || !r.ok) { setVerdict({ bad: true, text: t('flrExportFailed') }); return; }
+                    const blob = await r.blob();
+                    const named = /filename="([^"]+)"/.exec(r.headers.get('Content-Disposition') || '');
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = named ? named[1] : 'flight-recorder.json';
+                    document.body.appendChild(a);
+                    a.click();
+                    setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(a.href); }, 150);
+                } catch (e) {
+                    setVerdict({ bad: true, text: t('flrExportFailed') });
+                } finally {
+                    setBusy(false);
+                }
+            };
+
+            const check = async (file) => {
+                setVerdict(null);
+                if (!file) return;
+                try {
+                    const r = await fetchRef.current(`${API_URL}/timeline/evidence/verify`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: await file.text() });
+                    const v = r && r.ok ? await r.json().catch(() => null) : null;
+                    if (!v) { setVerdict({ bad: true, text: t('flrVerifyFailed') }); return; }
+                    setVerdict(v.valid ? { bad: false, text: t('flrVerifyValid') }
+                        : { bad: true, text: tlFill(t, 'flrVerifyInvalid', { reason: v.reason || '' }) });
+                } catch (e) {
+                    setVerdict({ bad: true, text: t('flrVerifyFailed') });
+                }
+            };
+
+            const btn = 'flex items-center gap-1 px-2 py-1 text-xs text-gray-300 hover:text-white border border-proxmox-border rounded';
+            return (
+                <div className="flex flex-wrap items-center gap-2" data-tl-evidence>
+                    <button type="button" onClick={download} disabled={busy} title={t('flrExportTitle')}
+                        className={`${btn} disabled:opacity-40`} data-tl-export>
+                        <Icons.Download />{t('flrExport')}
+                    </button>
+                    <label className={`${btn} cursor-pointer`}>
+                        <Icons.Check />{t('flrVerify')}
+                        <input type="file" accept="application/json,.json" className="hidden" data-tl-verify
+                            onChange={e => { check(e.target.files && e.target.files[0]); e.target.value = ''; }} />
+                    </label>
+                    {verdict && (
+                        <span className={`text-xs ${verdict.bad ? 'text-red-400' : 'text-green-400'}`}
+                            data-tl-verdict={verdict.bad ? 'bad' : 'ok'}>{verdict.text}</span>
+                    )}
+                </div>
+            );
+        }
+
         // LW Oct 2026 - the flight recorder: what happened on a cluster, a node or a guest in one
         // list, newest first (GET /api/timeline). What hangs under an event is correlation, the
         // same guest or node shortly before, and the page says so. Only reads, so a standby
@@ -6542,6 +6612,10 @@
                             </button>
                         </div>
                     </div>
+                    {!node && vmid == null && (
+                        <TimelineEvidence clusterId={clusterId} authFetch={authFetch} t={t}
+                            getQuery={() => ({ from: from.current || new Date(Date.now() - hours * 3600 * 1000).toISOString(), kinds: kind, severity })} />
+                    )}
                     {leaderAway && <div className="text-xs text-yellow-400" data-tl-leader-away>{t('pgHaLeaderAwayView')}</div>}
                     {failed && <div className="text-xs text-red-400" data-tl-error>{t('tlLoadError')}</div>}
                     {!loaded && !failed && !leaderAway && <div className="text-xs text-gray-500">{t('loading')}...</div>}
