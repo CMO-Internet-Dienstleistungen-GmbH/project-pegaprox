@@ -655,12 +655,13 @@ def _create_order(domain, email, ssl_dir, staging=False, directory_url=None):
 
 
 def request_certificate(domain, email, ssl_dir, staging=False, directory_url=None, challenge_type='http-01', dns_provider='manual', dns_config=None):
-    """
-    Request an ACME certificate via HTTP-01 challenge.
-    Supports Let's Encrypt and custom ACME endpoints (StepCA, etc).
+    """Request an ACME certificate via HTTP-01 or DNS-01 challenge.
+
+    Supports Let's Encrypt and custom ACME endpoints (StepCA, etc). ACME HTTPS
+    connections trust system CAs and honor explicit Requests CA bundle settings.
 
     Returns dict with 'success', 'message', optionally 'cert_path', 'key_path', 'expires'.
-    The caller must ensure /.well-known/acme-challenge/<token> is served on port 80.
+    For HTTP-01, the caller must serve /.well-known/acme-challenge/<token> on port 80.
     """
     try:
         if challenge_type == 'dns-01':
@@ -716,7 +717,7 @@ def request_certificate(domain, email, ssl_dir, staging=False, directory_url=Non
 
 
 def prepare_dns01_challenge(domain, email, ssl_dir, staging=False, directory_url=None, dns_provider='manual', dns_config=None):
-    """Prepare a DNS-01 challenge and return the TXT record the admin must create."""
+    """Prepare a DNS-01 TXT record, using system CA trust for ACME HTTPS calls."""
     try:
         context = _create_order(domain, email, ssl_dir, staging=staging, directory_url=directory_url)
         if not context.get('success'):
