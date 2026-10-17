@@ -31,12 +31,34 @@ _pending_challenges = {}
 _pending_dns_challenges = {}
 
 
-def _acme_verify():
-    """Trust system CAs for ACME, while keeping Requests' CA bundle overrides."""
-    if os.environ.get('REQUESTS_CA_BUNDLE') or os.environ.get('CURL_CA_BUNDLE'):
-        return True  # Requests applies these only when verify is True or None.
-    paths = ssl.get_default_verify_paths()
-    return paths.cafile or paths.capath or True
+def _acme_ssl_context():
+    """Trust the full system store as well as Requests' usual public CAs."""
+    context = ssl.create_default_context()
+    context.load_verify_locations(cafile=requests.certs.where())
+    return context
+
+
+class _AcmeTrustAdapter(requests.adapters.HTTPAdapter):
+    """Use system trust unless Requests receives an explicit CA bundle path."""
+
+    def __init__(self):
+        """Build a certificate-verifying context for ACME HTTPS requests."""
+        self._acme_context = _acme_ssl_context()
+        super().__init__()
+
+    def build_connection_pool_key_attributes(self, request, verify, cert=None):
+        """Keep Requests' bundle overrides ahead of the system trust context."""
+        host, pool = super().build_connection_pool_key_attributes(request, verify, cert)
+        if verify is True or verify is None:
+            pool['ssl_context'] = self._acme_context
+        return host, pool
+
+
+def _acme_request(method, url, **kwargs):
+    """Send an ACME request with system trust and Requests' environment overrides."""
+    with requests.Session() as session:
+        session.mount('https://', _AcmeTrustAdapter())
+        return session.request(method, url, **kwargs)
 
 
 def _b64url(data):
@@ -117,8 +139,9 @@ def _signed_request(url, payload, account_key, nonce, kid=None):
         'signature': _b64url(signature),
     }
     _guard_acme_url(url)
-    resp = requests.post(url, json=body, headers={'Content-Type': 'application/jose+json'},
-                         timeout=30, allow_redirects=False, verify=_acme_verify())
+    resp = _acme_request('POST', url, json=body,
+                         headers={'Content-Type': 'application/jose+json'},
+                         timeout=30, allow_redirects=False)
     return resp
 
 
@@ -146,9 +169,10 @@ def _guard_acme_url(url):
 
 
 def _get_nonce(directory):
+    """Fetch a replay nonce from the ACME server using the configured CA trust."""
     _guard_acme_url(directory['newNonce'])
-    resp = requests.head(directory['newNonce'], timeout=10, allow_redirects=False,
-                         verify=_acme_verify())
+    resp = _acme_request('HEAD', directory['newNonce'], timeout=10,
+                         allow_redirects=False)
     return resp.headers['Replay-Nonce']
 
 
@@ -588,8 +612,8 @@ def _create_order(domain, email, ssl_dir, staging=False, directory_url=None):
         return {'success': False, 'message': f'ACME directory URL rejected: {guard_err} '
                 '(set "Allow private/internal ACME CA" in SSL settings if this is an internal CA)'}
 
-    dir_resp = requests.get(acme_url, timeout=15, allow_redirects=False,
-                            verify=_acme_verify())  # M-8: no redirect to internal
+    dir_resp = _acme_request('GET', acme_url, timeout=15,
+                             allow_redirects=False)  # M-8: no redirect to internal
     dir_resp.raise_for_status()
     directory = dir_resp.json()
 
