@@ -62,24 +62,37 @@ def test_jobs_route_keeps_schedule_store_and_last_run_for_each_kind(pbs, admin):
         getattr(pbs, f'get_{kind}_jobs').assert_called_once_with()
 
 
-@pytest.mark.parametrize('upstream,expected_status,expected_code', [
-    ({'error': 'HTTP 403', 'status_code': 403}, 403, 'PBS_FORBIDDEN'),
-    ({'error': 'HTTP 500', 'status_code': 500}, 502, 'PBS_UPSTREAM'),
-    ({'error': 'Connection refused'}, 502, 'PBS_UNREACHABLE'),
-    ({'data': None}, 502, 'PBS_UPSTREAM'),
+@pytest.mark.parametrize('kind', ['sync', 'verify', 'prune'])
+@pytest.mark.parametrize('upstream,expected_code', [
+    ({'error': 'HTTP 403', 'status_code': 403}, 'PBS_FORBIDDEN'),
+    ({'error': 'HTTP 500', 'status_code': 500}, 'PBS_UPSTREAM'),
+    ({'error': 'Connection refused'}, 'PBS_UNREACHABLE'),
+    ({'data': None}, 'PBS_UPSTREAM'),
 ])
-def test_failed_job_listing_is_not_reported_as_empty(pbs, admin, upstream,
-                                                    expected_status, expected_code):
-    """A refusal or malformed response must not become a successful empty table."""
-    pbs.get_verify_jobs.return_value = upstream
+def test_failed_job_listing_keeps_other_kinds(pbs, admin, kind, upstream, expected_code):
+    getattr(pbs, f'get_{kind}_jobs').return_value = upstream
 
     response = admin.get(JOBS_PATH)
 
-    assert response.status_code == expected_status
-    assert response.get_json()['code'] == expected_code
-    pbs.get_sync_jobs.assert_called_once_with()
-    pbs.get_verify_jobs.assert_called_once_with()
-    pbs.get_prune_jobs.assert_not_called()
+    assert response.status_code == 200
+    assert response.get_json() == {
+        **JOB_LISTS, kind: [], 'errors': {kind: expected_code},
+    }
+    for name in JOB_LISTS:
+        getattr(pbs, f'get_{name}_jobs').assert_called_once_with()
+
+
+def test_all_job_listings_fail_with_explicit_errors(pbs, admin):
+    for kind in JOB_LISTS:
+        getattr(pbs, f'get_{kind}_jobs').return_value = {'error': 'HTTP 403', 'status_code': 403}
+
+    response = admin.get(JOBS_PATH)
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        'sync': [], 'verify': [], 'prune': [],
+        'errors': {kind: 'PBS_FORBIDDEN' for kind in JOB_LISTS},
+    }
 
 
 def test_caller_without_jobs_view_cannot_reach_pbs(api, seed, pbs):

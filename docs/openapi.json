@@ -21110,7 +21110,7 @@
           }
         },
         "summary": "List PBS sync, verify and prune jobs with schedule and last-run status.",
-        "description": "A failed PBS read must not look like an empty configured-job list.",
+        "description": "Returns 404 if the PBS manager is missing. Otherwise, successful job lists\nremain available; errors maps each failed kind to PBS_FORBIDDEN,\nPBS_UNREACHABLE or PBS_UPSTREAM (including malformed responses).",
         "parameters": [
           {
             "name": "pbs_id",

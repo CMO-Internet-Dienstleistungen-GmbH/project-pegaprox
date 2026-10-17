@@ -570,6 +570,19 @@ def clear_pbs_update_status(pbs_id):
     return jsonify({'cleared': ok})
 
 
+def _gc_jobs_by_store(mgr):
+    # MK Oct 2026 - when GC last ran is only in /admin/gc, one entry per datastore. A PBS
+    # without that list, or a token that may not read it, just shows no GC times
+    try:
+        resp = mgr.get_gc_jobs()
+    except Exception:
+        return {}
+    rows = resp.get('data') if isinstance(resp, dict) else None
+    if not isinstance(rows, list):
+        return {}
+    return {r['store']: r for r in rows if isinstance(r, dict) and isinstance(r.get('store'), str)}
+
+
 @bp.route('/api/pbs/<pbs_id>/datastores', methods=['GET'])
 @require_auth(perms=['pbs.datastore.view'])
 def get_pbs_datastores(pbs_id):
@@ -591,12 +604,15 @@ def get_pbs_datastores(pbs_id):
     
     datastores = config_resp.get('data', [])
     usage_list = {u.get('store'): u for u in usage_resp.get('data', [])}
+    gc_jobs = _gc_jobs_by_store(mgr)
     
     # Merge config with usage
     result = []
     for ds in datastores:
         name = ds.get('name', '')
         info = {**ds, **(usage_list.get(name, {}))}
+        if name in gc_jobs:
+            info['gc-job'] = gc_jobs[name]
         
         # Try to get detailed status (GC info, counts)
         try:
@@ -1221,7 +1237,9 @@ def get_pbs_task_detail(pbs_id, upid):
 def get_pbs_jobs(pbs_id):
     """List PBS sync, verify and prune jobs with schedule and last-run status.
 
-    A failed PBS read must not look like an empty configured-job list.
+    Returns 404 if the PBS manager is missing. Otherwise, successful job lists
+    remain available; errors maps each failed kind to PBS_FORBIDDEN,
+    PBS_UNREACHABLE or PBS_UPSTREAM (including malformed responses).
     """
     # NS Jul 2026 (CodeAnt IDOR) — enforce the per-PBS linked-clusters tenant gate
     ok, err = check_pbs_access(pbs_id)
@@ -1232,19 +1250,23 @@ def get_pbs_jobs(pbs_id):
     mgr = pbs_managers[pbs_id]
     
     jobs = {}
+    errors = {}
     for kind, get_jobs in (('sync', mgr.get_sync_jobs),
                            ('verify', mgr.get_verify_jobs),
                            ('prune', mgr.get_prune_jobs)):
         result = get_jobs()
         failure = pbs_upstream_error(result)
         if failure:
-            status, payload = failure
-            return jsonify(payload), status
-        if not isinstance(result, dict) or not isinstance(result.get('data'), list):
-            return jsonify({'error': 'PBS returned an invalid job list',
-                            'code': 'PBS_UPSTREAM'}), 502
-        jobs[kind] = result['data']
+            errors[kind] = failure[1]['code']
+            jobs[kind] = []
+        elif not isinstance(result, dict) or not isinstance(result.get('data'), list):
+            errors[kind] = 'PBS_UPSTREAM'
+            jobs[kind] = []
+        else:
+            jobs[kind] = result['data']
 
+    if errors:
+        jobs['errors'] = errors
     return jsonify(jobs)
 
 
@@ -3689,13 +3711,11 @@ def get_pbs_health(pbs_id):
     import time as _t
     now = _t.time()
     oldest_gc_age_h = None
+    # MK Oct 2026 - gc-status carries no time at all, so this factor never counted
+    gc_jobs = _gc_jobs_by_store(mgr)
     for s in stores:
-        gc = s.get('gc-status') or {}
-        upid = gc.get('upid')
-        # If upid present, gc has run; we can't easily get the timestamp without
-        # parsing — fall back to checking the store's own timestamp if available.
-        last = s.get('last-gc') or 0
-        if last:
+        last = (gc_jobs.get(s.get('name') or s.get('store')) or {}).get('last-run-endtime')
+        if isinstance(last, (int, float)) and not isinstance(last, bool) and last > 0:
             age_h = (now - last) / 3600
             if oldest_gc_age_h is None or age_h > oldest_gc_age_h:
                 oldest_gc_age_h = age_h

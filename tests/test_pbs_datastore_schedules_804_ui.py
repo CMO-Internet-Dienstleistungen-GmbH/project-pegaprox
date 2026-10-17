@@ -13,7 +13,10 @@ from test_ha_ui import PBS, _App, _FakeServer, browser  # noqa: F401
 
 
 STORES = [
-    {'name': 'alpha', 'gc-schedule': 'daily', 'detail': {'gc-status': {'last-run-endtime': 1780000000}}},
+    {'name': 'alpha', 'gc-schedule': 'daily',
+     'gc-job': {'store': 'alpha', 'schedule': 'sat 01:00',
+                'last-run-endtime': 1780000000, 'last-run-state': 'OK'},
+     'detail': {'gc-status': {'upid': 'UPID:gc', 'removed-bytes': 1024}}},
     {'name': 'beta', 'gc-schedule': 'weekly', 'detail': {'gc-status': {}}},
 ]
 JOBS = {
@@ -63,7 +66,7 @@ def test_selected_datastore_shows_only_its_schedules(browser, layout):
             'gc', 'sync', 'verify', 'prune'
         ]
         text = table.inner_text()
-        for expected in ('daily', 'sync-alpha', 'mon 02:00', 'verify-alpha', 'prune-alpha', 'Manual'):
+        for expected in ('sat 01:00', 'sync-alpha', 'mon 02:00', 'verify-alpha', 'prune-alpha', 'Manual'):
             assert expected in text
         assert 'sync-beta' not in text and 'verify-beta' not in text and 'prune-beta' not in text
         assert rows.first.locator('td').nth(3).inner_text() != '-'
@@ -157,7 +160,7 @@ def test_gc_schedule_remains_visible_without_configured_jobs(browser):
         table.wait_for(timeout=5000)
         assert table.locator('[data-pbs-schedule-kind="gc"]').count() == 1
         assert table.locator('[data-pbs-schedule-kind]').count() == 1
-        assert 'daily' in table.inner_text()
+        assert 'sat 01:00' in table.inner_text()
         assert not app.errors, app.errors
     finally:
         app.ctx.close()
@@ -183,6 +186,37 @@ def test_job_read_refusal_is_visible_beside_datastore_schedules(browser):
 
         page.get_by_role('button', name='Jobs').first.click()
         assert page.get_by_role('alert').filter(has_text='Jobs').count() > 0
+        assert not app.errors, app.errors
+    finally:
+        app.ctx.close()
+
+
+@pytest.mark.parametrize('layout', ['modern', 'corporate'])
+def test_failed_prune_read_keeps_sync_and_verify_visible(browser, layout):
+    reads = dict(READS)
+    reads[('GET', '/api/pbs/p1/jobs')] = (200, {
+        **JOBS, 'prune': [], 'errors': {'prune': 'PBS_FORBIDDEN'},
+    })
+    app = _App(browser, _FakeServer(role='standalone', layout=layout, extra=reads))
+    try:
+        page = app.page
+        page.get_by_text('backup01').first.click()
+        page.get_by_role('button', name='Datastores').first.click()
+        page.get_by_role('button', name=re.compile(r'^alpha\b')).click()
+        table = page.locator('[data-pbs-datastore-schedules="alpha"]')
+        table.wait_for(timeout=5000)
+        assert table.get_by_role('alert').count() == 1
+        assert 'Prune Jobs' in table.get_by_role('alert').inner_text()
+        assert table.locator('[data-pbs-schedule-kind="sync"]').count() == 1
+        assert table.locator('[data-pbs-schedule-kind="verify"]').count() == 1
+        assert table.locator('[data-pbs-schedule-kind="prune"]').count() == 0
+
+        page.get_by_role('button', name='Jobs').first.click()
+        assert page.get_by_role('alert').count() == 1
+        assert 'Prune Jobs' in page.get_by_role('alert').inner_text()
+        assert page.locator('tr').filter(has_text='sync-alpha').count() == 1
+        assert page.locator('tr').filter(has_text='verify-alpha').count() == 1
+        assert page.get_by_text('No prune jobs configured').count() == 0
         assert not app.errors, app.errors
     finally:
         app.ctx.close()

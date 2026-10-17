@@ -18,10 +18,10 @@
          */
         function pbsDatastoreScheduleRows(store, datastore, jobs) {
             if (!store || !datastore) return [];
-            const gcStatus = datastore.detail?.['gc-status'] || {};
+            const gcJob = datastore['gc-job'] || {};
             const rows = [{
-                kind: 'gc', id: '', schedule: datastore['gc-schedule'] || '',
-                lastRun: gcStatus['last-run-endtime'] ?? null, disabled: false,
+                kind: 'gc', id: '', schedule: gcJob.schedule ?? datastore['gc-schedule'] ?? '',
+                lastRun: gcJob['last-run-endtime'] ?? null, disabled: false,
             }];
             for (const kind of ['sync', 'verify', 'prune']) {
                 const list = Array.isArray(jobs?.[kind]) ? jobs[kind] : [];
@@ -35,6 +35,18 @@
                 }
             }
             return rows;
+        }
+
+        function PbsJobReadError({ kind }) {
+            const { t } = useTranslation();
+            const labels = {
+                sync: t('pbsSyncJobs') || 'Sync Jobs',
+                verify: t('pbsVerifyJobs') || 'Verify Jobs',
+                prune: t('pbsPruneJobs') || 'Prune Jobs',
+            };
+            return <div role="alert" className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3 mb-3 text-sm text-yellow-300">
+                {t('pbsLoadAllDataError') || 'Could not load all data:'} {labels[kind]}
+            </div>;
         }
 
         /**
@@ -60,6 +72,9 @@
                     {error && <div role="alert" className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3 mb-3 text-sm text-yellow-300">
                         {t('pbsLoadAllDataError') || 'Could not load all data:'} {t('pbsJobsTab') || 'Jobs'}
                     </div>}
+                    {['sync', 'verify', 'prune'].filter(kind => jobs?.errors?.[kind]).map(kind => (
+                        <PbsJobReadError key={kind} kind={kind} />
+                    ))}
                     <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-auto">
                         <table className="w-full text-sm">
                             <thead><tr className="border-b border-proxmox-border text-gray-500 text-xs">
@@ -86,6 +101,17 @@
                     </div>
                 </div>
             );
+        }
+
+        // LW Oct 2026 - PBS keeps a datastore's GC counters (gc-status, in the usage list) apart
+        // from when GC ran (gc-job, from /admin/gc). Neither has a dedup factor: PBS shows the
+        // index size over the bytes on disk, so we do the same
+        function pbsGcView(ds) {
+            const status = ds?.['gc-status'] || ds?.detail?.['gc-status'] || {};
+            const job = ds?.['gc-job'] || {};
+            const onDisk = Number(status['disk-bytes']) || 0;
+            const indexed = Number(status['index-data-bytes']) || 0;
+            return { status, job, dedup: onDisk > 0 && indexed > 0 ? indexed / onDisk : null };
         }
 
         // Task Bar Component with Task Viewer
@@ -24494,7 +24520,7 @@
                                                             const total = ds.total || ds.avail ? (ds.used || 0) + (ds.avail || 0) : 1;
                                                             const pct = total > 0 ? ((used / total) * 100).toFixed(1) : 0;
                                                             const detail = ds.detail || {};
-                                                            const gcStatus = detail['gc-status'] || {};
+                                                            const gc = pbsGcView(ds);
                                                             const pctColor = isCorporate ? (parseFloat(pct) > 85 ? '#f54f47' : parseFloat(pct) > 60 ? '#efc006' : '#60b515') : undefined;
                                                             return (
                                                                 <div key={ds.name || ds.store}
@@ -24513,7 +24539,7 @@
                                                                             </div>
                                                                             <span className="text-[12px] w-12 text-right" style={{color: pctColor}}>{pct}%</span>
                                                                             <span className="text-[11px]" style={{color: 'var(--corp-text-muted)'}}>{formatBytes(used)} / {formatBytes(total)}</span>
-                                                                            {gcStatus.index && <span className="text-[11px]" style={{color: 'var(--corp-accent)'}}>{(gcStatus['dedup-factor'] || 1).toFixed(1)}x</span>}
+                                                                            {gc.dedup !== null && <span className="text-[11px]" style={{color: 'var(--corp-accent)'}}>{gc.dedup.toFixed(1)}x</span>}
                                                                         </>
                                                                     ) : (
                                                                         <>
@@ -24530,10 +24556,10 @@
                                                                             <div className="grid grid-cols-2 gap-2 text-xs">
                                                                                 <div><span className="text-gray-500">{t('used') || 'Used'}:</span> <span className="text-gray-300">{formatBytes(used)}</span></div>
                                                                                 <div><span className="text-gray-500">{t('total') || 'Total'}:</span> <span className="text-gray-300">{formatBytes(total)}</span></div>
-                                                                                {gcStatus.index && (
+                                                                                {gc.dedup !== null && (
                                                                                     <>
-                                                                                        <div><span className="text-gray-500">{t('pbsDedupShort') || 'Dedup'}:</span> <span className="text-cyan-400">{(gcStatus['dedup-factor'] || 1).toFixed(2)}x</span></div>
-                                                                                        <div><span className="text-gray-500">{t('pbsChunksShort') || 'Chunks'}:</span> <span className="text-gray-300">{(gcStatus['disk-chunks'] || 0).toLocaleString()}</span></div>
+                                                                                        <div><span className="text-gray-500">{t('pbsDedupShort') || 'Dedup'}:</span> <span className="text-cyan-400">{gc.dedup.toFixed(2)}x</span></div>
+                                                                                        <div><span className="text-gray-500">{t('pbsChunksShort') || 'Chunks'}:</span> <span className="text-gray-300">{(gc.status['disk-chunks'] || 0).toLocaleString()}</span></div>
                                                                                     </>
                                                                                 )}
                                                                                 {detail['total-snapshots'] !== undefined && (
@@ -24844,7 +24870,9 @@
                                                             {/* Namespace Selector + GC Status */}
                                                             {(() => {
                                                                 const currentDs = pbsDatastores.find(d => (d.name || d.store) === pbsSelectedStore);
-                                                                const gcStatus = currentDs?.detail?.['gc-status'] || {};
+                                                                const gc = pbsGcView(currentDs);
+                                                                const gcStatus = gc.status;
+                                                                const gcSecs = Number(gc.job.duration) || 0;
                                                                 return (
                                                                     <div className="flex flex-wrap gap-4 items-start">
                                                                         {pbsNamespaces.length > 0 && (
@@ -24865,15 +24893,20 @@
                                                                                 </select>
                                                                             </div>
                                                                         )}
-                                                                        {gcStatus['last-run-endtime'] && (
+                                                                        {(gc.job['last-run-endtime'] || gcStatus.upid) && (
                                                                             <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-3 flex-1 min-w-[300px]">
                                                                                 <span className="text-xs text-gray-500 block mb-1.5">{t('pbsGarbageCollection') || 'Garbage Collection'}</span>
                                                                                 <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-                                                                                    <span className="text-gray-500">{t('pbsLastGc') || 'Last GC'}:</span><span className="text-gray-300">{fmtDate(gcStatus['last-run-endtime'] * 1000)}</span>
-                                                                                    <span className="text-gray-500">{t('duration') || 'Duration'}:</span><span className="text-gray-300">{gcStatus['last-run-duration'] ? `${Math.floor(gcStatus['last-run-duration'] / 60)}m ${gcStatus['last-run-duration'] % 60}s` : '-'}</span>
-                                                                                    <span className="text-gray-500">{t('pbsDedupFactor') || 'Dedup Factor'}:</span><span className="text-cyan-400 font-medium">{(gcStatus['dedup-factor'] || 1).toFixed(2)}x</span>
-                                                                                    <span className="text-gray-500">{t('pbsDiskChunks') || 'Disk Chunks'}:</span><span className="text-gray-300">{(gcStatus['disk-chunks'] || 0).toLocaleString()}</span>
-                                                                                    <span className="text-gray-500">{t('pbsDiskBytes') || 'Disk Bytes'}:</span><span className="text-gray-300">{formatBytes(gcStatus['disk-bytes'] || 0)}</span>
+                                                                                    <span className="text-gray-500">{t('pbsLastGc') || 'Last GC'}:</span><span className="text-gray-300">{gc.job['last-run-endtime'] ? fmtDate(gc.job['last-run-endtime'] * 1000) : '-'}</span>
+                                                                                    {gc.job['last-run-state'] && gc.job['last-run-state'] !== 'ok' && (
+                                                                                        <><span className="text-gray-500">{t('status') || 'Status'}:</span><span className="text-red-400 break-words">{gc.job['last-run-state']}</span></>
+                                                                                    )}
+                                                                                    <span className="text-gray-500">{t('duration') || 'Duration'}:</span><span className="text-gray-300">{gcSecs ? `${Math.floor(gcSecs / 60)}m ${gcSecs % 60}s` : '-'}</span>
+                                                                                    <span className="text-gray-500">{t('pbsDedupFactor') || 'Dedup Factor'}:</span><span className="text-cyan-400 font-medium">{gc.dedup !== null ? `${gc.dedup.toFixed(2)}x` : '-'}</span>
+                                                                                    {gcStatus['disk-bytes'] !== undefined && (
+                                                                                        <><span className="text-gray-500">{t('pbsDiskChunks') || 'Disk Chunks'}:</span><span className="text-gray-300">{(gcStatus['disk-chunks'] || 0).toLocaleString()}</span>
+                                                                                        <span className="text-gray-500">{t('pbsDiskBytes') || 'Disk Bytes'}:</span><span className="text-gray-300">{formatBytes(gcStatus['disk-bytes'] || 0)}</span></>
+                                                                                    )}
                                                                                     {gcStatus['pending-chunks'] > 0 && (
                                                                                         <><span className="text-gray-500">{t('pending') || 'Pending'}:</span><span className="text-yellow-400">{gcStatus['pending-chunks']} chunks ({formatBytes(gcStatus['pending-bytes'] || 0)})</span></>
                                                                                     )}
@@ -25132,7 +25165,7 @@
                                                 {/* Sync Jobs */}
                                                 <div>
                                                     <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">{t('pbsSyncJobs') || 'Sync Jobs'} ({(pbsJobs.sync || []).length})</h3>
-                                                    {(pbsJobs.sync || []).length > 0 ? (
+                                                    {pbsJobs.errors?.sync ? <PbsJobReadError kind="sync" /> : (pbsJobs.sync || []).length > 0 ? (
                                                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                             <table className="w-full text-sm">
                                                                 <thead><tr className="border-b border-proxmox-border text-gray-500 text-xs">
@@ -25165,7 +25198,7 @@
                                                 {/* Verify Jobs */}
                                                 <div>
                                                     <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">{t('pbsVerifyJobs') || 'Verify Jobs'} ({(pbsJobs.verify || []).length})</h3>
-                                                    {(pbsJobs.verify || []).length > 0 ? (
+                                                    {pbsJobs.errors?.verify ? <PbsJobReadError kind="verify" /> : (pbsJobs.verify || []).length > 0 ? (
                                                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                             <table className="w-full text-sm">
                                                                 <thead><tr className="border-b border-proxmox-border text-gray-500 text-xs">
@@ -25198,7 +25231,7 @@
                                                 {/* Prune Jobs */}
                                                 <div>
                                                     <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">{t('pbsPruneJobs') || 'Prune Jobs'} ({(pbsJobs.prune || []).length})</h3>
-                                                    {(pbsJobs.prune || []).length > 0 ? (
+                                                    {pbsJobs.errors?.prune ? <PbsJobReadError kind="prune" /> : (pbsJobs.prune || []).length > 0 ? (
                                                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                             <table className="w-full text-sm">
                                                                 <thead><tr className="border-b border-proxmox-border text-gray-500 text-xs">

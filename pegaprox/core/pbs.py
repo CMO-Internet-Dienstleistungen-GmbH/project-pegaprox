@@ -593,6 +593,11 @@ class PBSManager:
     def get_datastore_status(self, store: str) -> dict:
         """Get detailed status of a datastore (usage, GC status, counts)"""
         return self.api_get(f'/admin/datastore/{store}/status')
+
+    def get_gc_jobs(self) -> dict:
+        """GC of every datastore: end and state of the last run, its duration, the next run.
+        The gc-status of a datastore holds the counters of the last run, not when it ran."""
+        return self.api_get('/admin/gc')
     
     def get_snapshots(self, store: str, ns: str = None, backup_type: str = None, backup_id: str = None) -> dict:
         """List snapshots in a datastore, optionally filtered by group.

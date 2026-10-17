@@ -180,7 +180,9 @@ def _files():
     """pegaprox/ and plugins/, and whatever else the root of the checkout lets the code
     import: a module next to pegaprox/ is a way out as much as one inside it, so is a
     package of its own. Not the tests, and not a virtualenv or a package build in the
-    checkout (no __init__.py at their top)."""
+    checkout (no __init__.py at their top). Not a dot file either: the SSH websocket server
+    (pegaprox/api/.ssh_ws_server.py) is written out by a running instance and git ignores it,
+    so a checkout an instance runs from would count calls the repository does not have."""
     out, tops = [], ['pegaprox', 'plugins']
     for name in sorted(os.listdir(ROOT)):
         path = os.path.join(ROOT, name)
@@ -193,7 +195,8 @@ def _files():
     for base in tops:
         for d, dirs, names in os.walk(os.path.join(ROOT, base)):
             dirs[:] = [n for n in dirs if n != '__pycache__']
-            out += [os.path.relpath(os.path.join(d, n), ROOT) for n in names if n.endswith('.py')]
+            out += [os.path.relpath(os.path.join(d, n), ROOT) for n in names
+                    if n.endswith('.py') and not n.startswith('.')]
     return sorted(out)
 
 
