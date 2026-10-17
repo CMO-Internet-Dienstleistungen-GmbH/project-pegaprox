@@ -49515,6 +49515,86 @@
         ]
       }
     },
+    "/api/timeline/evidence": {
+      "get": {
+        "operationId": "timeline.get_timeline_evidence_get",
+        "tags": [
+          "timeline"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "The timeline of a window as a signed JSON attachment: the events the caller may see (every page of them, up to EVENTS_MAX), the audit rows of the window when the caller holds admin.audit, and where the audit chain stood. Same query as GET /api/timeline: ?clusters=<id,id> (all the caller reaches by default) ?from= ?to= ?kinds= ?severity=",
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "cluster.view"
+        ]
+      }
+    },
+    "/api/timeline/evidence/verify": {
+      "post": {
+        "operationId": "timeline.verify_timeline_evidence_post",
+        "tags": [
+          "timeline"
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Not authenticated"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "summary": "Check a bundle against this instance: signed by it, and unchanged since. Answers {valid, reason}.",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "x-pegaprox-auth": "decorator",
+        "security": [
+          {
+            "apiToken": []
+          },
+          {
+            "sessionId": []
+          }
+        ],
+        "x-pegaprox-permissions": [
+          "cluster.view"
+        ]
+      }
+    },
     "/api/clusters/{cluster_id}/nodes/{node}/shellws": {
       "get": {
         "operationId": "__flask_sock.node_shell_websocket_proxy_get",

@@ -232,6 +232,7 @@ LEADER_ONLY_READS = frozenset((
     '/api/clusters/<cluster_id>/vms/<int:vmid>/migration-history',
     '/api/clusters/<cluster_id>/balance-history',
     '/api/timeline',
+    '/api/timeline/evidence',
 ))
 # The task lists of an XCP-ng pool. PegaProx follows the XAPI tasks it started itself, in
 # the process that started them (core/xcpng.py _active_tasks), so a member lists none of

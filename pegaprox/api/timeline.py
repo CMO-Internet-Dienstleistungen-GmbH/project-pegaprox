@@ -784,6 +784,52 @@ def _listed(raw, allowed, what):
     return set(items)
 
 
+def _window_args(args):
+    """The window and the filters of a query: (since, until, clipped, kinds, severities).
+    ValueError carries the message of the 400."""
+    try:
+        until = tl.parse_when(args['to']) if args.get('to') else datetime.now(timezone.utc)
+        since = tl.parse_when(args['from']) if args.get('from') else until - tl.WINDOW_DEFAULT
+    except (ValueError, OverflowError):
+        raise ValueError('from and to must be ISO 8601 times or epoch seconds') from None
+    if since >= until:
+        raise ValueError('from must be before to')
+    # MK Oct 2026 - a longer window is cut to the newest 30 days (the 30 days the UI asks for
+    # reach a few milliseconds further by the time they arrive); 'from' in the answer says where
+    clipped = until - since > tl.WINDOW_MAX
+    if clipped:
+        since = until - tl.WINDOW_MAX
+    kinds = _listed(args.get('kinds'), tl.KINDS, 'kinds')
+    severities = _listed(args.get('severity'), tl.SEVERITIES, 'severity')
+    return since, until, clipped, kinds, severities
+
+
+def _one_page(ask, since, until, window):
+    """Read every source for `ask` and cut the page: (events shown, cursor of the next page
+    or None, {kind: note}). The links to what happened shortly before are hung on the page."""
+    kinds, severities, before, limit = ask.kinds, ask.severities, ask.before, ask.cap
+    events, notes = _read(ask)
+    # MK Oct 2026 - a page goes no deeper than the oldest row of a source that hit its cap,
+    # else the rows that source left out fell between this page and the next
+    floor = max((n['_floor'] for k, n in notes.items()
+                 if n.get('_floor') is not None and (not kinds or k in kinds)), default=None)
+    for n in notes.values():
+        n.pop('_floor', None)
+    shown, more = tl.page(events, since, until, before=before, kinds=kinds, severities=severities,
+                          limit=limit, floor=floor)
+    tl.link(shown, events, window)
+    capped = any(n.get('capped') for k, n in notes.items() if not kinds or k in kinds)
+    if len(shown) >= limit and (more or capped):
+        nxt = tl.cursor_of(shown[-1])
+    elif floor is not None and floor >= since:
+        # MK Oct 2026 - what the filters keep down to the floor is all on this page, even when
+        # that is nothing: the next one starts below the floor's second, not at the end
+        nxt = tl.cursor_below(floor)
+    else:
+        nxt = None
+    return shown, nxt, notes
+
+
 @bp.route('/api/timeline', methods=['GET'])
 @require_auth(perms=['cluster.view'])
 def get_timeline():
@@ -819,20 +865,7 @@ def get_timeline():
     else:
         vmid = None
     try:
-        until = tl.parse_when(args['to']) if args.get('to') else datetime.now(timezone.utc)
-        since = tl.parse_when(args['from']) if args.get('from') else until - tl.WINDOW_DEFAULT
-    except (ValueError, OverflowError):
-        return _bad('from and to must be ISO 8601 times or epoch seconds')
-    if since >= until:
-        return _bad('from must be before to')
-    # MK Oct 2026 - a longer window is cut to the newest 30 days (the 30 days the UI asks for
-    # reach a few milliseconds further by the time they arrive); 'from' in the answer says where
-    clipped = until - since > tl.WINDOW_MAX
-    if clipped:
-        since = until - tl.WINDOW_MAX
-    try:
-        kinds = _listed(args.get('kinds'), tl.KINDS, 'kinds')
-        severities = _listed(args.get('severity'), tl.SEVERITIES, 'severity')
+        since, until, clipped, kinds, severities = _window_args(args)
     except ValueError as e:
         return _bad(str(e))
     before = None
@@ -862,25 +895,7 @@ def get_timeline():
     if vmid is not None and not ask.sees(vmid):
         return jsonify({'error': 'Permission denied'}), 403
 
-    events, notes = _read(ask)
-    # MK Oct 2026 - a page goes no deeper than the oldest row of a source that hit its cap,
-    # else the rows that source left out fell between this page and the next
-    floor = max((n['_floor'] for k, n in notes.items()
-                 if n.get('_floor') is not None and (not kinds or k in kinds)), default=None)
-    for n in notes.values():
-        n.pop('_floor', None)
-    shown, more = tl.page(events, since, until, before=before, kinds=kinds, severities=severities,
-                          limit=limit, floor=floor)
-    tl.link(shown, events, window)
-    capped = any(n.get('capped') for k, n in notes.items() if not kinds or k in kinds)
-    if len(shown) >= limit and (more or capped):
-        nxt = tl.cursor_of(shown[-1])
-    elif floor is not None and floor >= since:
-        # MK Oct 2026 - what the filters keep down to the floor is all on this page, even when
-        # that is nothing: the next one starts below the floor's second, not at the end
-        nxt = tl.cursor_below(floor)
-    else:
-        nxt = None
+    shown, nxt, notes = _one_page(ask, since, until, window)
     return jsonify({
         'cluster': cid, 'node': node, 'vmid': vmid,
         'from': tl.iso(since), 'to': tl.iso(until), 'clipped': clipped,
@@ -890,3 +905,159 @@ def get_timeline():
         'correlation': {'window_minutes': correlate,
                         'note': 'Events on the same guest or node shortly before; correlation, not cause.'},
     })
+
+
+# --- the evidence bundle ----------------------------------------------------------------------
+
+# pages read per cluster for one bundle: 500 events each, so a bit more than the cap holds
+_EVIDENCE_PAGES = 60
+
+
+def _evidence_clusters(args):
+    """(cluster ids, None) or (None, error response): the ones named in ?clusters= (or
+    ?cluster=), each under the access rule of GET /api/timeline, else every cluster the
+    caller may reach."""
+    from pegaprox.core import flight_recorder as fr
+    raw = (args.get('clusters') or args.get('cluster') or '').strip()
+    if raw:
+        ids = []
+        for part in raw.split(','):
+            part = part.strip()
+            if part and part not in ids:
+                ids.append(part)
+        if not ids or len(ids) > fr.CLUSTERS_MAX or any(len(c) > 128 for c in ids):
+            return None, _bad(f'clusters is a list of up to {fr.CLUSTERS_MAX} cluster ids')
+        for cid in ids:
+            ok, err = check_cluster_access(cid)
+            if not ok:
+                return None, err
+            if cluster_managers.get(cid) is None:
+                return None, (jsonify({'error': 'Cluster not found'}), 404)
+        return ids, None
+    ids = []
+    for cid in sorted(cluster_managers):
+        if check_cluster_access(cid)[0]:
+            ids.append(cid)
+    return ids[:fr.CLUSTERS_MAX], None
+
+
+def _walk_cluster(cid, mgr, user, since, until, kinds, severities, cap):
+    """Every event of one cluster in the window the caller may see, page by page:
+    (events, {kind: note} of the first page, whether more were left over)."""
+    out, seen, notes, before = [], set(), None, None
+    for _ in range(_EVIDENCE_PAGES):
+        hi, edge = until, None
+        if before and before[0] <= until:
+            hi = edge = before[0].replace(microsecond=0)
+        ask = _Ask(cid, mgr, user, None, None, since, hi, tl.LIMIT_MAX, edge=edge, before=before,
+                   kinds=kinds, severities=severities)
+        shown, nxt, page_notes = _one_page(ask, since, until, timedelta(0))
+        if notes is None:
+            notes = {k: {a: b for a, b in n.items() if a != 'count'} for k, n in page_notes.items()}
+        for ev in shown:
+            if ev['id'] not in seen:
+                seen.add(ev['id'])
+                out.append(ev)
+        if not nxt:
+            return out, notes, False
+        if len(out) >= cap:
+            return out, notes, True
+        cursor = tl.parse_cursor(nxt)
+        if cursor == before:
+            return out, notes, False
+        before = cursor
+    return out, notes, True
+
+
+@bp.route('/api/timeline/evidence', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_timeline_evidence():
+    """The timeline of a window as a signed JSON attachment: the events the caller may see
+    (every page of them, up to EVENTS_MAX), the audit rows of the window when the caller
+    holds admin.audit, and where the audit chain stood. Same query as GET /api/timeline:
+    ?clusters=<id,id> (all the caller reaches by default) ?from= ?to= ?kinds= ?severity="""
+    import socket
+    from flask import Response
+    from pegaprox.constants import PEGAPROX_VERSION
+    from pegaprox.core import flight_recorder as fr
+    from pegaprox.utils.audit import log_audit
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import has_permission
+
+    args = request.args
+    ids, err = _evidence_clusters(args)
+    if err:
+        return err
+    try:
+        since, until, clipped, kinds, severities = _window_args(args)
+    except ValueError as e:
+        return _bad(str(e))
+
+    username = request.session.get('user', '')
+    user = build_authz_user(username, request.session)
+    events, sources, left_over = [], {}, False
+    for cid in ids:
+        got, notes, more = _walk_cluster(cid, cluster_managers[cid], user, since, until, kinds, severities,
+                                         fr.EVENTS_MAX)
+        events += got
+        sources[cid] = notes or {}
+        left_over = left_over or more
+    events.sort(key=tl.order, reverse=True)
+    truncated = left_over or len(events) > fr.EVENTS_MAX
+    events = events[:fr.EVENTS_MAX]
+
+    clusters = []
+    for cid in ids:
+        name = getattr(getattr(cluster_managers[cid], 'config', None), 'name', '')
+        clusters.append({'id': cid, 'name': name if isinstance(name, str) else ''})
+    doc = {
+        'format': fr.FORMAT, 'version': fr.VERSION,
+        'generated_at': tl.iso(datetime.now(timezone.utc)), 'generated_by': username,
+        'instance': {'name': socket.gethostname(), 'version': PEGAPROX_VERSION},
+        'window': {'since': tl.iso(since), 'until': tl.iso(until), 'clipped': clipped},
+        'filters': {'clusters': ids, 'kinds': sorted(kinds) if kinds else None,
+                    'severities': sorted(severities) if severities else None},
+        'clusters': clusters,
+        'sources': sources,
+        'events': [tl.public(e) for e in events],
+        'event_count': len(events), 'event_cap': fr.EVENTS_MAX, 'truncated': truncated,
+    }
+    audit_count = None
+    if has_permission(user, 'admin.audit'):
+        # NS Oct 2026 - scoped as GET /api/audit scopes a caller confined to some clusters: the
+        # rows of the clusters they see whole. A cluster they only reach through some guests
+        # adds none, and neither does the caller's own trail outside these clusters.
+        whole = [c for c in ids if not caller_is_scoped(user, c)]
+        rows, audit_cut = fr.audit_rows(whole, since, until)
+        doc['audit'] = {'included': True, 'clusters': whole, 'rows': fr.public_rows(rows),
+                        'row_count': len(rows), 'row_cap': fr.AUDIT_MAX, 'truncated': audit_cut}
+        doc['audit_chain'] = dict(fr.chain_report(rows), included=True)
+        audit_count = len(rows)
+    else:
+        why = 'the audit rows need the admin.audit permission'
+        doc['audit'] = {'included': False, 'why': why}
+        doc['audit_chain'] = {'included': False, 'why': why}
+    fr.sign(doc)
+
+    log_audit(username or 'system', 'timeline.evidence_export',
+              f"Exported flight recorder evidence {doc['window']['since']} to {doc['window']['until']}: "
+              f"{len(events)} events" + (f", {audit_count} audit rows" if audit_count is not None else '')
+              + f", {len(ids)} clusters" + (' (events cut at the cap)' if truncated else ''))
+
+    def stamp(dt):
+        return dt.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    name = f'flight-recorder-{stamp(since)}-{stamp(until)}.json'
+    return Response(json.dumps(doc, ensure_ascii=False, indent=1), mimetype='application/json',
+                    headers={'Content-Disposition': f'attachment; filename="{name}"'})
+
+
+@bp.route('/api/timeline/evidence/verify', methods=['POST'])
+@require_auth(perms=['cluster.view'])
+def verify_timeline_evidence():
+    """Check a bundle against this instance: signed by it, and unchanged since. Answers
+    {valid, reason}."""
+    from pegaprox.core import flight_recorder as fr
+    res = fr.verify(request.get_json(silent=True))
+    if res is None:
+        return _bad('The body must be a flight recorder bundle')
+    return jsonify(res)

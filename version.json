@@ -137,6 +137,7 @@
     "pegaprox/core/db.py",
     "pegaprox/core/dbcrypto.py",
     "pegaprox/core/esxi_cluster.py",
+    "pegaprox/core/flight_recorder.py",
     "pegaprox/core/ha.py",
     "pegaprox/core/ha_transport.py",
     "pegaprox/core/ha_vote.py",
