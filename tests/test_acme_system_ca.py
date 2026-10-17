@@ -54,14 +54,11 @@ def local_acme_server(tmp_path):
     (ca_dir / f'{cert_hash:08x}.0').symlink_to(ca_file)
 
     class Handler(BaseHTTPRequestHandler):
-        """Handle the ACME directory, nonce, and signed request endpoints."""
 
         def log_message(self, *args):
-            """Suppress request logs from the test server."""
             pass
 
         def respond(self, payload, status=200, **headers):
-            """Write a JSON response with optional ACME headers."""
             data = json.dumps(payload).encode()
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
@@ -73,7 +70,6 @@ def local_acme_server(tmp_path):
                 self.wfile.write(data)
 
         def do_GET(self):
-            """Return the ACME directory and its endpoint URLs."""
             base = f'https://localhost:{self.server.server_port}'
             assert self.path == '/directory'
             self.respond({'newNonce': base + '/nonce',
@@ -81,12 +77,10 @@ def local_acme_server(tmp_path):
                           'newOrder': base + '/order'})
 
         def do_HEAD(self):
-            """Issue a replay nonce for signed requests."""
             assert self.path == '/nonce'
             self.respond({}, Replay_Nonce='nonce-1')
 
         def do_POST(self):
-            """Accept account, order, and authorization requests."""
             self.rfile.read(int(self.headers['Content-Length']))
             base = f'https://localhost:{self.server.server_port}'
             if self.path == '/account':
