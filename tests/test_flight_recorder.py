@@ -53,8 +53,9 @@ def test_an_admin_gets_an_attachment_with_everything_in_the_window(env):
 
 def test_the_events_are_those_of_the_timeline(env):
     c = _admin_client(env)
-    _, doc = _bundle(c, f'?clusters={CID}')
+    # the timeline first: the export of one cluster is an audit row of that cluster after it
     got = c.get(f'/api/timeline?cluster={CID}&limit=500&correlate=0').get_json()
+    _, doc = _bundle(c, f'?clusters={CID}')
     assert [e['id'] for e in doc['events']] == [e['id'] for e in got['events']]
 
 
@@ -177,6 +178,57 @@ def test_an_audit_holder_of_a_tenant_gets_the_rows_of_its_clusters_whole_only(en
     assert not any(CID in json.dumps(x) for x in doc['audit']['rows'])
 
 
+def test_a_token_below_its_owners_role_gets_no_audit_rows(env):
+    """An admin's viewer token: what the token's role holds counts, not the owner's."""
+    from pegaprox.utils.auth import create_api_token
+    env.seed.user('root', role='admin')
+    token = create_api_token('root', 'evidence', role='viewer')['token']
+    r = env.api.anon().get(f'{ROUTE}?clusters={CID}', headers={'Authorization': f'Bearer {token}'})
+    assert r.status_code == 200, r.get_data(as_text=True)
+    doc = json.loads(r.get_data(as_text=True))
+    assert doc['audit'] == {'included': False, 'why': doc['audit']['why']}
+    assert doc['audit_chain']['included'] is False
+    kinds = {e['kind'] for e in doc['events']}
+    # drift and syslog want admin.audit, the incidents an admin
+    assert kinds and not kinds & {'drift', 'syslog', 'incident'}
+    assert doc['generated_by'] == 'root'
+
+
+def test_a_tenant_admin_gets_its_tenants_clusters_and_their_audit_rows_only(env):
+    """Administrator inside a tenant (the override), not of the instance."""
+    env.seed.tenant('acme', clusters=['other'])
+    u = env.seed.user('tara', role='user', tenant_id='acme', tenant_permissions={'acme': {'role': 'admin'}})
+    c = env.api.as_user(u)
+    _, doc = _bundle(c)
+    assert doc['filters']['clusters'] == ['other'] and doc['audit']['clusters'] == ['other']
+    assert doc['audit']['rows'] and {r['cluster_id'] for r in doc['audit']['rows']} == {'other'}
+    assert doc['events'] and {e['cluster'] for e in doc['events']} == {'other'}
+    # the plan to CID and the incidents (instance admins only) stay out
+    assert not {e['kind'] for e in doc['events']} & {'site_recovery', 'incident'}
+    assert c.get(f'{ROUTE}?clusters={CID}').status_code == 403
+
+
+def test_an_auditor_confined_to_a_pool_gets_no_audit_rows_of_that_cluster(env):
+    """admin.audit through a custom role in the default tenant, and a pool grant on CID:
+    CID is a cluster this caller sees some guests of, so none of its audit rows."""
+    from pegaprox.utils import rbac
+    from test_proxlb_pins import _seed_pool_membership
+    env.db.conn.execute("INSERT INTO custom_roles (name, permissions, description, tenant_id, created_at) "
+                        "VALUES ('pool_auditor', ?, '', '', '2026-01-01')",
+                        (json.dumps(['cluster.view', 'admin.audit']),))
+    env.db.conn.commit()
+    rbac.invalidate_roles_cache()
+    env.seed.pool(CID, 'pool_1', 'paula', ['pool.view', 'vm.view'])
+    _seed_pool_membership(CID, {100: ('qemu', 'pool_1'), 200: ('qemu', 'pool_2')})
+    c = env.api.as_user(env.seed.user('paula', role='pool_auditor'))
+    _, doc = _bundle(c)
+    assert doc['audit']['included'] is True
+    assert CID in doc['filters']['clusters'] and CID not in doc['audit']['clusters']
+    assert doc['audit']['rows'] and {r['cluster_id'] for r in doc['audit']['rows']} == {'other'}
+    mine = [e for e in doc['events'] if e['cluster'] == CID]
+    assert mine and all(e['guest'] == 100 for e in mine)
+
+
 def test_the_chain_section_checks_the_rows_exported(env):
     db = env.db
     for i in range(3):
@@ -255,6 +307,77 @@ def test_a_body_that_is_no_bundle_is_refused_or_invalid(env):
     assert _check(c, {'format': 'something else'})['valid'] is False
 
 
+@pytest.mark.parametrize('where', ['top', 'event', 'audit row'])
+def test_a_key_written_twice_makes_the_bundle_invalid(env, where):
+    """The parser keeps the last of two equal keys, so the signed value goes last and a
+    forged one before it: valid here, while a reader that keeps the first (or a person
+    reading the file) sees the forged one."""
+    c = _admin_client(env)
+    r, doc = _bundle(c, f'?clusters={CID}')
+    raw = r.get_data(as_text=True)
+    signed = {'top': '"generated_by": "root"',
+              'event': json.dumps({'title': doc['events'][0]['title']}, ensure_ascii=False)[1:-1],
+              'audit row': json.dumps({'details': doc['audit']['rows'][0]['details']}, ensure_ascii=False)[1:-1]}[where]
+    assert signed in raw
+    key = signed.split(':', 1)[0]
+    forged = raw.replace(signed, f'{key}: "nothing happened here", {signed}', 1)
+    assert json.loads(forged) == json.loads(raw)
+    res = c.post(VERIFY, data=forged, content_type='application/json')
+    assert res.status_code == 200, res.get_data(as_text=True)
+    assert res.get_json()['valid'] is False and 'twice' in res.get_json()['reason']
+    # the file as it came is still fine
+    assert c.post(VERIFY, data=raw, content_type='application/json').get_json()['valid'] is True
+
+
+def test_a_body_nested_too_deep_is_a_400_not_a_crash(env):
+    c = _admin_client(env)
+    deep = '[' * 100000 + ']' * 100000
+    assert c.post(VERIFY, data=deep, content_type='application/json').status_code == 400
+    deep = '{"format": "pegaprox-flight-recorder", "x": ' + '{"a": ' * 100000 + '1' + '}' * 100001
+    assert c.post(VERIFY, data=deep, content_type='application/json').status_code == 400
+
+
+@pytest.mark.parametrize('name,how', [
+    ('a note beside the value', lambda s: s.update(note='checked by the auditor, nothing found')),
+    ('another algorithm named', lambda s: s.update(alg='none')),
+    ('no algorithm named', lambda s: s.pop('alg')),
+])
+def test_the_signature_block_holds_the_signature_and_nothing_else(env, name, how):
+    """Only the rest of the bundle is signed: whatever sits in the signature block next to the
+    value is covered by nothing."""
+    c = _admin_client(env)
+    _, doc = _bundle(c, f'?clusters={CID}')
+    how(doc['signature'])
+    res = _check(c, doc)
+    assert res['valid'] is False and 'signature' in res['reason'], name
+
+
+def test_the_verify_post_is_behind_the_csrf_check(env):
+    c = _admin_client(env)
+    _, doc = _bundle(c, f'?clusters={CID}')
+    bare = c._c.post(VERIFY, json=doc, headers={'X-Session-ID': c.session_id}, base_url='http://localhost')
+    assert bare.status_code == 403 and 'CSRF' in bare.get_json()['error']
+    assert c.post(VERIFY, json=doc, headers={'Origin': 'https://elsewhere.example'}).status_code == 403
+    assert c.post(VERIFY, json=doc).get_json()['valid'] is True
+
+
+def test_a_bundle_at_the_event_cap_still_verifies(env):
+    """A bundle comes back whole to be checked. At the event cap, with titles and details as
+    long as an event carries them, it is larger than the 10 MB an API call may be."""
+    c = _admin_client(env)
+    _, doc = _bundle(c, f'?clusters={CID}')
+    one = dict(doc['events'][0], title='t' * 300, details='d' * 500)
+    doc['events'] = [dict(one, id=f'audit:{i}') for i in range(fr.EVENTS_MAX)]
+    doc['event_count'] = len(doc['events'])
+    doc.pop('signature')
+    fr.sign(doc)
+    raw = json.dumps(doc, ensure_ascii=False, indent=1).encode('utf-8')     # as the route writes it
+    assert len(raw) > 10 * 1024 * 1024
+    r = c.post(VERIFY, data=raw, content_type='application/json')
+    assert r.status_code == 200, (r.status_code, r.get_data(as_text=True)[:200])
+    assert r.get_json()['valid'] is True
+
+
 def test_a_recovery_evidence_document_does_not_verify_here(env):
     from pegaprox.core import assurance
     c = _admin_client(env)
@@ -312,11 +435,11 @@ def test_the_two_domains_differ():
 
 def test_the_event_cap_sets_truncated_and_the_count(env, monkeypatch):
     monkeypatch.setattr(fr, 'EVENTS_MAX', 5)
+    full = _admin_client(env).get(f'/api/timeline?cluster={CID}&limit=500&correlate=0').get_json()['events']
     _, doc = _bundle(_admin_client(env), f'?clusters={CID}')
     assert doc['truncated'] is True and doc['event_count'] == 5 == len(doc['events'])
     assert doc['event_cap'] == 5
     # the newest ones are what stays
-    full = _admin_client(env).get(f'/api/timeline?cluster={CID}&limit=500&correlate=0').get_json()['events']
     assert [e['id'] for e in doc['events']] == [e['id'] for e in full][:5]
     assert _check(_admin_client(env), doc)['valid'] is True
 
@@ -335,13 +458,46 @@ def test_more_pages_than_one_are_walked(env, monkeypatch):
     monkeypatch.setattr(tl_limit(), 'LIMIT_MAX', 500)
     _, whole = _bundle(c, f'?clusters={CID}')
     assert len(doc['events']) > 3
-    assert [e['id'] for e in doc['events']] == [e['id'] for e in whole['events']]
+    # the second bundle has the export of the first among its events
+    later = [e['id'] for e in whole['events'] if e['title'] != 'timeline.evidence_export']
+    assert [e['id'] for e in doc['events']] == later
     assert tapi  # the route module is the one under test
 
 
 def tl_limit():
     from pegaprox.core import timeline
     return timeline
+
+
+def test_the_event_cap_is_the_bundles_not_each_clusters(env, monkeypatch):
+    """Every cluster was walked to the cap of its own and all of it held at once: 50 busy
+    clusters made a million events in memory for a bundle that keeps 20000. Once the bundle
+    is full, a cluster whose next page is older than everything kept is read no further."""
+    import pegaprox.api.timeline as tapi
+    for name in ('zz1', 'zz2'):
+        env.api.set_manager(name, env.api.make_fake_manager(name, get_tasks=[]))
+        for i in range(8):
+            env.db.add_migration_event(name, 500 + i, f'old{i}', 'a', 'b', 'success', reason='r',
+                                       timestamp=_local(300 + i))
+    c = _admin_client(env)
+    _, whole = _bundle(c)
+    assert {e['cluster'] for e in whole['events']} >= {CID, 'zz1', 'zz2'}
+
+    monkeypatch.setattr(fr, 'EVENTS_MAX', 5)
+    monkeypatch.setattr(tl_limit(), 'LIMIT_MAX', 2)
+    walked = {}
+    real = tapi._walk_cluster
+
+    def spy(cid, *a, **kw):
+        got = real(cid, *a, **kw)
+        walked[cid] = len(got[0])
+        return got
+    monkeypatch.setattr(tapi, '_walk_cluster', spy)
+    _, doc = _bundle(c)
+    assert [e['id'] for e in doc['events']] == [e['id'] for e in whole['events']][:5]
+    assert doc['truncated'] is True and doc['event_count'] == 5
+    # the two old clusters: one page each (2 events), not walked to the cap (6)
+    assert walked['zz1'] <= 2 and walked['zz2'] <= 2, walked
 
 
 def test_the_export_is_written_to_the_audit_log(env):
@@ -357,6 +513,22 @@ def test_the_export_is_written_to_the_audit_log(env):
     assert not any(r['action'] == 'timeline.evidence_export' for r in doc['audit']['rows'])
     _, later = _bundle(c, f'?clusters={CID}')
     assert later['event_count'] >= 0
+
+
+def test_the_export_row_says_which_clusters_and_belongs_to_a_single_one(env):
+    """'2 clusters' tells an auditor nothing. And the export of one cluster is that cluster's
+    row, so its own trail shows who took the bundle, as the recovery evidence does."""
+    c = _admin_client(env)
+    _bundle(c, f'?clusters={CID},other')
+    row = env.db.query("SELECT * FROM audit_log WHERE action = 'timeline.evidence_export'")[0]
+    assert CID in row['details'] and 'other' in row['details']
+    assert not row['cluster_id']
+    _bundle(c, f'?clusters={CID}')
+    row = env.db.query("SELECT * FROM audit_log WHERE action = 'timeline.evidence_export' ORDER BY id DESC")[0]
+    assert row['cluster_id'] == CID and CID in row['details']
+    _, later = _bundle(c, f'?clusters={CID}')
+    assert any(r['action'] == 'timeline.evidence_export' for r in later['audit']['rows'])
+    assert any(e['title'] == 'timeline.evidence_export' for e in later['events'])
 
 
 def test_a_refused_request_writes_nothing(env):

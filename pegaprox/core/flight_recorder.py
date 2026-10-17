@@ -9,6 +9,7 @@ as a bundle, and a bundle never verifies as one of those, whatever its format fi
 
 import hashlib
 import hmac
+import json
 from datetime import timedelta
 
 from pegaprox.core import timeline as tl
@@ -48,6 +49,10 @@ def verify(doc):
     value = sig.get('value')
     if not isinstance(value, str) or not value:
         return {'valid': False, 'reason': 'the bundle carries no signature'}
+    # the block is the one part the signature does not cover: a note in it, or another
+    # algorithm named, would come out of here under "valid"
+    if set(sig) != {'alg', 'value'} or sig['alg'] != 'HMAC-SHA256':
+        return {'valid': False, 'reason': 'the signature block is not the one this instance writes'}
     key = get_db().aes_key
     if not key:
         return {'valid': False, 'reason': 'this instance has no signing key'}
@@ -59,6 +64,35 @@ def verify(doc):
         return {'valid': False, 'reason': 'the signature does not match: the bundle was changed, or '
                                           'another instance (or key) signed it'}
     return {'valid': True, 'reason': 'signed by this instance and unchanged'}
+
+
+class _Twice(ValueError):
+    pass
+
+
+def _once(pairs):
+    out = {}
+    for k, v in pairs:
+        if k in out:
+            raise _Twice(k)
+        out[k] = v
+    return out
+
+
+def verify_body(raw):
+    """verify() for a body as it was sent, None when it is no JSON object.
+
+    NS Oct 2026 - parsed here, not with request.get_json: that keeps the last of two equal
+    keys, so a forged value put in front of the signed one verified, while a reader that
+    keeps the first one (or anyone reading the file) saw the forged one."""
+    try:
+        doc = json.loads(raw, object_pairs_hook=_once)
+    except _Twice:
+        return {'valid': False, 'reason': 'a key appears twice in one object, so what a reader sees '
+                                          'need not be what was signed'}
+    except (ValueError, RecursionError):
+        return None
+    return verify(doc)
 
 
 def audit_rows(cluster_ids, since, until, cap=None):

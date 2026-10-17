@@ -941,9 +941,10 @@ def _evidence_clusters(args):
     return ids[:fr.CLUSTERS_MAX], None
 
 
-def _walk_cluster(cid, mgr, user, since, until, kinds, severities, cap):
+def _walk_cluster(cid, mgr, user, since, until, kinds, severities, cap, floor=None):
     """Every event of one cluster in the window the caller may see, page by page:
-    (events, {kind: note} of the first page, whether more were left over)."""
+    (events, {kind: note} of the first page, whether more were left over). floor: the order
+    of the oldest event a full bundle keeps; a page that reaches below it is the last one."""
     out, seen, notes, before = [], set(), None, None
     for _ in range(_EVIDENCE_PAGES):
         hi, edge = until, None
@@ -960,7 +961,7 @@ def _walk_cluster(cid, mgr, user, since, until, kinds, severities, cap):
                 out.append(ev)
         if not nxt:
             return out, notes, False
-        if len(out) >= cap:
+        if len(out) >= cap or (floor is not None and shown and tl.order(shown[-1]) < floor):
             return out, notes, True
         cursor = tl.parse_cursor(nxt)
         if cursor == before:
@@ -995,16 +996,18 @@ def get_timeline_evidence():
 
     username = request.session.get('user', '')
     user = build_authz_user(username, request.session)
-    events, sources, left_over = [], {}, False
+    # NS Oct 2026 - the cap is the bundle's: what is kept is cut to it after each cluster, and
+    # once it is full the next cluster is read no deeper than the oldest event kept. Each
+    # walked to a cap of its own, 50 busy clusters held a million events for 20000.
+    events, sources, truncated = [], {}, False
     for cid in ids:
+        floor = tl.order(events[-1]) if len(events) >= fr.EVENTS_MAX else None
         got, notes, more = _walk_cluster(cid, cluster_managers[cid], user, since, until, kinds, severities,
-                                         fr.EVENTS_MAX)
-        events += got
+                                         fr.EVENTS_MAX, floor=floor)
         sources[cid] = notes or {}
-        left_over = left_over or more
-    events.sort(key=tl.order, reverse=True)
-    truncated = left_over or len(events) > fr.EVENTS_MAX
-    events = events[:fr.EVENTS_MAX]
+        events = sorted(events + got, key=tl.order, reverse=True)
+        truncated = truncated or more or len(events) > fr.EVENTS_MAX
+        del events[fr.EVENTS_MAX:]
 
     clusters = []
     for cid in ids:
@@ -1039,10 +1042,14 @@ def get_timeline_evidence():
         doc['audit_chain'] = {'included': False, 'why': why}
     fr.sign(doc)
 
+    # the clusters by id, and the export of a single one is that cluster's row (as the
+    # recovery evidence does it), so its own trail and timeline show who took it
+    one = clusters[0] if len(clusters) == 1 else None
     log_audit(username or 'system', 'timeline.evidence_export',
               f"Exported flight recorder evidence {doc['window']['since']} to {doc['window']['until']}: "
               f"{len(events)} events" + (f", {audit_count} audit rows" if audit_count is not None else '')
-              + f", {len(ids)} clusters" + (' (events cut at the cap)' if truncated else ''))
+              + f", {len(ids)} clusters ({', '.join(ids)})" + (' (events cut at the cap)' if truncated else ''),
+              cluster=(one['name'] or one['id']) if one else None, cluster_id=one['id'] if one else None)
 
     def stamp(dt):
         return dt.astimezone(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
@@ -1057,7 +1064,7 @@ def verify_timeline_evidence():
     """Check a bundle against this instance: signed by it, and unchanged since. Answers
     {valid, reason}."""
     from pegaprox.core import flight_recorder as fr
-    res = fr.verify(request.get_json(silent=True))
+    res = fr.verify_body(request.get_data()) if request.is_json else None
     if res is None:
         return _bad('The body must be a flight recorder bundle')
     return jsonify(res)
