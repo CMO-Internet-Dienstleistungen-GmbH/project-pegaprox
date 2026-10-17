@@ -22,7 +22,7 @@ import json
 import logging
 import uuid
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, g, jsonify, request
 
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth, build_authz_user
@@ -106,7 +106,19 @@ def _cluster_known(cid):
 # --- scope and reach -------------------------------------------------------------------
 
 def _guests_reached(user, cid, vmids):
-    return all(user_can_access_vm(user, cid, int(v), 'vm.view') for v in vmids)
+    # a list names the same guests plan after plan, and each plan is asked twice in _view:
+    # one answer per guest and request
+    memo = getattr(g, '_chg_reached', None)
+    if memo is None:
+        memo = g._chg_reached = {}
+    who = (user.get('username'), user.get('effective_role'))
+    for v in vmids:
+        key = who + (cid, int(v))
+        if key not in memo:
+            memo[key] = user_can_access_vm(user, cid, int(v), 'vm.view')
+        if not memo[key]:
+            return False
+    return True
 
 
 def _in_own_tenant(user, cid, vmids):
@@ -225,19 +237,32 @@ def list_changes():
         return _json_error('unknown status', 400, statuses=list(plans.STATUSES) + ['expired'])
     limit = bounded_limit(request.args.get('limit'), default=200, maximum=500)
     user, now = _caller(), plans.now_utc()
-    sql, args = 'SELECT * FROM change_plans', []
-    if cid:
-        ok, err = check_cluster_access(cid)
-        if not ok:
-            return err
-        sql += ' WHERE cluster_id = ?'
-        args.append(cid)
-    # an expired plan is a derived state: it is filtered after the read
-    if status and status != 'expired':
-        sql += (' AND' if cid else ' WHERE') + ' status = ?'
-        args.append(status)
+    where, args = [], []
     try:
-        rows = get_db().query(sql + ' ORDER BY updated_at DESC, id LIMIT ?', tuple(args) + (SCAN,))
+        if cid:
+            ok, err = check_cluster_access(cid)
+            if not ok:
+                return err
+            reach = [cid]
+        else:
+            # NS Oct 2026 - only the clusters the caller reaches go into the read: the newest
+            # SCAN rows of all of them left a tenant nothing of its own once others had more
+            reach = [r['cluster_id'] for r in get_db().query('SELECT DISTINCT cluster_id FROM change_plans')
+                     if check_cluster_access(r['cluster_id'])[0]]
+            if not reach:
+                return jsonify({'changes': [], 'me': _me()})
+        where.append(f"cluster_id IN ({','.join('?' * len(reach))})")
+        args.extend(reach)
+        # expired is derived; the read takes the open plans whose window is over, and the
+        # filter below has the last word
+        if status == 'expired':
+            where.append("status IN ('draft', 'submitted', 'approved') AND window_end < ?")
+            args.append(plans.iso_utc(now))
+        elif status:
+            where.append('status = ?')
+            args.append(status)
+        rows = get_db().query('SELECT * FROM change_plans WHERE ' + ' AND '.join(where)
+                              + ' ORDER BY updated_at DESC, id LIMIT ?', tuple(args) + (SCAN,))
     except Exception:
         logging.exception('[changes] list not read')
         return _json_error('internal error', 500)

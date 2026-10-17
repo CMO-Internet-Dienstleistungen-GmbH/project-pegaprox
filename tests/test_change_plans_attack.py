@@ -102,6 +102,58 @@ def test_a_digit_python_cannot_count_with_is_a_400_not_a_500(estate, target):
     assert r.status_code == 400, r.get_data(as_text=True)
 
 
+# -- the list of a tenant is not cut short by the plans of others ------------------------------
+
+def test_a_tenant_sees_its_plan_behind_thousands_of_another_tenant(estate, db):
+    _insert(db, 'ours', status='submitted', cluster=CL, kind='guests', targets=(150,), title='Ours')
+    db.conn.execute("UPDATE change_plans SET updated_at = '2026-01-01T00:00:00Z' WHERE id = 'ours'")
+    now = _iso()
+    db.conn.executemany(
+        'INSERT INTO change_plans (id, cluster_id, title, scope, window_start, window_end, status, '
+        "requested_by, created_at, updated_at) VALUES (?, ?, 'theirs', ?, ?, ?, 'draft', 'zed', ?, ?)",
+        [(f'x{i}', OTHER, json.dumps({'kind': 'cluster', 'targets': []}), now, now, now, now)
+         for i in range(changes_api.SCAN + 1)])
+    db.conn.commit()
+    ta = estate.tenant_holder('tadmin')
+    ids = [p['id'] for p in ta.get('/api/changes').get_json()['changes']]
+    assert ids == ['ours']
+    assert [p['id'] for p in ta.get('/api/changes?status=submitted').get_json()['changes']] == ['ours']
+
+
+def test_an_expired_plan_is_found_behind_thousands_of_live_ones(estate, db):
+    _insert(db, 'old', status='approved', start=_iso(hours=-3), end=_iso(hours=-1))
+    db.conn.execute("UPDATE change_plans SET updated_at = '2026-01-01T00:00:00Z' WHERE id = 'old'")
+    now = _iso()
+    db.conn.executemany(
+        'INSERT INTO change_plans (id, cluster_id, title, scope, window_start, window_end, status, '
+        "requested_by, created_at, updated_at) VALUES (?, ?, 'live', ?, ?, ?, 'approved', 'zed', ?, ?)",
+        [(f'x{i}', CL, json.dumps({'kind': 'cluster', 'targets': []}), _iso(hours=-1), _iso(hours=1), now, now)
+         for i in range(changes_api.SCAN + 1)])
+    db.conn.commit()
+    got = estate.admin('bob').get(f'/api/changes?cluster={CL}&status=expired').get_json()['changes']
+    assert [p['id'] for p in got] == ['old']
+
+
+def test_a_tenant_list_asks_about_each_guest_once(estate, db, monkeypatch):
+    """A tenant approver's list judged every guest of every plan, twice: 40 plans of the same
+    50 guests were 4000 per-guest checks, 500 plans of 200 guests ten seconds."""
+    now = _iso()
+    db.conn.executemany(
+        'INSERT INTO change_plans (id, cluster_id, title, scope, window_start, window_end, status, '
+        "requested_by, created_at, updated_at) VALUES (?, ?, 't', ?, ?, ?, 'submitted', 'zed', ?, ?)",
+        [(f'p{i}', CL, json.dumps({'kind': 'guests', 'targets': list(range(100, 150))}),
+          _iso(minutes=30), _iso(hours=3), now, now) for i in range(40)])
+    db.conn.commit()
+    calls = []
+    real = changes_api.user_can_access_vm
+    monkeypatch.setattr(changes_api, 'user_can_access_vm',
+                        lambda *a, **k: calls.append(a[1:3]) or real(*a, **k))
+    ta = estate.tenant_holder('tadmin')
+    got = ta.get('/api/changes?limit=500').get_json()['changes']
+    assert len(got) == 40 and all(p['can']['approve'] for p in got)
+    assert len(calls) <= 50, len(calls)
+
+
 # -- the body names no status, no approver, no requester ---------------------------------------
 
 def test_a_status_or_approver_in_the_body_changes_nothing(estate, db):
