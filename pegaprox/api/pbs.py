@@ -1219,7 +1219,10 @@ def get_pbs_task_detail(pbs_id, upid):
 @bp.route('/api/pbs/<pbs_id>/jobs', methods=['GET'])
 @require_auth(perms=['pbs.jobs.view'])
 def get_pbs_jobs(pbs_id):
-    """List all PBS jobs (sync, verify, prune)"""
+    """List PBS sync, verify and prune jobs with schedule and last-run status.
+
+    A failed PBS read must not look like an empty configured-job list.
+    """
     # NS Jul 2026 (CodeAnt IDOR) — enforce the per-PBS linked-clusters tenant gate
     ok, err = check_pbs_access(pbs_id)
     if not ok:
@@ -1228,15 +1231,21 @@ def get_pbs_jobs(pbs_id):
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
     
-    sync = mgr.get_sync_jobs()
-    verify = mgr.get_verify_jobs()
-    prune = mgr.get_prune_jobs()
-    
-    return jsonify({
-        'sync': sync.get('data', []),
-        'verify': verify.get('data', []),
-        'prune': prune.get('data', []),
-    })
+    jobs = {}
+    for kind, get_jobs in (('sync', mgr.get_sync_jobs),
+                           ('verify', mgr.get_verify_jobs),
+                           ('prune', mgr.get_prune_jobs)):
+        result = get_jobs()
+        failure = pbs_upstream_error(result)
+        if failure:
+            status, payload = failure
+            return jsonify(payload), status
+        if not isinstance(result, dict) or not isinstance(result.get('data'), list):
+            return jsonify({'error': 'PBS returned an invalid job list',
+                            'code': 'PBS_UPSTREAM'}), 502
+        jobs[kind] = result['data']
+
+    return jsonify(jobs)
 
 
 @bp.route('/api/pbs/<pbs_id>/jobs/<job_type>/<job_id>/run', methods=['POST'])

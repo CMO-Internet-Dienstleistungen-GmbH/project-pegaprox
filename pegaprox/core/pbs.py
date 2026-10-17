@@ -697,16 +697,16 @@ class PBSManager:
     # ── Jobs ──
     
     def get_sync_jobs(self) -> dict:
-        """List configured sync jobs"""
-        return self.api_get('/config/sync')
+        """List sync jobs with their schedules and last-run status."""
+        return self.api_get('/admin/sync')
     
     def get_verify_jobs(self) -> dict:
-        """List configured verify jobs"""
-        return self.api_get('/config/verify')
+        """List verify jobs with their schedules and last-run status."""
+        return self.api_get('/admin/verify')
     
     def get_prune_jobs(self) -> dict:
-        """List configured prune jobs"""
-        return self.api_get('/config/prune')
+        """List prune jobs with their schedules and last-run status."""
+        return self.api_get('/admin/prune')
     
     def run_sync_job(self, job_id: str) -> dict:
         """Manually trigger a sync job"""
