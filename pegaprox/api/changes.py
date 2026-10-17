@@ -375,13 +375,16 @@ def _not_now(plan, action):
                        409, code='INVALID_TRANSITION', status=plan['status'])
 
 
-def _move(plan, action, sets):
-    """Write the transition and the fields with it; False when the plan changed under us."""
+def _move(plan, action, sets, keep=()):
+    """Write the transition and the fields with it; False when the plan changed under us.
+    keep: columns that must still hold what the caller read and judged."""
     after = plans.TRANSITIONS[plan['status']][action]
     cols = dict(sets, status=after, updated_at=_stamp())
-    sql = 'UPDATE change_plans SET ' + ', '.join(f'{k} = ?' for k in cols) + ' WHERE id = ? AND status = ?'
+    sql = ('UPDATE change_plans SET ' + ', '.join(f'{k} = ?' for k in cols) + ' WHERE id = ? AND status = ?'
+           + ''.join(f' AND {k} IS ?' for k in keep))
     db = get_db()
-    cur = db.conn.execute(sql, tuple(cols.values()) + (plan['id'], plan['status']))
+    cur = db.conn.execute(sql, tuple(cols.values()) + (plan['id'], plan['status'])
+                          + tuple(plan[k] for k in keep))
     db.conn.commit()
     return cur.rowcount == 1
 
@@ -459,7 +462,9 @@ def submit_change(pid):
     if refusal:
         return _json_error(f'Access denied: {refusal}', 403)
     try:
-        moved = _move(p, 'submit', {})
+        # a draft is edited without the window rules; one edited since they were checked
+        # above is not submitted with them unchecked (an edited scope was judged by the edit)
+        moved = _move(p, 'submit', {}, keep=('window_start', 'window_end'))
     except Exception:
         logging.exception('[changes] plan not stored')
         return _json_error('internal error', 500)

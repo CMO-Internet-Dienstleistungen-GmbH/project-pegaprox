@@ -99,7 +99,8 @@ def clean_scope(raw):
         for t in targets:
             if isinstance(t, bool) or not isinstance(t, (int, str)):
                 return None, 'guest targets are VMIDs'
-            if isinstance(t, str) and not t.strip().isdigit():
+            # isdigit() alone passes a superscript two, which int() then refuses with a 500
+            if isinstance(t, str) and not (t.strip().isascii() and t.strip().isdigit()):
                 return None, 'guest targets are VMIDs'
             n = int(t)
             if not 0 < n <= _VMID_MAX:

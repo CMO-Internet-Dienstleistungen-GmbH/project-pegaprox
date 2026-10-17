@@ -66,6 +66,42 @@ def test_the_owning_tenant_admin_still_approves_that_guest(estate, api, db):
     assert _status(db, pid) == 'approved'
 
 
+# -- the window that was checked is the window that is submitted -------------------------------
+
+def test_an_edit_landing_while_submit_checks_does_not_ride_along(estate, api, db, monkeypatch):
+    """Submit checks the window and the reach, then writes the status. A draft edited in
+    between (a second tab, the requester racing themselves while the reach check waits on
+    the pool cache of the cluster) went out with a window nobody checked."""
+    alice = estate.admin('alice')
+    pid = _make(alice)
+    real = changes_api._request_refusal
+    year = {'window_start': _iso(minutes=30), 'window_end': _iso(days=365)}
+
+    def racing(user, cid, scope):
+        out = real(user, cid, scope)
+        monkeypatch.setattr(changes_api, '_request_refusal', real)
+        r = alice.put(f'/api/changes/{pid}', json=year)
+        assert r.status_code == 200, r.get_data(as_text=True)
+        return out
+
+    monkeypatch.setattr(changes_api, '_request_refusal', racing)
+    r = alice.post(f'/api/changes/{pid}/submit')
+    assert r.status_code == 409, r.get_data(as_text=True)
+    row = db.query_one('SELECT status, window_start, window_end FROM change_plans WHERE id = ?', (pid,))
+    assert row['status'] == 'draft'
+    # and submitted again, the window is judged and refused
+    again = alice.post(f'/api/changes/{pid}/submit')
+    assert again.status_code == 400 and again.get_json()['code'] == 'BAD_WINDOW'
+
+
+# -- garbage -----------------------------------------------------------------------------------
+
+@pytest.mark.parametrize('target', ['²', '①', '12³'])
+def test_a_digit_python_cannot_count_with_is_a_400_not_a_500(estate, target):
+    r = estate.admin('alice').post('/api/changes', json=_plan_body(targets=(target,)))
+    assert r.status_code == 400, r.get_data(as_text=True)
+
+
 # -- the body names no status, no approver, no requester ---------------------------------------
 
 def test_a_status_or_approver_in_the_body_changes_nothing(estate, db):
