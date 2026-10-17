@@ -11,6 +11,7 @@ import base64
 import re
 import requests
 import secrets
+import ssl
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding, utils
@@ -28,6 +29,14 @@ _pending_challenges = {}
 
 # DNS-01 requests waiting for the admin to publish the TXT record.
 _pending_dns_challenges = {}
+
+
+def _acme_verify():
+    """Trust system CAs for ACME, while keeping Requests' CA bundle overrides."""
+    if os.environ.get('REQUESTS_CA_BUNDLE') or os.environ.get('CURL_CA_BUNDLE'):
+        return True  # Requests applies these only when verify is True or None.
+    paths = ssl.get_default_verify_paths()
+    return paths.cafile or paths.capath or True
 
 
 def _b64url(data):
@@ -109,7 +118,7 @@ def _signed_request(url, payload, account_key, nonce, kid=None):
     }
     _guard_acme_url(url)
     resp = requests.post(url, json=body, headers={'Content-Type': 'application/jose+json'},
-                         timeout=30, allow_redirects=False)
+                         timeout=30, allow_redirects=False, verify=_acme_verify())
     return resp
 
 
@@ -138,7 +147,8 @@ def _guard_acme_url(url):
 
 def _get_nonce(directory):
     _guard_acme_url(directory['newNonce'])
-    resp = requests.head(directory['newNonce'], timeout=10, allow_redirects=False)
+    resp = requests.head(directory['newNonce'], timeout=10, allow_redirects=False,
+                         verify=_acme_verify())
     return resp.headers['Replay-Nonce']
 
 
@@ -578,7 +588,8 @@ def _create_order(domain, email, ssl_dir, staging=False, directory_url=None):
         return {'success': False, 'message': f'ACME directory URL rejected: {guard_err} '
                 '(set "Allow private/internal ACME CA" in SSL settings if this is an internal CA)'}
 
-    dir_resp = requests.get(acme_url, timeout=15, allow_redirects=False)  # M-8: no redirect to internal
+    dir_resp = requests.get(acme_url, timeout=15, allow_redirects=False,
+                            verify=_acme_verify())  # M-8: no redirect to internal
     dir_resp.raise_for_status()
     directory = dir_resp.json()
 
