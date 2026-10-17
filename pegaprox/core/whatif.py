@@ -1688,6 +1688,26 @@ class _Risk:
                 'last_success_at': row['last_success_at'], 'basis': _KNOWN}
 
 
+def guest_risk(cluster_id, guests, critical=None):
+    """{vmid: {'critical', 'tags', 'restore'}} for resource rows {vmid: row} of one cluster,
+    read the way the risk view reads them: the critical tags once, the restore test marks
+    once, however many guests there are. The preflight asks this for the guests it checks;
+    restore is proven, not_proven, failing or unknown (the marks could not be read)."""
+    if not guests:
+        return {}
+    rows = []
+    for vmid, g in guests.items():
+        rows.append(dict(g, vmid=int(vmid)))
+    ctx = _Risk(cluster_id, rows, critical)
+    now = time.time()
+    out = {}
+    for vmid in ctx.vms:
+        out[vmid] = {'critical': ctx.is_critical(vmid),
+                     'tags': sorted(ctx.critical & ctx.guest_tags(ctx.vms[vmid].get('tags'))),
+                     'restore': ctx.restore_of(vmid, now)['state']}
+    return out
+
+
 def _weigh(rows, ctx):
     """Counts of the affected guests and their weight (OUTCOME_WEIGHT, a critical guest
     CRITICAL_FACTOR times)."""
@@ -1751,6 +1771,66 @@ def risk_view(report, ctx):
     return report
 
 
+# NS Oct 2026 - one line for the people who do not read the whole report. It is made of what
+# the report already holds, no score: a guest that cannot be placed blocks, the rest warns
+VERDICT_TEXT = {
+    'guests_down': '{count} guests cannot be placed anywhere and stay down',
+    'headroom_unplaced': 'In {count} failure combinations guests cannot be placed on the nodes left',
+    'headroom_quorum': 'In {count} failure combinations the cluster loses quorum',
+    'critical_affected': '{count} critical guests are affected: {names}',
+    'restore_unproven': '{count} affected guests have no proven restore',
+    'over_threshold': 'Over the CPU or memory threshold afterwards: {nodes}',
+    'headroom_over': '{count} failure combinations leave nodes over their threshold',
+    'tenants_assumed': 'Tenants are counted per cluster, not per guest: {tenants}',
+}
+VERDICT_NAMES = 5       # critical guests named in the line, the rest is a count
+
+
+def _vreason(level, code, **args):
+    return {'level': level, 'code': code, 'args': args,
+            'text': VERDICT_TEXT[code].format(**{k: _say(v) for k, v in args.items()})}
+
+
+def verdict(report):
+    """{'level': ready|warning|blocked, 'reasons': [{level, code, args, text}]} of a report."""
+    blocked, warned = [], []
+    rows = report.get('guests') or []
+    down = sum(1 for r in rows if r.get('outcome') == 'down')
+    if down:
+        blocked.append(_vreason('blocked', 'guests_down', count=down))
+    head = report.get('headroom') or {}
+    combos = head.get('combinations') or []
+    unplaced = sum(1 for c in combos if c.get('unplaced'))
+    if unplaced:
+        blocked.append(_vreason('blocked', 'headroom_unplaced', count=unplaced))
+    no_quorum = sum(1 for c in combos if c.get('quorate') is False)
+    if no_quorum:
+        blocked.append(_vreason('blocked', 'headroom_quorum', count=no_quorum))
+    risk = report.get('risk')
+    crit = [r for r in rows if r.get('critical')]
+    if crit:
+        names = sorted(f"{r['name'] or r['vmid']}" for r in crit)
+        shown = ', '.join(names[:VERDICT_NAMES]) + (f" and {len(names) - VERDICT_NAMES} more"
+                                                    if len(names) > VERDICT_NAMES else '')
+        warned.append(_vreason('warning', 'critical_affected', count=len(crit), names=shown))
+    unproven = sum(1 for r in rows if (r.get('restore') or {}).get('state') in ('not_proven', 'failing'))
+    if unproven:
+        warned.append(_vreason('warning', 'restore_unproven', count=unproven))
+    hot = sorted({r['node'] for r in report.get('nodes') or []
+                  if r.get('over_cpu') or r.get('over_mem') or r.get('overcommitted')})
+    if hot:
+        warned.append(_vreason('warning', 'over_threshold', nodes=hot))
+    if head.get('failing') and not unplaced and not no_quorum:
+        warned.append(_vreason('warning', 'headroom_over', count=head['failing']))
+    # the default tenant counts every cluster, it says nothing about who is hit
+    named = [t['name'] for t in ((risk or {}).get('tenants') or {}).get('items') or []
+             if t.get('id') != 'default']
+    if named and rows:
+        warned.append(_vreason('warning', 'tenants_assumed', tenants=named))
+    level = 'blocked' if blocked else 'warning' if warned else 'ready'
+    return {'level': level, 'reasons': blocked + warned}
+
+
 _SCENARIO_FN = {'node_failure': _node_failure, 'maintenance': _maintenance, 'headroom': _headroom,
                 'storage_failure': _storage_failure, 'network_failure': _network_failure,
                 'pbs_failure': _pbs_failure}
@@ -1767,6 +1847,7 @@ def run(mgr, scenario, thresholds=None):
     except Exception as e:
         log.error(f"[WHATIF] risk view failed: {e}")
         report['risk'] = None
+    report['verdict'] = verdict(report)
     return report
 
 

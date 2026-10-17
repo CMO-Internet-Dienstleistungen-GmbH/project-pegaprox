@@ -109,6 +109,10 @@ def _visible(cluster_id, report):
     for r in seen:
         if 'tenants' in r:
             r['tenants'] = [t for t in r['tenants'] if mine is True or t == mine] if mine else []
+    # NS Oct 2026 - the verdict names critical guests and tenants: say it again from what this
+    # caller may see, so it names no guest or tenant the rows above leave out
+    report['guests'] = seen
+    report['verdict'] = whatif.verdict(report)
     report['guests_hidden'] = len(rows) - len(seen)
     report['guests_truncated'] = max(0, len(seen) - GUEST_ROWS)
     report['guests'] = seen[:GUEST_ROWS]
