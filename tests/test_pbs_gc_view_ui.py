@@ -16,7 +16,8 @@ STORES = [
     {'name': 'alpha', 'total': 1000, 'used': 400, 'avail': 600,
      'gc-status': {'upid': 'UPID:pbs:0000:0000:0000:6A1B2C00:garbage_collection:alpha:root@pam:',
                    'index-data-bytes': 3500, 'disk-bytes': 1000, 'disk-chunks': 12},
-     'gc-job': {'store': 'alpha', 'last-run-endtime': END, 'last-run-state': 'ok', 'duration': 75},
+     # PBS writes the task state as it prints it: OK, WARNINGS: n, or the error
+     'gc-job': {'store': 'alpha', 'last-run-endtime': END, 'last-run-state': 'OK', 'duration': 75},
      'detail': {}},
     {'name': 'beta', 'total': 1000, 'used': 100, 'avail': 900,
      'gc-job': {'store': 'beta', 'last-run-endtime': END, 'last-run-state': 'TASK ERROR: out of space'},
@@ -54,6 +55,8 @@ def test_the_gc_card_shows_the_last_run_and_the_dedup_factor(browser, layout):
         assert '1m 15s' in text
         assert '3.50x' in text
         assert 'TASK ERROR' not in text
+        # a run that went fine is not a status line of its own
+        assert 'Status' not in text and 'OK' not in text
         assert not app.errors, app.errors
     finally:
         app.ctx.close()

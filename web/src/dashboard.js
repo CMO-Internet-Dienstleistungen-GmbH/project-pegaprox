@@ -25129,6 +25129,10 @@
                                                                 const gc = pbsGcView(currentDs);
                                                                 const gcStatus = gc.status;
                                                                 const gcSecs = Number(gc.job.duration) || 0;
+                                                                // PBS writes the task state: "OK", "WARNINGS: n", or the error itself
+                                                                const gcState = String(gc.job['last-run-state'] || '');
+                                                                const gcStateOk = !gcState || /^(TASK )?OK$/i.test(gcState);
+                                                                const gcStateWarn = /^(TASK )?WARNINGS/i.test(gcState);
                                                                 return (
                                                                     <div className="flex flex-wrap gap-4 items-start">
                                                                         {pbsNamespaces.length > 0 && (
@@ -25154,8 +25158,8 @@
                                                                                 <span className="text-xs text-gray-500 block mb-1.5">{t('pbsGarbageCollection') || 'Garbage Collection'}</span>
                                                                                 <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
                                                                                     <span className="text-gray-500">{t('pbsLastGc') || 'Last GC'}:</span><span className="text-gray-300">{gc.job['last-run-endtime'] ? fmtDate(gc.job['last-run-endtime'] * 1000) : '-'}</span>
-                                                                                    {gc.job['last-run-state'] && gc.job['last-run-state'] !== 'ok' && (
-                                                                                        <><span className="text-gray-500">{t('status') || 'Status'}:</span><span className="text-red-400 break-words">{gc.job['last-run-state']}</span></>
+                                                                                    {!gcStateOk && (
+                                                                                        <><span className="text-gray-500">{t('status') || 'Status'}:</span><span className={`${gcStateWarn ? 'text-yellow-400' : 'text-red-400'} break-words`}>{gcState}</span></>
                                                                                     )}
                                                                                     <span className="text-gray-500">{t('duration') || 'Duration'}:</span><span className="text-gray-300">{gcSecs ? `${Math.floor(gcSecs / 60)}m ${gcSecs % 60}s` : '-'}</span>
                                                                                     <span className="text-gray-500">{t('pbsDedupFactor') || 'Dedup Factor'}:</span><span className="text-cyan-400 font-medium">{gc.dedup !== null ? `${gc.dedup.toFixed(2)}x` : '-'}</span>
