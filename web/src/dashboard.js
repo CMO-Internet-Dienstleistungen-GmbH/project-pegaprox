@@ -12419,6 +12419,8 @@
             const [pbsTasks, setPbsTasks] = useState([]);
             const [pbsJobsResult, setPbsJobsResult] = useState({ id: null, data: {}, error: false });
             const pbsJobsSeq = React.useRef(0);
+            const selectedPBSIdRef = React.useRef(null);
+            selectedPBSIdRef.current = selectedPBS?.id ?? null;
             const pbsJobs = pbsJobsResult.id === selectedPBS?.id ? pbsJobsResult.data : {};
             const pbsJobsError = pbsJobsResult.id === selectedPBS?.id && pbsJobsResult.error;
             const [pbsActiveTab, setPbsActiveTab] = useState('dashboard');
@@ -16380,6 +16382,7 @@
                     const interval = setInterval(() => {
                         fetchPBSStatus(selectedPBS.id);
                         fetchPBSDatastores(selectedPBS.id);
+                        fetchPBSJobs(selectedPBS.id);
                     }, 30000);
                     return () => clearInterval(interval);
                 }
@@ -16533,15 +16536,26 @@
                 } catch (e) { addToast(`${action} error: ${e.message}`, 'error'); }
             };
             
+            /**
+             * Start a PBS job and refresh its server's tasks and last-run status.
+             * @param {'sync'|'verify'|'prune'} jobType - PBS job kind.
+             * @param {string} jobId - Job to run.
+             * @returns {Promise<void>}
+             */
             const pbsRunJob = async (jobType, jobId) => {
                 if (!selectedPBS) return;
+                const pbsId = selectedPBS.id;
                 try {
-                    const resp = await authFetch(`${API_URL}/pbs/${selectedPBS.id}/jobs/${jobType}/${jobId}/run`, {
+                    const resp = await authFetch(`${API_URL}/pbs/${pbsId}/jobs/${jobType}/${jobId}/run`, {
                         method: 'POST',
                     });
                     if (resp && resp.ok) {
                         addToast(`${jobType} job '${jobId}' started`, 'success');
-                        setTimeout(() => fetchPBSTasks(selectedPBS.id), 1000);
+                        setTimeout(() => {
+                            if (selectedPBSIdRef.current !== pbsId) return;
+                            fetchPBSTasks(pbsId);
+                            fetchPBSJobs(pbsId);
+                        }, 1000);
                     } else {
                         const err = resp ? await resp.json().catch(() => ({})) : {};
                         addToast(`Job failed: ${err.error || 'unknown'}`, 'error');
@@ -16561,7 +16575,7 @@
             };
             
             
-            // PBS prune dialog  
+            // PBS prune dialog
             const [showPbsPrune, setShowPbsPrune] = useState(null);
             
             // ============================================================

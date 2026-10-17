@@ -38,6 +38,13 @@ READS = {
 }
 
 
+def _jobs_after_run():
+    """Return the mocked PBS job list after the sync job has finished."""
+    jobs = {kind: [dict(job) for job in entries] for kind, entries in JOBS.items()}
+    jobs['sync'][0]['last-run-endtime'] += 3600
+    return jobs
+
+
 @pytest.mark.parametrize('layout', ['modern', 'corporate'])
 def test_selected_datastore_shows_only_its_schedules(browser, layout):
     """Changing stores changes the GC schedule and filters each kind of PBS job."""
@@ -72,6 +79,65 @@ def test_selected_datastore_shows_only_its_schedules(browser, layout):
         assert 'sync-alpha' not in text and 'verify-alpha' not in text and 'prune-alpha' not in text
         assert not [call for call in app.server.calls
                     if call[0] != 'GET' and call[1].startswith('/api/pbs/')], app.server.calls
+        assert not app.errors, app.errors
+    finally:
+        app.ctx.close()
+
+
+def test_scheduled_run_refreshes_datastore_last_run_on_poll(browser):
+    """The 30-second PBS poll refreshes last-run status without changing stores."""
+    app = _App(browser, _FakeServer(role='standalone', extra=READS), clock=True)
+    try:
+        page = app.page
+        page.get_by_text('backup01').first.click()
+        page.get_by_role('button', name='Datastores').first.click()
+        page.get_by_role('button', name=re.compile(r'^alpha\b')).click()
+        cell = page.locator('[data-pbs-datastore-schedules="alpha"] [data-pbs-schedule-kind="sync"] td').nth(3)
+        previous = cell.inner_text()
+        assert previous != '-'
+        initial_reads = app.server.calls.count(('GET', '/api/pbs/p1/jobs'))
+
+        app.server.extra[('GET', '/api/pbs/p1/jobs')] = (200, _jobs_after_run())
+        page.clock.run_for(31000)
+        page.wait_for_function(
+            '''previous => {
+                const cell = document.querySelector('[data-pbs-datastore-schedules="alpha"] '
+                    + '[data-pbs-schedule-kind="sync"] td:nth-child(4)');
+                return cell && cell.textContent.trim() !== previous;
+            }''', arg=previous, timeout=5000,
+        )
+        assert app.server.calls.count(('GET', '/api/pbs/p1/jobs')) > initial_reads
+        assert not app.errors, app.errors
+    finally:
+        app.ctx.close()
+
+
+def test_manual_run_refreshes_jobs_last_run(browser):
+    """Run now reloads job status as well as tasks for the selected PBS."""
+    reads = dict(READS)
+    reads[('POST', '/api/pbs/p1/jobs/sync/sync-alpha/run')] = (200, {'data': 'UPID:run'})
+    app = _App(browser, _FakeServer(role='standalone', extra=reads), clock=True)
+    try:
+        page = app.page
+        page.get_by_text('backup01').first.click()
+        page.get_by_role('button', name='Jobs').first.click()
+        row = page.locator('tr').filter(has_text='sync-alpha').first
+        previous = row.locator('td').nth(4).inner_text()
+        assert previous != '-'
+        initial_reads = app.server.calls.count(('GET', '/api/pbs/p1/jobs'))
+
+        row.get_by_role('button', name='Run').click()
+        page.get_by_text("sync job 'sync-alpha' started").wait_for(timeout=5000)
+        app.server.extra[('GET', '/api/pbs/p1/jobs')] = (200, _jobs_after_run())
+        page.clock.run_for(1100)
+        page.wait_for_function(
+            '''previous => {
+                const row = [...document.querySelectorAll('tr')]
+                    .find(row => row.textContent.includes('sync-alpha'));
+                return row && row.querySelectorAll('td')[4]?.textContent.trim() !== previous;
+            }''', arg=previous, timeout=5000,
+        )
+        assert app.server.calls.count(('GET', '/api/pbs/p1/jobs')) > initial_reads
         assert not app.errors, app.errors
     finally:
         app.ctx.close()
