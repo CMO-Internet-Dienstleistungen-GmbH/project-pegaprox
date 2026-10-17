@@ -478,8 +478,13 @@ def backup_times(cluster_id, mgr):
 
 # --- the verdict of one guest ------------------------------------------------------------
 
-def _reason(level, code, text, overridable=False):
-    reason = {'level': level, 'code': code, 'text': text}
+def _reason(level, code, text, overridable=False, args=None, variant=None):
+    # NS Oct 2026 - args holds the values the English text contains, spelled the way the
+    # text spells them, so the UI can render its own wording of the code from them; variant
+    # names a second wording of one code (the UI tries pf_<code>_<variant> first)
+    reason = {'level': level, 'code': code, 'text': text, 'args': dict(args or {})}
+    if variant:
+        reason['variant'] = variant
     if level == BLOCKED:
         reason['overridable'] = bool(overridable)
     return reason
@@ -504,17 +509,17 @@ class _Guest:
                     'status': g.get('status') or 'unknown', 'to': None, 'verdict': READY,
                     'overridable': False, 'overridden': False, 'reasons': [], 'abort': ''}
 
-    def add(self, level, code, text, overridable=False):
-        self.row['reasons'].append(_reason(level, code, text, overridable))
+    def add(self, level, code, text, overridable=False, args=None, variant=None):
+        self.row['reasons'].append(_reason(level, code, text, overridable, args, variant))
 
-    def block(self, code, text, overridable=False):
-        self.add(BLOCKED, code, text, overridable)
+    def block(self, code, text, overridable=False, args=None, variant=None):
+        self.add(BLOCKED, code, text, overridable, args, variant)
 
-    def warn(self, code, text):
-        self.add(WARNING, code, text)
+    def warn(self, code, text, args=None, variant=None):
+        self.add(WARNING, code, text, args=args, variant=variant)
 
-    def info(self, code, text):
-        self.add(INFO, code, text)
+    def info(self, code, text, args=None, variant=None):
+        self.add(INFO, code, text, args=args, variant=variant)
 
     @property
     def blocked(self):
@@ -586,7 +591,8 @@ class _Sim:
             return
         n = self.node(t)
         if n is None:
-            gv.warn('memory_unknown', f"The memory of {t} is not known: whether it fits is not checked")
+            gv.warn('memory_unknown', f"The memory of {t} is not known: whether it fits is not checked",
+                    args={'node': t})
             return
         need = _int(gv.g.get('maxmem'))
         after = n['mem_used'] + need
@@ -594,7 +600,7 @@ class _Sim:
         if short:
             figures = '' if self.scoped else f"{_gb(after)} of {_gb(n['mem_total'])}, "
             gv.block('memory_short', f"{t} runs out of memory with it ({figures}counting the guests before it "
-                                     f"in this set)", overridable=True)
+                                     f"in this set)", overridable=True, args={'node': t, 'figures': figures})
             if not forced:
                 return
         n['mem_used'] = after
@@ -602,14 +608,16 @@ class _Sim:
         pct = after * 100.0 / n['mem_total']
         if pct > MEM_WARN_PCT and not short:
             gv.warn('memory_tight', f"{t} is nearly out of memory with it" if self.scoped
-                    else f"{t} is at {pct:.0f}% memory with it")
+                    else f"{t} is at {pct:.0f}% memory with it",
+                    args={'node': t} if self.scoped else {'node': t, 'pct': f"{pct:.0f}"})
         vcpus = _int(gv.g.get('maxcpu'))
         if n['cpus'] and vcpus:
             n['cpu_used'] += vcpus * float(gv.g.get('cpu') or 0) if isinstance(gv.g.get('cpu'), (int, float)) else 0
             cpu_pct = n['cpu_used'] * 100.0 / n['cpus']
             if cpu_pct > CPU_WARN_PCT:
                 gv.warn('cpu_busy', f"{t} is nearly out of CPU with it" if self.scoped
-                        else f"{t} is at {cpu_pct:.0f}% CPU with it")
+                        else f"{t} is at {cpu_pct:.0f}% CPU with it",
+                        args={'node': t} if self.scoped else {'node': t, 'pct': f"{cpu_pct:.0f}"})
 
     def _left(self, key, free):
         if key not in self.disk:
@@ -670,7 +678,8 @@ def _cpu_checks(gv, src_info, tgt_info, t, baseline, live, tgt_cpus, scoped=Fals
     if gv.running and vcpus and tgt_cpus and vcpus > tgt_cpus:
         # a caller confined to some guests reads no figures of a node, nor its CPU model
         gv.block('vcpus', f"It has more vCPUs than {t} has CPUs: it cannot run there" if scoped
-                 else f"It has {vcpus} vCPUs and {t} has {tgt_cpus}: it cannot run there")
+                 else f"It has {vcpus} vCPUs and {t} has {tgt_cpus}: it cannot run there",
+                 args={'node': t} if scoped else {'node': t, 'vcpus': str(vcpus), 'cpus': str(tgt_cpus)})
     if gv.cfg is None:
         return
     vm_cpu = PegaProxManager.cpu_type_of(gv.cfg)
@@ -679,31 +688,39 @@ def _cpu_checks(gv, src_info, tgt_info, t, baseline, live, tgt_cpus, scoped=Fals
         if not verdict.get('compatible', True):
             gv.block('cpu_vendor', f"CPU type {vm_cpu}: {t} has a CPU of another vendor - it cannot move live "
                                    f"to {t}" if scoped
-                     else f"CPU type {vm_cpu}: {verdict.get('reason')} - it cannot move live to {t}")
+                     else f"CPU type {vm_cpu}: {verdict.get('reason')} - it cannot move live to {t}",
+                     args={'cpu': str(vm_cpu), 'node': t} if scoped
+                     else {'cpu': str(vm_cpu), 'node': t, 'detail': str(verdict.get('reason'))})
         elif verdict.get('warning'):
             gv.warn('cpu_model', f"CPU type {vm_cpu}: {t} has another CPU model - the migration may fail on "
-                                 f"CPU flags" if scoped else verdict['warning'])
+                                 f"CPU flags" if scoped else verdict['warning'],
+                    args={'cpu': str(vm_cpu), 'node': t} if scoped else {'detail': str(verdict['warning'])})
     if baseline:
         policy = PegaProxManager.cpu_verdict(vm_cpu, {}, {}, baseline)
         if not policy.get('compatible', True):
-            gv.warn('cpu_baseline', f"{policy.get('reason')}: the balancer will not move it")
+            gv.warn('cpu_baseline', f"{policy.get('reason')}: the balancer will not move it",
+                    args={'detail': str(policy.get('reason'))})
 
 
 def _device_checks(gv, live):
     for key, kind, mapped in local_devices(gv.cfg, gv.kind):
         if kind == 'bind':
             gv.block('bind_mount', f"{key} is a bind mount of a host directory: Proxmox does not migrate it "
-                                   f"(mark it shared if the path exists on every node)")
+                                   f"(mark it shared if the path exists on every node)", args={'key': key})
         elif kind == 'virtiofs':
             if live and gv.running:
-                gv.block('virtiofs_live', f"{key} is a virtiofs share: it does not migrate live - shut the VM down first")
+                gv.block('virtiofs_live', f"{key} is a virtiofs share: it does not migrate live - shut the VM down first",
+                         args={'key': key})
             else:
-                gv.warn('virtiofs', f"{key} is a virtiofs share: its directory mapping has to cover the target node")
+                gv.warn('virtiofs', f"{key} is a virtiofs share: its directory mapping has to cover the target node",
+                        args={'key': key})
         elif not mapped:
             gv.block('local_device', f"{key} passes a {kind.upper()} device of {gv.node} through: Proxmox does not "
-                                     f"migrate it - use a resource mapping or remove it")
+                                     f"migrate it - use a resource mapping or remove it",
+                     args={'key': key, 'kind': kind.upper(), 'node': gv.node})
         else:
-            gv.warn('mapped_device', f"{key} uses a resource mapping: it has to cover the target node")
+            gv.warn('mapped_device', f"{key} uses a resource mapping: it has to cover the target node",
+                    args={'key': key})
 
 
 def _backup_check(gv, side):
@@ -715,14 +732,43 @@ def _backup_check(gv, side):
     ts = _int(times.get(gv.vmid))
     sla = _int(_setting(side.mgr, 'backup_sla_max_age_hours'))
     if not ts:
-        gv.warn('no_backup', 'No backup of it was found')
+        gv.warn('no_backup', 'No backup of it was found', args={})
         return
     age_h = max(0.0, (time.time() - ts) / 3600.0)
     if sla and age_h > sla:
         gv.warn('backup_old', f"Its newest backup is {age_h:.0f} h old, older than the {sla} h of the "
-                              f"cluster's backup SLA")
+                              f"cluster's backup SLA", args={'hours': f"{age_h:.0f}", 'sla': str(sla)})
     else:
-        gv.info('backup_recent', f"Newest backup {age_h:.0f} h old")
+        gv.info('backup_recent', f"Newest backup {age_h:.0f} h old", args={'hours': f"{age_h:.0f}"})
+
+
+def _risk_checks(side, gvs):
+    """What the guests carry that the move should not take lightly: a critical tag, a restore
+    that is not proven or failing. One read of the tags and the restore test marks for the
+    whole set. Never a block: the first of the two is an info, both together a warning.
+    NS Oct 2026"""
+    gvs = [gv for gv in gvs if gv.g and not gv.g.get('template')]
+    if not gvs:
+        return
+    from pegaprox.core import whatif
+    try:
+        risk = whatif.guest_risk(side.id, {gv.vmid: gv.g for gv in gvs})
+    except Exception as e:
+        log.debug(f"[PREFLIGHT] risk of {side.id}: {e}")
+        return
+    for gv in gvs:
+        got = risk.get(gv.vmid)
+        if not got:
+            continue
+        bad = got['restore'] in ('not_proven', 'failing')
+        level = WARNING if got['critical'] and bad else INFO
+        if got['critical']:
+            tags = ', '.join(got['tags'])
+            gv.add(level, 'critical_guest', f"Critical guest (tagged {tags})", args={'tags': tags})
+        if got['restore'] == 'failing':
+            gv.add(level, 'restore_failing', 'Its last restore test failed', args={})
+        elif got['restore'] == 'not_proven':
+            gv.add(level, 'restore_not_proven', 'No restore of it has been proven lately', args={})
 
 
 def _frame(kind, side, scoped):
@@ -772,7 +818,7 @@ def intra(cluster_id, mgr, vmids, target=None, online=True, with_local_disks=Fal
         rows = []
         for vmid in vmids:
             gv = _Guest(vmid, (guests or {}).get(vmid))
-            gv.info('unsupported', 'PegaProx checks migrations on Proxmox clusters only')
+            gv.info('unsupported', 'PegaProx checks migrations on Proxmox clusters only', args={})
             gv.row['to'] = target
             rows.append(gv.finish())
         out['steps'] = _intra_steps(rows, target, online, mode, parallel)
@@ -787,14 +833,15 @@ def intra(cluster_id, mgr, vmids, target=None, online=True, with_local_disks=Fal
         all_gv.append(gv)
         if g is None:
             if guests is None:
-                gv.warn('guests_unread', 'The guest list of the cluster could not be read: nothing is checked')
+                gv.warn('guests_unread', 'The guest list of the cluster could not be read: nothing is checked',
+                        args={})
             else:
-                gv.block('not_found', 'Not on this cluster')
+                gv.block('not_found', 'Not on this cluster', args={})
             continue
         if target and gv.node == target:
-            gv.block('already_there', f'Already on {target}')
+            gv.block('already_there', f'Already on {target}', args={'node': target})
         elif vmid in busy:
-            gv.block('busy', 'Another bulk migration moves it already')
+            gv.block('busy', 'Another bulk migration moves it already', args={})
         else:
             todo.append(gv)
     configs = side.configs([gv.g for gv in todo])
@@ -819,10 +866,12 @@ def intra(cluster_id, mgr, vmids, target=None, online=True, with_local_disks=Fal
         t = target or _pick(side, sim, gv, pool, online, with_local_disks)
         gv.row['to'] = t
         if not t:
-            gv.block('no_node', 'No node can take it: on every node that could, one of the checks blocks it')
+            gv.block('no_node', 'No node can take it: on every node that could, one of the checks blocks it',
+                     args={})
             continue
         _intra_checks(side, sim, gv, t, online, with_local_disks, override)
 
+    _risk_checks(side, [gv for gv in todo if gv.row['to']])
     _affinity_checks(side, todo, guests, scoped, override, affinity_override)
     for gv in todo:
         if gv.row['to']:
@@ -859,25 +908,27 @@ def _pick(side, sim, gv, pool, online, with_local_disks):
 def _intra_checks(side, sim, gv, t, online, with_local_disks, override=()):
     nodes = side.nodes() or {}
     if nodes and t not in nodes:
-        gv.block('target_unknown', f'{t} is no node of this cluster')
+        gv.block('target_unknown', f'{t} is no node of this cluster', args={'node': t})
         return
     tinfo = nodes.get(t) or {}
     if nodes and (tinfo.get('offline') or tinfo.get('status', 'online') != 'online'):
-        gv.block('target_offline', f'{t} is not online')
+        gv.block('target_offline', f'{t} is not online', args={'node': t})
         return
     if tinfo.get('maintenance_mode'):
-        gv.warn('target_maintenance', f'{t} is in maintenance: its evacuation may move it away again')
+        gv.warn('target_maintenance', f'{t} is in maintenance: its evacuation may move it away again',
+                args={'node': t})
     _busy_checks(gv)
     live = bool(online)
     if gv.running and not live:
         if gv.kind == 'qemu':
             gv.block('running_offline', 'It runs: Proxmox moves a running VM only live - pick live '
-                                        'migration or shut it down first')
+                                        'migration or shut it down first', args={})
         else:
             gv.block('running_offline', 'It runs: a container moves in restart mode only - pick live '
-                                        'migration or shut it down first')
+                                           'migration or shut it down first', args={}, variant='ct')
     elif gv.running and gv.kind == 'lxc':
-        gv.warn('ct_restart', f"It is a container: it stops on {gv.node} and starts again on {t}")
+        gv.warn('ct_restart', f"It is a container: it stops on {gv.node} and starts again on {t}",
+                args={'from': gv.node, 'node': t})
     _cpu_checks(gv, (nodes.get(gv.node) or {}).get('cpuinfo') or {}, tinfo.get('cpuinfo') or {}, t,
                 _setting(side.mgr, 'cpu_baseline'), live,
                 _int((tinfo.get('cpuinfo') or {}).get('cpus')) if isinstance(tinfo.get('cpuinfo'), dict) else 0,
@@ -887,9 +938,11 @@ def _intra_checks(side, sim, gv, t, online, with_local_disks, override=()):
         allowed = ha['limits'].get(gv.vmid)
         if allowed is not None and t not in allowed:
             gv.block('ha_node_rule', f"Proxmox HA keeps it on {', '.join(sorted(allowed)) or 'no node'} "
-                                     f"(strict node affinity or a restricted group)")
+                                     f"(strict node affinity or a restricted group)",
+                     args={'nodes': ', '.join(sorted(allowed)) or 'no node'})
     if gv.cfg is None:
-        gv.warn('config_unread', 'Its configuration could not be read: disks, networks and devices are not checked')
+        gv.warn('config_unread', 'Its configuration could not be read: disks, networks and devices are '
+                                 'not checked', args={})
         _place(sim, gv, t, (), override)
         return
 
@@ -899,7 +952,8 @@ def _intra_checks(side, sim, gv, t, online, with_local_disks, override=()):
         if tgt_st is not None:
             row = tgt_st.get(vol['storage'])
             if row is None or row.get('status') != 'available':
-                gv.block('storage_missing', f"{vol['key']} is on storage {vol['storage']}, which {t} does not have")
+                gv.block('storage_missing', f"{vol['key']} is on storage {vol['storage']}, which {t} does not have",
+                         args={'key': vol['key'], 'storage': vol['storage'], 'node': t})
                 continue
         src = (src_st or {}).get(vol['storage'])
         # a storage this node does not list cannot be told apart, so it is not counted as local
@@ -907,50 +961,59 @@ def _intra_checks(side, sim, gv, t, online, with_local_disks, override=()):
             continue
         local.append(dict(vol, type=str(src.get('plugintype') or '')))
     if tgt_st is None:
-        gv.warn('storage_unread', f'The storages of {t} could not be read: not checked')
+        gv.warn('storage_unread', f'The storages of {t} could not be read: not checked', args={'node': t})
     if local:
         names = ', '.join(f"{v['key']} on {v['storage']}" for v in local[:4])
         if gv.running and live and gv.kind == 'qemu' and not with_local_disks:
-            gv.block('local_disks', f"It has local disks ({names}): a live migration needs 'migrate local disks'")
+            gv.block('local_disks', f"It has local disks ({names}): a live migration needs 'migrate local disks'",
+                     args={'names': names})
         else:
-            gv.info('local_disks', f"Its local disks are copied to {t}: {names}")
+            gv.info('local_disks', f"Its local disks are copied to {t}: {names}",
+                    args={'node': t, 'names': names}, variant='copied')
         for storage in sorted({v['storage'] for v in local}):
             need = sum(v['size'] for v in local if v['storage'] == storage)
             free = _free(tgt_st.get(storage)) if tgt_st is not None else None
             if not sim.space(t, storage, need, free):
                 gv.block('storage_full', f"Storage {storage} on {t} has less room than its {_gb(need)} "
-                                         f"(counting the guests before it in this set)", overridable=True)
+                                         f"(counting the guests before it in this set)", overridable=True,
+                         args={'storage': storage, 'node': t, 'size': _gb(need)})
             room.append((storage, need, free))
         if 'parent' in gv.cfg:
             repl = {str(j.get('target')) for j in side.jobs_of(gv.vmid)}
             if gv.running and live and gv.kind == 'qemu':
                 if not (all(v['type'] == 'zfspool' for v in local) and t in repl):
                     gv.block('snapshots_live', f"It has snapshots and local disks ({names}): Proxmox does not move "
-                                               f"those while it runs - shut it down or remove the snapshots")
+                                               f"those while it runs - shut it down or remove the snapshots",
+                             args={'names': names})
             else:
                 stuck = [v for v in local if not snapshot_family(v['type'], v['format'], gv.kind)]
                 if stuck:
+                    which = ', '.join(v['key'] + ' on ' + v['storage'] for v in stuck[:4])
                     gv.block('snapshots_storage', f"It has snapshots on local storage that cannot carry them along "
-                                                  f"({', '.join(v['key'] + ' on ' + v['storage'] for v in stuck[:4])})"
-                                                  f": remove the snapshots first")
+                                                  f"({which}): remove the snapshots first",
+                             args={'names': which})
     for key, storage, _vol in cdrom_images(gv.cfg):
         src = (src_st or {}).get(storage)
         if src is not None and not src.get('shared'):
-            gv.block('local_cdrom', f"{key} holds an image on local storage {storage} - eject it first")
+            gv.block('local_cdrom', f"{key} holds an image on local storage {storage} - eject it first",
+                         args={'key': key, 'storage': storage})
     bridges, vnets_known = side.bridges(t)
     nics = guest_nics(gv.cfg)
     if nics and bridges is None:
-        gv.warn('network_unread', f'The network of {t} could not be read: bridges not checked')
+        gv.warn('network_unread', f'The network of {t} could not be read: bridges not checked',
+                args={'node': t})
     elif nics:
         missing = [(k, b) for k, b in nics if b not in bridges]
         for key, bridge in missing:
             if not vnets_known:
                 gv.warn('bridge_unknown', f"{key} uses {bridge}: {t} has no such bridge, and the SDN VNets "
-                                          f"could not be read")
+                                          f"could not be read", args={'key': key, 'bridge': bridge, 'node': t})
             elif gv.running:
-                gv.block('bridge_missing', f"{key} uses bridge {bridge}, which {t} does not have: it cannot run there")
+                gv.block('bridge_missing', f"{key} uses bridge {bridge}, which {t} does not have: it cannot run there",
+                         args={'key': key, 'bridge': bridge, 'node': t})
             else:
-                gv.warn('bridge_missing', f"{key} uses bridge {bridge}, which {t} does not have: it will not start there")
+                gv.warn('bridge_missing', f"{key} uses bridge {bridge}, which {t} does not have: it will "
+                                                  f"not start there", args={'key': key, 'bridge': bridge, 'node': t}, variant='stopped')
     _device_checks(gv, live)
     _place(sim, gv, t, room, override)
 
@@ -958,9 +1021,9 @@ def _intra_checks(side, sim, gv, t, online, with_local_disks, override=()):
 def _busy_checks(gv):
     lock = gv.g.get('lock') or (gv.cfg or {}).get('lock')
     if lock:
-        gv.block('locked', f"It is locked ({lock}): Proxmox migrates no locked guest")
+        gv.block('locked', f"It is locked ({lock}): Proxmox migrates no locked guest", args={'lock': str(lock)})
     if str(gv.g.get('hastate') or '') in ('migrate', 'relocate'):
-        gv.block('ha_moving', 'Proxmox HA moves it right now')
+        gv.block('ha_moving', 'Proxmox HA moves it right now', args={})
 
 
 def _affinity_checks(side, todo, guests, scoped, override=(), may_override=True):
@@ -1006,14 +1069,16 @@ def _affinity_checks(side, todo, guests, scoped, override=(), may_override=True)
             except Exception as e:
                 log.debug(f"[PREFLIGHT] affinity of {gv.vmid}: {e}")
                 aff = None
-                out.append(_reason(WARNING, 'affinity_unread', 'The affinity rules could not be checked'))
+                out.append(_reason(WARNING, 'affinity_unread', 'The affinity rules could not be checked', args={}))
             if isinstance(aff, dict) and aff.get('violation') is True:
                 if aff.get('enforce'):
                     out.append(_reason(BLOCKED, 'affinity', f"Affinity rule '{aff.get('rule')}' keeps it off "
-                                                            f"{gv.row['to']}", overridable=may_override))
+                                                            f"{gv.row['to']}", overridable=may_override,
+                                         args={'rule': str(aff.get('rule')), 'node': str(gv.row['to'])}))
                 else:
+                    soft = '' if scoped else f": {aff.get('message')}"
                     out.append(_reason(WARNING, 'affinity_soft', f"Affinity rule '{aff.get('rule')}' (not enforced)"
-                                       + ('' if scoped else f": {aff.get('message')}")))
+                                       + soft, args={'rule': str(aff.get('rule')), 'detail': soft}))
         sid = sid_of(gv.vmid, gv.kind)
         for rule in ha_rules:
             if sid not in rule['sids']:
@@ -1026,10 +1091,12 @@ def _affinity_checks(side, todo, guests, scoped, override=(), may_override=True)
                 if apart:
                     out.append(_reason(WARNING, 'ha_together', f"HA rule {rule['rule']} keeps it together with "
                                                                f"other guests{who}: Proxmox HA moves them to "
-                                                               f"{gv.row['to']} as well"))
+                                                               f"{gv.row['to']} as well",
+                                         args={'rule': str(rule['rule']), 'who': who, 'node': str(gv.row['to'])}))
             elif any(n == gv.row['to'] for n in where.values()):
                 out.append(_reason(BLOCKED, 'ha_apart', f"HA rule {rule['rule']} keeps it apart from other "
-                                                        f"guests{who} that are on {gv.row['to']} then"))
+                                                        f"guests{who} that are on {gv.row['to']} then",
+                                         args={'rule': str(rule['rule']), 'who': who, 'node': str(gv.row['to'])}))
         return out
 
     # where everyone is once the set moved
@@ -1059,18 +1126,21 @@ def _intra_after(side, gv, t, backups):
     ha = side.ha()
     managed = bool(ha) and gv.vmid in ha['managed']
     if managed:
-        gv.info('ha_managed', 'Proxmox HA manages it: PegaProx hands the move to the HA manager')
+        gv.info('ha_managed', 'Proxmox HA manages it: PegaProx hands the move to the HA manager', args={})
         pref = ha['prefer'].get(gv.vmid)
         if pref and pref[0] and t not in pref[0]:
             gv.warn('ha_prefers', f"Proxmox HA prefers {', '.join(sorted(pref[0]))} for it ({pref[1]}) and "
-                                  f"may move it back")
+                                  f"may move it back",
+                    args={'nodes': ', '.join(sorted(pref[0])), 'source': str(pref[1])})
     for job in side.jobs_of(gv.vmid):
         if str(job.get('target')) == t:
             gv.info('replicated_to_target', f"Replication job {job.get('id')} has it on {t} already: only what "
-                                            f"changed since its last run moves, and Proxmox turns the job round")
+                                            f"changed since its last run moves, and Proxmox turns the job round",
+                    args={'job': str(job.get('id')), 'node': t})
         else:
             gv.info('replication_follows', f"Replication job {job.get('id')} to {job.get('target')} runs from "
-                                           f"{t} afterwards")
+                                           f"{t} afterwards",
+                    args={'job': str(job.get('id')), 'target': str(job.get('target')), 'node': t})
     if backups:
         _backup_check(gv, side)
     if managed:
@@ -1185,31 +1255,34 @@ def cross(src_id, src_mgr, tgt_id, tgt_mgr, vmids, target_node, storage_map=None
         gv.row['to'] = target_node
         if g is None:
             if guests is None:
-                gv.warn('guests_unread', f'The guest list of {src.name} could not be read: it is not checked there')
+                gv.warn('guests_unread', f'The guest list of {src.name} could not be read: it is not checked there',
+                        args={'cluster': src.name}, variant='cluster')
                 todo.append(gv)
             else:
-                gv.block('not_found', f'Not on {src.name}')
+                gv.block('not_found', f'Not on {src.name}', args={'cluster': src.name}, variant='cluster')
             continue
         todo.append(gv)
 
     target_ok = True
     if getattr(tgt_mgr, 'cluster_type', 'proxmox') != 'proxmox' or getattr(src_mgr, 'cluster_type', 'proxmox') != 'proxmox':
         for gv in all_gv:
-            gv.block('unsupported', 'A remote migration runs between Proxmox clusters only')
+            gv.block('unsupported', 'A remote migration runs between Proxmox clusters only', args={},
+                     variant='cross')
         target_ok = False
     elif getattr(tgt_mgr, 'is_connected', True) is False:
         for gv in todo:
-            gv.block('target_offline', f'{tgt.name} is not connected')
+            gv.block('target_offline', f'{tgt.name} is not connected', args={'cluster': tgt.name}, variant='cluster')
         target_ok = False
     tnodes = (tgt.nodes() or {}) if target_ok else {}
     tinfo = tnodes.get(target_node) or {}
     if target_ok and tnodes and target_node not in tnodes:
         for gv in todo:
-            gv.block('target_unknown', f'{target_node} is no node of {tgt.name}')
+            gv.block('target_unknown', f'{target_node} is no node of {tgt.name}',
+                     args={'node': str(target_node), 'cluster': tgt.name}, variant='cluster')
         target_ok = False
     elif target_ok and tnodes and (tinfo.get('offline') or tinfo.get('status', 'online') != 'online'):
         for gv in todo:
-            gv.block('target_offline', f'{target_node} is not online')
+            gv.block('target_offline', f'{target_node} is not online', args={'node': str(target_node)})
         target_ok = False
 
     configs = src.configs([gv.g for gv in todo if gv.g])
@@ -1234,6 +1307,8 @@ def cross(src_id, src_mgr, tgt_id, tgt_mgr, vmids, target_node, storage_map=None
                           may_delete, user, taken, route, override)
     if target_ok and quota:
         _quota_check(src, tgt, [gv for gv in todo if not gv.hard_blocked], user, delete_source)
+    if target_ok:
+        _risk_checks(src, todo)
     for gv in todo:
         if backups and gv.g:
             _backup_check(gv, src)
@@ -1255,30 +1330,31 @@ def _cross_checks(src, tgt, sim, gv, t, storage_map, target_storage, bridge_map,
                   online, force_online, delete_source, may_delete, user, taken, route, override=()):
     _busy_checks(gv)
     if delete_source and not may_delete:
-        gv.block('needs_delete', 'Removing the source guest needs vm.delete on it')
+        gv.block('needs_delete', 'Removing the source guest needs vm.delete on it', args={})
     live = bool(online)
     if gv.kind == 'qemu' and gv.cfg is not None:
         live, _gb_total, note = cross_online(gv.cfg, bool(online), bool(force_online))
         if note:
-            gv.warn('large_disk', note)
+            gv.warn('large_disk', note, args={'detail': str(note)})
     if gv.running and gv.kind == 'lxc':
         gv.block('ct_running', 'It runs: PegaProx moves containers to another cluster offline - shut it down '
-                               'first', overridable=True)
+                               'first', overridable=True, args={})
     elif gv.running and not live:
         gv.block('running_offline', 'It runs and the move goes offline: Proxmox moves a running VM only live - '
-                                    'shut it down first, or force online', overridable=True)
+                                      'shut it down first, or force online', overridable=True, args={}, variant='cross')
 
     tv = target_vmid or gv.vmid
     if taken is None:
         gv.warn('target_guests_unread', f'The guests of {tgt.name} could not be read: whether VMID {tv} is free '
-                                        f'there is not checked')
+                                        f'there is not checked', args={'cluster': tgt.name, 'vmid': str(tv)})
     elif tv in taken:
-        gv.block('vmid_taken', f'VMID {tv} is taken on {tgt.name}: pick another one')
+        gv.block('vmid_taken', f'VMID {tv} is taken on {tgt.name}: pick another one',
+                 args={'vmid': str(tv), 'cluster': tgt.name})
     from pegaprox.utils.rbac import acts_as_admin, check_tenant_vmid, DEFAULT_TENANT_ID
     if user is not None and not acts_as_admin(user):
         ok, msg = check_tenant_vmid(user.get('tenant_id') or DEFAULT_TENANT_ID, tv)
         if not ok:
-            gv.block('vmid_range', msg)
+            gv.block('vmid_range', msg, args={'detail': str(msg)})
 
     nodes_src = src.nodes() or {}
     tnodes = tgt.nodes() or {}
@@ -1291,63 +1367,72 @@ def _cross_checks(src, tgt, sim, gv, t, storage_map, target_storage, bridge_map,
     ha = src.ha()
     if ha and gv.vmid in ha['managed']:
         gv.warn('ha_source', f"Proxmox HA manages it on {src.name}: take it out of HA there first, and add it "
-                             f"to HA on {tgt.name} afterwards")
+                             f"to HA on {tgt.name} afterwards", args={'source': src.name, 'cluster': tgt.name})
     for job in src.jobs_of(gv.vmid):
         gv.warn('replication_left', f"Replication job {job.get('id')} on {src.name} stays behind and fails once "
-                                    f"it left: remove the job")
+                                    f"it left: remove the job", args={'job': str(job.get('id')), 'cluster': src.name})
     if route and not route.get('host'):
-        gv.warn('transfer_fallback', route.get('note') or 'The transfer network is not used')
+        note = route.get('note') or 'The transfer network is not used'
+        gv.warn('transfer_fallback', note, args={'detail': str(note)})
 
     if gv.cfg is None:
         if gv.g:
-            gv.warn('config_unread', 'Its configuration could not be read: disks, networks and devices are not checked')
+            gv.warn('config_unread', 'Its configuration could not be read: disks, networks and devices are '
+                                 'not checked', args={})
         _place(sim, gv, t, (), override)
         return
     tgt_st = tgt.storages(t)
     if tgt_st is None:
-        gv.warn('storage_unread', f'The storages of {t} could not be read: not checked')
+        gv.warn('storage_unread', f'The storages of {t} could not be read: not checked', args={'node': t})
     need = {}
     for vol in guest_volumes(gv.cfg, gv.kind):
         dst = (storage_map or {}).get(vol['storage']) if storage_map else target_storage
         if not dst:
-            gv.block('storage_unmapped', f"{vol['key']} is on {vol['storage']}, which the storage map does not cover")
+            gv.block('storage_unmapped', f"{vol['key']} is on {vol['storage']}, which the storage map does not cover",
+                     args={'key': vol['key'], 'storage': vol['storage']})
             continue
         if tgt_st is None:
             continue
         row = tgt_st.get(dst)
         if row is None or row.get('status') != 'available':
-            gv.block('storage_missing', f"{vol['key']} goes to storage {dst}, which {t} does not have")
+            gv.block('storage_missing', f"{vol['key']} goes to storage {dst}, which {t} does not have",
+                     args={'key': vol['key'], 'storage': str(dst), 'node': t}, variant='cross')
             continue
         content = 'rootdir' if gv.kind == 'lxc' else 'images'
         if storage_mapping_problems({vol['storage']: dst}, {dst: row}, content):
-            gv.block('storage_content', f"{vol['key']} goes to storage {dst}, which does not take {content}")
+            gv.block('storage_content', f"{vol['key']} goes to storage {dst}, which does not take {content}",
+                     args={'key': vol['key'], 'storage': str(dst), 'content': content})
             continue
         need[dst] = need.get(dst, 0) + vol['size']
     room = [(dst, size, _free((tgt_st or {}).get(dst))) for dst, size in sorted(need.items())]
     for dst, size, free in room:
         if not sim.space(t, dst, size, free):
             gv.block('storage_full', f"Storage {dst} on {t} has less room than its {_gb(size)} (counting the "
-                                     f"guests before it in this set)", overridable=True)
+                                     f"guests before it in this set)", overridable=True,
+                     args={'storage': str(dst), 'node': t, 'size': _gb(size)})
     for key, _storage, volid in cdrom_images(gv.cfg):
         gv.block('cdrom', f"{key} holds an image ({volid}): eject it first, a remote migration does not take it "
-                          f"along", overridable=True)
+                          f"along", overridable=True, args={'key': key, 'volid': str(volid)})
     nics = guest_nics(gv.cfg)
     bridges, vnets_known = tgt.bridges(t) if nics else (set(), True)
     if nics and bridges is None:
-        gv.warn('network_unread', f'The network of {t} could not be read: bridges not checked')
+        gv.warn('network_unread', f'The network of {t} could not be read: bridges not checked',
+                args={'node': t})
     for key, bridge in nics if bridges is not None else ():
         dst = (bridge_map or {}).get(bridge) if bridge_map else (target_bridge or 'vmbr0')
         if not dst:
-            gv.block('bridge_unmapped', f"{key} uses {bridge}, which the network map does not cover")
+            gv.block('bridge_unmapped', f"{key} uses {bridge}, which the network map does not cover",
+                     args={'key': key, 'bridge': bridge})
         elif dst not in bridges:
             if vnets_known:
-                gv.block('bridge_missing', f"{key} goes to bridge {dst}, which {t} does not have")
+                gv.block('bridge_missing', f"{key} goes to bridge {dst}, which {t} does not have",
+                         args={'key': key, 'bridge': str(dst), 'node': t}, variant='cross')
             else:
                 gv.warn('bridge_unknown', f"{key} goes to {dst}: {t} has no such bridge, and the SDN VNets "
-                                          f"could not be read")
+                                            f"could not be read", args={'key': key, 'bridge': str(dst), 'node': t}, variant='cross')
     if 'parent' in gv.cfg:
         gv.block('snapshots_remote', 'It has snapshots: a remote migration does not take them along - remove '
-                                     'them first', overridable=True)
+                                     'them first', overridable=True, args={})
     _device_checks(gv, live)
     _place(sim, gv, t, room, override)
 
@@ -1377,9 +1462,10 @@ def _quota_check(src, tgt, movers, user, delete_source):
     what = ', '.join(res.get('violations') or [])
     for gv in movers:
         if res.get('enforce') == 'block':
-            gv.block('quota', f"The tenant's quota would be exceeded ({what})")
+            gv.block('quota', f"The tenant's quota would be exceeded ({what})", args={'what': what})
         else:
-            gv.warn('quota', f"The tenant's quota would be exceeded ({what}) - it only warns")
+            gv.warn('quota', f"The tenant's quota would be exceeded ({what}) - it only warns",
+                    args={'what': what}, variant='soft')
 
 
 def _cross_steps(rows, src, tgt, t, route, delete_source):

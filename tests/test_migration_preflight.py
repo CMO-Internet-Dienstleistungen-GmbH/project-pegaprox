@@ -21,6 +21,7 @@ from test_ha_api import ha_env, _standby_of_active, _audit  # noqa: F401 (ha_env
 
 import pegaprox.api.clusters as clusters_api
 import pegaprox.core.preflight as pf
+import pegaprox.core.whatif as whatif
 import pegaprox.core.transfer_net as xn
 from pegaprox.core import bulk_migrate as bulk
 
@@ -164,6 +165,17 @@ def _fresh(monkeypatch):
     bulk.reset_for_tests()
     # the backup age comes from the shared scan, which has not run here
     monkeypatch.setattr(pf, 'backup_times', lambda cid, mgr: None)
+    # nor have restore tests: every guest would carry a note that none is proven
+    monkeypatch.setattr(whatif, 'guest_risk', lambda cid, guests, critical=None: {})
+    # NS Oct 2026 - every reason any test here makes carries args whose values its text holds
+    made = pf._reason
+
+    def _checked(level, code, text, overridable=False, args=None, variant=None):
+        assert isinstance(args, dict), (code, 'no args')
+        for key, value in args.items():
+            assert isinstance(value, str) and value in text, (code, key, value, text)
+        return made(level, code, text, overridable, args, variant)
+    monkeypatch.setattr(pf, '_reason', _checked)
     yield
     for run in bulk.runs():
         bulk.cancel(run, 'teardown')
