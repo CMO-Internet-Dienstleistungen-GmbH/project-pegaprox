@@ -237,6 +237,13 @@
     
     <!-- LW: Mar 2026 - switched to static Tailwind build (#118), CDN JIT broke offline -->
     <link rel="stylesheet" href="/static/css/tailwind.min.css">
+    <!-- LW Oct 2026 (#1150) - the static build only knows the classes that existed when it was
+         made. Overlay layers added since are spelled out here: without them the PBS dialogs had
+         no z-index at all, and a sticky table header of the corporate layout painted over them -->
+    <style>
+        .z-\[150\] { z-index: 150; }
+        .z-\[10010\] { z-index: 10010; }
+    </style>
     
     <!-- noVNC - lazy loaded when needed (local-first, CDN fallback skipped on air-gap) -->
     <script>
