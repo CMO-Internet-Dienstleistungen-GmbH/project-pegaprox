@@ -38,3 +38,15 @@ def test_http_scheme_still_rejected_even_with_opt_in(monkeypatch):
     _settings(monkeypatch, True)
     with pytest.raises(SsrfError):
         acme._guard_acme_url('http://192.168.88.88/acme/directory')
+
+
+@pytest.mark.parametrize('method', ['GET', 'HEAD', 'POST'])
+def test_acme_request_guards_url_before_opening_session(monkeypatch, method):
+    _settings(monkeypatch, False)
+
+    def unexpected_session():
+        pytest.fail('A rejected ACME URL must not open a request session')
+
+    monkeypatch.setattr(acme.requests, 'Session', unexpected_session)
+    with pytest.raises(SsrfError):
+        acme._acme_request(method, PRIVATE)
