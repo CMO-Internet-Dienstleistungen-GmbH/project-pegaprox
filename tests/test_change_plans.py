@@ -598,3 +598,12 @@ def test_the_event_list_names_the_plan_and_the_status_counts_the_planned(scanned
     assert 'change_title' not in by[('storage', 'local')] and by[('storage', 'local')]['change_id'] is None
     status = root.get(f'/api/clusters/{CL}/drift/status').get_json()
     assert status['planned'] == 1 and status['by_category']['deviation'] == 5
+
+
+def test_a_plan_of_a_cluster_the_requester_lost_is_gone_for_them_too(estate, db):
+    """Reach is judged today: a plan they wrote on a cluster that is no longer theirs is not shown."""
+    _insert(db, 'mine', status='draft', cluster=OTHER, kind='guests', targets=(150,), requested_by='tadmin')
+    ta = estate.tenant_holder('tadmin')
+    assert ta.get('/api/changes/mine').status_code == 404
+    assert ta.get('/api/changes').get_json()['changes'] == []
+    assert ta.post('/api/changes/mine/cancel').status_code == 404
