@@ -2410,12 +2410,43 @@ class PegaProxDB:
             _have = {r[1] for r in cursor.execute("PRAGMA table_info(drift_events)").fetchall()}
             for _cn, _cd in (('category', "TEXT NOT NULL DEFAULT 'deviation'"),
                              ('confirmed_by', "TEXT DEFAULT ''"),
-                             ('confirmed_at', 'TEXT')):
+                             ('confirmed_at', 'TEXT'),
+                             # NS Oct 2026 - the approved change plan a deviation was planned under
+                             ('change_id', 'TEXT')):
                 if _cn not in _have:
                     cursor.execute(f"ALTER TABLE drift_events ADD COLUMN {_cn} {_cd}")
             logging.info("Ensured drift_baselines + drift_events tables exist")
         except Exception as e:
             logging.error(f"Error creating drift tables: {e}")
+
+        # NS Oct 2026 - Change Guardian, basic stage: a planned change with a scope and a window,
+        # approved by a second person. Shared with the standbys (core/ha.py SYNC_TABLES); times are UTC ISO.
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS change_plans (
+                    id TEXT PRIMARY KEY,
+                    cluster_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT DEFAULT '',
+                    scope TEXT NOT NULL DEFAULT '{}',
+                    window_start TEXT,
+                    window_end TEXT,
+                    status TEXT NOT NULL DEFAULT 'draft',
+                    requested_by TEXT NOT NULL,
+                    requester_tenant TEXT DEFAULT '',
+                    approved_by TEXT DEFAULT '',
+                    approved_at TEXT,
+                    rejected_by TEXT DEFAULT '',
+                    rejected_at TEXT,
+                    reject_reason TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_change_plans_cluster ON change_plans(cluster_id, status)')
+            logging.info("Ensured change_plans table exists")
+        except Exception as e:
+            logging.error(f"Error creating change_plans table: {e}")
 
         # MK May 2026 — Web Push subscriptions for browser notifications
         try:

@@ -49,6 +49,7 @@ def register_blueprints(app):
     from pegaprox.api.banners import bp as banners_bp
     from pegaprox.api.whatif import bp as whatif_bp
     from pegaprox.api.timeline import bp as timeline_bp
+    from pegaprox.api.changes import bp as changes_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(users_bp)
@@ -92,6 +93,7 @@ def register_blueprints(app):
     app.register_blueprint(banners_bp)
     app.register_blueprint(whatif_bp)
     app.register_blueprint(timeline_bp)
+    app.register_blueprint(changes_bp)
 
     # Initialize WebSocket support for realtime blueprint
     from pegaprox.api.realtime import sock

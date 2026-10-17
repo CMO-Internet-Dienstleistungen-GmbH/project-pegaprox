@@ -42,7 +42,7 @@ from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth
 from pegaprox.api.helpers import check_cluster_access, require_unconfined
 from pegaprox.core.db import get_db
-from pegaprox.core import dbcrypto, ha
+from pegaprox.core import dbcrypto, ha, changes
 from pegaprox.background import guest_index
 from pegaprox.models.permissions import ROLE_ADMIN
 
@@ -607,15 +607,20 @@ KINDS = ('vm_config', 'storage', 'network', 'cluster_options',
          'firewall', 'ha_rules', 'backup_jobs', 'access')
 
 
-def _record_event(cluster_id, kind, scope, diffs, severity, summary, category=CATEGORY_DEVIATION):
+def _record_event(cluster_id, kind, scope, diffs, severity, summary, category=CATEGORY_DEVIATION,
+                  change_id=None):
+    # NS Oct 2026 - only a deviation can be planned; a violation of a rule or an incident is
+    # never linked to a change, whatever the caller found
+    if category != CATEGORY_DEVIATION:
+        change_id = None
     try:
         c = get_db().conn.cursor()
         c.execute('''
             INSERT INTO drift_events (cluster_id, kind, scope, severity,
-                                      summary, diff, detected_at, status, category)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
+                                      summary, diff, detected_at, status, category, change_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
         ''', (cluster_id, kind, scope, severity, summary,
-              json.dumps(diffs), datetime.now().isoformat(), category))
+              json.dumps(diffs), datetime.now().isoformat(), category, change_id))
         eid = c.lastrowid
         get_db().conn.commit()
         return eid
@@ -996,6 +1001,8 @@ def _scan_cluster(cluster_id, autobaseline=False):
     # the same diff against the same baseline is one event, not one per scan
     open_diffs = _open_deviation_diffs(cluster_id)
     already_open = 0
+    # NS Oct 2026 - the approved plans whose window is open right now, read once for the scan
+    plans = changes.approved_in_window(cluster_id)
 
     new_events = []
     seeded = 0
@@ -1016,9 +1023,10 @@ def _scan_cluster(cluster_id, autobaseline=False):
             continue
         sev = _severity_for(kind, diffs, scope)
         summary = _short_summary(kind, scope, diffs)
-        eid = _record_event(cluster_id, kind, scope, diffs, sev, summary)
+        planned = changes.link_for(plans, kind, scope)
+        eid = _record_event(cluster_id, kind, scope, diffs, sev, summary, change_id=planned)
         new_events.append({'id': eid, 'kind': kind, 'scope': scope,
-                           'severity': sev, 'summary': summary})
+                           'severity': sev, 'summary': summary, 'change_id': planned})
 
     # detect deletions: baseline keys that are no longer in current state
     missing = [(key, bk) for key, bk in baselines.items() if key not in seen_keys]
@@ -1075,9 +1083,10 @@ def _scan_cluster(cluster_id, autobaseline=False):
             continue
         summary = f"{kind} {scope}: object removed"
         sev = 'warning' if kind in ('vm_config', 'storage', 'firewall', 'access', 'backup_jobs') else 'info'
-        eid = _record_event(cluster_id, kind, scope, diffs, sev, summary)
+        planned = changes.link_for(plans, kind, scope)
+        eid = _record_event(cluster_id, kind, scope, diffs, sev, summary, change_id=planned)
         new_events.append({'id': eid, 'kind': kind, 'scope': scope,
-                           'severity': sev, 'summary': summary})
+                           'severity': sev, 'summary': summary, 'change_id': planned})
 
     # MK Oct 2026 - policy checks judge this scan's snapshot, and the result of the scan
     # says per kind what was read: a kind that was not is "not checked", not "no drift"
@@ -1312,6 +1321,10 @@ def drift_status(cluster_id):
         # baseline count
         c.execute("SELECT COUNT(*) AS n FROM drift_baselines WHERE cluster_id=?", (cluster_id,))
         baseline_count = c.fetchone()['n']
+        # open deviations that sit inside an approved change; they stay deviations
+        c.execute("SELECT COUNT(*) AS n FROM drift_events WHERE cluster_id=? AND status='open' "
+                  "AND category=? AND change_id IS NOT NULL", (cluster_id, CATEGORY_DEVIATION))
+        planned_total = c.fetchone()['n']
 
         # last scan: pick max(detected_at) from events, fallback to baseline created_at
         c.execute("SELECT MAX(detected_at) AS t FROM drift_events WHERE cluster_id=?", (cluster_id,))
@@ -1323,6 +1336,7 @@ def drift_status(cluster_id):
             'by_kind': by_kind,
             'by_severity': sev_total,
             'by_category': by_category,
+            'planned': planned_total,
             'baselines': baseline_count,
             'last_event_at': last_event_t,
             # what the last scan could read per kind; empty until this instance has scanned
@@ -1392,6 +1406,11 @@ def list_events(cluster_id):
             except Exception:
                 pass
             out.append(d)
+        # NS Oct 2026 - a deviation planned under an approved change names it
+        named = changes.titles(e.get('change_id') for e in out)
+        for e in out:
+            if e.get('change_id'):
+                e['change_title'] = named.get(e['change_id'], '')
         return jsonify({'events': out})
     except Exception as e:
         logging.exception('handler error in drift.py'); return jsonify({'error': 'internal error'}), 500
@@ -1555,7 +1574,9 @@ def confirm_incident(eid):
         if _cerr:
             return _cerr
         if flag:
-            c.execute("UPDATE drift_events SET category=?, confirmed_by=?, confirmed_at=? WHERE id=?",
+            # an incident is never planned, whatever the deviation was linked to before
+            c.execute("UPDATE drift_events SET category=?, confirmed_by=?, confirmed_at=?, change_id=NULL "
+                      "WHERE id=?",
                       (CATEGORY_INCIDENT, _current_user(), datetime.now().isoformat(), eid))
         else:
             if ev['category'] != CATEGORY_INCIDENT:

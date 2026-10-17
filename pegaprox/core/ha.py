@@ -321,6 +321,8 @@ SYNC_TABLES = (
     'vmware_servers', 'xcpng_pools', 'xcpng_pool_members', 'xcpng_vmid_map',
     'cross_cluster_replications', 'efficient_snapshots', 'site_recovery_plans',
     'site_recovery_vms', 'snapshot_policies', 'drift_baselines', 'multi_cluster_vnets',
+    # planned changes and who approved them; the drift events that point at one stay per host
+    'change_plans',
     'siem_targets', 'push_subscriptions', 'plugin_state', 'status_incidents',
     'custom_cloud_templates', 'power_rates', 'cost_rates', 'auto_install_profiles',
     'pegaprox_kv',
