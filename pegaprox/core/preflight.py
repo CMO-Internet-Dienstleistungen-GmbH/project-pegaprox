@@ -746,7 +746,8 @@ def _risk_checks(side, gvs):
     """What the guests carry that the move should not take lightly: a critical tag, a restore
     that is not proven or failing. One read of the tags and the restore test marks for the
     whole set. Never a block: the first of the two is an info, both together a warning.
-    NS Oct 2026"""
+    NS Oct 2026 - "not proven" only for a critical guest: most installs run no restore tests,
+    and a line on every guest of every move says nothing. A failed test is news on any guest."""
     gvs = [gv for gv in gvs if gv.g and not gv.g.get('template')]
     if not gvs:
         return
@@ -767,7 +768,7 @@ def _risk_checks(side, gvs):
             gv.add(level, 'critical_guest', f"Critical guest (tagged {tags})", args={'tags': tags})
         if got['restore'] == 'failing':
             gv.add(level, 'restore_failing', 'Its last restore test failed', args={})
-        elif got['restore'] == 'not_proven':
+        elif got['restore'] == 'not_proven' and got['critical']:
             gv.add(level, 'restore_not_proven', 'No restore of it has been proven lately', args={})
 
 

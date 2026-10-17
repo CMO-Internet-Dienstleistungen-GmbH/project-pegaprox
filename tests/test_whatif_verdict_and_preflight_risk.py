@@ -243,11 +243,13 @@ def test_a_critical_guest_is_an_info_and_never_a_block(api, monkeypatch, real_ri
     assert row[100]['verdict'] == 'ready' and 'critical_guest' not in _reasons(res, 101)
 
 
-def test_a_restore_that_is_not_proven_or_failing_is_an_info(api, monkeypatch, real_risk):
+def test_a_failing_restore_is_an_info_and_an_unproven_one_says_nothing(api, monkeypatch, real_risk):
+    # most installs run no restore tests: "not proven" on every guest of every move is noise,
+    # so it is only said for a critical guest (next test). A failed test is news on any guest.
     m = _risk_pve(api, [_guest(100), _guest(101), _guest(102)])
     _proven(monkeypatch, {100: 'not_proven', 101: 'failing', 102: 'proven'})
     res = pf.intra('cluster_1', m, [100, 101, 102], 'pve2')
-    assert _reasons(res, 100)['restore_not_proven']['level'] == 'info'
+    assert not {'restore_not_proven', 'restore_failing'} & set(_reasons(res, 100))
     assert _reasons(res, 101)['restore_failing']['level'] == 'info'
     assert not {'restore_not_proven', 'restore_failing'} & set(_reasons(res, 102))
     assert {g['vmid']: g['verdict'] for g in res['guests']} == {100: 'ready', 101: 'ready', 102: 'ready'}
