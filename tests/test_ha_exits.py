@@ -454,10 +454,9 @@ EXITS = {
     ('pegaprox/utils/oidc.py', 'oidc_get_user_info', 'http-direct'): (2, 'external'),
     ('pegaprox/utils/oidc.py', 'oidc_get_user_groups_ex', 'http-direct'): (1, 'external'),
     ('pegaprox/api/auth.py', 'oidc_test_connection', 'http-direct'): (2, 'external'),
-    ('pegaprox/core/acme.py', '_signed_request', 'http-direct'): (1, 'external'),
-    ('pegaprox/core/acme.py', '_get_nonce', 'http-direct'): (1, 'external'),
+    # ACME requests pass the URL guard before reaching this external CA session.
+    ('pegaprox/core/acme.py', '_acme_request', 'http-session'): (1, 'external'),
     ('pegaprox/core/acme.py', '_cloudflare_api', 'http-direct'): (1, 'external'),
-    ('pegaprox/core/acme.py', '_create_order', 'http-direct'): (1, 'external'),
     ('pegaprox/api/siem.py', '_http_post', 'http-urllib'): (1, 'external'),
     ('pegaprox/api/push.py', '_send_one', 'http-urllib'): (1, 'external'),
     ('pegaprox/app.py', 'download_static_files', 'http-urllib'): (3, 'external'),
@@ -506,11 +505,11 @@ def test_the_inventory_counts_what_the_report_says():
         by[verdict] += n
     # S4 with the witness and the lease link, and the connection check, the three restarts
     # asking systemctl in one helper, the join fingerprint read through tls_fingerprint:
-    # 258 calls out of this process, 153 (function, kind) pairs in 139 functions; 46 of
+    # 256 calls out of this process, 151 (function, kind) pairs in 137 functions; 46 of
     # them guarded at the exit and 85 execs on a client from a guarded factory. No route
     # relies on the write gate alone any more
-    assert sum(n for n, _v in EXITS.values()) == 258 and len(EXITS) == 153
-    assert len({(f, q) for f, q, _k in EXITS}) == 139
+    assert sum(n for n, _v in EXITS.values()) == 256 and len(EXITS) == 151
+    assert len({(f, q) for f, q, _k in EXITS}) == 137
     assert by['guard'] == 46 and by['client'] == 85
 
 
