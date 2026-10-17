@@ -772,58 +772,11 @@
                         )}
                     </div>
 
-                    {/* Maintenance Confirmation Modal */}
+                    {/* Maintenance: the what-if of the evacuation, then the options (NS Oct 2026) */}
                     {showMaintenanceConfirm && (
-                        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60" onClick={() => setShowMaintenanceConfirm(false)}>
-                            <div
-                                className="w-full max-w-md max-h-[90vh] overflow-y-auto bg-proxmox-card border border-proxmox-border rounded-2xl shadow-2xl"
-                                data-testid="maint-dialog"
-                                onClick={e => e.stopPropagation()}
-                            >
-                                <div className="p-6 border-b border-proxmox-border">
-                                    <div className="flex items-center gap-3">
-                                        <div className="p-3 bg-yellow-500/10 rounded-xl">
-                                            <Icons.Wrench />
-                                        </div>
-                                        <div>
-                                            <h2 className="text-lg font-bold text-white">{t('maintenanceModeTitle')}</h2>
-                                            <p className="text-sm text-gray-400">{name}</p>
-                                        </div>
-                                    </div>
-                                </div>
-                                <div className="p-6">
-                                    <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-4 mb-4">
-                                        <p className="text-sm text-yellow-200">
-                                            <strong>{t('warning')}:</strong> {t('maintenanceWarning').replace('Warning: ', '')}
-                                        </p>
-                                    </div>
-                                    <p className="text-sm text-gray-400 mb-4">
-                                        {t('maintenanceDesc')}
-                                    </p>
-                                    {/* LW Oct 2026 (#763, #954) - the evacuation options of the rolling update, for this node */}
-                                    <div className="mb-6">
-                                        <MaintenanceEvacOptions clusterId={clusterId} node={name} value={maintOptions} onChange={setMaintOptions} />
-                                    </div>
-                                    <div className="flex gap-3">
-                                        <button
-                                            onClick={() => setShowMaintenanceConfirm(false)}
-                                            className="flex-1 px-4 py-2.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-gray-300 font-medium hover:bg-proxmox-hover transition-colors"
-                                        >
-                                            {t('cancel')}
-                                        </button>
-                                        <button
-                                            onClick={() => {
-                                                setShowMaintenanceConfirm(false);
-                                                onMaintenanceToggle(name, true, maintOptions);
-                                            }}
-                                            className="flex-1 px-4 py-2.5 bg-yellow-500 hover:bg-yellow-600 rounded-lg text-black font-medium transition-colors"
-                                        >
-                                            {t('startMaintenance')}
-                                        </button>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
+                        <MaintenanceDialog clusterId={clusterId} node={name} options={maintOptions} onOptions={setMaintOptions}
+                            onCancel={() => setShowMaintenanceConfirm(false)}
+                            onConfirm={() => { setShowMaintenanceConfirm(false); onMaintenanceToggle(name, true, maintOptions); }} />
                     )}
 
                     {/* Update Confirmation Modal */}
@@ -1290,20 +1243,9 @@
 
                     {/* Confirmation Modals */}
                     {showMaintenanceConfirm && (
-                        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60">
-                            <div className="w-full max-w-sm max-h-[90vh] overflow-y-auto bg-proxmox-card border border-proxmox-border p-5" data-testid="maint-dialog">
-                                <h3 className="text-[14px] font-semibold mb-2" style={{color: '#e9ecef'}}>{t('enterMaintenance') || 'Enter Maintenance Mode'}</h3>
-                                <p className="text-[13px] mb-4" style={{color: '#adbbc4'}}>{t('maintenanceWarning') || `All VMs on ${name} will be migrated to other nodes.`}</p>
-                                {/* LW Oct 2026 (#763, #954) */}
-                                <div className="mb-4">
-                                    <MaintenanceEvacOptions clusterId={clusterId} node={name} value={maintOptions} onChange={setMaintOptions} />
-                                </div>
-                                <div className="flex justify-end gap-2">
-                                    <button onClick={() => setShowMaintenanceConfirm(false)} className="px-3 py-1.5 text-[13px] border border-proxmox-border hover:text-white" style={{color: '#adbbc4'}}>{t('cancel')}</button>
-                                    <button onClick={() => { onMaintenanceToggle && onMaintenanceToggle(name, true, maintOptions); setShowMaintenanceConfirm(false); }} className="px-3 py-1.5 text-[13px] text-white" style={{background: '#efc006', border: '1px solid #d4a905'}}>{t('confirm') || 'Confirm'}</button>
-                                </div>
-                            </div>
-                        </div>
+                        <MaintenanceDialog clusterId={clusterId} node={name} options={maintOptions} onOptions={setMaintOptions}
+                            onCancel={() => setShowMaintenanceConfirm(false)}
+                            onConfirm={() => { onMaintenanceToggle && onMaintenanceToggle(name, true, maintOptions); setShowMaintenanceConfirm(false); }} />
                     )}
                     {showUpdateConfirm && (
                         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60">

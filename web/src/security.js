@@ -2162,6 +2162,194 @@
             );
         }
 
+        // NS Oct 2026 - what a reason of the server says in the user's language. The preflight
+        // (prefix 'pf_') and the what-if verdict ('wiv_') send {code, args, text}: the wording of
+        // the code comes from t(prefix + code) with {name} filled from args. The English text of
+        // the server stands in when the key is missing, and when the wording asks for a value
+        // the server did not send (a caller confined to some guests gets fewer figures).
+        // A reason with a variant has its own key, pf_<code>_<variant>.
+        function sayReason(t, prefix, r) {
+            const args = r.args || {};
+            const key = prefix + r.code + (r.variant ? '_' + r.variant : '');
+            const wording = t(key);
+            if (!wording || wording === key) return r.text || '';
+            const need = (wording.match(/\{\w+\}/g) || []).map(m => m.slice(1, -1));
+            if (need.some(k => !(k in args))) return r.text || '';
+            return wording.replace(/\{(\w+)\}/g, (m, k) => (Array.isArray(args[k]) ? args[k].join(', ') : String(args[k])));
+        }
+
+        // the one line on top of a what-if report: ready, warning or blocked and why
+        function WhatIfVerdictLine({ verdict }) {
+            const { t } = useTranslation();
+            if (!verdict || !verdict.level) return null;
+            const look = {
+                ready: 'bg-green-500/10 text-green-400 border-green-500/30',
+                warning: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30',
+                blocked: 'bg-red-500/10 text-red-400 border-red-500/30',
+            };
+            const reasons = verdict.reasons || [];
+            return (
+                <div data-testid="whatif-verdict" data-verdict={verdict.level}
+                    className={`border rounded-xl p-3 text-sm ${look[verdict.level] || look.warning}`}>
+                    <div className="font-semibold">{t('wiv_level_' + verdict.level)}</div>
+                    {reasons.length > 0 && (
+                        <ul className="list-disc pl-5 mt-1 space-y-0.5 text-xs">
+                            {reasons.map(r => (
+                                <li key={r.code} data-verdict-reason={r.code}>{sayReason(t, 'wiv_', r)}</li>
+                            ))}
+                        </ul>
+                    )}
+                </div>
+            );
+        }
+
+        // the old RAM-only check of the maintenance preview as one line, '' when it has nothing to say
+        function maintPreviewText(t, p) {
+            if (!p) return '';
+            if (p.reason === 'no_target_nodes' && p.guest_count > 0)
+                return t('maintPreviewNoTargets');
+            const proceed = ' ' + t('maintPreviewProceed');
+            if (!p.headroom_sufficient)
+                return t('maintPreviewNoHeadroom') + proceed;
+            if (p.over_threshold && p.over_threshold.length)
+                return t('maintPreviewOverThreshold') + p.over_threshold.join(', ') + proceed;
+            return '';
+        }
+
+        // NS Oct 2026 - the dialog every way into a node's maintenance goes through: it runs the
+        // 'maintenance' what-if for the node once when it opens and says what the evacuation
+        // would do, next to the evacuation options. The server action is never held back by
+        // the check: a refused or failed what-if falls back to the old capacity pre-check, and
+        // only a blocked verdict asks for a tick first.
+        function MaintenanceDialog({ clusterId, node, options, onOptions, onCancel, onConfirm }) {
+            const { t } = useTranslation();
+            const { getAuthHeaders } = useAuth();
+            const { isCorporate } = useLayout();
+            const [check, setCheck] = useState({ state: 'loading' });
+            const [ack, setAck] = useState(false);
+            const MAX_NAMED = 8;
+            useEffect(() => {
+                let gone = false;
+                const base = `${API_URL}/clusters/${encodeURIComponent(clusterId)}`;
+                (async () => {
+                    try {
+                        const r = await fetch(`${base}/whatif`, {
+                            method: 'POST', credentials: 'include',
+                            headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+                            body: JSON.stringify({ type: 'maintenance', nodes: [node] }),
+                        });
+                        const d = r.ok ? await r.json() : null;
+                        if (d && d.verdict && d.verdict.level) { if (!gone) setCheck({ state: 'ok', report: d }); return; }
+                    } catch (_) { /* the old pre-check below */ }
+                    let text = '';
+                    try {
+                        const pv = await fetch(`${base}/nodes/${encodeURIComponent(node)}/maintenance-preview?threshold=90`,
+                            { credentials: 'include', headers: getAuthHeaders() });
+                        if (pv.ok) text = maintPreviewText(t, await pv.json());
+                    } catch (_) { /* nothing to add */ }
+                    if (!gone) setCheck({ state: 'fallback', text });
+                })();
+                return () => { gone = true; };
+            }, [clusterId, node]);
+
+            const report = check.state === 'ok' ? check.report : null;
+            const blocked = report?.verdict?.level === 'blocked';
+            const rows = report?.guests || [];
+            const fill = (s, vars) => String(s).replace(/\{(\w+)\}/g, (m, k) => (vars[k] != null ? vars[k] : m));
+            const named = (list) => {
+                const names = list.slice(0, MAX_NAMED).map(g => `${g.name || g.vmid} (${g.vmid})`);
+                return names.join(', ') + (list.length > MAX_NAMED ? ', ' + fill(t('maintDlgMore'), { n: list.length - MAX_NAMED }) : '');
+            };
+            const crit = rows.filter(g => g.critical);
+            const unproven = rows.filter(g => g.restore && (g.restore.state === 'not_proven' || g.restore.state === 'failing'));
+            const down = rows.filter(g => g.outcome === 'down');
+            const moving = (report?.summary?.moved || 0) + (report?.summary?.restarted || 0);
+            const tenants = (report?.risk?.tenants?.items || []).filter(x => x.affected > 0);
+            const hot = (report?.nodes || []).filter(n => n.over_cpu || n.over_mem || n.overcommitted).map(n => n.node);
+
+            const overlay = isCorporate
+                ? 'fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60'
+                : 'fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60';
+            const panel = isCorporate
+                ? 'w-full max-w-md max-h-[90vh] overflow-y-auto bg-proxmox-card border border-proxmox-border p-5'
+                : 'w-full max-w-md max-h-[90vh] overflow-y-auto bg-proxmox-card border border-proxmox-border rounded-2xl shadow-2xl p-6';
+            const cancelCls = isCorporate
+                ? 'px-3 py-1.5 text-[13px] border border-proxmox-border hover:text-white'
+                : 'flex-1 px-4 py-2.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-gray-300 font-medium hover:bg-proxmox-hover transition-colors';
+            const enableCls = isCorporate
+                ? 'px-3 py-1.5 text-[13px] text-white disabled:opacity-50'
+                : 'flex-1 px-4 py-2.5 bg-yellow-500 hover:bg-yellow-600 rounded-lg text-black font-medium transition-colors disabled:opacity-50';
+            const enableStyle = isCorporate ? { background: '#efc006', border: '1px solid #d4a905' } : undefined;
+            const line = 'text-xs text-gray-300';
+
+            return (
+                <div className={overlay} onClick={onCancel}>
+                    <div className={panel} data-testid="maint-dialog" onClick={e => e.stopPropagation()}>
+                        <div className="flex items-center gap-3 mb-3">
+                            <div className="p-2 bg-yellow-500/10 rounded-lg"><Icons.Wrench /></div>
+                            <div>
+                                <h3 className="text-base font-semibold text-white">{t('enterMaintenance') || 'Enter Maintenance Mode'}</h3>
+                                <p className="text-sm text-gray-400">{node}</p>
+                            </div>
+                        </div>
+
+                        <p className="text-xs text-gray-400 mb-3">{t('maintenanceDesc')}</p>
+
+                        <div className="space-y-2 mb-4" data-testid="maint-check" data-state={check.state}>
+                            {check.state === 'loading' && <p className="text-xs text-gray-500">{t('maintDlgChecking')}</p>}
+                            {check.state === 'fallback' && (
+                                <div data-testid="maint-fallback" className="text-xs text-gray-300 space-y-1">
+                                    <p className="text-gray-500">{t('maintDlgFallback')}</p>
+                                    <p className={check.text ? 'text-yellow-400' : 'text-gray-400'}>{check.text || t('maintDlgFallbackNone')}</p>
+                                </div>
+                            )}
+                            {report && (<>
+                                <WhatIfVerdictLine verdict={report.verdict} />
+                                <p className={line} data-testid="maint-moves">{fill(t('maintDlgMoves'), { n: moving })}</p>
+                                {down.length > 0 && <p className="text-xs text-red-400" data-testid="maint-down">{fill(t('maintDlgStay'), { n: down.length })}: {named(down)}</p>}
+                                {crit.length > 0 && (
+                                    <p className={line} data-testid="maint-critical">
+                                        <span className="text-white">{t('maintDlgCritical')}:</span> {named(crit)}
+                                    </p>
+                                )}
+                                {unproven.length > 0 && (
+                                    <p className={line} data-testid="maint-unproven">
+                                        <span className="text-white">{fill(t('maintDlgUnproven'), { n: unproven.length })}:</span> {named(unproven)}
+                                    </p>
+                                )}
+                                {tenants.length > 0 && (
+                                    <p className={line} data-testid="maint-tenants">
+                                        <span className="text-white">{t('maintDlgTenants')}:</span> {tenants.map(x => x.name).join(', ')}
+                                        {' '}<span data-whatif-basis="assumed" className="px-1.5 py-0.5 rounded text-[10px] whitespace-nowrap bg-yellow-500/10 text-yellow-400">{t('whatifAssumed')}</span>
+                                    </p>
+                                )}
+                                {hot.length > 0 && <p className="text-xs text-yellow-400" data-testid="maint-over">{fill(t('maintDlgOver'), { nodes: hot.join(', ') })}</p>}
+                                {options.relax_anti_affinity && <p className="text-xs text-gray-500">{t('maintDlgRelaxNote')}</p>}
+                            </>)}
+                        </div>
+
+                        <div className="mb-4">
+                            <MaintenanceEvacOptions clusterId={clusterId} node={node} value={options} onChange={onOptions} />
+                        </div>
+
+                        {blocked && (
+                            <label className="flex items-start gap-2 cursor-pointer mb-4 text-sm text-red-300">
+                                <input type="checkbox" data-testid="maint-ack" checked={ack} onChange={e => setAck(e.target.checked)}
+                                    className="mt-0.5 w-4 h-4 flex-shrink-0 rounded border-proxmox-border bg-proxmox-dark" />
+                                <span>{t('maintDlgAck')}</span>
+                            </label>
+                        )}
+                        <div className={isCorporate ? 'flex justify-end gap-2' : 'flex gap-3'}>
+                            <button type="button" data-testid="maint-cancel" onClick={onCancel} className={cancelCls}
+                                style={isCorporate ? { color: '#adbbc4' } : undefined}>{t('cancel')}</button>
+                            <button type="button" data-testid="maint-enable" disabled={blocked && !ack} onClick={onConfirm}
+                                className={enableCls} style={enableStyle}>{t('maintDlgEnable')}</button>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
         // LW Oct 2026 (#763, #954) - the two evacuation options and what ticking each would change,
         // read from the plan. The rolling update dialog, its schedule and the maintenance dialog
         // of a node use them; the plan is read once each time the dialog opens

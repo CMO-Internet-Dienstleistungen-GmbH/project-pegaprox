@@ -3446,7 +3446,7 @@
                                                 <span className="text-xs text-gray-500">{g.node} → {g.to || '?'}</span>
                                             </div>
                                             {(g.reasons || []).map((r, i) => (
-                                                <div key={i} data-pf-reason={r.code} className={`text-xs pl-4 ${MIG_PF_REASON[r.level] || 'text-gray-400'}`}>{r.text}</div>
+                                                <div key={i} data-pf-reason={r.code} className={`text-xs pl-4 ${MIG_PF_REASON[r.level] || 'text-gray-400'}`}>{sayReason(t, 'pf_', r)}</div>
                                             ))}
                                             {level === 'blocked' && g.overridable && (
                                                 <label className="flex items-center gap-2 text-xs text-gray-300 pl-4">

@@ -44,17 +44,20 @@ def _shared():
 
 
 def _dialogs():
-    """The places that use the options: the schedule dialog, the three maintenance dialogs."""
+    """The places that use the options: the schedule dialog and the maintenance dialog that every
+    node's maintenance goes through (NS Oct 2026: the three node dialogs became one)."""
     sec = _read('web', 'src', 'security.js')
     tables = _read('web', 'src', 'tables.js')
     nodes = _read('web', 'src', 'node_modals.js')
     out = [sec[sec.index('{/* LW Oct 2026 (#763, #954) - the same two options for the scheduled run */}'):
                sec.index('{/* NS: GitHub #40 - Advanced Options */}')]]
-    for src in (tables, tables[tables.index('function NodeCompactRow('):]):
-        at = src.index('<MaintenanceEvacOptions')
-        out.append(src[src.rfind('{showMaintenanceConfirm && (', 0, at):src.index('</button>', at)])
-    at = nodes.index('{showMaintConfirm && !haReadOnly && (')
-    out.append(nodes[at:nodes.index('</button>', nodes.index('<MaintenanceEvacOptions', at))])
+    at = sec.index('function MaintenanceDialog(')
+    out.append(sec[at:sec.index('// LW Oct 2026 (#763, #954) - the two evacuation options and what', at)])
+    assert '<MaintenanceEvacOptions' in out[-1]
+    # every node dialog of the pages asks through it, with its own options
+    for src in (tables, tables[tables.index('function NodeCompactRow('):], nodes):
+        at = src.index('<MaintenanceDialog')
+        assert 'options={maintOptions} onOptions={setMaintOptions}' in src[at:at + 300]
     return out
 
 
@@ -131,7 +134,7 @@ def test_the_options_go_out_with_the_schedule_and_the_maintenance():
     assert 'migrate_templates: scheduleMigrateTemplates && !scheduleSkipEvacuation,' in save
     assert 'relax_anti_affinity: scheduleRelaxAntiAffinity && !scheduleSkipEvacuation,' in save
     dash = _read('web', 'src', 'dashboard.js')
-    toggle = dash[dash.index('const handleMaintenanceToggle = async (nodeName, enable, options) => {'):]
+    toggle = dash[dash.index('const handleMaintenanceToggle = async (nodeName, enable, options, forCluster) => {'):]
     toggle = toggle[:toggle.index('\n            };')]
     assert 'migrate_templates: options?.migrate_templates === true,' in toggle
     assert 'relax_anti_affinity: options?.relax_anti_affinity === true,' in toggle
@@ -321,7 +324,7 @@ def test_runtime_the_node_card_asks_with_both_options_in_modern(real_app):
     dialog.wait_for(timeout=5000)
     assert 'pve5' in dialog.inner_text()
     _check_maintenance_dialog(app, dialog, 'maintenance-options-modern')
-    dialog.locator('button', has_text='Start Maintenance').click()
+    dialog.locator('button', has_text='Enable maintenance').click()
     body = _maintenance_body(app)
     assert body == {'enable': True, 'migrate_templates': True, 'relax_anti_affinity': True}
     assert ('GET', '/api/clusters/cluster_1/nodes/pve5/maintenance-plan') in app.server.calls
@@ -342,7 +345,7 @@ def test_runtime_both_options_are_off_on_each_opening(real_app):
     page.locator('button[title="Enter Maintenance Mode"]').nth(1).click()
     _wait_plan(dialog, 'maint')
     assert not dialog.locator('[data-testid="maint-relax-affinity"]').is_checked()
-    dialog.locator('button', has_text='Start Maintenance').click()
+    dialog.locator('button', has_text='Enable maintenance').click()
     body = _maintenance_body(app)
     assert body == {'enable': True, 'migrate_templates': False, 'relax_anti_affinity': False}
     assert not app.errors, app.errors
@@ -400,7 +403,7 @@ def test_runtime_an_xcpng_host_shows_neither_option(real_app, api):
         deadline -= 1
     page.wait_for_timeout(300)
     assert dialog.locator('[data-testid="maint-evac-options"]').count() == 0
-    dialog.locator('button', has_text='Start Maintenance').click()
+    dialog.locator('button', has_text='Enable maintenance').click()
     assert _maintenance_body(app) == {'enable': True, 'migrate_templates': False, 'relax_anti_affinity': False}
     assert not app.errors, app.errors
 

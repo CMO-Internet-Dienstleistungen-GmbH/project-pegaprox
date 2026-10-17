@@ -319,6 +319,34 @@ def test_runtime_german_says_it_in_german(app_of):
     assert not app.errors, app.errors
 
 
+def test_runtime_german_shows_a_reason_in_german_with_its_values(app_of):
+    # NS Oct 2026 - the reason comes as code and args, the wording from the key
+    app = app_of(layout='modern', language='de', configs={100: dict(CFG, lock='backup')})
+    _open_resources_de(app)
+    _tick(app, 100)
+    view = _check(_dialog(app))
+    reason = view.locator('[data-pf-guest="100"] [data-pf-reason="locked"]')
+    assert reason.inner_text() == 'Es ist gesperrt (backup): Proxmox migriert keinen gesperrten Gast'
+    assert 'It is locked' not in view.inner_text()
+    assert not app.errors, app.errors
+
+
+def test_runtime_a_code_without_a_key_shows_the_servers_english(app_of, monkeypatch):
+    import pegaprox.core.preflight as pf
+    made = pf._reason
+
+    def renamed(level, code, text, overridable=False, args=None, variant=None):
+        return made(level, 'a_code_no_language_has' if code == 'locked' else code, text, overridable, args, variant)
+    monkeypatch.setattr(pf, '_reason', renamed)
+    app = app_of(layout='modern', language='de', configs={100: dict(CFG, lock='backup')})
+    _open_resources_de(app)
+    _tick(app, 100)
+    view = _check(_dialog(app))
+    reason = view.locator('[data-pf-guest="100"] [data-pf-reason="a_code_no_language_has"]')
+    assert reason.inner_text() == 'It is locked (backup): Proxmox migrates no locked guest'
+    assert not app.errors, app.errors
+
+
 def _open_resources_de(app):
     page = app.page
     page.get_by_text('Testi').first.click()

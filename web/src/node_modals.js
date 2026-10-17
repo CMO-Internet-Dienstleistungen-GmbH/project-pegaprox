@@ -6471,19 +6471,9 @@
                     </div>
 
                     {showMaintConfirm && !haReadOnly && (
-                        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60" onClick={() => setShowMaintConfirm(false)}>
-                            <div className="w-full max-w-sm max-h-[90vh] overflow-y-auto bg-proxmox-card border border-proxmox-border p-5" data-testid="maint-dialog" onClick={e => e.stopPropagation()}>
-                                <h3 className="text-[14px] font-semibold mb-2" style={{color: '#e9ecef'}}>{t('enterMaintenance') || 'Enter Maintenance Mode'}: {node}</h3>
-                                <p className="text-[13px] mb-4" style={{color: '#adbbc4'}}>{t('maintenanceWarning')}</p>
-                                <div className="mb-4">
-                                    <MaintenanceEvacOptions clusterId={clusterId} node={node} value={maintOptions} onChange={setMaintOptions} />
-                                </div>
-                                <div className="flex justify-end gap-2">
-                                    <button onClick={() => setShowMaintConfirm(false)} className="px-3 py-1.5 text-[13px] border border-proxmox-border hover:text-white" style={{color: '#adbbc4'}}>{t('cancel')}</button>
-                                    <button onClick={() => { setShowMaintConfirm(false); onMaintenanceToggle(node, true, maintOptions); }} className="px-3 py-1.5 text-[13px] text-white" style={{background: '#efc006', border: '1px solid #d4a905'}}>{t('startMaintenance')}</button>
-                                </div>
-                            </div>
-                        </div>
+                        <MaintenanceDialog clusterId={clusterId} node={node} options={maintOptions} onOptions={setMaintOptions}
+                            onCancel={() => setShowMaintConfirm(false)}
+                            onConfirm={() => { setShowMaintConfirm(false); onMaintenanceToggle(node, true, maintOptions); }} />
                     )}
                 </div>
             );

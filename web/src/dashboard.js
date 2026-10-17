@@ -8266,6 +8266,7 @@
 
                     {report && (
                         <div className="space-y-4" data-whatif="report">
+                            <WhatIfVerdictLine verdict={report.verdict} />
                             {/* a headroom check moves no guest of its own: its table is the answer */}
                             {!report.headroom && <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
                                 {WHATIF_OUTCOMES.map(o => (
@@ -12799,6 +12800,8 @@
             // #625: the last agent check of the open HA settings, and what HA disable left behind
             const [haAgentCheck, setHaAgentCheck] = useState(null);
             const [haDisableReport, setHaDisableReport] = useState(null);
+            // NS Oct 2026 - the maintenance dialog of the cloud menus and the sidebar: {clusterId, node, options}
+            const [maintDialog, setMaintDialog] = useState(null);
             
             // NS: Global Search state - Jan 2026
             const [globalSearchQuery, setGlobalSearchQuery] = useState('');
@@ -17925,41 +17928,23 @@
                 }
             };
 
-            // #611 — non-blocking pre-flight RAM capacity check before entering
-            // maintenance. Any failure returns '' so the confirm proceeds unchanged.
-            const buildMaintPreviewWarning = async (clusterId, nodeName) => {
-                try {
-                    const pv = await authFetch(`${API_URL}/clusters/${clusterId}/nodes/${nodeName}/maintenance-preview?threshold=90`);
-                    if (!pv || !pv.ok) return '';
-                    const p = await pv.json();
-                    if (!p) return '';
-                    const proceed = '\n' + (t('maintPreviewProceed') || 'You can still proceed — this is only a capacity pre-check, not a hard block.');
-                    if (p.reason === 'no_target_nodes' && p.guest_count > 0)
-                        return '\n\n' + (t('maintPreviewNoTargets') || "Warning: no other online node to evacuate this node's guests to — they will keep running (a reboot takes them down).");
-                    if (!p.headroom_sufficient)
-                        return '\n\n' + (t('maintPreviewNoHeadroom') || 'Warning: the remaining online nodes may not have enough free RAM to hold all guests from this node. Some migrations could fail.') + proceed;
-                    if (p.over_threshold && p.over_threshold.length)
-                        return '\n\n' + (t('maintPreviewOverThreshold') || 'Warning: evacuating this node would push these node(s) over the RAM threshold: ') + p.over_threshold.join(', ') + proceed;
-                    return '';
-                } catch (_) { return ''; }
-            };
-
             // LW Oct 2026 (#763, #954) - options: the evacuation options the maintenance dialog of a
-            // node was left with ({ migrate_templates, relax_anti_affinity }), sent as they are
-            const handleMaintenanceToggle = async (nodeName, enable, options) => {
-                if (!selectedCluster) return;
+            // node was left with ({ migrate_templates, relax_anti_affinity }), sent as they are.
+            // NS Oct 2026 - enabling without options (the cloud menus, the sidebar) opens the
+            // maintenance dialog first, which runs the what-if of the node; the node dialogs ask
+            // on their own and call with their options. forCluster: the cluster of a sidebar node.
+            const handleMaintenanceToggle = async (nodeName, enable, options, forCluster) => {
+                const cid = forCluster || selectedCluster?.id;
+                if (!cid) return;
                 if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
+                if (enable && options === undefined) { setMaintDialog({ clusterId: cid, node: nodeName, options: {} }); return; }
                 // #147
-                const msg = enable
-                    ? `${t('startingMaintenanceMode') || 'Enable maintenance mode'}: "${nodeName}"? VMs will be evacuated.`
-                    : `${t('disableMaintenance') || 'Disable maintenance'}: "${nodeName}"?`;
-                const warn = enable ? await buildMaintPreviewWarning(selectedCluster.id, nodeName) : '';
-                if (!confirm(msg + warn)) return;
+                if (!enable && !confirm(`${t('disableMaintenance') || 'Disable maintenance'}: "${nodeName}"?`)) return;
 
                 try {
                     if (enable) {
                         addToast(`${t('startingMaintenanceMode') || 'Starting maintenance mode'}: ${nodeName}...`, 'info');
-                        const response = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/nodes/${nodeName}/maintenance`, {
+                        const response = await authFetch(`${API_URL}/clusters/${cid}/nodes/${nodeName}/maintenance`, {
                             method: 'PUT',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
@@ -17971,24 +17956,25 @@
                         
                         if (response && response.ok) {
                             addToast(`${t('maintenanceModeEnabled') || 'Maintenance mode enabled'}: ${nodeName}`);
-                            await fetchClusterMetrics(selectedCluster.id);
+                            await fetchClusterMetrics(cid);
                         } else {
                             const err = await response.json();
                             addToast(err.error || t('activationError') || 'Activation error', 'error');
                         }
                     } else {
-                        const response = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/nodes/${nodeName}/maintenance`, {
+                        const response = await authFetch(`${API_URL}/clusters/${cid}/nodes/${nodeName}/maintenance`, {
                             method: 'DELETE'
                         });
                         
                         if (response && response.ok) {
                             addToast(`${t('nodeMaintenanceExited') || 'Maintenance mode exited'}: ${nodeName}`);
-                            await fetchClusterMetrics(selectedCluster.id);
+                            await fetchClusterMetrics(cid);
                         } else {
                             const err = await response.json();
                             addToast(err.error || t('deactivationError') || 'Deactivation error', 'error');
                         }
                     }
+                    if (forCluster) fetchSidebarClusterData(cid);
                 } catch (error) {
                     addToast(t('connectionError'), 'error');
                 }
@@ -18569,25 +18555,10 @@
                         { perm: 'vm.create', label: t('newVm') || 'New VM', icon: <Icons.Monitor className="w-3.5 h-3.5" />, onClick: () => openCreateOnCluster('qemu') },
                         { perm: 'vm.create', label: t('newContainer') || 'New Container', icon: <Icons.Box className="w-3.5 h-3.5" />, onClick: () => openCreateOnCluster('lxc') },
                         { separator: true },
-                        { perm: 'node.maintenance', label: maintenance ? (t('exitMaintenance') || 'Exit Maintenance') : (t('enterMaintenance') || 'Enter Maintenance'), icon: <Icons.Wrench className="w-3.5 h-3.5" />, onClick: async () => {
-                            // NS: Mar 2026 - inline API call with known clusterId to avoid stale closure on selectedCluster
-                            const mMsg = maintenance ? `${t('disableMaintenance') || 'Disable maintenance'}: "${nodeName}"?` : `${t('startingMaintenanceMode') || 'Enable maintenance mode'}: "${nodeName}"? VMs will be evacuated.`;
-                            const mWarn = maintenance ? '' : await buildMaintPreviewWarning(clusterId, nodeName);
-                            if (!confirm(mMsg + mWarn)) return;
+                        { perm: 'node.maintenance', label: maintenance ? (t('exitMaintenance') || 'Exit Maintenance') : (t('enterMaintenance') || 'Enter Maintenance'), icon: <Icons.Wrench className="w-3.5 h-3.5" />, onClick: () => {
+                            // NS: Mar 2026 - the cluster id of the node travels along, selectedCluster may be stale here
                             selectCluster();
-                            try {
-                                if (!maintenance) {
-                                    addToast(`${t('startingMaintenanceMode') || 'Starting maintenance mode'}: ${nodeName}...`, 'info');
-                                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/nodes/${nodeName}/maintenance`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enable: true }) });
-                                    if (r && r.ok) { addToast(`${t('maintenanceModeEnabled') || 'Maintenance mode enabled'}: ${nodeName}`); fetchClusterMetrics(clusterId); }
-                                    else { const err = await r?.json().catch(() => ({})); addToast(err?.error || t('activationError') || 'Activation error', 'error'); }
-                                } else {
-                                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/nodes/${nodeName}/maintenance`, { method: 'DELETE' });
-                                    if (r && r.ok) { addToast(`${t('nodeMaintenanceExited') || 'Maintenance mode exited'}: ${nodeName}`); fetchClusterMetrics(clusterId); }
-                                    else { const err = await r?.json().catch(() => ({})); addToast(err?.error || t('deactivationError') || 'Deactivation error', 'error'); }
-                                }
-                                fetchSidebarClusterData(clusterId);
-                            } catch (e) { addToast(t('connectionError'), 'error'); }
+                            handleMaintenanceToggle(nodeName, !maintenance, undefined, clusterId);
                         }, disabled: !online },
                         ...(haConsolesElsewhere ? onActiveItems('node.shell', '', !online) : [
                         { perm: 'node.shell', label: t('sshConsole') || 'SSH Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => { selectCluster(); const c = clusters.find(cl => cl.id === clusterId); if (c) { setConsoleInfo({ vmid: 0, node: nodeName, type: 'node', host: c.host }); setConsoleVm({ vmid: 0, node: nodeName, type: 'node', name: nodeName }); } }, disabled: !online, console: true },
@@ -18960,6 +18931,12 @@
                         <UserProfileModal isOpen={showProfile} onClose={() => setShowProfile(false)} addToast={addToast} />
                         <PegaProxSettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} addToast={addToast} onGroupsChanged={fetchClusterGroups} />
                         {showApiReference && <ApiReferenceModal onClose={() => setShowApiReference(false)} />}
+                        {maintDialog && (
+                            <MaintenanceDialog clusterId={maintDialog.clusterId} node={maintDialog.node} options={maintDialog.options}
+                                onOptions={(o) => setMaintDialog(prev => prev ? { ...prev, options: o } : prev)}
+                                onCancel={() => setMaintDialog(null)}
+                                onConfirm={() => { const d = maintDialog; setMaintDialog(null); handleMaintenanceToggle(d.node, true, d.options, d.clusterId); }} />
+                        )}
                         {toastPortal}
                     </div>
                 );
@@ -29195,6 +29172,13 @@
                                 PegaProx {PEGAPROX_VERSION}
                             </div>
                         </div>
+                    )}
+
+                    {maintDialog && (
+                        <MaintenanceDialog clusterId={maintDialog.clusterId} node={maintDialog.node} options={maintDialog.options}
+                            onOptions={(o) => setMaintDialog(prev => prev ? { ...prev, options: o } : prev)}
+                            onCancel={() => setMaintDialog(null)}
+                            onConfirm={() => { const d = maintDialog; setMaintDialog(null); handleMaintenanceToggle(d.node, true, d.options, d.clusterId); }} />
                     )}
 
                     {/* Toast Notifications — rendered via portal to document.body to avoid corporate layout z-index/overflow issues */}
