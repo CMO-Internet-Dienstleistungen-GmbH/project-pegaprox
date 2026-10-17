@@ -570,6 +570,19 @@ def clear_pbs_update_status(pbs_id):
     return jsonify({'cleared': ok})
 
 
+def _gc_jobs_by_store(mgr):
+    # MK Oct 2026 - when GC last ran is only in /admin/gc, one entry per datastore. A PBS
+    # without that list, or a token that may not read it, just shows no GC times
+    try:
+        resp = mgr.get_gc_jobs()
+    except Exception:
+        return {}
+    rows = resp.get('data') if isinstance(resp, dict) else None
+    if not isinstance(rows, list):
+        return {}
+    return {r['store']: r for r in rows if isinstance(r, dict) and isinstance(r.get('store'), str)}
+
+
 @bp.route('/api/pbs/<pbs_id>/datastores', methods=['GET'])
 @require_auth(perms=['pbs.datastore.view'])
 def get_pbs_datastores(pbs_id):
@@ -591,12 +604,15 @@ def get_pbs_datastores(pbs_id):
     
     datastores = config_resp.get('data', [])
     usage_list = {u.get('store'): u for u in usage_resp.get('data', [])}
+    gc_jobs = _gc_jobs_by_store(mgr)
     
     # Merge config with usage
     result = []
     for ds in datastores:
         name = ds.get('name', '')
         info = {**ds, **(usage_list.get(name, {}))}
+        if name in gc_jobs:
+            info['gc-job'] = gc_jobs[name]
         
         # Try to get detailed status (GC info, counts)
         try:
@@ -3680,13 +3696,11 @@ def get_pbs_health(pbs_id):
     import time as _t
     now = _t.time()
     oldest_gc_age_h = None
+    # MK Oct 2026 - gc-status carries no time at all, so this factor never counted
+    gc_jobs = _gc_jobs_by_store(mgr)
     for s in stores:
-        gc = s.get('gc-status') or {}
-        upid = gc.get('upid')
-        # If upid present, gc has run; we can't easily get the timestamp without
-        # parsing — fall back to checking the store's own timestamp if available.
-        last = s.get('last-gc') or 0
-        if last:
+        last = (gc_jobs.get(s.get('name') or s.get('store')) or {}).get('last-run-endtime')
+        if isinstance(last, (int, float)) and not isinstance(last, bool) and last > 0:
             age_h = (now - last) / 3600
             if oldest_gc_age_h is None or age_h > oldest_gc_age_h:
                 oldest_gc_age_h = age_h
