@@ -26,7 +26,7 @@ from flask import Blueprint, jsonify, request
 
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth, build_authz_user
-from pegaprox.utils.rbac import (acts_as_admin, has_permission,
+from pegaprox.utils.rbac import (acts_as_admin, has_permission, get_user_clusters,
                                  user_can_access_vm, tenant_vmid_range, acting_tenant,
                                  TenantRangeUnknown)
 from pegaprox.api.helpers import bounded_limit, caller_is_scoped, check_cluster_access
@@ -110,8 +110,18 @@ def _guests_reached(user, cid, vmids):
 
 
 def _in_own_tenant(user, cid, vmids):
-    """A guest is in the caller's tenant when they reach it and, where their tenant has a
-    slice of VMIDs, it lies inside the slice. Cluster ownership is part of reaching it."""
+    """A guest is in the caller's tenant when the cluster is one of their tenant's, they
+    reach the guest, and, where their tenant has a slice of VMIDs, it lies inside it."""
+    # NS Oct 2026 - a VM ACL or a pool grant reaches a guest on someone else's cluster, a
+    # '*' row every account; neither makes it theirs to approve for. Same line as the role
+    # fall-through in rbac.user_can_access_vm.
+    try:
+        own = get_user_clusters(user, include_pools=False)
+    except Exception:
+        logging.exception('[changes] clusters of the approver not read')
+        return False
+    if own is not None and cid not in own:
+        return False
     if not _guests_reached(user, cid, vmids):
         return False
     tenant = acting_tenant(user)
