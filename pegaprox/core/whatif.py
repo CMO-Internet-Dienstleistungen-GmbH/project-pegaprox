@@ -1823,7 +1823,10 @@ def verdict(report):
         shown = ', '.join(names[:VERDICT_NAMES]) + (f" and {len(names) - VERDICT_NAMES} more"
                                                     if len(names) > VERDICT_NAMES else '')
         warned.append(_vreason('warning', 'critical_affected', count=len(crit), names=shown))
-    unproven = sum(1 for r in rows if (r.get('restore') or {}).get('state') in ('not_proven', 'failing'))
+    # MK Oct 2026 - as in the preflight: "not proven" counts for a critical guest only (most
+    # installs run no restore tests, so it said nothing), a failing test on any guest
+    unproven = sum(1 for r in rows if (r.get('restore') or {}).get('state') == 'failing'
+                   or ((r.get('restore') or {}).get('state') == 'not_proven' and r.get('critical')))
     if unproven:
         warned.append(_vreason('warning', 'restore_unproven', count=unproven))
     hot = sorted({r['node'] for r in report.get('nodes') or []

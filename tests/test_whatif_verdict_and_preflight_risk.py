@@ -89,19 +89,27 @@ def test_many_critical_guests_are_cut_to_a_few_names(lab):
     assert reason['args']['names'] in reason['text']
 
 
-def test_affected_guests_without_a_proven_restore_warn_never_tested_or_failing(lab):
+def test_a_failing_restore_test_warns_for_any_guest_an_unproven_one_only_for_a_critical(lab):
+    # as in the preflight: most installs run no restore tests, a warning on every guest says nothing
     mgr = _env(lab)
-    _mark_passed(100)           # 101 was never tested
-    v = _verdict(mgr)['verdict']
-    assert v['level'] == 'warning'
-    assert [(r['code'], r['args']) for r in v['reasons']] == [('restore_unproven', {'count': 1})]
-    # a failing test is no better
+    _mark_passed(100)           # 101 was never tested, and is not critical
+    assert _verdict(mgr)['verdict'] == {'level': 'ready', 'reasons': []}
+    # a failing test is news on any guest
     recovery.note_result({'cluster_id': CID, 'vmid': 101, 'status': 'failed', 'id': 'bad101',
                           'backup_ts': T_PBS, 'measured_seconds': 60.0, 'checks': []}, at=NOW - 60)
     v = _verdict(mgr)['verdict']
-    assert v['reasons'][0]['args'] == {'count': 1}
+    assert v['level'] == 'warning'
+    assert [(r['code'], r['args']) for r in v['reasons']] == [('restore_unproven', {'count': 1})]
     _mark_passed(101)
     assert _verdict(mgr)['verdict']['level'] == 'ready'
+
+
+def test_a_critical_guest_never_tested_warns_for_both(lab):
+    mgr = _env(lab, tags={101: 'critical'})
+    _mark_passed(100)
+    v = _verdict(mgr)['verdict']
+    assert [(r['code'], r['args'].get('count')) for r in v['reasons']] == [('critical_affected', 1),
+                                                                          ('restore_unproven', 1)]
 
 
 def test_nodes_pushed_over_the_threshold_warn(lab):
