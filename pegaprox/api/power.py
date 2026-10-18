@@ -354,6 +354,14 @@ def upsert(cluster_id):
              ('node_idle_w', 'node_max_w', 'mem_w_per_gb', 'pue', 'kwh_price', 'kg_co2_per_kwh')}
     except (TypeError, ValueError):
         return jsonify({'error': 'rates must be numeric'}), 400
+    # MK Oct 2026 - as for a host profile: 1e999 went in as inf and came back as Infinity,
+    # which is no JSON, and every power and cost page of the cluster failed on it
+    if not all(math.isfinite(v) and v >= 0 for v in f.values()):
+        return jsonify({'error': 'rates must be finite and not negative'}), 400
+    if f['pue'] < 1:
+        return jsonify({'error': 'pue must be at least 1'}), 400
+    if max(f['node_idle_w'], f['node_max_w']) > _MAX_HOST_W:
+        return jsonify({'error': f'watts must be between 0 and {int(_MAX_HOST_W)}'}), 400
     cur = (body.get('currency') or 'EUR').strip()[:8]
     notes = (body.get('notes') or '').strip()[:500]
     try:

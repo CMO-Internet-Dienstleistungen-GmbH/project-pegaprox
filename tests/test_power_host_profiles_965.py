@@ -226,6 +226,18 @@ def test_host_profile_rejects_nonsense(api, seed, monkeypatch, body):
     assert r.status_code == 400, r.get_data(as_text=True)
 
 
+@pytest.mark.parametrize('bad', [{'kwh_price': 1e999}, {'node_max_w': float('nan')}, {'pue': -3},
+                                 {'pue': 0.5}, {'mem_w_per_gb': -1}, {'node_idle_w': 1e6}])
+def test_cluster_rates_reject_nonsense_and_keep_the_page_readable(api, seed, bad):
+    c = api.as_user(_admin(seed))
+    _plain_rates(api, seed)
+    body = {'node_idle_w': 80, 'node_max_w': 300, 'mem_w_per_gb': 0, 'pue': 1,
+            'kwh_price': 0.30, 'kg_co2_per_kwh': 0.40, **bad}
+    assert c.put('/api/power/rates/cluster_1', json=body).status_code == 400
+    r = c.get('/api/power/rates/cluster_1')
+    assert 'Infinity' not in r.get_data(as_text=True) and r.get_json()['pue'] == 1.0
+
+
 def test_host_profile_only_for_a_host_of_the_cluster(api, seed, monkeypatch):
     _cluster(api, monkeypatch)
     c = api.as_user(_admin(seed))
