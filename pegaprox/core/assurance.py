@@ -127,10 +127,11 @@ def gap_list(rows, cluster_label=None):
     return found[:GAPS_MAX], counts, len(found) > GAPS_MAX
 
 
-def plan_gaps(cluster_id, state_of):
+def plan_gaps(cluster_id, state_of, reaches=None):
     """Gaps of the Site Recovery plans that protect guests of `cluster_id`, from what is
     stored and the connection state of the clusters: `state_of(cluster_id)` returns 'ok',
-    'offline' or 'missing'. Returns [{'kind', 'plan_id', 'plan', 'vmid', ...}]; a plan whose
+    'offline' or 'missing'; `reaches(cluster_id)`, when given, leaves out the plans whose
+    target it says no to. Returns [{'kind', 'plan_id', 'plan', 'vmid', ...}]; a plan whose
     target cannot be reached has one gap without a vmid."""
     conn = get_db().conn
     out = []
@@ -138,6 +139,8 @@ def plan_gaps(cluster_id, state_of):
                          'LIMIT 1000', (cluster_id,)).fetchall()
     for p in plans:
         pid, name, target = p['id'], p['name'], p['target_cluster']
+        if reaches is not None and not reaches(target):
+            continue
         st = state_of(target)
         if st != 'ok':
             out.append({'kind': 'plan_target_unreachable', 'plan_id': pid, 'plan': name, 'vmid': None,
@@ -302,7 +305,10 @@ def verify(doc):
     sig = doc.get('signature') if isinstance(doc.get('signature'), dict) else {}
     key = get_db().aes_key
     value = sig.get('value')
-    valid = bool(key and isinstance(value, str)
+    # the block is the one part the signature does not cover: a note in it, or another
+    # algorithm named, came out of here as valid (as for the flight recorder bundle)
+    valid = bool(key and isinstance(value, str) and set(sig) == {'alg', 'value'}
+                 and sig['alg'] == 'HMAC-SHA256'
                  and hmac.compare_digest(value, hmac.new(key, _SIG_DOMAIN + _canonical(doc),
                                                          hashlib.sha256).hexdigest()))
     head = doc.get('audit_head') if isinstance(doc.get('audit_head'), dict) else None
@@ -312,14 +318,34 @@ def verify(doc):
     return {'signature_valid': valid, 'audit_chain': chain}
 
 
-def build_evidence(scope_kind, scope_id, days, clusters, rows, gaps, plan_gap_rows, cov):
+def verify_body(raw):
+    """verify() for a body as it was sent, None when it is no JSON object. MK Oct 2026 -
+    parsed with the flight recorder's check for a key that appears twice: request.get_json
+    keeps the last one, so a coverage put in front of the signed one verified while a
+    reader that keeps the first (or anyone reading the file) saw it."""
+    from pegaprox.core.flight_recorder import _once, _Twice
+    try:
+        doc = json.loads(raw, object_pairs_hook=_once)
+    except _Twice:
+        return {'signature_valid': False, 'audit_chain': 'none',
+                'reason': 'a key appears twice in one object, so what a reader sees need not be what was signed'}
+    except (ValueError, RecursionError):
+        return None
+    return verify(doc)
+
+
+def build_evidence(scope_kind, scope_id, days, clusters, rows, gaps, plan_gap_rows, cov, confined=False):
     """The evidence document, signed. `rows` are assessed rows each with the evidence_guest
-    entry under row['_evidence'] (the caller has scoped them already)."""
+    entry under row['_evidence'] (the caller has scoped them already). confined: the caller
+    sees only some guests of the scope, and the signed scope says so."""
+    scope = {'kind': scope_kind, 'id': scope_id}
+    if confined:
+        scope['confined'] = True
     doc = {
         'format': EVIDENCE_FORMAT,
         'generated_at': datetime.now().isoformat(timespec='seconds'),
         'pegaprox_version': PEGAPROX_VERSION,
-        'scope': {'kind': scope_kind, 'id': scope_id},
+        'scope': scope,
         'period_days': days,
         'clusters': clusters,
         'coverage': cov,

@@ -156,6 +156,29 @@ def test_site_recovery_plan_gaps(routes):
     assert got == {('plan_no_replication', 'p1'), ('plan_target_unreachable', 'p2')}
 
 
+def test_a_plan_to_a_cluster_of_another_tenant_is_not_shown(routes):
+    other = routes.api.make_fake_manager('c2')
+    other.is_connected = True
+    routes.api.set_manager('c2', other)
+    routes.seed.tenant('t_own', ['c1'])
+    routes.seed.tenant('acme', ['c2'])
+    _plan('p1', 'c1', 'c2', [(100, ''), (102, '')])     # to acme's cluster
+    _plan('p2', 'c1', 'c9', [(100, '')])                # a target that is gone is nobody's
+
+    def gaps(c):
+        return {(g['kind'], g['plan_id']) for g in _assurance(c)['plan_gaps']}
+
+    op = routes.api.as_user(routes.seed.user('op_sr', role='user', tenant_id='t_own',
+                                             permissions=['backup.view', 'site_recovery.view']))
+    assert gaps(op) == {('plan_target_unreachable', 'p2'), ('plan_no_replication', 'p2')}
+    blind = routes.api.as_user(routes.seed.user('op_blind', role='user', tenant_id='t_own',
+                                                permissions=['backup.view'], denied=['site_recovery.view']))
+    assert gaps(blind) == set()
+    assert blind.get('/api/clusters/c1/recovery-evidence').get_json()['plan_gaps'] == []
+    # counterproof: the admin sees both plans
+    assert ('plan_no_replication', 'p1') in gaps(routes.admin)
+
+
 # --- manual confirmations ----------------------------------------------------------------------
 
 def _confirm(c, **body):
@@ -308,6 +331,27 @@ def test_a_changed_document_fails_verification(routes):
     assert routes.admin.post('/api/recovery-evidence/verify', json=doc).get_json()['signature_valid'] is False
 
 
+def test_a_key_twice_or_a_note_in_the_signature_block_does_not_verify(routes):
+    url = '/api/recovery-evidence/verify'
+    raw = routes.admin.get('/api/clusters/c1/recovery-evidence').get_data(as_text=True)
+    assert routes.admin.post(url, data=raw, content_type='application/json').get_json()['signature_valid'] is True
+    # a coverage in front of the signed one: a reader that keeps the first key sees 100 %
+    forged = raw.replace('"coverage": {', '"coverage": {"all": {"percent": 100.0}}, "coverage": {', 1)
+    assert forged != raw
+    res = routes.admin.post(url, data=forged, content_type='application/json').get_json()
+    assert res['signature_valid'] is False and 'twice' in res['reason']
+    for block in ({'note': 'audited, all fine'}, {'alg': 'none'}):
+        doc = json.loads(raw)
+        doc['signature'].update(block)
+        assert routes.admin.post(url, json=doc).get_json()['signature_valid'] is False, block
+
+
+def test_a_deeply_nested_body_is_a_400(routes):
+    body = '[' * 100000 + ']' * 100000
+    r = routes.admin.post('/api/recovery-evidence/verify', data=body, content_type='application/json')
+    assert r.status_code == 400
+
+
 def test_verify_wants_a_document(routes):
     for body in ({}, {'format': 'other'}, [1], 'x'):
         assert routes.admin.post('/api/recovery-evidence/verify', json=body).status_code == 400
@@ -350,6 +394,10 @@ def test_who_gets_which_evidence(routes, kind, code, vmids):
         if vmids is not None:
             assert sorted(g['vmid'] for g in r.get_json()['guests']) == vmids
     if kind == 'acl_confined':
+        # what it signs says it saw part of the cluster
+        doc = c.get('/api/clusters/c1/recovery-evidence').get_json()
+        assert doc['scope'] == {'kind': 'cluster', 'id': 'c1', 'confined': True}
+        assert routes.admin.post('/api/recovery-evidence/verify', json=doc).get_json()['signature_valid'] is True
         # the plans of the cluster are not theirs
         _plan('p9', 'c1', 'c9', [(100, '')])
         assert c.get('/api/clusters/c1/recovery-assurance').get_json()['plan_gaps'] == []

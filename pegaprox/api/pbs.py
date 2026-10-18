@@ -15,7 +15,7 @@ from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.sanitization import bounded_list
 from pegaprox.api.helpers import safe_error, check_pbs_access, check_cluster_access, scope_vm_rows, require_unconfined, bounded_limit, acts_as_admin, caller_acts_as_admin
-from pegaprox.api.helpers import upstream_failure, tenant_quota_gate
+from pegaprox.api.helpers import upstream_failure, tenant_quota_gate, caller_is_scoped
 from pegaprox.core.pbs import PBSManager, load_pbs_servers, save_pbs_server, pbs_config_from_row, pbs_target_refusal
 
 bp = Blueprint('pbs', __name__)
@@ -3378,10 +3378,13 @@ def _assured(cluster_id, label, rows, settings):
 
 def _site_gaps(cluster_id):
     """Site Recovery plan gaps of a cluster as far as the caller may see them: a confined
-    caller sees none, the plans are not theirs."""
+    caller sees none, the plans are not theirs; nor does one without site_recovery.view, or
+    a plan whose target it does not reach (as in the timeline)."""
     from pegaprox.core import assurance
     from pegaprox.api.helpers import caller_is_scoped
-    if caller_is_scoped(_caller(), cluster_id):
+    from pegaprox.utils.rbac import has_permission
+    user = _caller()
+    if caller_is_scoped(user, cluster_id) or not has_permission(user, 'site_recovery.view'):
         return []
 
     def state_of(cid):
@@ -3389,7 +3392,15 @@ def _site_gaps(cluster_id):
         if m is None:
             return 'missing'
         return 'ok' if getattr(m, 'is_connected', False) else 'offline'
-    return assurance.plan_gaps(cluster_id, state_of)
+
+    def reaches(cid):
+        # MK Oct 2026 - a plan names its target and the gap says how that cluster is doing;
+        # one of another tenant is not for this caller. A target that is gone names nobody's.
+        if cid not in cluster_managers:
+            return True
+        ok, _err = check_cluster_access(cid)
+        return ok and not caller_is_scoped(user, cid)
+    return assurance.plan_gaps(cluster_id, state_of, reaches)
 
 
 def _evidence_for(cluster_id, rows):
@@ -3469,6 +3480,7 @@ def get_recovery_evidence(cluster_id):
     try:
         rows, meta = recovery.cluster_report(cluster_id, mgr, stale_days=days)
         label = _cluster_label(cluster_id, mgr)
+        confined = caller_is_scoped(_caller(), cluster_id)
         rows = _assured(cluster_id, label, scope_vm_rows(cluster_id, rows), meta['settings'])
         plan_gaps = _site_gaps(cluster_id)
         _evidence_for(cluster_id, rows)
@@ -3479,7 +3491,7 @@ def get_recovery_evidence(cluster_id):
               f'Exported the recovery evidence of {label} ({len(rows)} guests)', cluster=label)
     doc = assurance.build_evidence(
         'cluster', cluster_id, days, [{'cluster_id': cluster_id, 'cluster_name': label, 'state': 'ok'}],
-        rows, gaps, plan_gaps, assurance.coverage(rows))
+        rows, gaps, plan_gaps, assurance.coverage(rows), confined=confined)
     return _evidence_response(doc, fmt, f'recovery-evidence-{cluster_id}')
 
 
@@ -3502,12 +3514,13 @@ def get_tenant_recovery_evidence(tenant_id):
         return err
     results = run_concurrent([lambda c=cid, m=mgr: recovery.cluster_report(c, m, stale_days=days)
                               for cid, mgr, _e in reach], timeout=120)
-    rows, plan_gaps = [], []
+    rows, plan_gaps, confined = [], [], False
     try:
         for (cid, _mgr, entry), res in zip(reach, results):
             if not res:
                 entry['state'] = 'unreadable'
                 continue
+            confined = confined or caller_is_scoped(_caller(), cid)
             found = _assured(cid, entry['cluster_name'], scope_vm_rows(cid, res[0]), res[1]['settings'])
             _evidence_for(cid, found)
             rows += found
@@ -3520,7 +3533,7 @@ def get_tenant_recovery_evidence(tenant_id):
     log_audit(request.session.get('user', 'system'), 'backup.recovery_evidence',
               f'Exported the recovery evidence of tenant {tenant_id} ({len(rows)} guests)')
     doc = assurance.build_evidence('tenant', tenant_id, days, clusters, rows, gaps, plan_gaps,
-                                   assurance.coverage(rows))
+                                   assurance.coverage(rows), confined=confined)
     return _evidence_response(doc, fmt, f'recovery-evidence-{tenant_id}')
 
 
@@ -3530,7 +3543,7 @@ def verify_recovery_evidence():
     """Check an evidence document against this instance: whether it signed it, unchanged,
     and whether the audit chain head it names is in this instance's chain."""
     from pegaprox.core import assurance
-    res = assurance.verify(request.get_json(silent=True))
+    res = assurance.verify_body(request.get_data()) if request.is_json else None
     if res is None:
         return jsonify({'error': 'The body must be a recovery evidence document'}), 400
     return jsonify(res)
