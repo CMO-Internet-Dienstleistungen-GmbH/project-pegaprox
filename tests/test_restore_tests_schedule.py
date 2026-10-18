@@ -227,9 +227,22 @@ def _g(vmid, node='pve1', kind='qemu', **kw):
     return dict({'vmid': vmid, 'type': kind, 'node': node, 'name': f'g{vmid}', 'status': 'running'}, **kw)
 
 
+class _SlotClock:
+    """recovery's clock, a minute after the test slot. A run names no time, so pick() reads
+    the clock, and the backups here are hours older than SUNDAY: against the real clock
+    they went past max_age_days a week after it, and every run test picked nothing."""
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+    @staticmethod
+    def time():
+        return NOW + 60
+
+
 @pytest.fixture
 def clusters(db, monkeypatch):
     monkeypatch.setattr(recovery, '_backups', {})
+    monkeypatch.setattr(recovery, 'time', _SlotClock())
     saved = dict(cluster_managers)
     cluster_managers.clear()
     yield cluster_managers
