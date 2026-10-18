@@ -3621,6 +3621,11 @@ def rotate_encryption_key():
         log_audit(usr, 'security.key_rotation_failed', f"Key rotation failed: {result.get('error', 'Unknown error')}")
         return jsonify(result), 500
 
+
+# the newest audit entries the compliance check verifies
+AUDIT_SPOT_CHECK = 100
+
+
 @bp.route('/api/security/compliance', methods=['GET'])
 @require_auth(perms=['security.settings.manage'])
 def get_compliance_status():
@@ -3714,11 +3719,18 @@ def get_compliance_status():
                 'SELECT hmac_signature, chain_seq FROM audit_log ORDER BY id DESC LIMIT 1').fetchone()
             if last is None:
                 add('audit_logging_enabled', 'not_checked', reason='No audit entry has been written yet')
+            elif not (last['hmac_signature'] and last['chain_seq'] is not None):
+                add('audit_logging_enabled', 'failed', 'The newest audit entry is not signed into the chain')
             else:
-                signed = bool(last['hmac_signature']) and last['chain_seq'] is not None
-                add('audit_logging_enabled', 'passed' if signed else 'failed',
-                    'Entries are signed and hash-chained' if signed
-                    else 'The newest audit entry is not signed into the chain')
+                # MK Oct 2026 - and the signatures hold: a signature field that is only filled
+                # in passed as well. The newest entries, off the hub, as the integrity check
+                # walks them
+                res = database.verify_audit_log_integrity(limit=AUDIT_SPOT_CHECK)
+                ch = res.get('chain') or {}
+                bad = int(res.get('potentially_tampered') or 0) + int(ch.get('broken_links') or 0)
+                add('audit_logging_enabled', 'failed' if bad else 'passed',
+                    f'{bad} of the newest audit entries do not verify against their signature or chain'
+                    if bad else 'Entries are signed and hash-chained, the newest verify')
         except Exception as e:
             logging.error(f"compliance: audit log unreadable: {e}")
             add('audit_logging_enabled', 'not_checked', reason='The audit log could not be read')

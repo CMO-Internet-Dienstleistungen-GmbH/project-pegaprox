@@ -64,6 +64,19 @@ def test_audit_logging_looks_at_the_newest_entry(api, seed):
     assert _by_id(_get(api, admin))['audit_logging_enabled']['status'] == 'failed'
 
 
+def test_audit_logging_verifies_the_newest_entries(api, seed):
+    """A filled-in signature field passed before; the signature has to hold."""
+    admin = seed.user('root', role='admin')
+    seed.db.add_audit_entry('root', 'test.signed', 'x')
+    seed.db.add_audit_entry('root', 'test.signed', 'y')
+    assert _by_id(_get(api, admin))['audit_logging_enabled']['status'] == 'passed'
+    seed.db.conn.execute("UPDATE audit_log SET details = 'changed' WHERE id = (SELECT MAX(id) FROM audit_log "
+                         "WHERE action = 'test.signed')")
+    seed.db.conn.commit()
+    ctl = _by_id(_get(api, admin))['audit_logging_enabled']
+    assert ctl['status'] == 'failed' and 'do not verify' in ctl['detail'], ctl
+
+
 def test_two_factor_counts_when_it_is_required(api, seed):
     admin = seed.user('root', role='admin')
     seed.db.save_server_setting('force_2fa', False)
