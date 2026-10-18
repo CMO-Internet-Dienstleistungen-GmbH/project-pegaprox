@@ -991,6 +991,10 @@ class PegaProxManager:
                 kwargs['timeout'] = 15  # 15 s is plenty for any PVE API call
             return _original_request(method, url, **kwargs)
         session.request = _request_with_default_timeout
+        # MK Oct 2026 - a node, a task id or a volume from a request goes into these paths;
+        # one with a '..' segment would be folded into another endpoint by requests
+        from pegaprox.utils.sanitization import refuse_climbing_paths
+        refuse_climbing_paths(session)
         # an automatic leader that lost its lease sends no change from here (#625)
         ha_transport.guard_session(session)
 
@@ -12355,6 +12359,8 @@ echo "AGENT_INSTALLED_OK"
             return []
 
     def stop_task(self, node: str, upid: str) -> bool:
+        if not validate_hostname(node or '') or not re.fullmatch(r'UPID:[^/?#%\s]{1,400}', upid or ''):
+            return False
 
         if not self.is_connected:
             if not self.connect_to_proxmox():
@@ -19650,6 +19656,8 @@ echo "AGENT_INSTALLED_OK"
     
     def get_node_task_log(self, node: str, upid: str, start: int = 0, limit: int = 500) -> List[str]:
         """Get log for a specific task"""
+        if not validate_hostname(node or '') or not re.fullmatch(r'UPID:[^/?#%\s]{1,400}', upid or ''):
+            return []
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return []

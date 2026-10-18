@@ -16,6 +16,7 @@ from pegaprox.utils.audit import log_audit
 from pegaprox.utils.sanitization import bounded_list
 from pegaprox.api.helpers import safe_error, check_pbs_access, check_cluster_access, scope_vm_rows, require_unconfined, bounded_limit, acts_as_admin, caller_acts_as_admin
 from pegaprox.api.helpers import upstream_failure, tenant_quota_gate, caller_is_scoped
+from pegaprox.utils.sanitization import valid_pbs_upid
 from pegaprox.core.pbs import PBSManager, load_pbs_servers, save_pbs_server, pbs_config_from_row, pbs_target_refusal
 
 bp = Blueprint('pbs', __name__)
@@ -1219,6 +1220,8 @@ def get_pbs_task_detail(pbs_id, upid):
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
+    if not valid_pbs_upid(upid):
+        return jsonify({'error': 'Invalid task id'}), 400
     # sec (audit) — the log names the archives and the guest it backed up
     _bt, _bid = _pbs_upid_guest(upid)
     ok, err = _authz_pbs_backup(mgr, _bt, _bid, 'vm.view', store=_pbs_task_store(upid), ns='')
@@ -2000,6 +2003,8 @@ def stop_pbs_task(pbs_id, upid):
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
+    if not valid_pbs_upid(upid):
+        return jsonify({'error': 'Invalid task id'}), 400
     result = mgr.stop_task(upid)
     if 'error' in result:
         return jsonify(result), 400

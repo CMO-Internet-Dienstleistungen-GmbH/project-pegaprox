@@ -15,6 +15,7 @@ from pegaprox.constants import *
 from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.utils.sanitization import sanitize_log_message as _sl  # CWE-117
+from pegaprox.utils.sanitization import validate_hostname, valid_upid
 from pegaprox.core.db import get_db
 
 from pegaprox.utils.auth import require_auth, load_users, verify_password
@@ -1162,6 +1163,9 @@ def get_node_task_log_api(cluster_id, node, upid):
         return jsonify({'error': 'Cluster not found'}), 404
     
     manager = cluster_managers[cluster_id]
+    # MK Oct 2026 - a task id has no slash; anything else goes nowhere near the URL
+    if not validate_hostname(node) or not valid_upid(upid):
+        return jsonify({'error': 'Invalid node or task id'}), 400
 
     # sec (private disclosure Sep 2026 — audit): the UPID names a guest (PVE field 6). A scoped
     # caller must not read the task log of a VM outside their grant — the DELETE/cancel sibling
@@ -1201,6 +1205,8 @@ def get_node_task_status_api(cluster_id, node, upid):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     manager = cluster_managers[cluster_id]
+    if not validate_hostname(node) or not valid_upid(upid):
+        return jsonify({'error': 'Invalid node or task id'}), 400
 
     from pegaprox.utils.auth import build_authz_user as _bau
     from pegaprox.utils.rbac import user_can_access_vm as _ucav

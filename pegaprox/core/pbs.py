@@ -20,6 +20,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from pegaprox.core.db import get_db
 from pegaprox.globals import pbs_managers
 from pegaprox.utils.ssh import read_capped as _read_capped
+from pegaprox.utils.sanitization import valid_pbs_upid
 
 def _validate_pbs_host(host: str) -> bool:
     """Format-only check on the PBS host string.
@@ -142,6 +143,9 @@ class PBSManager:
             self._session.mount('https://', _PinnedFingerprintAdapter(_pin))
             logging.info(f"[PBS] {self.name}: pinning the server certificate to its "
                          f"configured fingerprint")
+        # MK Oct 2026 - no path from a request is folded into another endpoint (as for PVE)
+        from pegaprox.utils.sanitization import refuse_climbing_paths
+        refuse_climbing_paths(self._session)
         # an automatic leader that lost its lease changes nothing on the PBS (#625)
         from pegaprox.core import ha_transport
         ha_transport.guard_session(self._session)
@@ -693,10 +697,14 @@ class PBSManager:
     
     def get_task_status(self, upid: str) -> dict:
         """Get status of a specific task"""
+        if not valid_pbs_upid(upid):
+            return {'error': 'Invalid task id'}
         return self.api_get(f'/nodes/localhost/tasks/{upid}/status')
     
     def get_task_log(self, upid: str) -> dict:
         """Get log output of a task"""
+        if not valid_pbs_upid(upid):
+            return {'error': 'Invalid task id'}
         return self.api_get(f'/nodes/localhost/tasks/{upid}/log')
     
     # ── Jobs ──
@@ -922,6 +930,8 @@ class PBSManager:
     
     def stop_task(self, upid: str) -> dict:
         """Stop/abort a running task"""
+        if not valid_pbs_upid(upid):
+            return {'error': 'Invalid task id'}
         return self.api_delete(f'/nodes/localhost/tasks/{upid}')
     
     # ── Notification CRUD ──
