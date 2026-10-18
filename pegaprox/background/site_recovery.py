@@ -25,42 +25,49 @@ logger = logging.getLogger('pegaprox.site_recovery')
 # MK Oct 2026 - the plans a worker of this process is on, and the ones asked to stop. A
 # cancel used to write 'ready' only: the worker went on with the next guest, and with the
 # plan 'ready' a second failover or a failback started over it
-_live = {}             # plan_id -> what runs: planned, emergency, failback, test, cleanup
-_stop = set()
+# Each entry belongs to the worker greenlet that made it: one finishing (its webhook can
+# take 30 s after the plan reads ready again) removes its own entry only, and a stop asked
+# of the plan reaches the worker that runs it now.
+_live = {}             # plan_id -> {'kind': planned|emergency|failback|test|cleanup, 'owner', 'stop'}
 _live_lock = threading.Lock()
 
 
 def run_alive(plan_id):
     """What a worker of this process runs for the plan, None when nothing does."""
     with _live_lock:
-        return _live.get(plan_id)
+        entry = _live.get(plan_id)
+        return entry['kind'] if entry else None
 
 
 def ask_to_stop(plan_id):
     """The plan's worker stops before its next guest. False when none runs."""
     with _live_lock:
-        if plan_id not in _live:
+        entry = _live.get(plan_id)
+        if entry is None:
             return False
-        _stop.add(plan_id)
+        entry['stop'] = True
         return True
 
 
 def _stopping(plan_id):
+    from greenlet import getcurrent
     with _live_lock:
-        return plan_id in _stop
+        entry = _live.get(plan_id)
+        return bool(entry and entry['owner'] is getcurrent() and entry['stop'])
 
 
 @contextmanager
 def _running(plan_id, kind):
+    from greenlet import getcurrent
+    me = getcurrent()
     with _live_lock:
-        _live[plan_id] = kind
-        _stop.discard(plan_id)
+        _live[plan_id] = {'kind': kind, 'owner': me, 'stop': False}
     try:
         yield
     finally:
         with _live_lock:
-            _live.pop(plan_id, None)
-            _stop.discard(plan_id)
+            if (_live.get(plan_id) or {}).get('owner') is me:
+                del _live[plan_id]
 
 
 def _on_the_plan(kind=None):
@@ -1300,6 +1307,13 @@ def _heartbeat_check():
                           f"Auto-failover BLOCKED for '{_sl(plan['name'])}': {'; '.join(blockers[:5])}")
                 _last_fail_times.pop(plan_id, None)
                 _cooldowns[plan_id] = now + 600  # shorter cooldown — admin may fix replication
+                continue
+
+            # MK Oct 2026 - not while a worker of this process is still on the plan: a
+            # cancelled run reads ready again before its post webhook is through. Before the
+            # cooldown and the outage clock are touched, so the next pass after it takes over
+            if run_alive(plan_id):
+                logger.info(f"[SR] Auto-failover for '{_sl(plan['name'])}' waits: a run of it is still under way")
                 continue
 
             logger.error(f"[SR] AUTO-FAILOVER triggered for '{_sl(plan['name'])}' after {int(elapsed)}s")

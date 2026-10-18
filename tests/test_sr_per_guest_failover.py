@@ -662,3 +662,82 @@ def test_a_cancel_with_nothing_running_here_sets_the_plan_ready(api, site):
     r = _admin(api, site).post('/api/site-recovery/plans/p1/cancel')
     assert r.status_code == 200
     assert site.db.query_one("SELECT status FROM site_recovery_plans WHERE id = 'p1'")['status'] == 'ready'
+
+
+def test_the_heartbeat_waits_while_a_cancelled_run_finishes(api, site, monkeypatch):
+    """A cancelled run reads ready again before its post webhook is through (up to 30 s);
+    the auto-failover claimed the plan in that window and ran beside it."""
+    from gevent.event import Event
+    db, c = site.db, _admin(api, site)
+    db.execute("UPDATE site_recovery_plans SET auto_failover = 1, post_failover_webhook = 'https://hook.example/post' "
+               "WHERE id = 'p1'")
+    # healthy replicas, or the auto-failover's own health gate holds it back anyway
+    for vmid, _name in GUESTS:
+        _job(db, f'j{vmid}', vmid)
+        db.execute("UPDATE cross_cluster_replications SET last_status = 'ok' WHERE id = ?", (f'j{vmid}',))
+        db.execute("UPDATE site_recovery_vms SET replication_job_id = ? WHERE plan_id = 'p1' AND vmid = ?",
+                   (f'j{vmid}', vmid))
+    api.set_manager(SRC, _mgr(SRC, connected=False))
+    monkeypatch.setattr(srw, '_cooldowns', {})
+    monkeypatch.setattr(srw, '_last_fail_times', {'p1': time.time() - 1000})
+    gate, started, hook_done = Event(), [], Event()
+
+    def slow(mgr, vmid, vtype='qemu'):
+        started.append(vmid)
+        gate.wait(5)
+        return True, ''
+    monkeypatch.setattr(srw, '_start_replicated_vm', slow)
+
+    def slow_hook(url):
+        if url:
+            gevent.sleep(1.0)
+            hook_done.set()
+    monkeypatch.setattr(srw, '_fire_webhook', slow_hook)
+    assert c.post('/api/site-recovery/plans/p1/emergency', json={}).status_code == 200
+    _until(lambda: started == [100])
+    assert c.post('/api/site-recovery/plans/p1/cancel').status_code == 202
+    gate.set()
+    # the worker is through its guests and in its webhook, the plan reads ready
+    _until(lambda: db.query_one("SELECT status FROM site_recovery_plans WHERE id = 'p1'")['status'] == 'ready')
+    assert srw.run_alive('p1') == 'emergency' and not hook_done.is_set()
+    for _ in range(3):
+        srw._heartbeat_check()
+        gevent.sleep(0.05)
+    assert db.query_one("SELECT status FROM site_recovery_plans WHERE id = 'p1'")['status'] == 'ready'
+    assert started == [100]
+    _until(lambda: srw.run_alive('p1') is None)
+    # counterproof in the same set-up: with nothing left running it does take the plan
+    srw._heartbeat_check()
+    _until(lambda: started == [100, 101, 102])
+    _until(lambda: srw.run_alive('p1') is None)
+
+
+def test_a_finishing_worker_leaves_the_next_ones_entry_and_stop():
+    from gevent.event import Event
+    a_in, a_out, b_in, b_out = Event(), Event(), Event(), Event()
+    seen = {}
+
+    def worker(kind, entered, leave):
+        with srw._running('px', kind):
+            entered.set()
+            leave.wait(5)
+            seen[kind] = srw._stopping('px')
+    ga = gevent.spawn(worker, 'emergency', a_in, a_out)
+    a_in.wait(5)
+    gb = gevent.spawn(worker, 'failback', b_in, b_out)
+    b_in.wait(5)
+    assert srw.ask_to_stop('px')
+    a_out.set()
+    ga.join(5)
+    # the one that ran first has gone; what runs now is still known, and its stop holds
+    assert srw.run_alive('px') == 'failback' and seen['emergency'] is False
+    b_out.set()
+    gb.join(5)
+    assert seen['failback'] is True and srw.run_alive('px') is None
+
+
+def test_a_plan_whose_run_is_cancelling_is_deleted_with_force_only(api, site):
+    site.db.execute("UPDATE site_recovery_plans SET status = 'cancelling' WHERE id = 'p1'")
+    c = _admin(api, site)
+    assert c.delete('/api/site-recovery/plans/p1').status_code == 409
+    assert c.delete('/api/site-recovery/plans/p1?force=1').status_code == 200

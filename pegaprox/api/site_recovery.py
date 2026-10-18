@@ -483,8 +483,9 @@ def delete_plan(plan_id):
     if not ok:
         return err
 
-    # #238: allow force-delete of stuck plans via ?force=1 query param
-    if plan['status'] in ('running', 'testing'):
+    # #238: allow force-delete of stuck plans via ?force=1 query param; a cancelled run is
+    # active until its worker is through
+    if plan['status'] in ('running', 'testing', 'cancelling'):
         force = request.args.get('force', '').lower() in ('1', 'true')
         if not force:
             return jsonify({'error': 'Plan is currently active. Use force=1 to delete anyway.'}), 409
