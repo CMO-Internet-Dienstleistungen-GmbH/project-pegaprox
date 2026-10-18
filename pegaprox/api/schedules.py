@@ -1601,10 +1601,10 @@ def check_scheduled_updates(minutes=None):
                 if ha.schedule_fire_first():
                     # automatic failover, at most once (5.7): written and on its way to the
                     # members before the update starts; a one-time one switches itself off
-                    update_schedule_last_run(cluster_id, now.isoformat(), calculate_next_update_run(
+                    update_schedule_last_run(cluster_id, slot.isoformat(), calculate_next_update_run(
                         day, time_str) if schedule_type == 'recurring' else None)
                     if schedule_type == 'once':
-                        save_update_schedule(cluster_id, dict(schedule, enabled=False, last_run=now.isoformat()))
+                        save_update_schedule(cluster_id, dict(schedule, enabled=False, last_run=slot.isoformat()))
                     ha.schedule_fired()
 
                 # Execute the scheduled rolling update
@@ -1627,7 +1627,9 @@ def check_scheduled_updates(minutes=None):
                 execute_scheduled_rolling_update(mgr, cluster_id, action)
                 
                 # Update last run time
-                last_run_str = now.isoformat()
+                # the minute it was due for, not the clock now: a pass that caught up 23:59
+                # after midnight stored the next day, and that day's run was then skipped
+                last_run_str = slot.isoformat()
                 next_run_str = calculate_next_update_run(day, time_str) if schedule_type == 'recurring' else None
                 update_schedule_last_run(cluster_id, last_run_str, next_run_str)
                 

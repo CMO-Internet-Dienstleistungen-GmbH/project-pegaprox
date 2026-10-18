@@ -781,6 +781,30 @@ def test_a_pass_that_ran_past_the_minute_still_starts_the_update(api, seed, db, 
     assert ran == [CID]
 
 
+def test_an_update_caught_up_after_midnight_keeps_the_next_days_run(api, seed, db, monkeypatch):
+    # the pass that covered 23:59 reached the updates at 00:00:20; storing that clock as the
+    # last run made the next evening's 23:59 look done already
+    import pegaprox.api.schedules as sch
+    from datetime import datetime
+    store = {CID: {'enabled': True, 'schedule_type': 'recurring', 'day': 'daily', 'time': '23:59'}}
+    clock = {'now': datetime(2026, 10, 4, 0, 0, 20)}
+    monkeypatch.setattr(ha, 'schedule_now', lambda: clock['now'])
+    monkeypatch.setattr(ha, 'schedule_fire_first', lambda: False)
+    monkeypatch.setattr(sch, 'load_all_update_schedules', lambda: {k: dict(v) for k, v in store.items()})
+    monkeypatch.setattr(sch, 'update_schedule_last_run', lambda cid, last, nxt: store[cid].update(last_run=last))
+    monkeypatch.setattr(sch, '_creator_may_update', lambda cid, s: True)
+    cluster = _Cluster()
+    cluster.is_connected = True
+    api.set_manager(CID, cluster)
+    ran = []
+    monkeypatch.setattr(sch, 'execute_scheduled_rolling_update', lambda m, cid, a: ran.append(cid))
+    sch.check_scheduled_updates([datetime(2026, 10, 3, 23, 59), datetime(2026, 10, 4, 0, 0)])
+    assert ran == [CID] and store[CID]['last_run'].startswith('2026-10-03T23:59')
+    clock['now'] = datetime(2026, 10, 4, 23, 59, 5)
+    sch.check_scheduled_updates([datetime(2026, 10, 4, 23, 59)])
+    assert ran == [CID, CID]
+
+
 # -- the Proxmox HA rules: off while the run is paused, on again with its cancel ----------------
 
 def test_the_rules_stay_off_through_the_interruption_and_go_on_with_the_cancel(api, seed, db, root, monkeypatch):
