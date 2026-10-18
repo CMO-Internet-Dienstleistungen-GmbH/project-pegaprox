@@ -2471,6 +2471,9 @@
                 // NS Oct 2026 - how old the figures of a history report are
                 reportAsOf: 'Stand {time}',
                 reportUpdating: 'wird aktualisiert',
+                // LW Oct 2026 - the per-VM power table: a guest without a host, memory over 100 %
+                powerNoHost: 'Kein Host erfasst: Der Gast ist weg, und seine Historie stammt aus der Zeit, bevor Hosts erfasst wurden. Sein Anteil steckt in Nicht zugeordnet.',
+                powerMemOverAssigned: 'Mehr als zugewiesen: Proxmox zählt den QEMU-Prozess, den ein Gast ohne Balloon-Treiber über seinen RAM treiben kann. Der Host verbraucht dafür trotzdem Strom.',
                 powerHostSaveFailed: 'Host-Profil konnte nicht gespeichert werden',
                 powerHostLoadFailed: 'Hosts konnten nicht geladen werden',
                 powerPerHost: 'Pro Host',
@@ -5457,6 +5460,7 @@
                 pbsHealthTooltip: 'PBS-Health - für Details klicken',
                 pbsDashboardTab: 'Dashboard',
                 pbsJobsTab: 'Jobs',
+                pbsNextRun: 'Nächster Lauf',
                 pbsRootDisk: 'Root-Disk',
                 pbsWorker: 'Worker',
                 pbsWorkerId: 'Worker-ID',
@@ -10202,6 +10206,9 @@
                 // NS Oct 2026 - how old the figures of a history report are
                 reportAsOf: 'As of {time}',
                 reportUpdating: 'updating',
+                // LW Oct 2026 - the per-VM power table: a guest without a host, memory over 100 %
+                powerNoHost: 'No host recorded: the guest is gone, and its history is from before hosts were tracked. Its share is in Unallocated.',
+                powerMemOverAssigned: 'More than assigned: Proxmox counts the QEMU process, which a guest without the balloon driver can push past its RAM. The host draws for it all the same.',
                 powerHostSaveFailed: 'Could not save the host profile',
                 powerHostLoadFailed: 'Could not load the hosts',
                 powerPerHost: 'Per host',
@@ -13136,6 +13143,7 @@
                 pbsHealthTooltip: 'PBS health — click for breakdown',
                 pbsDashboardTab: 'Dashboard',
                 pbsJobsTab: 'Jobs',
+                pbsNextRun: 'Next Run',
                 pbsRootDisk: 'Root Disk',
                 pbsWorker: 'Worker',
                 pbsWorkerId: 'Worker ID',
@@ -17230,6 +17238,9 @@
                 // NS Oct 2026 - how old the figures of a history report are
                 reportAsOf: '截至 {time}',
                 reportUpdating: '正在更新',
+                // LW Oct 2026 - the per-VM power table: a guest without a host, memory over 100 %
+                powerNoHost: '未记录主机：该客户机已不存在，其历史早于主机记录。它的份额计入未分配。',
+                powerMemOverAssigned: '超出分配值：Proxmox 统计的是 QEMU 进程，没有气球驱动的客户机可能使其超出分配的内存。主机仍为此耗电。',
                 powerHostSaveFailed: '无法保存主机配置',
                 powerHostLoadFailed: '无法加载主机',
                 powerPerHost: '按主机',
@@ -19850,6 +19861,7 @@
                 pbsHealthTooltip: 'PBS 健康 - 点击查看明细',
                 pbsDashboardTab: '仪表板',
                 pbsJobsTab: '作业',
+                pbsNextRun: '下次运行',
                 pbsRootDisk: '根磁盘',
                 pbsWorker: '工作进程',
                 pbsWorkerId: '工作进程 ID',
@@ -23898,6 +23910,9 @@
                 // NS Oct 2026 - how old the figures of a history report are
                 reportAsOf: 'Stan na {time}',
                 reportUpdating: 'aktualizacja',
+                // LW Oct 2026 - the per-VM power table: a guest without a host, memory over 100 %
+                powerNoHost: 'Brak zapisanego hosta: gościa już nie ma, a jego historia pochodzi sprzed rejestrowania hostów. Jego udział jest w Nieprzypisane.',
+                powerMemOverAssigned: 'Więcej niż przydzielono: Proxmox liczy proces QEMU, który gość bez sterownika balloon może wypchnąć ponad swój RAM. Host i tak pobiera na to prąd.',
                 powerHostSaveFailed: 'Nie udało się zapisać profilu hosta',
                 powerHostLoadFailed: 'Nie udało się wczytać hostów',
                 powerPerHost: 'Według hosta',
@@ -26517,6 +26532,7 @@
                 pbsHealthTooltip: 'Stan PBS — kliknij, aby zobaczyć szczegóły',
                 pbsDashboardTab: 'Panel',
                 pbsJobsTab: 'Harmonogramy',
+                pbsNextRun: 'Następne uruchomienie',
                 pbsRootDisk: 'Dysk główny',
                 pbsWorker: 'Proces roboczy',
                 pbsWorkerId: 'ID procesu roboczego',
@@ -30117,6 +30133,9 @@
                 // NS Oct 2026 - how old the figures of a history report are
                 reportAsOf: 'Données de {time}',
                 reportUpdating: 'mise à jour en cours',
+                // LW Oct 2026 - the per-VM power table: a guest without a host, memory over 100 %
+                powerNoHost: 'Aucun hôte enregistré : l\'invité n\'existe plus et son historique date d\'avant le suivi des hôtes. Sa part est dans Non attribué.',
+                powerMemOverAssigned: 'Plus que l\'attribution : Proxmox compte le processus QEMU, qu\'un invité sans pilote balloon peut pousser au-delà de sa RAM. L\'hôte consomme quand même pour cela.',
                 powerHostSaveFailed: 'Impossible d\'enregistrer le profil de l\'hôte',
                 powerHostLoadFailed: 'Impossible de charger les hôtes',
                 powerPerHost: 'Par hôte',
@@ -33235,6 +33254,7 @@
                 pbsHealthTooltip: 'Santé PBS - cliquez pour le détail',
                 pbsDashboardTab: 'Tableau de bord',
                 pbsJobsTab: 'Tâches planifiées',
+                pbsNextRun: 'Prochaine exécution',
                 pbsRootDisk: 'Disque racine',
                 pbsWorker: 'Worker',
                 pbsWorkerId: 'ID du worker',
@@ -37184,6 +37204,9 @@
                 // NS Oct 2026 - how old the figures of a history report are
                 reportAsOf: 'Datos de las {time}',
                 reportUpdating: 'actualizando',
+                // LW Oct 2026 - the per-VM power table: a guest without a host, memory over 100 %
+                powerNoHost: 'Ningún host registrado: el invitado ya no existe y su historial es anterior al registro de hosts. Su parte está en Sin asignar.',
+                powerMemOverAssigned: 'Más de lo asignado: Proxmox cuenta el proceso QEMU, que un invitado sin el controlador balloon puede llevar más allá de su RAM. El host consume igualmente por ello.',
                 powerHostSaveFailed: 'No se pudo guardar el perfil del host',
                 powerHostLoadFailed: 'No se pudieron cargar los hosts',
                 powerPerHost: 'Por host',
@@ -37436,6 +37459,7 @@
                 pbsHealthTooltip: 'Salud PBS - haz clic para ver el desglose',
                 pbsDashboardTab: 'Panel',
                 pbsJobsTab: 'Tareas programadas',
+                pbsNextRun: 'Próxima ejecución',
                 pbsRootDisk: 'Disco raíz',
                 pbsWorker: 'Worker',
                 pbsWorkerId: 'ID del worker',
@@ -44307,6 +44331,9 @@
                 // NS Oct 2026 - how old the figures of a history report are
                 reportAsOf: 'Dados de {time}',
                 reportUpdating: 'atualizando',
+                // LW Oct 2026 - the per-VM power table: a guest without a host, memory over 100 %
+                powerNoHost: 'Nenhum host registrado: o convidado não existe mais e seu histórico é anterior ao registro dos hosts. Sua parte está em Não atribuído.',
+                powerMemOverAssigned: 'Mais do que o atribuído: o Proxmox conta o processo QEMU, que um convidado sem o driver balloon pode levar além da sua RAM. O host consome energia por isso da mesma forma.',
                 powerHostSaveFailed: 'Não foi possível salvar o perfil do host',
                 powerHostLoadFailed: 'Não foi possível carregar os hosts',
                 powerPerHost: 'Por host',
@@ -47346,6 +47373,7 @@
                 pbsHealthTooltip: 'Saúde PBS - clique para ver os detalhes',
                 pbsDashboardTab: 'Painel',
                 pbsJobsTab: 'Jobs',
+                pbsNextRun: 'Próxima execução',
                 pbsRootDisk: 'Disco raiz',
                 pbsWorker: 'Worker',
                 pbsWorkerId: 'ID do worker',
@@ -51134,6 +51162,9 @@
                 // NS Oct 2026 - how old the figures of a history report are
                 reportAsOf: '{time} 기준',
                 reportUpdating: '업데이트 중',
+                // LW Oct 2026 - the per-VM power table: a guest without a host, memory over 100 %
+                powerNoHost: '기록된 호스트 없음: 게스트가 삭제되었고 기록이 호스트 추적 이전의 것입니다. 해당 몫은 미할당에 포함됩니다.',
+                powerMemOverAssigned: '할당량 초과: Proxmox는 QEMU 프로세스를 계산하며, 벌룬 드라이버가 없는 게스트는 할당된 RAM을 넘길 수 있습니다. 호스트는 그만큼 전력을 사용합니다.',
                 powerHostSaveFailed: '호스트 프로필을 저장할 수 없습니다',
                 powerHostLoadFailed: '호스트를 불러올 수 없습니다',
                 powerPerHost: '호스트별',
@@ -53937,6 +53968,7 @@
                 pbsHealthTooltip: 'PBS 상태 - 클릭하여 세부 정보 보기',
                 pbsDashboardTab: '대시보드',
                 pbsJobsTab: '예약 작업',
+                pbsNextRun: '다음 실행',
                 pbsRootDisk: '루트 디스크',
                 pbsWorker: '워커',
                 pbsWorkerId: '워커 ID',
@@ -58363,6 +58395,9 @@
                 // NS Oct 2026 - how old the figures of a history report are
                 reportAsOf: 'Dati delle {time}',
                 reportUpdating: 'aggiornamento in corso',
+                // LW Oct 2026 - the per-VM power table: a guest without a host, memory over 100 %
+                powerNoHost: 'Nessun host registrato: il guest non esiste più e la sua cronologia risale a prima del tracciamento degli host. La sua quota è in Non assegnato.',
+                powerMemOverAssigned: 'Più di quanto assegnato: Proxmox conta il processo QEMU, che un guest senza driver balloon può spingere oltre la sua RAM. L\'host consuma comunque per questo.',
                 powerHostSaveFailed: 'Impossibile salvare il profilo host',
                 powerHostLoadFailed: 'Impossibile caricare gli host',
                 powerPerHost: 'Per host',
@@ -61108,6 +61143,7 @@
                 pbsHealthTooltip: 'Salute PBS - clicca per il dettaglio',
                 pbsDashboardTab: 'Dashboard',
                 pbsJobsTab: 'Job',
+                pbsNextRun: 'Prossima esecuzione',
                 pbsRootDisk: 'Disco root',
                 pbsWorker: 'Worker',
                 pbsWorkerId: 'ID worker',

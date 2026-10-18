@@ -22,6 +22,7 @@
             const rows = [{
                 kind: 'gc', id: '', schedule: gcJob.schedule ?? datastore['gc-schedule'] ?? '',
                 lastRun: gcJob['last-run-endtime'] ?? null, disabled: false,
+                state: gcJob['last-run-state'] ?? '', nextRun: gcJob['next-run'] ?? null,
             }];
             for (const kind of ['sync', 'verify', 'prune']) {
                 const list = Array.isArray(jobs?.[kind]) ? jobs[kind] : [];
@@ -31,10 +32,22 @@
                         kind, id: job.id || '', schedule: job.schedule || '',
                         lastRun: job['last-run-endtime'] ?? null,
                         disabled: Boolean(job.disable),
+                        state: job['last-run-state'] ?? '', nextRun: job['next-run'] ?? null,
                     });
                 }
             }
             return rows;
+        }
+
+        // LW Oct 2026 - what PBS wrote for the last run of a job: "OK", "WARNINGS: n", or the error
+        // itself. A failed sync read like a good one while only its end time was shown
+        function PbsRunState({ state }) {
+            const s = String(state || '');
+            if (!s) return <span className="text-gray-500">-</span>;
+            const ok = /^(TASK )?OK$/i.test(s);
+            const warn = /^(TASK )?WARNINGS/i.test(s);
+            return <span data-pbs-run-state={ok ? 'ok' : warn ? 'warning' : 'error'} title={s}
+                className={`${ok ? 'text-green-400' : warn ? 'text-yellow-400' : 'text-red-400'} break-all`}>{s}</span>;
         }
 
         function PbsJobReadError({ kind }) {
@@ -82,6 +95,8 @@
                                 <th scope="col" className="text-left p-3">{t('id') || 'ID'}</th>
                                 <th scope="col" className="text-left p-3">{t('schedule') || 'Schedule'}</th>
                                 <th scope="col" className="text-left p-3">{t('lastRun') || 'Last Run'}</th>
+                                <th scope="col" className="text-left p-3">{t('status') || 'Status'}</th>
+                                <th scope="col" className="text-left p-3">{t('pbsNextRun') || 'Next Run'}</th>
                             </tr></thead>
                             <tbody>
                                 {rows.map((row, i) => (
@@ -94,6 +109,8 @@
                                             {row.disabled && <> <span className="text-yellow-400">({t('disabled') || 'Disabled'})</span></>}
                                         </td>
                                         <td className="p-3 text-gray-500">{row.lastRun ? fmtDate(row.lastRun * 1000) : '-'}</td>
+                                        <td className="p-3"><PbsRunState state={row.state} /></td>
+                                        <td className="p-3 text-gray-500">{row.nextRun ? fmtDate(row.nextRun * 1000) : '-'}</td>
                                     </tr>
                                 ))}
                             </tbody>
@@ -5469,14 +5486,19 @@
                                                 <td className="py-1.5 text-white">{r.name}{r.low_data && <span className="ml-1 text-yellow-500" title={t('lowDataWarning') || 'limited samples'}>⚠</span>}</td>
                                                 <td className="text-gray-400">{r.vmid}</td>
                                                 <td className="text-gray-400">
-                                                    {r.node}
+                                                    {/* LW Oct 2026 - a guest that is gone and ran before hosts were tracked
+                                                        has no host to charge: say so instead of an empty cell and a "~" */}
+                                                    {r.node ? r.node : <span data-power-no-host title={t('powerNoHost') || 'No host recorded: the guest is gone, and its history is from before hosts were tracked. Its share is in Unallocated.'}>-</span>}
                                                     {Object.keys(r.by_node || {}).length > 1 && (
                                                         <span className="ml-1 text-blue-400" title={`${t('powerMigrated') || 'Ran on several hosts in this window'}: ${Object.entries(r.by_node).map(([n, k]) => `${n} ${k} kWh`).join(', ')}`}>+{Object.keys(r.by_node).length - 1}</span>
                                                     )}
-                                                    {r.node_estimated && <span className="ml-1 text-yellow-500" title={t('powerNodeGuessed') || 'Host partly taken from where it runs today'}>~</span>}
+                                                    {r.node_estimated && r.node && <span className="ml-1 text-yellow-500" title={t('powerNodeGuessed') || 'Host partly taken from where it runs today'}>~</span>}
                                                 </td>
                                                 <td className="text-right text-gray-300">{r.avg_cpu_pct}%</td>
-                                                <td className="text-right text-gray-300">{r.avg_mem_pct}%</td>
+                                                <td className="text-right text-gray-300">
+                                                    {r.avg_mem_pct}%
+                                                    {r.avg_mem_pct > 100 && <span data-power-mem-over className="ml-1 text-yellow-500" title={t('powerMemOverAssigned') || 'More than assigned: Proxmox counts the QEMU process, which a guest without the balloon driver can push past its RAM. The host draws for it all the same.'}>ⓘ</span>}
+                                                </td>
                                                 <td className="text-right text-gray-400">{r.running_h}</td>
                                                 <td className="text-right text-yellow-400">{r.kwh}</td>
                                                 <td className="text-right text-yellow-400">{r.monthly_kwh}</td>
@@ -17079,6 +17101,12 @@
                 } catch (e) { addToast('Error: ' + e.message, 'error'); }
             };
             
+            // LW Oct 2026 - opening the Jobs or Datastores tab reads the jobs again instead of
+            // showing what the last 30 s poll had
+            useEffect(() => {
+                if (selectedPBS && (pbsActiveTab === 'jobs' || pbsActiveTab === 'datastores')) fetchPBSJobs(selectedPBS.id);
+            }, [pbsActiveTab]);
+
             // Load PBS when selected
             useEffect(() => {
                 if (selectedPBS) {
@@ -25839,7 +25867,7 @@
                                                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                             <table className="w-full text-sm">
                                                                 <thead><tr className="border-b border-proxmox-border text-gray-500 text-xs">
-                                                                    <th className="text-left p-3">{t('id') || 'ID'}</th><th className="text-left p-3">{t('pbsStore') || 'Store'}</th><th className="text-left p-3">{t('pbsRemote') || 'Remote'}</th><th className="text-left p-3">{t('schedule') || 'Schedule'}</th><th className="text-left p-3">{t('lastRun') || 'Last Run'}</th>
+                                                                    <th className="text-left p-3">{t('id') || 'ID'}</th><th className="text-left p-3">{t('pbsStore') || 'Store'}</th><th className="text-left p-3">{t('pbsRemote') || 'Remote'}</th><th className="text-left p-3">{t('schedule') || 'Schedule'}</th><th className="text-left p-3">{t('lastRun') || 'Last Run'}</th><th className="text-left p-3">{t('status') || 'Status'}</th><th className="text-left p-3">{t('pbsNextRun') || 'Next Run'}</th>
                                                                     {isAdmin && <th className="text-right p-3">{t('actions') || 'Actions'}</th>}
                                                                 </tr></thead>
                                                                 <tbody>
@@ -25850,6 +25878,8 @@
                                                                             <td className="p-3 text-gray-400">{job.remote || '-'} / {job['remote-store'] || '-'}</td>
                                                                             <td className="p-3 text-gray-400">{job.schedule || (t('manual') || 'manual')}</td>
                                                                             <td className="p-3 text-gray-500">{job['last-run-endtime'] ? fmtDate(job['last-run-endtime'] * 1000) : '-'}</td>
+                                                                            <td className="p-3"><PbsRunState state={job['last-run-state']} /></td>
+                                                                            <td className="p-3 text-gray-500">{job['next-run'] ? fmtDate(job['next-run'] * 1000) : '-'}</td>
                                                                             {isAdmin && (
                                                                                 <td className="p-3 text-right">
                                                                                     <button onClick={() => pbsRunJob('sync', job.id)} className="px-2 py-1 rounded text-xs bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 transition-all flex items-center gap-1 ml-auto">
@@ -25872,7 +25902,7 @@
                                                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                             <table className="w-full text-sm">
                                                                 <thead><tr className="border-b border-proxmox-border text-gray-500 text-xs">
-                                                                    <th className="text-left p-3">{t('id') || 'ID'}</th><th className="text-left p-3">{t('pbsStore') || 'Store'}</th><th className="text-left p-3">{t('schedule') || 'Schedule'}</th><th className="text-left p-3">{t('pbsIgnoreVerified') || 'Ignore Verified'}</th><th className="text-left p-3">{t('lastRun') || 'Last Run'}</th>
+                                                                    <th className="text-left p-3">{t('id') || 'ID'}</th><th className="text-left p-3">{t('pbsStore') || 'Store'}</th><th className="text-left p-3">{t('schedule') || 'Schedule'}</th><th className="text-left p-3">{t('pbsIgnoreVerified') || 'Ignore Verified'}</th><th className="text-left p-3">{t('lastRun') || 'Last Run'}</th><th className="text-left p-3">{t('status') || 'Status'}</th><th className="text-left p-3">{t('pbsNextRun') || 'Next Run'}</th>
                                                                     {isAdmin && <th className="text-right p-3">{t('actions') || 'Actions'}</th>}
                                                                 </tr></thead>
                                                                 <tbody>
@@ -25883,6 +25913,8 @@
                                                                             <td className="p-3 text-gray-400">{job.schedule || (t('manual') || 'manual')}</td>
                                                                             <td className="p-3 text-gray-400">{job['ignore-verified'] ? (t('yes') || 'Yes') : (t('no') || 'No')}</td>
                                                                             <td className="p-3 text-gray-500">{job['last-run-endtime'] ? fmtDate(job['last-run-endtime'] * 1000) : '-'}</td>
+                                                                            <td className="p-3"><PbsRunState state={job['last-run-state']} /></td>
+                                                                            <td className="p-3 text-gray-500">{job['next-run'] ? fmtDate(job['next-run'] * 1000) : '-'}</td>
                                                                             {isAdmin && (
                                                                                 <td className="p-3 text-right">
                                                                                     <button onClick={() => pbsRunJob('verify', job.id)} className="px-2 py-1 rounded text-xs bg-green-500/20 text-green-400 hover:bg-green-500/30 transition-all flex items-center gap-1 ml-auto">
@@ -25905,7 +25937,7 @@
                                                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                             <table className="w-full text-sm">
                                                                 <thead><tr className="border-b border-proxmox-border text-gray-500 text-xs">
-                                                                    <th className="text-left p-3">{t('id') || 'ID'}</th><th className="text-left p-3">{t('pbsStore') || 'Store'}</th><th className="text-left p-3">{t('schedule') || 'Schedule'}</th><th className="text-left p-3">{t('retention') || 'Retention'}</th><th className="text-left p-3">{t('lastRun') || 'Last Run'}</th>
+                                                                    <th className="text-left p-3">{t('id') || 'ID'}</th><th className="text-left p-3">{t('pbsStore') || 'Store'}</th><th className="text-left p-3">{t('schedule') || 'Schedule'}</th><th className="text-left p-3">{t('retention') || 'Retention'}</th><th className="text-left p-3">{t('lastRun') || 'Last Run'}</th><th className="text-left p-3">{t('status') || 'Status'}</th><th className="text-left p-3">{t('pbsNextRun') || 'Next Run'}</th>
                                                                     {isAdmin && <th className="text-right p-3">{t('actions') || 'Actions'}</th>}
                                                                 </tr></thead>
                                                                 <tbody>
@@ -25918,6 +25950,8 @@
                                                                                 {[job['keep-last'] && `L:${job['keep-last']}`, job['keep-daily'] && `D:${job['keep-daily']}`, job['keep-weekly'] && `W:${job['keep-weekly']}`, job['keep-monthly'] && `M:${job['keep-monthly']}`, job['keep-yearly'] && `Y:${job['keep-yearly']}`].filter(Boolean).join(' ') || '-'}
                                                                             </td>
                                                                             <td className="p-3 text-gray-500">{job['last-run-endtime'] ? fmtDate(job['last-run-endtime'] * 1000) : '-'}</td>
+                                                                            <td className="p-3"><PbsRunState state={job['last-run-state']} /></td>
+                                                                            <td className="p-3 text-gray-500">{job['next-run'] ? fmtDate(job['next-run'] * 1000) : '-'}</td>
                                                                             {isAdmin && (
                                                                                 <td className="p-3 text-right">
                                                                                     <button onClick={() => pbsRunJob('prune', job.id)} className="px-2 py-1 rounded text-xs bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500/30 transition-all flex items-center gap-1 ml-auto">
