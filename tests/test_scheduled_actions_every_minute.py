@@ -63,7 +63,7 @@ def run(monkeypatch):
     monkeypatch.setattr(sched, '_record_action_run', record)
     monkeypatch.setattr(sched, 'execute_scheduled_action',
                         lambda a: r.ran.append((a['id'], r.clock.now().strftime('%H:%M'))))
-    monkeypatch.setattr(sched, 'check_scheduled_updates', lambda: None)
+    monkeypatch.setattr(sched, 'check_scheduled_updates', lambda *a: None)
 
     def cleanup():
         r.cleanups += 1

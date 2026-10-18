@@ -375,7 +375,7 @@ def check_schedules():
 
             # MK: Check for scheduled rolling updates
             try:
-                check_scheduled_updates()
+                check_scheduled_updates(minutes)
             except Exception as e:
                 logging.error(f"[SCHEDULER] Scheduled updates check error: {e}")
             
@@ -1520,11 +1520,16 @@ def calculate_next_update_run(day: str, time_str: str) -> str:
         return None
 
 
-def check_scheduled_updates():
-    """Check if any scheduled updates should run - called by scheduler"""
+def check_scheduled_updates(minutes=None):
+    """Check if any scheduled updates should run - called by scheduler with the minutes its
+    pass covers (the current one alone when None)"""
     try:
         schedules = load_all_update_schedules()
         now = ha.schedule_now()
+        # MK Oct 2026 - the minutes of the pass, as the actions have them since 3f86cb2: a
+        # pass that took past the minute, or caught up after a stall, looked at the clock
+        # again and stepped over the update without a word
+        slots = list(minutes) if minutes else [now]
         
         for cluster_id, schedule in schedules.items():
             if not schedule.get('enabled'):
@@ -1556,17 +1561,21 @@ def check_scheduled_updates():
                 'friday': 4, 'saturday': 5, 'sunday': 6
             }
             
-            is_correct_day = (day == 'daily' or now.weekday() == day_map.get(day.lower(), -1))
-            is_correct_time = now.hour == hour and now.minute == minute
-            
-            if is_correct_day and is_correct_time:
-                # Check if already ran today (for recurring)
+            slot = next((m for m in reversed(slots)
+                         if (day == 'daily' or m.weekday() == day_map.get(day.lower(), -1))
+                         and m.hour == hour and m.minute == minute), None)
+
+            if slot is not None:
+                # a minute caught up that a new leader still holds (5.7)
+                if slot < _minute(now) and ha.schedule_held(slot):
+                    continue
+                # Check if already ran that day (for recurring)
                 if schedule_type == 'recurring':
                     last_run = schedule.get('last_run')
                     if last_run:
                         try:
                             last_run_date = datetime.fromisoformat(last_run).date()
-                            if last_run_date == now.date():
+                            if last_run_date >= slot.date():
                                 continue  # Already ran today
                         except:
                             pass

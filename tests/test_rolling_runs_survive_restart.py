@@ -758,6 +758,29 @@ def test_the_schedule_check_skips_a_cluster_with_a_paused_run(api, seed, db, mon
     assert ran == []
 
 
+def test_a_pass_that_ran_past_the_minute_still_starts_the_update(api, seed, db, monkeypatch):
+    # the pass began at 03:00 and reached the updates at 03:01: the minute it covers counts,
+    # not the clock read again
+    import pegaprox.api.schedules as sch
+    from datetime import datetime
+    monkeypatch.setattr(ha, 'schedule_now', lambda: datetime(2026, 10, 3, 3, 1, 12))
+    monkeypatch.setattr(ha, 'schedule_fire_first', lambda: False)
+    monkeypatch.setattr(sch, 'load_all_update_schedules', lambda: {CID: {
+        'enabled': True, 'schedule_type': 'recurring', 'day': 'daily', 'time': '03:00'}})
+    monkeypatch.setattr(sch, '_creator_may_update', lambda cid, s: True)
+    monkeypatch.setattr(sch, 'update_schedule_last_run', lambda *a: None)
+    cluster = _Cluster()
+    cluster.is_connected = True
+    api.set_manager(CID, cluster)
+    ran = []
+    monkeypatch.setattr(sch, 'execute_scheduled_rolling_update', lambda m, cid, a: ran.append(cid))
+    sch.check_scheduled_updates([datetime(2026, 10, 3, 3, 0), datetime(2026, 10, 3, 3, 1)])
+    assert ran == [CID]
+    # a pass of 03:02 alone starts nothing
+    sch.check_scheduled_updates([datetime(2026, 10, 3, 3, 2)])
+    assert ran == [CID]
+
+
 # -- the Proxmox HA rules: off while the run is paused, on again with its cancel ----------------
 
 def test_the_rules_stay_off_through_the_interruption_and_go_on_with_the_cancel(api, seed, db, root, monkeypatch):

@@ -366,7 +366,7 @@ def _actions(monkeypatch, r, acts):
         next(a for a in acts if a['id'] == aid)['last_run'] = when
     monkeypatch.setattr(actions_loop, '_record_action_run', record)
     monkeypatch.setattr(actions_loop, 'execute_scheduled_action', lambda a: r.ran.append(a['name']))
-    monkeypatch.setattr(actions_loop, 'check_scheduled_updates', lambda: None)
+    monkeypatch.setattr(actions_loop, 'check_scheduled_updates', lambda *a: None)
     monkeypatch.setattr(actions_loop, '_scheduler_running', True)
 
     def stop():
