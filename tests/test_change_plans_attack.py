@@ -104,6 +104,15 @@ def test_a_digit_python_cannot_count_with_is_a_400_not_a_500(estate, target):
 
 # -- the list of a tenant is not cut short by the plans of others ------------------------------
 
+@pytest.mark.parametrize('when', ['9999-12-31T23:59:59-23:00', '0001-01-01T00:00:00+23:00'])
+def test_a_window_past_the_calendar_is_a_400_not_a_500(estate, when):
+    assert changes.parse_utc(when) is None
+    alice = estate.admin('alice')
+    assert alice.post('/api/changes', json=_plan_body(window_end=when)).status_code == 400
+    pid = _make(alice)
+    assert alice.put(f'/api/changes/{pid}', json={'window_start': when}).status_code == 400
+
+
 def test_a_tenant_sees_its_plan_behind_thousands_of_another_tenant(estate, db):
     _insert(db, 'ours', status='submitted', cluster=CL, kind='guests', targets=(150,), title='Ours')
     db.conn.execute("UPDATE change_plans SET updated_at = '2026-01-01T00:00:00Z' WHERE id = 'ours'")

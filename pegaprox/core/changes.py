@@ -62,11 +62,12 @@ def parse_utc(value):
         text = text[:-1] + '+00:00'
     try:
         dt = datetime.fromisoformat(text)
-    except ValueError:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        # an offset can push the year past 9999 or before 1: no date then, not a 500
+        return dt.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
 
 
 def iso_utc(dt):
