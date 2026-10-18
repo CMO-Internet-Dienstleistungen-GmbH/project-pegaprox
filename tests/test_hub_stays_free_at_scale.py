@@ -48,9 +48,10 @@ def _hub_gap(work):
 
 
 def _held_briefly(gap, wall):
-    """Under the fixed bound, or, where a loaded machine runs it all slower, a small part
-    of the whole run: the loops this is about held the hub for all of it."""
-    return gap < GAP or gap < wall / 4
+    """Under the fixed bound, or, where a loaded machine runs it all slower, under half of
+    the whole run: the loops this is about held the hub for nine tenths of it and more (the
+    set-up before a loop, 19900 pairs sorted at 200 nodes, is a hold of its own)."""
+    return gap < GAP or gap < wall / 2
 
 
 def _whatif_cluster():
