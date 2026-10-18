@@ -219,6 +219,16 @@ def _node_history_forgotten():
     node_history.forget()
 
 
+@pytest.fixture(autouse=True)
+def _history_reports_forgotten():
+    """The power, cost and right-sizing reports are kept per cluster id for minutes
+    (helpers.history_report), and the next test's cluster_1 has another history."""
+    from pegaprox.api import helpers
+    helpers.forget_reports()
+    yield
+    helpers.forget_reports()
+
+
 def _reset_api_rate_window():
     """Forget every client the API rate limiter has seen. Shared process state, and the
     whole harness looks like one client to it."""

@@ -84,7 +84,7 @@ def _canned_rows():
 
 def test_costs_per_vm_pool_user_scoped(api, seed, monkeypatch):
     mallory = _pool_user(seed)
-    monkeypatch.setattr('pegaprox.api.costs._load_history', lambda *a, **k: [{'x': 1}])
+    monkeypatch.setattr('pegaprox.api.costs._load_history', lambda *a, **k: [(0, {})])
     monkeypatch.setattr('pegaprox.api.costs._compute_per_vm', lambda *a, **k: _canned_rows())
     api.set_manager('cluster_1', api.make_fake_manager(cluster_id='cluster_1'))
     resp = api.as_user(mallory).get('/api/clusters/cluster_1/costs/per-vm')

@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+import pegaprox.api.helpers as helpers
 import pegaprox.api.power as power
 import pegaprox.utils.rbac as rbac
 
@@ -319,7 +320,8 @@ def test_summary_and_per_vm_share_one_run(api, seed, monkeypatch):
     assert c.get('/api/clusters/cluster_1/power/per-vm?days=1').status_code == 200
     assert len(runs) == 1
     # and the per-VM route did not write its monthly figures into the shared rows
-    assert all('monthly_kwh' not in r for r in power._results[('cluster_1', 1)][3]['rows'])
+    kept = next(v[0] for k, v in helpers._reports.items() if k[0] == 'power')
+    assert all('monthly_kwh' not in r for r in kept['rows'])
 
 
 def test_a_confined_caller_cannot_read_the_host_profiles(api, seed, monkeypatch):

@@ -1269,3 +1269,159 @@ def load_metrics_window(days):
     # NOTE: the returned dicts are the cached parsed structure — callers must
     # treat them as read-only (the aggregation paths only read, never mutate).
     return run_heavy_read(sql, sql_params, cache_key=f"mh_parsed:{days}", transform=_parse)
+
+
+# NS Oct 2026 - what the history reports (power, costs, right-sizing) work out of it: guests x
+# snapshots in plain Python, about 11 s at 10k guests over a month. Run on the hub, that held
+# every other request, event stream and console of the process for as long, and the renewal
+# of the HA lease with them. The arithmetic now runs in gevent's thread pool, one report at a
+# time (two side by side took 36 s where one after the other takes 26: the GIL). A result is
+# kept: younger than _REPORT_FRESH and of the same history it is served as is, younger than
+# _REPORT_KEEP it is served while a new one is worked out in the background. Only a report
+# nobody has asked for yet, or one older than that, is waited for.
+_REPORT_FRESH = 60
+_REPORT_KEEP = 900
+_REPORT_MAX = 256
+_REPORT_ROWS = 100000    # guest rows kept over all reports; a row per guest is the bulk of one
+_reports = {}            # key -> (value, version, monotonic when computed, wall clock, rows)
+_report_running = {}     # key -> AsyncResult of the computation under way
+_report_gen = [0]        # forget_reports() moves it on: what was under way then stores nothing
+_report_lock = []
+
+
+def history_version(snaps):
+    """What a report of the history goes stale with: how many snapshots, and the newest."""
+    try:
+        return len(snaps), snaps[-1][0]
+    except (IndexError, KeyError, TypeError):
+        return len(snaps), None
+
+
+def report_owner(mgr):
+    """What a report key names the cluster manager by. A reconnected cluster gets a new
+    manager, and the id() of a collected one can come back for the next."""
+    owner = getattr(mgr, '_report_owner', None)
+    if owner is None:
+        owner = mgr._report_owner = object()
+    return owner
+
+
+def run_off_hub(fn, *args):
+    """fn(*args) in gevent's thread pool, one at a time, inline where there is no hub. fn is
+    plain arithmetic: no request, no session, no cluster manager (their sockets belong to
+    the hub), and it only reads what it is handed."""
+    try:
+        from gevent import get_hub
+        pool = get_hub().threadpool
+    except Exception:
+        return fn(*args)
+    if not _report_lock:
+        try:
+            from gevent.lock import BoundedSemaphore
+            _report_lock.append(BoundedSemaphore(1))
+        except Exception:
+            _report_lock.append(None)
+    lock = _report_lock[0]
+    if lock is None:
+        return pool.apply(fn, args)
+    lock.acquire()
+    try:
+        task = pool.spawn(fn, *args)
+    except BaseException:
+        lock.release()
+        raise
+    # free once the thread is done, not when this greenlet stops waiting: a waiter that is
+    # killed leaves its thread running, and the next report must not start beside it
+    task.rawlink(lambda _done: lock.release())
+    return task.get()
+
+
+def history_report(key, version, build, rows=None):
+    """(value, stamp) of build() for `key`, which names everything the result depends on
+    apart from the history (cluster, window, rates); `version` is that history
+    (history_version). build() runs on the hub, in a greenlet of its own that no request
+    can cut off, so it may read live data, and hands its arithmetic to run_off_hub.
+    rows(value): how many guest rows it holds, for the cap on what is kept. The value is
+    shared: callers copy before they change it.
+    stamp = {'computed_at', 'refreshing'} for the page to say how old the figures are."""
+    _forget_old_reports()
+    have = _reports.get(key)
+    if have is not None:
+        if have[1] == version and time.monotonic() - have[2] < _REPORT_FRESH:
+            return have[0], _report_stamp(key, have)
+        if _report_start(key, version, build, rows) is not None:
+            return have[0], _report_stamp(key, have)
+    done = _report_start(key, version, build, rows)
+    have = done.get() if done is not None else _report_run(key, version, build, rows, None, _report_gen[0])
+    return have[0], _report_stamp(key, have)
+
+
+def forget_reports():
+    """Every kept report, for the tests: the next test's cluster_1 is another cluster."""
+    _report_gen[0] += 1
+    _reports.clear()
+    _report_running.clear()
+
+
+def _report_stamp(key, have):
+    from datetime import timezone
+    return {'computed_at': datetime.fromtimestamp(have[3], timezone.utc).isoformat(timespec='seconds'),
+            'refreshing': key in _report_running}
+
+
+def _report_start(key, version, build, rows):
+    """The AsyncResult of the run of `key`, started now unless one is under way; None
+    without gevent, where the caller works it out itself."""
+    done = _report_running.get(key)
+    if done is not None:
+        return done
+    try:
+        import gevent
+        from gevent.event import AsyncResult
+    except Exception:
+        return None
+    done = _report_running[key] = AsyncResult()
+    # the generation as of now: the greenlet may start after a forget_reports()
+    gevent.spawn(_report_run, key, version, build, rows, done, _report_gen[0])
+    return done
+
+
+def _report_run(key, version, build, rows, done, gen):
+    try:
+        value = build()
+        have = (value, version, time.monotonic(), time.time(), rows(value) if rows else 1)
+        if gen == _report_gen[0]:
+            _reports[key] = have
+            _forget_old_reports()
+        if done is not None:
+            done.set(have)
+        return have
+    except Exception as e:
+        if done is None:
+            raise
+        logging.exception(f'[reports] the {key[0]} report was not worked out')
+        done.set_exception(e)
+    except BaseException:
+        # the run itself killed (the process stops): whoever waits hears so, not GreenletExit
+        if done is not None:
+            done.set_exception(RuntimeError('the report was cut off'))
+        raise
+    finally:
+        if done is not None and _report_running.get(key) is done:
+            del _report_running[key]
+
+
+def _forget_old_reports():
+    """Past _REPORT_KEEP a report goes; over _REPORT_MAX reports or _REPORT_ROWS guest rows,
+    the oldest go first. The newest stays whatever its size: dropping it would only mean
+    working it out on every request."""
+    now = time.monotonic()
+    for k in [k for k, v in _reports.items() if now - v[2] >= _REPORT_KEEP]:
+        del _reports[k]
+    total = sum(v[4] for v in _reports.values())
+    if len(_reports) <= _REPORT_MAX and total <= _REPORT_ROWS:
+        return
+    for k in sorted(_reports, key=lambda k: _reports[k][2])[:-1]:
+        if len(_reports) <= _REPORT_MAX and total <= _REPORT_ROWS:
+            break
+        total -= _reports.pop(k)[4]

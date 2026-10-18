@@ -42,13 +42,13 @@ import json
 import logging
 import math
 import re
-import time
 from datetime import datetime, timedelta
 from flask import Blueprint, jsonify, request
 
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth
-from pegaprox.api.helpers import check_cluster_access, load_metrics_window, scope_vm_rows, require_unconfined
+from pegaprox.api.helpers import (check_cluster_access, load_metrics_window, scope_vm_rows, require_unconfined,
+                                  history_report, history_version, report_owner, run_off_hub, _history_stride)
 from pegaprox.utils.audit import log_audit
 from pegaprox.core.db import get_db
 from pegaprox.models.permissions import ROLE_ADMIN
@@ -423,50 +423,62 @@ def _caller_scoped(cluster_id):
     return caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session), cluster_id)
 
 
-# The page asks for the summary and the per-VM table at once, and both need the same
-# run over the whole history - so it runs once. Keyed on what goes into it; the result
-# is shared, callers must not change it.
-_RESULT_TTL = 60
-_results = {}
-
-
+# The page asks for the summary and the per-VM table at once, and both need the same run
+# over the whole history - so it runs once, off the hub (helpers.history_report). Keyed on
+# what goes into it besides the history; the result is shared, callers must not change it.
 def _cached_power(cluster_id, days, snaps, rates, profiles):
-    key = (len(snaps), snaps[-1][0], tuple(sorted(rates.items())),
-           tuple(sorted((n, p['idle_w'], p['max_w']) for n, p in profiles.items())))
     mgr = cluster_managers[cluster_id]
-    # before the lookup: a fresh read goes to PVE and yields, and the page's second
-    # request would then miss the result the first one is still computing
-    try:
-        resources = mgr.get_vm_resources(max_age=15) or []
-    except Exception:
-        resources = []
-    hit = _results.get((cluster_id, days))
     # the same manager too: a reconnected cluster gets a new one, with its own guests
-    if hit and hit[0] == key and hit[1] is mgr and time.monotonic() - hit[2] < _RESULT_TTL:
-        return hit[3]
-    # the collector writes every 5 min, a long window reads every n-th row of it
-    from pegaprox.api.helpers import _history_stride
-    res = _compute_power(snaps, resources, rates, profiles, step=300 * _history_stride(days))
-    now = time.monotonic()
-    # held for the page's second request only, it carries a row per guest
-    for k in [k for k, v in _results.items() if now - v[2] >= _RESULT_TTL]:
-        _results.pop(k, None)
-    _results[(cluster_id, days)] = (key, mgr, now, res)
-    return res
+    key = ('power', cluster_id, days, report_owner(mgr), tuple(sorted(rates.items())),
+           tuple(sorted((n, p['idle_w'], p['max_w']) for n, p in profiles.items())))
+
+    def build():
+        try:
+            resources = mgr.get_vm_resources(max_age=15) or []
+        except Exception:
+            resources = []
+        # the names and hosts copied here: the manager's own rows may change under a
+        # thread that is still reading them
+        live = [{'vmid': r.get('vmid'), 'name': r.get('name', ''), 'node': r.get('node', '')}
+                for r in resources]
+        # the collector writes every 5 min, a long window reads every n-th row of it
+        return run_off_hub(_compute_power, snaps, live, rates, profiles, 300 * _history_stride(days))
+
+    return history_report(key, history_version(snaps), build, rows=lambda res: len(res['rows']))
+
+
+def _named_now(cluster_id, rows):
+    """The kept rows with the names and hosts of now, read live for every request as before;
+    the kWh are the kept run's. A changed row is a copy, the kept one stays as it is."""
+    try:
+        live = {str(r.get('vmid') or ''): r for r in
+                cluster_managers[cluster_id].get_vm_resources(max_age=15) or []}
+    except Exception:
+        return rows
+    out = []
+    for r in rows:
+        lv = live.get(r['vmid'])
+        if lv is not None:
+            name, node = lv.get('name', ''), lv.get('node', '') or r['node']
+            if name != r['name'] or node != r['node']:
+                r = dict(r, name=name, node=node)
+        out.append(r)
+    return out
 
 
 def _report(cluster_id, days):
-    """(rates, snapshots, result, rows, scoped) for the summary and per-VM routes; result
-    is None when there is no history. rows are the result's, scoped to the caller (#773)."""
+    """(rates, snapshots, result, rows, scoped, stamp) for the summary and per-VM routes;
+    result is None when there is no history. rows are the result's, scoped to the caller
+    (#773); stamp says when the result was worked out."""
     rates = _get_rates(cluster_id)
     snaps = _load_history(cluster_id, days=days)
     if not snaps:
-        return rates, snaps, None, [], False
-    res = _cached_power(cluster_id, days, snaps, rates, _get_host_profiles(cluster_id))
-    rows = scope_vm_rows(cluster_id, res['rows'])
+        return rates, snaps, None, [], False, {}
+    res, stamp = _cached_power(cluster_id, days, snaps, rates, _get_host_profiles(cluster_id))
+    rows = scope_vm_rows(cluster_id, _named_now(cluster_id, res['rows']))
     # a confined caller sees their guests' share only, not what the hosts drew in total
     scoped = len(rows) != len(res['rows']) or _caller_scoped(cluster_id)
-    return rates, snaps, res, rows, scoped
+    return rates, snaps, res, rows, scoped, stamp
 
 
 def _monthly_factor(covered_h):
@@ -482,7 +494,7 @@ def cluster_summary(cluster_id):
         return jsonify({'error': 'cluster not found'}), 404
 
     days = _days_arg()
-    rates, snaps, res, rows, scoped = _report(cluster_id, days)
+    rates, snaps, res, rows, scoped, stamp = _report(cluster_id, days)
     if res is None:
         return jsonify({'enough_data': False, 'cluster_id': cluster_id, 'rates': rates, 'days': days})
 
@@ -548,6 +560,7 @@ def cluster_summary(cluster_id):
     out['window'] = money(total)
     out['monthly'] = money(total * factor)
     out['by_node'] = {n: money(kwh * factor) for n, kwh in by_node.items()}
+    out.update(stamp)
     return jsonify(out)
 
 
@@ -559,7 +572,7 @@ def per_vm(cluster_id):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'cluster not found'}), 404
     days = _days_arg()
-    rates, _snaps, res, scoped_rows, _scoped = _report(cluster_id, days)
+    rates, _snaps, res, scoped_rows, _scoped, stamp = _report(cluster_id, days)
     if res is None:
         return jsonify({'enough_data': False, 'rates': rates, 'rows': []})
     factor = _monthly_factor(res['covered_h'])
@@ -572,7 +585,7 @@ def per_vm(cluster_id):
         r['monthly_co2'] = round(kwh * rates['kg_co2_per_kwh'], 2)
         rows.append(r)
     return jsonify({'enough_data': True, 'cluster_id': cluster_id, 'days': days,
-                    'rates': rates, 'rows': rows})
+                    'rates': rates, 'rows': rows, **stamp})
 
 
 # ── #965 per-host power profiles ─────────────────────────────────────────

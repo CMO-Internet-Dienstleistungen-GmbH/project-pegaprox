@@ -32,7 +32,8 @@ from flask import Blueprint, jsonify, request
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.sanitization import sanitize_csv_field
-from pegaprox.api.helpers import check_cluster_access, load_metrics_window, scope_vm_rows
+from pegaprox.api.helpers import (check_cluster_access, load_metrics_window, scope_vm_rows, run_off_hub,
+                                  history_report, history_version)
 from pegaprox.core.db import get_db
 from pegaprox.models.permissions import ROLE_ADMIN
 
@@ -103,8 +104,24 @@ def _load_history(cluster_id, days=30):
     return out
 
 
-def _compute_per_vm(snapshots, mgr, rates, hours_window):
-    """Aggregate per-VM utilization across snapshots → cost rows."""
+def _compute_per_vm(snapshots, mgr, rates, hours_window, stats=None):
+    """Aggregate per-VM utilization across snapshots → cost rows. NS Oct 2026 - the history
+    part (_cost_stats) runs off the hub, or comes in kept as `stats`; the names, hosts and
+    disk sizes are read live here, on the hub, and the rates applied, for every request."""
+    if stats is None:
+        stats = run_off_hub(_cost_stats, snapshots)
+    live = []
+    try:
+        for r in (mgr.get_vm_resources() or []):
+            live.append({'vmid': r.get('vmid', ''), 'name': r.get('name', ''), 'node': r.get('node', ''),
+                         'maxdisk': r.get('maxdisk', 0)})
+    except Exception as e:
+        logging.debug(f"[costs] enrich failed: {e}")
+    return _cost_rows(stats, live, rates, hours_window)
+
+
+def _cost_stats(snapshots):
+    """{vmid: what the cost of a guest reads of the history}: plain arithmetic, off the hub."""
     # vmid -> {cpu_samples, mem_samples, name, node, type, maxmem, maxcpu, running_samples, total_samples}
     by_vm = {}
 
@@ -127,12 +144,25 @@ def _compute_per_vm(snapshots, mgr, rates, hours_window):
             if v.get('maxcpu'):
                 entry['maxcpu'] = max(entry['maxcpu'], v['maxcpu'])
 
+    out = {}
+    for vmid, e in by_vm.items():
+        cpu_samples = e['cpu_samples'] or [0]
+        mem_samples = e['mem_samples'] or [0]
+        out[vmid] = {'t': e['t'], 'r_count': e['r_count'], 'total': e['total'],
+                     'maxcpu': e['maxcpu'], 'maxmem': e['maxmem'],
+                     'avg_cpu_pct': sum(cpu_samples) / len(cpu_samples),
+                     'avg_mem_pct': sum(mem_samples) / len(mem_samples)}
+    return out
+
+
+def _cost_rows(stats, live, rates, hours_window):
+    """The cost rows of `stats`, named from `live` (the guest list as read on the hub)."""
     # Enrich with current name / node / disk size from live mgr
     name_by_vmid = {}
     node_by_vmid = {}
     disk_by_vmid = {}
     try:
-        for r in (mgr.get_vm_resources() or []):
+        for r in live:
             vid = str(r.get('vmid', ''))
             if not vid: continue
             name_by_vmid[vid] = r.get('name', '')
@@ -143,11 +173,9 @@ def _compute_per_vm(snapshots, mgr, rates, hours_window):
         logging.debug(f"[costs] enrich failed: {e}")
 
     rows = []
-    for vmid, e in by_vm.items():
-        cpu_samples = e['cpu_samples'] or [0]
-        mem_samples = e['mem_samples'] or [0]
-        avg_cpu_pct = sum(cpu_samples) / len(cpu_samples)
-        avg_mem_pct = sum(mem_samples) / len(mem_samples)
+    for vmid, e in stats.items():
+        avg_cpu_pct = e['avg_cpu_pct']
+        avg_mem_pct = e['avg_mem_pct']
         running_ratio = (e['r_count'] / e['total']) if e['total'] else 0
         # only count utilization for the time the VM was running
         active_h = hours_window * running_ratio
@@ -184,6 +212,16 @@ def _compute_per_vm(snapshots, mgr, rates, hours_window):
 
     rows.sort(key=lambda r: r['cost_total'], reverse=True)
     return rows
+
+
+def _cached_cost_rows(cluster_id, days, snapshots, rates):
+    """(rows, stamp): the cluster's cost rows. The history part is worked out once for the
+    summary, the per-VM table and the chargeback together, and kept (helpers.history_report);
+    names, hosts, disk sizes and the rates are applied per request, so a change to any of
+    them shows at once."""
+    stats, stamp = history_report(('costs', cluster_id, days), history_version(snapshots),
+                                  lambda: run_off_hub(_cost_stats, snapshots), rows=len)
+    return _compute_per_vm(snapshots, cluster_managers[cluster_id], rates, days * 24, stats=stats), stamp
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -305,9 +343,7 @@ def cluster_summary(cluster_id):
             'days': days,
         })
 
-    hours_window = days * 24
-    mgr = cluster_managers[cluster_id]
-    rows = _compute_per_vm(snapshots, mgr, rates, hours_window)
+    rows, stamp = _cached_cost_rows(cluster_id, days, snapshots, rates)
     # #773 audit — confine per-VM cost rows (top_spenders/by_node/vm_count all derive from these)
     # to VMs the caller may see, so a pool-scoped user doesn't get the whole cluster's spend.
     rows = scope_vm_rows(cluster_id, rows)
@@ -345,6 +381,7 @@ def cluster_summary(cluster_id):
         'by_node': {k: round(v * factor, 2) for k, v in by_node.items()},
         'top_spenders': rows[:10],
         'vm_count': len(rows),
+        **stamp,
     })
 
 
@@ -365,8 +402,7 @@ def per_vm(cluster_id):
     snapshots = _load_history(cluster_id, days=days)
     if not snapshots:
         return jsonify({'enough_data': False, 'rates': rates, 'rows': []})
-    mgr = cluster_managers[cluster_id]
-    rows = _compute_per_vm(snapshots, mgr, rates, days * 24)
+    rows, stamp = _cached_cost_rows(cluster_id, days, snapshots, rates)
     rows = scope_vm_rows(cluster_id, rows)  # #773 audit — per-VM rows scoped to the caller
     factor = 30.0 / days if days < 30 else 1.0
     for r in rows:
@@ -378,6 +414,7 @@ def per_vm(cluster_id):
         'days': days,
         'rates': rates,
         'rows': rows,
+        **stamp,
     })
 
 
@@ -419,6 +456,7 @@ def tenant_chargeback(tenant_id):
         all_rows = []
         grand_total = 0.0
         currency = 'EUR'
+        computed_at = None  # the oldest of the clusters' figures
         for cid, mgr in list(cluster_managers.items()):
             if allowed is not None and cid not in allowed:
                 continue
@@ -431,7 +469,9 @@ def tenant_chargeback(tenant_id):
                     by_cluster.append({'cluster_id': cid, 'cluster_name': cname, 'subtotal': 0.0,
                                        'monthly_subtotal': 0.0, 'vm_count': 0, 'enough_data': False})
                     continue
-                rows = _compute_per_vm(snaps, mgr, rates, days * 24)
+                rows, stamp = _cached_cost_rows(cid, days, snaps, rates)
+                if not computed_at or stamp['computed_at'] < computed_at:
+                    computed_at = stamp['computed_at']
                 if not _global:
                     # NS Oct 2026 - the statement is the tenant's clusters, its rows only the
                     # guests this caller may see, as on the per-cluster cost routes. A pool- or
@@ -479,6 +519,7 @@ def tenant_chargeback(tenant_id):
             'monthly_total': round(grand_total * factor, 2),
             'by_cluster': by_cluster,
             'rows': all_rows,
+            'computed_at': computed_at,
         })
     except Exception:
         logging.exception('handler error in costs.py (chargeback)')
