@@ -11043,7 +11043,12 @@
                 ready: 'bg-green-500/20 text-green-400', running: 'bg-blue-500/20 text-blue-400',
                 testing: 'bg-yellow-500/20 text-yellow-400', failed: 'bg-red-500/20 text-red-400',
                 completed: 'bg-purple-500/20 text-purple-400',
+                cancelling: 'bg-orange-500/20 text-orange-400', cancelled: 'bg-gray-500/20 text-gray-400',
             };
+            // LW Oct 2026 - a cancelled run finishes the guest it is on first: until then the plan
+            // reads 'cancelling', nothing starts on it and deleting it needs force, as while it runs
+            const srBusy = (status) => status === 'running' || status === 'cancelling';
+            const srActive = (status) => srBusy(status) || status === 'testing';
             const getClusterName = (id) => clusterLabel(clusters.find(cl => cl.id === id)) || id;
             const rpoColor = (vm) => {
                 if (!vm.last_replication) return 'text-gray-500';
@@ -11463,10 +11468,10 @@
                             <div className="flex items-center gap-2 flex-wrap">
                                 {canFailover && <button onClick={() => handleReadiness(pd.id)} disabled={actionRunning} className="px-3 py-1.5 text-xs rounded-lg bg-gray-600/50 text-gray-300 hover:bg-gray-600 disabled:opacity-40">{t('readinessCheck')}</button>}
                                 {canFailover && <button onClick={() => startDrDrill(pd)} disabled={actionRunning} className="px-3 py-1.5 text-xs rounded-lg bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 disabled:opacity-40">{t('drDrillRun') || 'DR Drill'}</button>}
-                                {canFailover && <button onClick={() => handleAction(pd.id, 'test', t('confirmFailover'))} disabled={actionRunning || pd.status === 'running'} className="px-3 py-1.5 text-xs rounded-lg bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500/30 disabled:opacity-40">{t('testFailover')}</button>}
-                                {canFailover && <button onClick={() => handleAction(pd.id, 'failover', t('confirmFailover'))} disabled={actionRunning || pd.status === 'running'} className="px-3 py-1.5 text-xs rounded-lg bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 disabled:opacity-40">{t('plannedFailover')}</button>}
-                                {canFailover && <button data-sr-action="emergency" onClick={() => setGuestPick('emergency')} disabled={actionRunning || pd.status === 'running' || pd.failover_state === 'all'} className="px-3 py-1.5 text-xs rounded-lg bg-red-500/20 text-red-400 hover:bg-red-500/30 disabled:opacity-40">{t('emergencyFailover')}</button>}
-                                {canFailover && pd.failed_over_count > 0 && <button data-sr-action="failback" onClick={() => setGuestPick('failback')} disabled={actionRunning || pd.status === 'running'} className="px-3 py-1.5 text-xs rounded-lg bg-purple-500/20 text-purple-400 hover:bg-purple-500/30 disabled:opacity-40">{t('failback')}</button>}
+                                {canFailover && <button onClick={() => handleAction(pd.id, 'test', t('confirmFailover'))} disabled={actionRunning || srBusy(pd.status)} className="px-3 py-1.5 text-xs rounded-lg bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500/30 disabled:opacity-40">{t('testFailover')}</button>}
+                                {canFailover && <button onClick={() => handleAction(pd.id, 'failover', t('confirmFailover'))} disabled={actionRunning || srBusy(pd.status)} className="px-3 py-1.5 text-xs rounded-lg bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 disabled:opacity-40">{t('plannedFailover')}</button>}
+                                {canFailover && <button data-sr-action="emergency" onClick={() => setGuestPick('emergency')} disabled={actionRunning || srBusy(pd.status) || pd.failover_state === 'all'} className="px-3 py-1.5 text-xs rounded-lg bg-red-500/20 text-red-400 hover:bg-red-500/30 disabled:opacity-40">{t('emergencyFailover')}</button>}
+                                {canFailover && pd.failed_over_count > 0 && <button data-sr-action="failback" onClick={() => setGuestPick('failback')} disabled={actionRunning || srBusy(pd.status)} className="px-3 py-1.5 text-xs rounded-lg bg-purple-500/20 text-purple-400 hover:bg-purple-500/30 disabled:opacity-40">{t('failback')}</button>}
                                 {canFailover && pd.status === 'testing' && <button onClick={() => handleAction(pd.id, 'test/cleanup', t('confirmTestCleanup'))} disabled={actionRunning} className="px-3 py-1.5 text-xs rounded-lg bg-orange-500/20 text-orange-400 hover:bg-orange-500/30 disabled:opacity-40">{t('testCleanup')}</button>}
                             </div>
                         </div>
@@ -11658,8 +11663,8 @@
                                 </div>
                                 {canManage && <div className="bg-red-500/5 border border-red-500/20 rounded-xl p-4">
                                     <h4 className="text-sm font-medium text-red-400 mb-2">{t('dangerZone') || 'Danger Zone'}</h4>
-                                    <button onClick={() => handleDeletePlan(pd.id, pd.status === 'running' || pd.status === 'testing')} className="px-3 py-1.5 text-xs rounded-lg bg-red-500/20 text-red-400 hover:bg-red-500/30">
-                                        {(pd.status === 'running' || pd.status === 'testing') ? (t('forceDeletePlan') || 'Force Delete (stuck)') : t('deletePlan')}
+                                    <button onClick={() => handleDeletePlan(pd.id, srActive(pd.status))} className="px-3 py-1.5 text-xs rounded-lg bg-red-500/20 text-red-400 hover:bg-red-500/30">
+                                        {(srActive(pd.status)) ? (t('forceDeletePlan') || 'Force Delete (stuck)') : t('deletePlan')}
                                     </button>
                                 </div>}
                             </div>
@@ -11680,7 +11685,7 @@
                                     </div>
                                     <select value={addVmForm.replication_job_id} onChange={e => setAddVmForm(f => ({...f, replication_job_id: e.target.value}))} className="w-full bg-proxmox-card border border-proxmox-border rounded-lg p-2 text-sm">
                                         <option value="">{t('linkReplication') || 'Link Replication Job (optional)'}</option>
-                                        {replJobs.filter(j => j.vmid == addVmForm.vmid).map(j => <option key={j.id} value={j.id}>{j.schedule} → {getClusterName(j.target_cluster)}</option>)}
+                                        {replJobs.filter(j => j.vmid == addVmForm.vmid && j.source_cluster === planDetail.source_cluster && j.target_cluster === planDetail.target_cluster).map(j => <option key={j.id} value={j.id}>{j.schedule} → {getClusterName(j.target_cluster)}</option>)}
                                     </select>
                                     <div className="flex justify-end gap-2">
                                         <button onClick={() => setShowAddVmModal(false)} className="px-3 py-1.5 text-sm text-gray-400 hover:text-white">{t('cancel') || 'Cancel'}</button>
@@ -11847,7 +11852,7 @@
                                     <div className="flex items-center justify-between mb-3"><h3 className="font-medium text-sm">{plan.name}</h3><span className={`px-2 py-0.5 rounded-full text-xs ${statusColors[plan.status] || 'bg-gray-500/20 text-gray-400'}`}>{plan.status}</span></div>
                                     <div className="text-xs text-gray-500 space-y-1"><p>{getClusterName(plan.source_cluster)} → {getClusterName(plan.target_cluster)}</p><p>{plan.vm_count} {t('protectedVMs')}</p>{plan.last_failover && <p>Last failover: {fmtDate(plan.last_failover)}</p>}</div>
                                     {plan.failed_over_count > 0 && <div className="mt-2"><SrFailoverBadge plan={plan} total={plan.vm_count} t={t} /></div>}
-                                    {canManage && <div className="mt-3 flex justify-end"><button onClick={(e) => { e.stopPropagation(); handleDeletePlan(plan.id, plan.status === 'running' || plan.status === 'testing'); }} className="text-red-400 hover:text-red-300 text-xs"><Icons.Trash2 className="w-3.5 h-3.5" /></button></div>}
+                                    {canManage && <div className="mt-3 flex justify-end"><button onClick={(e) => { e.stopPropagation(); handleDeletePlan(plan.id, srActive(plan.status)); }} className="text-red-400 hover:text-red-300 text-xs"><Icons.Trash2 className="w-3.5 h-3.5" /></button></div>}
                                 </div>
                             ))}
                         </div>

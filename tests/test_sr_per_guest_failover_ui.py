@@ -390,3 +390,27 @@ def test_runtime_in_german(open_app):
     assert picker.locator('[data-sr-pick-start]').inner_text() == 'Notfall-Failover starten (2)'
     _snap(app, 'sr-pick-emergency-de.png')
     assert not app.errors, app.errors
+
+
+def test_runtime_a_cancelling_run_starts_nothing_and_the_job_list_keeps_to_the_plan(open_app):
+    """A cancelled run finishes the guest it is on first; the plan reads 'cancelling' and
+    nothing starts on it. A guest's replication job is one from the plan's source to its
+    target: the server refuses any other since a1790f1."""
+    plan = _plan([_vm(101, 'db01', 'emergency'), _vm(102, 'app01')], status='cancelling')
+    app = open_app(plan=plan)
+    app.server.extra[('GET', '/api/cross-cluster-replications')] = (200, [
+        {'id': 'j-ours', 'vmid': 100, 'source_cluster': 'c1', 'target_cluster': 'c2', 'schedule': '0 */6 * * *'},
+        {'id': 'j-elsewhere', 'vmid': 100, 'source_cluster': 'c1', 'target_cluster': 'c9', 'schedule': '0 */2 * * *'}])
+    page = app.page
+    _to_plan(app, 'modern')
+    assert page.locator('[data-sr-action="emergency"]').is_disabled()
+    assert page.locator('[data-sr-action="failback"]').is_disabled()
+    assert page.locator('span', has_text='cancelling').count() >= 1
+    page.locator('button', has_text='Protected VMs').first.click()
+    page.locator('button', has_text='Add VM').first.click()
+    selects = page.locator('div.fixed select')
+    selects.first.wait_for(timeout=5000)
+    selects.first.select_option('100')
+    jobs = selects.nth(1).locator('option').all_inner_texts()
+    assert len(jobs) == 2 and '0 */6 * * *' in jobs[1], jobs
+    assert not app.errors, app.errors
