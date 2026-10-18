@@ -353,6 +353,10 @@ def _update_target(install_dir, rel_path):
     missing one still comes from the release.
     """
     parts = rel_path.replace('\\', '/').split('/')
+    # the file list comes from the update source (the tree listing, update_files): a part
+    # that climbs out, or an absolute path, writes nowhere
+    if not parts[0] or '..' in parts:
+        return None
     if len(parts) < 2 or parts[0] != 'plugins':
         return os.path.join(install_dir, rel_path)
     dst = os.path.join(os.path.abspath(PLUGINS_DIR), *parts[1:])

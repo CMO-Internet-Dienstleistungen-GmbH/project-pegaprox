@@ -144,3 +144,7 @@ def test_where_the_updater_writes(monkeypatch, tmp_path):
     assert t(inst, 'pegaprox/api/plugins.py') == os.path.join(inst, 'pegaprox/api/plugins.py')
     assert t(inst, 'config.json') == os.path.join(inst, 'config.json')
     assert t(inst, 'web/plugins/x.js') == os.path.join(inst, 'web/plugins/x.js')
+    # a path from the update source that climbs out of either writes nowhere
+    for bad in ('plugins/../../etc/cron.d/x', 'plugins/status_page/../../x', '../outside.py',
+                'pegaprox/../../x.py', '/etc/passwd', '\\etc\\x'):
+        assert t(inst, bad) is None, bad
