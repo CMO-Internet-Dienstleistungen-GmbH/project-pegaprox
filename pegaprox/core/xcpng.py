@@ -4493,6 +4493,13 @@ echo DONE""",
         try:
             vm_ref = self._resolve_vm(vmid)
             power = api.VM.get_power_state(vm_ref)
+            # MK Oct 2026 - only a running guest moves. The other branch shut the guest down
+            # hard and copied it within this pool (VM.copy onto no SR) under a new name: no
+            # move to the other pool, a second guest instead, and online=false took it too
+            if not online or power != 'Running':
+                return {'success': False, 'code': 'NOT_RUNNING',
+                        'error': 'Only a running guest moves to another pool from here: '
+                                 'start it first, or move it with the pool tools'}
 
             tcfg = target_pool.config
             remote_session = ha_transport.guard_xapi(XenAPI.Session(
@@ -4507,25 +4514,14 @@ echo DONE""",
             # add session ref for auth
             dest['session_id'] = remote_session._session
 
-            # live or offline?
-            live = online and power == 'Running'
-
-            if live:
-                # live migrate across pools
-                # NS: XAPI wants a dict with destination host/network info
-                dest_host_refs = remote_session.xenapi.host.get_all()
-                if not dest_host_refs:
-                    return {'success': False, 'error': 'No hosts in target pool'}
-                dest['host'] = dest_host_refs[0]  # pool master
-                # vdi_map and vif_map can be empty for default mapping
-                task_ref = api.Async.VM.migrate_send(vm_ref, dest, live, {}, {}, {})
-            else:
-                if power != 'Halted':
-                    api.VM.hard_shutdown(vm_ref)
-                    time.sleep(3)
-                # for offline, use VM.copy to remote SR
-                # this is more like clone+transfer
-                task_ref = api.Async.VM.copy(vm_ref, f'migrated-{vmid}', 'OpaqueRef:NULL')
+            # live migrate across pools
+            # NS: XAPI wants a dict with destination host/network info
+            dest_host_refs = remote_session.xenapi.host.get_all()
+            if not dest_host_refs:
+                return {'success': False, 'error': 'No hosts in target pool'}
+            dest['host'] = dest_host_refs[0]  # pool master
+            # vdi_map and vif_map can be empty for default mapping
+            task_ref = api.Async.VM.migrate_send(vm_ref, dest, True, {}, {}, {})
 
             task_id = self._track_task(task_ref, 'remote_migrate', vmid)
 

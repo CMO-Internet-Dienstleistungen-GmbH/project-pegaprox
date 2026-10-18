@@ -13938,6 +13938,7 @@ def remote_migrate_vm_api(cluster_id, node, vm_type, vmid):
     bwlimit = data.get('bwlimit')
     
     user = build_authz_user(request.session.get('user', ''), request.session)
+    _qwarn = None
     if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
         # NS Oct 2026 (#1088, #1048) - an XCP-ng pool logs into the target with stored
         # credentials, so the target is a registered pool, never a URL from the request
@@ -13957,6 +13958,17 @@ def remote_migrate_vm_api(cluster_id, node, vm_type, vmid):
             return err
         if caller_is_scoped(user, target_cluster):
             return jsonify({'error': 'Access denied to target cluster'}), 403
+        # MK Oct 2026 - the tenant quota, as for every other way a guest lands on a cluster;
+        # migrate_send moves it, so between two pools both counted for the tenant it adds nothing
+        from pegaprox.utils.rbac import landing_adds, quota_tenant
+        _qerr, _qwarn = tenant_quota_gate(
+            user, f'migration of {vm_type} {vmid} to another pool',
+            lambda: landing_adds(quota_tenant(user), target_cluster, guest_size(manager, node, vm_type, vmid),
+                                 source_cluster=cluster_id, source_removed=True),
+            cluster=getattr(target_mgr.config, 'name', target_cluster),
+            hold={'cluster_id': target_cluster, 'vmid': vmid})
+        if _qerr:
+            return _qerr
         result = manager.remote_migrate_vm(
             node, vmid, vm_type, None, target_storage, target_bridge,
             target_vmid, online, delete_source, bwlimit, target_pool=target_mgr)
@@ -13983,9 +13995,11 @@ def remote_migrate_vm_api(cluster_id, node, vm_type, vmid):
         # NS: Push immediate update for live UI
         push_immediate_update(cluster_id, delay=0.5)
         
-        return jsonify({'message': f'Remote migration started for {vm_type}/{vmid}', 'task': result.get('task')})
+        return jsonify({'message': f'Remote migration started for {vm_type}/{vmid}', 'task': result.get('task'),
+                        **({'quota_warning': _qwarn} if _qwarn else {})})
     else:
-        return jsonify({'error': result.get('error', 'Remote migration failed')}), 500
+        return jsonify({'error': result.get('error', 'Remote migration failed')}), \
+            409 if result.get('code') == 'NOT_RUNNING' else 500
 
 
 def _vmid_or_none(value):

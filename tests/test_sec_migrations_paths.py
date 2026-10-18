@@ -472,3 +472,60 @@ def test_v2p_a_tenant_without_the_target_cannot_start(api, seed, v2p_route):
     u = api.as_user(seed.user('outsider', role='user', tenant_id='globex'))
     assert u.post(V2P, json=_v2p_body()).status_code == 403
     assert v2p_route == []
+
+
+def test_xcp_remote_migrate_asks_the_tenant_quota(api, seed, xcp_pools, monkeypatch):
+    """A move between two pools of the tenant adds nothing; one onto a counted pool from a
+    pool that is not counted adds the guest. A refusal starts nothing."""
+    import pegaprox.api.vms as vms_api
+    from flask import jsonify
+    src, _ = xcp_pools
+    asked = []
+
+    def gate(user, what, adds, **kw):
+        asked.append(adds())
+        return (jsonify({'error': 'quota'}), 403) if len(asked) > 1 else None, None
+    monkeypatch.setattr(vms_api, 'tenant_quota_gate', gate)
+    monkeypatch.setattr(vms_api, 'guest_size', lambda *a: {'cores': 2, 'memory_gb': 4.0, 'disk_gb': 20.0})
+    u = api.as_user(seed.user('ops', role='user', tenant_id='acme'))
+    assert u.post(XRMIG, json={**_XBODY, 'target_cluster': 'xcp_b'}).status_code == 200
+    assert asked == [None]                      # both pools are acme's: a move adds nothing
+    r = u.post(XRMIG, json={**_XBODY, 'target_cluster': 'xcp_b'})
+    assert r.status_code == 403 and src.remote_migrate_vm.call_count == 1
+
+
+def _xcp_manager(power, monkeypatch):
+    import types
+    from unittest.mock import MagicMock
+    from pegaprox.core import xcpng
+    login = MagicMock(side_effect=AssertionError('no login to the target'))
+    monkeypatch.setattr(xcpng, 'XenAPI', types.SimpleNamespace(
+        Session=lambda *a, **k: types.SimpleNamespace(xenapi=types.SimpleNamespace(login_with_password=login))))
+    mgr = object.__new__(xcpng.XcpngManager)
+    mgr.config = types.SimpleNamespace(ssl_verification=True, user='src', pass_='x')
+    api_ = MagicMock()
+    api_.VM.get_power_state.return_value = power
+    mgr._api = lambda: api_
+    mgr._resolve_vm = lambda vmid: 'OpaqueRef:vm'
+    mgr.logger = MagicMock()
+    target = object.__new__(xcpng.XcpngManager)
+    target.config = types.SimpleNamespace(ssl_verification=True, user='root', pass_='y', name='b')
+    target._get_xapi_url = lambda: 'https://target.example'
+    return mgr, target, api_
+
+
+@pytest.mark.parametrize('power,online', [('Halted', True), ('Suspended', True), ('Running', False)])
+def test_xcp_remote_migrate_moves_a_running_guest_only(monkeypatch, power, online):
+    """The other branch shut the guest down hard and copied it within its own pool."""
+    mgr, target, api_ = _xcp_manager(power, monkeypatch)
+    res = mgr.remote_migrate_vm('xcp1', 100, online=online, target_pool=target)
+    assert res['success'] is False and res['code'] == 'NOT_RUNNING'
+    assert not api_.VM.hard_shutdown.called and not api_.Async.VM.copy.called
+    assert not api_.Async.VM.migrate_send.called
+
+
+def test_xcp_remote_migrate_a_refused_move_is_a_409(api, seed, xcp_pools):
+    src, _ = xcp_pools
+    src.remote_migrate_vm.return_value = {'success': False, 'code': 'NOT_RUNNING', 'error': 'not running'}
+    admin = api.as_user(seed.user('root', role='admin'))
+    assert admin.post(XRMIG, json={**_XBODY, 'target_cluster': 'xcp_b'}).status_code == 409
