@@ -173,3 +173,17 @@ def test_a_pbs_task_id_that_is_no_task_id_reaches_no_pbs(api, seed, pbs):
     good = 'UPID:pbs:00001234:0000ABCD:00000001:65000000:garbage_collection:store1:root@pam:'
     assert c.get(f'/api/pbs/p1/tasks/{good}').status_code == 200
     assert pbs.api_get.called
+
+
+def test_an_xcpng_task_reference_is_no_upid_and_still_reads(api, seed):
+    m = api.make_fake_manager(cluster_id='cluster_1', cluster_type='xcpng')
+    m.is_connected = True
+    m.get_node_task_log.return_value = ['Action: start']
+    api.set_manager('cluster_1', m)
+    c = api.as_user(seed.user('root', role='admin'))
+    assert c.get('/api/clusters/cluster_1/nodes/h1/tasks/a1b2c3d4/log').status_code == 200
+    assert m.get_node_task_log.call_args[0][:2] == ('h1', 'a1b2c3d4')
+    m.get_node_task_log.reset_mock()
+    for ref in ('a1b2/../x', 'a1b2/%2e%2e/x'):
+        assert c.get(f'/api/clusters/cluster_1/nodes/h1/tasks/{ref}/log').status_code in (400, 404)
+    assert not m.get_node_task_log.called

@@ -30,7 +30,7 @@ from pegaprox.core.config import load_config, save_config
 from pegaprox.core.manager import PegaProxManager
 from pegaprox.core.xcpng import XcpngManager, XENAPI_AVAILABLE
 from pegaprox.utils.sanitization import bounded_list, validate_ssh_user, validate_host_address
-from pegaprox.utils.sanitization import validate_hostname, valid_upid
+from pegaprox.utils.sanitization import task_ref_ok
 from pegaprox.api.helpers import (load_server_settings, get_connected_manager, check_cluster_access,
                                   safe_error, scope_vm_rows, require_unconfined, parse_pve_error,
                                   bounded_limit, node_maintenance_for_caller, upstream_failure)
@@ -3447,11 +3447,8 @@ def cancel_task(cluster_id, node, upid):
     mgr = cluster_managers[cluster_id]
     # MK Oct 2026 - a Proxmox task id has no slash, nor does an XCP-ng task reference; the
     # id goes into the path of the cancel call
-    if getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox':
-        if not validate_hostname(node) or not valid_upid(upid):
-            return jsonify({'error': 'Invalid node or task id'}), 400
-    elif not re.fullmatch(r'[^/?#%\s]{1,400}', upid or ''):
-        return jsonify({'error': 'Invalid task id'}), 400
+    if not task_ref_ok(getattr(mgr, 'cluster_type', 'proxmox'), node, upid):
+        return jsonify({'error': 'Invalid node or task id'}), 400
     
     # NS Aug 2026 (Aikido #469089252) — the UPID encodes the task's VM; gate per-VM so a
     # pool-scoped user can't cancel another pool/tenant's VM task on a shared cluster.

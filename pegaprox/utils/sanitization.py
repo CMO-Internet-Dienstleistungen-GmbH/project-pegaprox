@@ -108,6 +108,14 @@ def valid_upid(value) -> bool:
     return isinstance(value, str) and bool(UPID_RE.fullmatch(value))
 
 
+def task_ref_ok(cluster_type, node, upid) -> bool:
+    """A node and task reference of a cluster as they may go into an API path: a Proxmox
+    VE node name and UPID, or for XCP-ng and ESXi a task reference without a slash."""
+    if cluster_type == 'proxmox':
+        return validate_hostname(node) and valid_upid(upid)
+    return isinstance(upid, str) and bool(re.fullmatch(r'[^/?#%\s]{1,400}', upid))
+
+
 def valid_pbs_upid(value) -> bool:
     """A PBS task id. PBS escapes its worker id ('store1\\x3avm-100'), but the routes have
     taken one with the slashes in since they exist, so a slash is let through here; a '.'
