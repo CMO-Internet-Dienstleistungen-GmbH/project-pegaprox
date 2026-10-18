@@ -198,7 +198,9 @@ def check_pattern(pattern):
             name = str(op)
             if name in ('MAX_REPEAT', 'MIN_REPEAT', 'POSSESSIVE_REPEAT'):
                 lo, hi, sub = av
-                if hi == 1:          # x? - at most once, nothing to backtrack over
+                # x{n} - a fixed count, nothing to backtrack over. x? is a choice like any other
+                # repeat: '.?' * 20 + 'Z' takes seconds to fail on a 66-character task status
+                if lo == hi:
                     walk(sub, in_repeat)
                     continue
                 if in_repeat:
@@ -220,7 +222,7 @@ def check_pattern(pattern):
                 raise ValueError('back-references are not supported')
     walk(tree, False)
     if repeats[0] > PATTERN_REPEATS:
-        raise ValueError(f'at most {PATTERN_REPEATS} open repeats (*, + or {{n,m}}) per pattern')
+        raise ValueError(f'at most {PATTERN_REPEATS} open repeats (*, +, ? or {{n,m}}) per pattern')
     return compiled
 
 

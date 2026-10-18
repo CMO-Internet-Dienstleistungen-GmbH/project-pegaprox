@@ -745,7 +745,7 @@ def test_patterns_people_write_are_taken(pattern):
 
 
 @pytest.mark.parametrize('pattern', ['(a+)+b', '(ab|cd)*', r'(a)\1', '.*.*.*x', '(x*y)*', '[', 'a' * 121,
-                                     '(?:a|aa)+$'])
+                                     '(?:a|aa)+$', '.?' * 20 + 'Z', '.*x?.*', '(ab?)+'])
 def test_patterns_that_can_hold_up_the_loop_are_refused(pattern):
     with pytest.raises(ValueError):
         E.check_pattern(pattern)
@@ -761,6 +761,17 @@ def test_what_is_refused_would_really_take_long_and_what_is_taken_does_not():
     t = time.monotonic()
     ok.search('a' * E.SUBJECT_MAX)
     assert time.monotonic() - t < 0.05
+
+
+def test_optional_parts_count_as_repeats():
+    import re
+    # a run of optional parts backtracks too: each one doubles the ways to fail
+    slow = re.compile('.?' * 18 + 'Z')
+    t = time.monotonic()
+    slow.search("can't lock file '/var/lock/qemu-server/lock-101.conf' - got timeout")
+    assert time.monotonic() - t > 0.05, 'the counterproof pattern got fast - pick another'
+    assert E.check_pattern('colou?r .*failed')
+    assert E.check_pattern('x{3}.*y')
 
 
 # --- the routes ------------------------------------------------------------------------
