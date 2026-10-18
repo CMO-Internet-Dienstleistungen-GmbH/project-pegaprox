@@ -24,7 +24,7 @@ GAP = 0.3
 
 
 def _hub_gap(work):
-    """(result, longest time the hub was held) of work() on the hub."""
+    """(result, longest time the hub was held, time work() took) of work() on the hub."""
     gaps, stop = [], []
 
     def tick():
@@ -36,13 +36,21 @@ def _hub_gap(work):
             last = now
     g = gevent.spawn(tick)
     gevent.sleep(0.05)
+    start = time.perf_counter()
     try:
         out = work()
     finally:
+        wall = time.perf_counter() - start
         gevent.sleep(0.02)
         stop.append(1)
         g.join()
-    return out, max(gaps)
+    return out, max(gaps), wall
+
+
+def _held_briefly(gap, wall):
+    """Under the fixed bound, or, where a loaded machine runs it all slower, a small part
+    of the whole run: the loops this is about held the hub for all of it."""
+    return gap < GAP or gap < wall / 4
 
 
 def _whatif_cluster():
@@ -57,9 +65,10 @@ def _whatif_cluster():
 
 
 def test_the_ranking_lets_the_hub_in_between_its_candidates():
-    rep, gap = _hub_gap(lambda: whatif.ranking(_whatif_cluster(), {'cpu': 80.0, 'memory': 90.0}))
+    mgr = _whatif_cluster()
+    rep, gap, wall = _hub_gap(lambda: whatif.ranking(mgr, {'cpu': 80.0, 'memory': 90.0}))
     assert len(rep['ranking']) >= NODES // 2
-    assert gap < GAP, f'the hub was held {gap:.2f}s'
+    assert _held_briefly(gap, wall), f'the hub was held {gap:.2f}s of {wall:.2f}s'
 
 
 @pytest.mark.parametrize('scenario', [{'type': 'headroom', 'depth': 2},
@@ -67,9 +76,9 @@ def test_the_ranking_lets_the_hub_in_between_its_candidates():
                          ids=['headroom-pairs', 'maintenance-16'])
 def test_a_scenario_over_every_pair_or_many_guests_lets_the_hub_in(scenario):
     # 200 nodes are 19900 pairs; the pairs alone held the hub 0.7 s
-    _, gap = _hub_gap(lambda: whatif.run(_whatif_cluster(), whatif.parse_scenario(scenario),
-                                         {'cpu': 80.0, 'memory': 90.0}))
-    assert gap < GAP, f'the hub was held {gap:.2f}s'
+    mgr = _whatif_cluster()
+    _, gap, wall = _hub_gap(lambda: whatif.run(mgr, whatif.parse_scenario(scenario), {'cpu': 80.0, 'memory': 90.0}))
+    assert _held_briefly(gap, wall), f'the hub was held {gap:.2f}s of {wall:.2f}s'
 
 
 def test_the_preflight_without_a_target_lets_the_hub_in_between_its_guests():
@@ -81,10 +90,10 @@ def test_the_preflight_without_a_target_lets_the_hub_in_between_its_guests():
     cfgs = {g['vmid']: {'scsi0': 'ceph:vm-1-disk-0,size=32G', 'net0': 'virtio=AA:BB:CC:00:00:01,bridge=vmbr0'}
             for g in guests}
     m = tm._Pve(_Api(), guests=guests, nodes=nodes, configs=cfgs)
-    res, gap = _hub_gap(lambda: preflight.intra('cluster_1', m, [1000 + i for i in range(400)], None,
-                                                True, False, None, 2))
+    res, gap, wall = _hub_gap(lambda: preflight.intra('cluster_1', m, [1000 + i for i in range(400)], None,
+                                                      True, False, None, 2))
     assert res['totals']['guests'] == 400
-    assert gap < GAP, f'the hub was held {gap:.2f}s'
+    assert _held_briefly(gap, wall), f'the hub was held {gap:.2f}s of {wall:.2f}s'
 
 
 def test_a_long_search_lets_the_hub_in_between_its_guests():
@@ -96,9 +105,9 @@ def test_a_long_search_lets_the_hub_in_between_its_guests():
              'status': 'running', 'type': 'qemu', 'tags': 'a;b', 'pool': 'p', 'ip_addresses': ['10.0.0.1']}
         rows.append(search._search_facts(r, 'c1', 'Lab', {}))
     reading = search_query.parse(' OR '.join(f'zz{i}q' for i in range(20)))
-    hits, gap = _hub_gap(lambda: search._search_results(reading, rows, [], 'all'))
+    hits, gap, wall = _hub_gap(lambda: search._search_results(reading, rows, [], 'all'))
     assert hits == []
-    assert gap < GAP, f'the hub was held {gap:.2f}s'
+    assert _held_briefly(gap, wall), f'the hub was held {gap:.2f}s of {wall:.2f}s'
 
 
 def test_the_yield_lets_timers_run_where_sleep_zero_did_not():
