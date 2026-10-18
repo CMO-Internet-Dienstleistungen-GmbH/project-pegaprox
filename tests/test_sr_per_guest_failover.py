@@ -602,3 +602,63 @@ def test_a_plan_guest_links_only_its_own_replication_job(api, site):
     assert c.put(edit, json={'replication_job_id': 'j100'}).status_code == 400
     assert c.put(edit, json={'replication_job_id': 'j101'}).status_code == 200
     assert c.put(edit, json={'replication_job_id': ''}).status_code == 200
+
+
+def _until(cond, seconds=5.0):
+    import gevent
+    deadline = time.time() + seconds
+    while not cond():
+        assert time.time() < deadline, 'timed out'
+        gevent.sleep(0.02)
+
+
+@pytest.mark.parametrize('how', ['cancel', 'cleanup'])
+def test_a_run_under_way_is_stopped_not_overtaken(api, site, monkeypatch, how):
+    """Cancel wrote 'ready' and the worker went on; the test cleanup wrote 'ready' at its end
+    whatever ran. Either way a second failover started over the first and started guests
+    twice. Now a cancel stops the run before its next guest and nothing starts beside it."""
+    from gevent.event import Event
+    gate, started = Event(), []
+
+    def slow(mgr, vmid, vtype='qemu'):
+        started.append(vmid)
+        gate.wait(5)
+        return True, ''
+    monkeypatch.setattr(srw, '_start_replicated_vm', slow)
+    db, c = site.db, _admin(api, site)
+    db.execute("INSERT INTO site_recovery_events (id, plan_id, event_type, status, started_at, details) "
+               "VALUES ('t1', 'p1', 'test', 'completed', '2026-10-01T00:00:00', '{\"test_vmids\": []}')")
+    assert c.post('/api/site-recovery/plans/p1/emergency', json={}).status_code == 200
+    _until(lambda: started == [100])
+    if how == 'cancel':
+        r = c.post('/api/site-recovery/plans/p1/cancel')
+        assert r.status_code == 202 and r.get_json()['status'] == 'cancelling', r.get_json()
+    else:
+        assert c.post('/api/site-recovery/plans/p1/test/cleanup').status_code == 409
+    for route in ('emergency', 'failover', 'failback', 'test', 'test/cleanup'):
+        assert c.post(f'/api/site-recovery/plans/p1/{route}', json={}).status_code == 409, route
+    # what still runs counts, whatever the stored state says
+    db.execute("UPDATE site_recovery_plans SET status = 'ready' WHERE id = 'p1'")
+    r = c.post('/api/site-recovery/plans/p1/emergency', json={})
+    assert r.status_code == 409 and r.get_json()['code'] == 'SR_RUN_ALIVE'
+    db.execute("UPDATE site_recovery_plans SET status = ? WHERE id = 'p1'",
+               ('cancelling' if how == 'cancel' else 'running',))
+    gate.set()
+    _until(lambda: srw.run_alive('p1') is None)
+    assert len(started) == len(set(started))
+    if how == 'cancel':
+        assert started == [100]              # the guest it was on went through, the rest not begun
+        assert _state(db) == {100: 'emergency', 101: '', 102: ''}
+        assert db.query_one("SELECT status FROM site_recovery_plans WHERE id = 'p1'")['status'] == 'ready'
+        ev = db.query_one("SELECT status FROM site_recovery_events WHERE plan_id = 'p1' "
+                          "AND event_type = 'emergency'")
+        assert ev['status'] == 'cancelled'
+    else:
+        assert sorted(started) == [100, 101, 102]
+
+
+def test_a_cancel_with_nothing_running_here_sets_the_plan_ready(api, site):
+    site.db.execute("UPDATE site_recovery_plans SET status = 'testing' WHERE id = 'p1'")
+    r = _admin(api, site).post('/api/site-recovery/plans/p1/cancel')
+    assert r.status_code == 200
+    assert site.db.query_one("SELECT status FROM site_recovery_plans WHERE id = 'p1'")['status'] == 'ready'

@@ -271,6 +271,16 @@ def _replication_job_refusal(plan, vmid, job_id):
     return None
 
 
+def _run_under_way(plan_id):
+    """A 409 while a worker of this process is still on the plan, else None. MK Oct 2026 -
+    a cancelled run finishes the guest it is on first, and nothing may start beside it."""
+    from pegaprox.background.site_recovery import run_alive
+    kind = run_alive(plan_id)
+    if kind:
+        return jsonify({'error': f'A {kind} run of this plan is still under way', 'code': 'SR_RUN_ALIVE'}), 409
+    return None
+
+
 def _vmid_list(vmids, cap=20):
     vmids = list(vmids)
     text = ', '.join(str(v) for v in vmids[:cap])
@@ -796,8 +806,11 @@ def execute_planned_failover(plan_id):
     if not ok:
         return err
 
-    if plan['status'] == 'running':
+    if plan['status'] in ('running', 'cancelling'):
         return jsonify({'error': 'Failover already in progress'}), 409
+    busy = _run_under_way(plan_id)
+    if busy:
+        return busy
 
     src_mgr = cluster_managers.get(plan['source_cluster'])
     tgt_mgr = cluster_managers.get(plan['target_cluster'])
@@ -869,8 +882,11 @@ def execute_emergency_failover(plan_id):
     if err:
         return err
 
-    if plan['status'] == 'running':
+    if plan['status'] in ('running', 'cancelling'):
         return jsonify({'error': 'Failover already in progress'}), 409
+    busy = _run_under_way(plan_id)
+    if busy:
+        return busy
 
     tgt_mgr = cluster_managers.get(plan['target_cluster'])
     if not tgt_mgr or not tgt_mgr.is_connected:
@@ -933,8 +949,11 @@ def execute_test_failover(plan_id):
     if not ok:
         return err
 
-    if plan['status'] in ('running', 'testing'):
+    if plan['status'] in ('running', 'testing', 'cancelling'):
         return jsonify({'error': 'Action already in progress'}), 409
+    busy = _run_under_way(plan_id)
+    if busy:
+        return busy
 
     tgt_mgr = cluster_managers.get(plan['target_cluster'])
     if not tgt_mgr or not tgt_mgr.is_connected:
@@ -942,7 +961,13 @@ def execute_test_failover(plan_id):
 
     db = get_db()
     now = datetime.utcnow().isoformat()
-    db.execute("UPDATE site_recovery_plans SET status = 'testing', updated_at = ? WHERE id = ?", (now, plan_id))
+    # one claim, as the failover routes make theirs: two requests at once start one test
+    cur = db.conn.cursor()
+    cur.execute("UPDATE site_recovery_plans SET status = 'testing', updated_at = ? "
+                "WHERE id = ? AND status IN ('ready', 'completed', 'failed')", (now, plan_id))
+    db.conn.commit()
+    if cur.rowcount != 1:
+        return jsonify({'error': 'Action already in progress'}), 409
 
     from pegaprox.background.site_recovery import execute_test_failover
     _safe_spawn_failover(execute_test_failover, plan_id, _console_vmids(plan), _approved_vmids(plan))
@@ -970,6 +995,13 @@ def cleanup_test_failover(plan_id):
     ok, err = _authz_plan_vms(plan)   # sec (audit): per-VM gate, matching the read/failover routes
     if not ok:
         return err
+    # MK Oct 2026 - not beside a run of the plan: a failover's state would be set back to
+    # ready under it, a test still cloning would leave its last clones behind
+    if plan['status'] in ('running', 'cancelling'):
+        return jsonify({'error': 'A failover of this plan is under way'}), 409
+    busy = _run_under_way(plan_id)
+    if busy:
+        return busy
 
     from pegaprox.background.site_recovery import cleanup_test
     _safe_spawn_failover(cleanup_test, plan_id)
@@ -1007,8 +1039,11 @@ def execute_failback(plan_id):
     if err:
         return err
 
-    if plan['status'] == 'running':
+    if plan['status'] in ('running', 'cancelling'):
         return jsonify({'error': 'Action already in progress'}), 409
+    busy = _run_under_way(plan_id)
+    if busy:
+        return busy
 
     # MK Oct 2026 - per guest: a guest still at the source has no copy to bring home, and
     # migrating its replica over it is what the worker refuses anyway
@@ -1030,7 +1065,14 @@ def execute_failback(plan_id):
 
     db = get_db()
     now = datetime.utcnow().isoformat()
-    db.execute("UPDATE site_recovery_plans SET status = 'running', updated_at = ? WHERE id = ?", (now, plan_id))
+    # the claim the failover routes make: it was a plain write, so a failback raced a
+    # failover started in the same moment
+    cur = db.conn.cursor()
+    cur.execute("UPDATE site_recovery_plans SET status = 'running', updated_at = ? "
+                "WHERE id = ? AND status IN ('ready', 'completed', 'failed')", (now, plan_id))
+    db.conn.commit()
+    if cur.rowcount != 1:
+        return jsonify({'error': 'Action already in progress'}), 409
 
     from pegaprox.background.site_recovery import execute_failover
     _safe_spawn_failover(execute_failover, plan_id, 'failback', _approved_vmids(plan), picked)
@@ -1060,14 +1102,27 @@ def cancel_action(plan_id):
     if not ok:
         return err
 
-    if plan['status'] not in ('running', 'testing'):
+    if plan['status'] not in ('running', 'testing', 'cancelling'):
         return jsonify({'error': 'No active action to cancel'}), 409
     prev_status = plan['status']
     db = get_db()
+    usr = getattr(request, 'session', {}).get('user', 'system')
+    # MK Oct 2026 - a run under way is asked to stop before its next guest, and its worker
+    # sets the plan's state when it is through; until then the plan reads 'cancelling' and
+    # nothing else starts on it. Writing 'ready' at once let a second run start over it
+    from pegaprox.background.site_recovery import ask_to_stop
+    if ask_to_stop(plan_id):
+        if prev_status == 'running':
+            db.execute("UPDATE site_recovery_plans SET status = 'cancelling', updated_at = ? "
+                       "WHERE id = ? AND status = 'running'", (datetime.utcnow().isoformat(), plan_id))
+        log_audit(usr, 'site_recovery.cancelled',
+                  f"Asked the {prev_status} action on plan '{plan['name']}' to stop before its next guest")
+        return jsonify({'message': 'The run stops before its next guest'
+                                   + ('; clean up the test afterwards' if prev_status == 'testing' else ''),
+                        'status': 'cancelling' if prev_status == 'running' else prev_status}), 202
+    # nothing runs for it here: a test that is through cloning, or a state a restart left
     db.execute("UPDATE site_recovery_plans SET status = 'ready', updated_at = ? WHERE id = ?",
                (datetime.utcnow().isoformat(), plan_id))
-
-    usr = getattr(request, 'session', {}).get('user', 'system')
     log_audit(usr, 'site_recovery.cancelled', f"Cancelled {prev_status} action on plan '{plan['name']}'")
 
     return jsonify({'message': 'Action cancelled'})

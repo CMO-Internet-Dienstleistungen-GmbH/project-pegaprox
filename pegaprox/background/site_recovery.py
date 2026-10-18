@@ -1,11 +1,14 @@
 # site recovery failover orchestrator
 # NS Mar 2026 - handles planned, emergency, test failovers and auto-heartbeat
 
+import functools
 import json
 import logging
+import threading
 import time
 import uuid
 import requests
+from contextlib import contextmanager
 from datetime import datetime
 
 from pegaprox.core.db import get_db
@@ -18,6 +21,59 @@ from pegaprox.utils.sanitization import sanitize_log_message as _sl  # MK #33869
 from pegaprox.utils.sanitization import redact_url
 
 logger = logging.getLogger('pegaprox.site_recovery')
+
+# MK Oct 2026 - the plans a worker of this process is on, and the ones asked to stop. A
+# cancel used to write 'ready' only: the worker went on with the next guest, and with the
+# plan 'ready' a second failover or a failback started over it
+_live = {}             # plan_id -> what runs: planned, emergency, failback, test, cleanup
+_stop = set()
+_live_lock = threading.Lock()
+
+
+def run_alive(plan_id):
+    """What a worker of this process runs for the plan, None when nothing does."""
+    with _live_lock:
+        return _live.get(plan_id)
+
+
+def ask_to_stop(plan_id):
+    """The plan's worker stops before its next guest. False when none runs."""
+    with _live_lock:
+        if plan_id not in _live:
+            return False
+        _stop.add(plan_id)
+        return True
+
+
+def _stopping(plan_id):
+    with _live_lock:
+        return plan_id in _stop
+
+
+@contextmanager
+def _running(plan_id, kind):
+    with _live_lock:
+        _live[plan_id] = kind
+        _stop.discard(plan_id)
+    try:
+        yield
+    finally:
+        with _live_lock:
+            _live.pop(plan_id, None)
+            _stop.discard(plan_id)
+
+
+def _on_the_plan(kind=None):
+    """A worker is on its plan (the first argument) while it runs. kind names it; None
+    takes the failover type it was given."""
+    def wrap(fn):
+        @functools.wraps(fn)
+        def run(plan_id, *args, **kwargs):
+            what = kind or (args[0] if args else kwargs.get('failover_type', 'planned'))
+            with _running(plan_id, what):
+                return fn(plan_id, *args, **kwargs)
+        return run
+    return wrap
 
 _heartbeat_running = False
 
@@ -529,6 +585,7 @@ def _home_vmid_in_use(vm, dr_mgr, dr_id, home_id):
             f"remove either.")
 
 
+@_on_the_plan()
 def execute_failover(plan_id, failover_type='planned', authorized_vmids=None, only_vmids=None):
     """Main failover orchestrator. Runs in greenlet.
 
@@ -567,7 +624,7 @@ def execute_failover(plan_id, failover_type='planned', authorized_vmids=None, on
                                     'reason': 'not failed over' if going_home else 'failed over already'}
     vms = [v for v in vms if bool(v.get('failed_over')) == going_home]
     boot_groups = _group_vms_by_boot(vms)
-    failed = False
+    failed = cancelled = False
 
     logger.info(f"[SR] Starting {failover_type} failover for plan '{_sl(plan['name'])}' ({len(vms)} VMs, {len(boot_groups)} boot groups)")
     _broadcast_progress(plan_id, f"Starting {failover_type} failover...", 0)
@@ -636,6 +693,12 @@ def execute_failover(plan_id, failover_type='planned', authorized_vmids=None, on
             vmid = vm['vmid']
             vm_type = vm.get('vm_type', 'qemu')
             vm_name = vm.get('vm_name', f'VM {vmid}')
+            if cancelled or _stopping(plan_id):
+                # the guest before this one finished its step; this one is not begun
+                cancelled = True
+                results[str(vmid)] = {'success': False, 'cancelled': True, 'vm_name': vm_name,
+                                      'error': 'not started: the run was cancelled'}
+                continue
 
             # what refuses the guest before anything is written or asked; reads only
             err = None
@@ -720,21 +783,27 @@ def execute_failover(plan_id, failover_type='planned', authorized_vmids=None, on
             completed += 1
 
         # wait boot_delay before next group (use first VM's delay in group)
-        if group_idx < len(boot_groups) - 1:
+        if group_idx < len(boot_groups) - 1 and not cancelled:
             delay = group_vms[0].get('boot_delay', 30)
             if delay > 0:
                 logger.info(f"[SR] waiting {delay}s before next boot group")
                 _broadcast_progress(plan_id, f"Waiting {delay}s before next group...", int(completed / total_vms * 100))
-                time.sleep(delay)
+                # a second at a time, so a cancel does not wait out the delay
+                until = time.monotonic() + delay
+                while time.monotonic() < until and not _stopping(plan_id):
+                    time.sleep(min(1.0, until - time.monotonic()))
 
-    # done
+    # done; a cancelled run leaves the plan ready, as the cancel did before, with what it
+    # moved marked per guest
     final_status = 'failed' if failed else 'completed'
-    _complete_event(event_id, final_status, results)
+    _complete_event(event_id, 'cancelled' if cancelled else final_status, results)
 
     db = get_db()
     now = datetime.utcnow().isoformat()
     db.execute("UPDATE site_recovery_plans SET status = ?, last_failover = ?, updated_at = ? WHERE id = ?",
-               (final_status, now, now, plan_id))
+               ('ready' if cancelled else final_status, now, now, plan_id))
+    if cancelled:
+        final_status = 'cancelled'
 
     _fire_webhook(plan.get('post_failover_webhook'))
     _broadcast_progress(plan_id, f"Failover {final_status}", 100)
@@ -746,6 +815,7 @@ def execute_failover(plan_id, failover_type='planned', authorized_vmids=None, on
     logger.info(f"[SR] Failover {final_status} for '{_sl(plan['name'])}': {sum(1 for r in results.values() if r['success'])}/{total_vms} succeeded")
 
 
+@_on_the_plan('test')
 def execute_test_failover(plan_id, console_vmids=None, authorized_vmids=None):
     """Clone replicated VMs on target, start in test mode.
     VMs stay running until user triggers cleanup.
@@ -790,6 +860,11 @@ def execute_test_failover(plan_id, console_vmids=None, authorized_vmids=None):
             break
         vmid = vm['vmid']
         vm_name = vm.get('vm_name', f'VM {vmid}')
+        if _stopping(plan_id):
+            # what is cloned stays for the cleanup, nothing more is cloned
+            results[str(vmid)] = {'success': False, 'cancelled': True, 'vm_name': vm_name,
+                                  'error': 'not cloned: the test was cancelled'}
+            continue
         # MK May 2026 (#413) — site_recovery_vms has a `target_vmid` column for
         # asymmetric VMID mappings (xcrepl that renumbers, manual restore to a
         # new ID, etc). Prefer it when the operator filled it in; fall back to
@@ -954,6 +1029,7 @@ def execute_test_failover(plan_id, console_vmids=None, authorized_vmids=None):
     logger.info(f"[SR] Test failover complete for '{_sl(plan['name'])}': {len(test_vmids)} clones created")
 
 
+@_on_the_plan('cleanup')
 def cleanup_test(plan_id):
     """Stop and delete test clone VMs"""
     plan = _get_plan(plan_id)
@@ -1048,7 +1124,9 @@ def cleanup_test(plan_id):
         db.execute('UPDATE site_recovery_events SET details = ? WHERE id = ?',
                    (json.dumps(details), event['id']))
 
-    db.execute("UPDATE site_recovery_plans SET status = 'ready', updated_at = ? WHERE id = ?",
+    # only a plan in test: one a failover took over meanwhile keeps its state
+    db.execute("UPDATE site_recovery_plans SET status = 'ready', updated_at = ? WHERE id = ? "
+               "AND status NOT IN ('running', 'cancelling')",
                (datetime.utcnow().isoformat(), plan_id))
 
     log_audit('system', 'site_recovery.test_cleanup_complete',
@@ -1325,7 +1403,7 @@ def recover_orphan_runs():
         # then transitions to 'ready' on a manual reset).
         plan_rows = db.query(
             "SELECT id, name, status FROM site_recovery_plans "
-            "WHERE status IN ('running', 'testing')"
+            "WHERE status IN ('running', 'testing', 'cancelling')"
         ) or []
         for row in plan_rows:
             db.execute(
