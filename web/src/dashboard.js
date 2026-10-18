@@ -4956,6 +4956,48 @@
             );
         }
 
+        // NS Oct 2026 - power, costs and right-sizing come from a kept result, worked out off
+        // the server's main loop (helpers.history_report): say how old it is, and fetch again
+        // while a newer one is being worked out
+        function ReportStamp({ report, t }) {
+            if (!report?.computed_at) return null;
+            const at = new Date(report.computed_at);
+            if (isNaN(at.getTime())) return null;
+            const opts = { hour: '2-digit', minute: '2-digit', hour12: localStorage.getItem('pegaprox-time-format') === '12h' };
+            // a page left open overnight: the day too, or yesterday's figures read as today's
+            const time = at.toDateString() === new Date().toDateString()
+                ? at.toLocaleTimeString(undefined, opts)
+                : at.toLocaleString(undefined, { ...opts, day: '2-digit', month: '2-digit' });
+            return (
+                <div className="text-xs text-gray-500 mt-0.5" data-report-stamp>
+                    {(t('reportAsOf') || 'As of {time}').replace('{time}', () => time)}
+                    {report.refreshing && <span className="text-gray-400">{' · '}{t('reportUpdating') || 'updating'}</span>}
+                </div>
+            );
+        }
+
+        // `asking`: what the page shows (cluster, window); a new one starts with four tries again
+        function useReportFollowUp(report, refresh, asking) {
+            const latest = React.useRef(refresh);
+            latest.current = refresh;
+            const tries = React.useRef(0);
+            const seenAt = React.useRef(null);
+            const alive = React.useRef(true);
+            // one more round after every fetch, also one that failed and left `report` as it was
+            const [round, setRound] = React.useState(0);
+            React.useEffect(() => () => { alive.current = false; }, []);
+            React.useEffect(() => { tries.current = 0; }, asking);
+            React.useEffect(() => {
+                if (report?.computed_at !== seenAt.current) { seenAt.current = report?.computed_at; tries.current = 0; }
+                if (!report?.refreshing || tries.current >= 4) return;
+                const id = setTimeout(async () => {
+                    tries.current += 1;
+                    try { await latest.current(); } finally { if (alive.current) setRound(n => n + 1); }
+                }, 15000);
+                return () => clearTimeout(id);
+            }, [report, round]);
+        }
+
         // MK May 2026 — Power & Carbon Tracking. Same shape as Cost Dashboard
         // (rates editor + summary + per-VM table) but in kWh / kg CO₂.
         function PowerCarbonTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin }) {
@@ -4973,19 +5015,25 @@
             const [hostForm, setHostForm] = React.useState(null);
             const [savingHosts, setSavingHosts] = React.useState(false);
 
+            // NS Oct 2026 - only the newest request writes: a late answer for another window
+            // (a follow-up, a quick switch) must not land over the one now selected
+            const asked = React.useRef(0);
             const refresh = async () => {
                 if (!clusterId) return;
+                const mine = ++asked.current;
                 setLoading(true);
                 try {
                     const [s, p] = await Promise.all([
                         authFetch(`${API_URL}/clusters/${clusterId}/power/summary?days=${days}`).then(r => r?.json()).catch(() => null),
                         authFetch(`${API_URL}/clusters/${clusterId}/power/per-vm?days=${days}`).then(r => r?.json()).catch(() => null),
                     ]);
+                    if (mine !== asked.current) return;
                     if (s && !s.error) setSummary(s);
                     if (p && p.rows) setRows(p.rows);
-                } finally { setLoading(false); }
+                } finally { if (mine === asked.current) setLoading(false); }
             };
             React.useEffect(() => { refresh(); /* eslint-disable-line */ }, [clusterId, days]);
+            useReportFollowUp(summary, refresh, [clusterId, days]);
 
             const openRates = async () => {
                 const r = await authFetch(`${API_URL}/power/rates/${clusterId}`).then(x => x?.json()).catch(() => null);
@@ -5256,6 +5304,7 @@
                             <p className="text-xs text-gray-500 mt-0.5">
                                 {t('powerDesc') || 'Estimated electricity + CO₂ per VM, based on metrics history × node-power profile × PUE × grid CO₂ intensity.'}
                             </p>
+                            <ReportStamp report={summary} t={t} />
                         </div>
                         <div className="flex gap-2">
                             <select value={days} onChange={e => setDays(parseInt(e.target.value, 10))}
@@ -5571,20 +5620,24 @@
             const [savingRates, setSavingRates] = React.useState(false);
             const [sortBy, setSortBy] = React.useState('cost_total');
 
+            const asked = React.useRef(0);  // only the newest request writes, as in PowerCarbonTab
             const refresh = async () => {
                 if (!clusterId) return;
+                const mine = ++asked.current;
                 setLoading(true);
                 try {
                     const [s, p] = await Promise.all([
                         authFetch(`${API_URL}/clusters/${clusterId}/costs/summary?days=${days}`).then(r => r?.json()).catch(() => null),
                         authFetch(`${API_URL}/clusters/${clusterId}/costs/per-vm?days=${days}`).then(r => r?.json()).catch(() => null),
                     ]);
+                    if (mine !== asked.current) return;
                     if (s && !s.error) setSummary(s);
                     if (p && p.rows) setRows(p.rows);
-                } finally { setLoading(false); }
+                } finally { if (mine === asked.current) setLoading(false); }
             };
 
             React.useEffect(() => { refresh(); /* eslint-disable-line */ }, [clusterId, days]);
+            useReportFollowUp(summary, refresh, [clusterId, days]);
 
             const openRates = async () => {
                 const r = await authFetch(`${API_URL}/cost/rates/${clusterId}`).then(r => r?.json()).catch(() => null);
@@ -5781,6 +5834,7 @@
                             <p className="text-xs text-gray-500 mt-0.5">
                                 {t('costDashboardDesc') || 'Estimated chargeback per VM/CT based on metrics history × configured rates.'}
                             </p>
+                            <ReportStamp report={summary} t={t} />
                         </div>
                         <div className="flex gap-2">
                             <select value={days} onChange={e => setDays(parseInt(e.target.value, 10))}
@@ -9270,18 +9324,22 @@
             const [forcing, setForcing] = React.useState(false);
             const [exporting, setExporting] = React.useState(false);
 
+            const asked = React.useRef(0);  // only the newest request writes, as in PowerCarbonTab
             const refresh = async () => {
                 if (!clusterId) return;
+                const mine = ++asked.current;
                 setLoading(true);
                 try {
                     const [r1, r2] = await Promise.all([
                         authFetch(`${API_URL}/clusters/${clusterId}/insights/right-sizing`).then(r => r?.json()).catch(() => null),
                         authFetch(`${API_URL}/clusters/${clusterId}/insights/forecast`).then(r => r?.json()).catch(() => null),
                     ]);
+                    if (mine !== asked.current) return;
                     if (r1 && !r1.error) setRs(r1);
                     if (r2 && !r2.error) setFc(r2);
-                } finally { setLoading(false); }
+                } finally { if (mine === asked.current) setLoading(false); }
             };
+            useReportFollowUp(rs, refresh, [clusterId]);
 
             const refreshTop = async (metric) => {
                 if (!clusterId) return;
@@ -9597,6 +9655,7 @@
                             <p className="text-xs text-gray-500 mt-0.5">
                                 {t('insightsDesc') || 'Right-sizing recommendations + capacity forecasts based on 30 days of historical metrics.'}
                             </p>
+                            <ReportStamp report={rs} t={t} />
                         </div>
                         <div className="flex gap-2">
                             {canAct && (

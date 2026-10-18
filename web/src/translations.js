@@ -2468,6 +2468,9 @@
                 powerHostMaxW: 'Volllast (W)',
                 powerHostGone: 'nicht mehr im Cluster',
                 powerHostsSaved: 'Host-Profile gespeichert',
+                // NS Oct 2026 - how old the figures of a history report are
+                reportAsOf: 'Stand {time}',
+                reportUpdating: 'wird aktualisiert',
                 powerHostSaveFailed: 'Host-Profil konnte nicht gespeichert werden',
                 powerHostLoadFailed: 'Hosts konnten nicht geladen werden',
                 powerPerHost: 'Pro Host',
@@ -10196,6 +10199,9 @@
                 powerHostMaxW: 'Full load (W)',
                 powerHostGone: 'no longer in the cluster',
                 powerHostsSaved: 'Host profiles saved',
+                // NS Oct 2026 - how old the figures of a history report are
+                reportAsOf: 'As of {time}',
+                reportUpdating: 'updating',
                 powerHostSaveFailed: 'Could not save the host profile',
                 powerHostLoadFailed: 'Could not load the hosts',
                 powerPerHost: 'Per host',
@@ -17221,6 +17227,9 @@
                 powerHostMaxW: '满载 (W)',
                 powerHostGone: '已不在集群中',
                 powerHostsSaved: '主机配置已保存',
+                // NS Oct 2026 - how old the figures of a history report are
+                reportAsOf: '截至 {time}',
+                reportUpdating: '正在更新',
                 powerHostSaveFailed: '无法保存主机配置',
                 powerHostLoadFailed: '无法加载主机',
                 powerPerHost: '按主机',
@@ -23886,6 +23895,9 @@
                 powerHostMaxW: 'Pełne obciążenie (W)',
                 powerHostGone: 'nie należy już do klastra',
                 powerHostsSaved: 'Profile hostów zapisane',
+                // NS Oct 2026 - how old the figures of a history report are
+                reportAsOf: 'Stan na {time}',
+                reportUpdating: 'aktualizacja',
                 powerHostSaveFailed: 'Nie udało się zapisać profilu hosta',
                 powerHostLoadFailed: 'Nie udało się wczytać hostów',
                 powerPerHost: 'Według hosta',
@@ -30102,6 +30114,9 @@
                 powerHostMaxW: 'Pleine charge (W)',
                 powerHostGone: 'ne fait plus partie du cluster',
                 powerHostsSaved: 'Profils des hôtes enregistrés',
+                // NS Oct 2026 - how old the figures of a history report are
+                reportAsOf: 'Données de {time}',
+                reportUpdating: 'mise à jour en cours',
                 powerHostSaveFailed: 'Impossible d\'enregistrer le profil de l\'hôte',
                 powerHostLoadFailed: 'Impossible de charger les hôtes',
                 powerPerHost: 'Par hôte',
@@ -37166,6 +37181,9 @@
                 powerHostMaxW: 'Plena carga (W)',
                 powerHostGone: 'ya no pertenece al clúster',
                 powerHostsSaved: 'Perfiles de host guardados',
+                // NS Oct 2026 - how old the figures of a history report are
+                reportAsOf: 'Datos de las {time}',
+                reportUpdating: 'actualizando',
                 powerHostSaveFailed: 'No se pudo guardar el perfil del host',
                 powerHostLoadFailed: 'No se pudieron cargar los hosts',
                 powerPerHost: 'Por host',
@@ -44286,6 +44304,9 @@
                 powerHostMaxW: 'Carga total (W)',
                 powerHostGone: 'não faz mais parte do cluster',
                 powerHostsSaved: 'Perfis de host salvos',
+                // NS Oct 2026 - how old the figures of a history report are
+                reportAsOf: 'Dados de {time}',
+                reportUpdating: 'atualizando',
                 powerHostSaveFailed: 'Não foi possível salvar o perfil do host',
                 powerHostLoadFailed: 'Não foi possível carregar os hosts',
                 powerPerHost: 'Por host',
@@ -51110,6 +51131,9 @@
                 powerHostMaxW: '최대 부하 (W)',
                 powerHostGone: '더 이상 클러스터에 없음',
                 powerHostsSaved: '호스트 프로필이 저장되었습니다',
+                // NS Oct 2026 - how old the figures of a history report are
+                reportAsOf: '{time} 기준',
+                reportUpdating: '업데이트 중',
                 powerHostSaveFailed: '호스트 프로필을 저장할 수 없습니다',
                 powerHostLoadFailed: '호스트를 불러올 수 없습니다',
                 powerPerHost: '호스트별',
@@ -58336,6 +58360,9 @@
                 powerHostMaxW: 'Pieno carico (W)',
                 powerHostGone: 'non fa più parte del cluster',
                 powerHostsSaved: 'Profili host salvati',
+                // NS Oct 2026 - how old the figures of a history report are
+                reportAsOf: 'Dati delle {time}',
+                reportUpdating: 'aggiornamento in corso',
                 powerHostSaveFailed: 'Impossibile salvare il profilo host',
                 powerHostLoadFailed: 'Impossibile caricare gli host',
                 powerPerHost: 'Per host',
