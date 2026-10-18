@@ -826,6 +826,16 @@ def get_cert_info(ssl_dir):
                 subject_cn = attr.value
                 break
 
+        # MK Oct 2026 - a certificate may name its hosts in the SAN only (ACME CAs leave
+        # the CN out more and more): the subject is then the first of them
+        try:
+            domains = cert.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName).value.get_values_for_type(x509.DNSName)
+        except x509.ExtensionNotFound:
+            domains = []
+        if not subject_cn and domains:
+            subject_cn = domains[0]
+
         # check if it's a Let's Encrypt cert
         issuer_org = ''
         for attr in cert.issuer:
@@ -840,6 +850,7 @@ def get_cert_info(ssl_dir):
 
         return {
             'subject': subject_cn,
+            'domains': domains,
             'issuer': issuer_cn,
             'issuer_org': issuer_org,
             'expires': expires.isoformat(),
