@@ -264,3 +264,20 @@ def test_runtime_an_empty_watt_field_is_caught_before_it_is_sent(open_app):
     page.get_by_text('pve1: Enter idle and full-load watts').first.wait_for(timeout=5000)
     assert ('PUT', f'{HOSTS}/pve1') not in app.server.calls
     assert modal.is_visible()
+
+
+def test_runtime_refused_rates_say_why_and_keep_the_dialog(open_app):
+    """The server refuses rates it cannot count with (a PUE under 1, a negative price); the
+    dialog stayed open and said nothing."""
+    app = open_app()
+    app.server.extra[('GET', '/api/power/rates/c1')] = (200, RATES)
+    app.server.extra[('PUT', '/api/power/rates/c1')] = (400, {'error': 'pue must be at least 1'})
+    page = _open_power(app)
+    page.get_by_role('button', name='Rates', exact=True).click()
+    pue = page.locator('input[type="number"]').nth(3)
+    pue.wait_for(timeout=5000)
+    pue.fill('0.5')
+    page.get_by_role('button', name='Save', exact=True).click()
+    page.get_by_text('pue must be at least 1').first.wait_for(timeout=5000)
+    assert pue.is_visible() and pue.input_value() == '0.5'
+    assert app.server.bodies['/api/power/rates/c1'][-1]['pue'] == 0.5

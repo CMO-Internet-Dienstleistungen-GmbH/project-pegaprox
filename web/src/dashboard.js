@@ -5078,6 +5078,11 @@
                         addToast(t('powerRatesSaved') || 'Power rates saved', 'success');
                         setShowRates(false);
                         await refresh();
+                    } else if (r) {
+                        // LW Oct 2026 - the server refuses rates it cannot count with (a PUE under 1,
+                        // a negative price); the dialog stayed open and said nothing
+                        const body = await r.json().catch(() => ({}));
+                        addToast(body?.error || t('saveFailed') || 'Save failed', 'error');
                     }
                 } finally { setSavingRates(false); }
             };
