@@ -426,10 +426,6 @@ def delete_cluster_alert(cluster_id, alert_id):
         return jsonify({'error': safe_error(e, 'Alert operation failed')}), 500
 
 
-# incidents about a node itself, not about anything on it a confined caller may see
-_NODE_ONLY_METRICS = ('zfs_health', 'clock_drift', 'qdevice', 'ceph_osd_latency')
-
-
 @bp.route('/api/clusters/<cluster_id>/active-alerts', methods=['GET'])
 @require_auth()
 def get_active_alerts(cluster_id):
@@ -452,11 +448,11 @@ def get_active_alerts(cluster_id):
         incidents = [dict(zip(_q, r)) for r in rows]
         _ok = _alert_scoper(cluster_id)
         if _ok is not None:
-            # MK Oct 2026 - a ZFS pool is storage of a node, a Ceph OSD a disk of one, and a
-            # node's clock and QDevice daemon are the node's: a pool or guest grant reaches
-            # none of them
-            incidents = [i for i in incidents if i.get('metric') not in _NODE_ONLY_METRICS
-                         and (i.get('target_type') != 'vm' or _ok(i.get('target_id')))]
+            # MK Oct 2026 - its own guests' incidents and the cluster's (Ceph health). Nothing
+            # about a node: its pools, OSDs, clock and QDevice, a node threshold, a task without
+            # a guest - a pool or guest grant reaches none of them, and the rows name the nodes
+            incidents = [i for i in incidents if i.get('target_type') == 'cluster'
+                         or (i.get('target_type') == 'vm' and _ok(i.get('target_id')))]
         mutes = alert_events.active_mutes(cluster_id)
         out = []
         for i in incidents:

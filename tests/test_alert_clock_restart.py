@@ -426,6 +426,22 @@ def test_a_confined_caller_sees_its_guests_loops_and_no_clock(routes, monkeypatc
     assert len(routes.admin.get('/api/clusters/c1/alert-mutes').get_json()['mutes']) == 2
 
 
+def test_a_confined_caller_sees_no_incident_of_a_node(routes, monkeypatch, db):
+    # a node task without a guest and a node threshold name the nodes; the cluster's Ceph
+    # health stays, as for the ZFS pools (test_zfs_pool_health)
+    _incident(db, 'task_failed', 'task:pve3:vzdump:', 'node', 'pve3')
+    _incident(db, 'cpu', 'node:pve1', 'node', 'pve1', rid='r2')
+    _incident(db, 'ceph_health', 'ceph', 'cluster', '')
+    _incident(db, 'restart_loop', 'vm:101', 'vm', '101')
+    from pegaprox.utils import rbac
+    monkeypatch.setattr(rbac, 'user_can_access_vm', lambda u, cid, vmid, perm='vm.view', vt=None: int(vmid) == 101)
+    _store(monkeypatch)
+    rows = _who(routes, 'pool_confined').get('/api/clusters/c1/active-alerts').get_json()['active_alerts']
+    assert sorted(i['object_key'] for i in rows) == ['ceph', 'vm:101']
+    rows = routes.admin.get('/api/clusters/c1/active-alerts').get_json()['active_alerts']
+    assert len(rows) == 4
+
+
 def test_an_acknowledged_loop_stays_quiet_and_still_closes(routes, cluster, sent, monkeypatch, db):
     """Ack stops the escalation of an incident like any other; the rule still closes it
     once the guest is quiet."""
