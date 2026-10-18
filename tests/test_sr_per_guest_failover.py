@@ -580,3 +580,25 @@ def test_an_old_database_gets_the_columns_and_its_state_once(db):
     db._init_db()
     assert srw.replay_failover_state() is None
     assert _state(db) == {100: '', 101: ''}
+
+
+def test_a_plan_guest_links_only_its_own_replication_job(api, site):
+    # the link is what auto-failover asks about the replica, and what is held and switched
+    # off with the guest: another guest's job, or one between other clusters, is refused
+    db = site.db
+    _job(db, 'j100', 100)
+    _job(db, 'j101', 101)
+    _job(db, 'j100-far', 100, tgt='cluster_9')
+    _plan(db, plan_id='p2', guests=())
+    c = _admin(api, site)
+    add = '/api/site-recovery/plans/p2/vms'
+    for job in ('j101', 'j100-far', 'nope', {'id': 'j100'}):
+        r = c.post(add, json={'vmid': 100, 'replication_job_id': job})
+        assert r.status_code == 400, (job, r.data)
+    assert c.post(add, json={'vmid': 100, 'replication_job_id': 'j100'}).status_code == 201
+    assert c.post(add, json={'vmid': 101}).status_code == 201
+    vm = db.query_one("SELECT id FROM site_recovery_vms WHERE plan_id = 'p2' AND vmid = 101")['id']
+    edit = f'/api/site-recovery/plans/p2/vms/{vm}'
+    assert c.put(edit, json={'replication_job_id': 'j100'}).status_code == 400
+    assert c.put(edit, json={'replication_job_id': 'j101'}).status_code == 200
+    assert c.put(edit, json={'replication_job_id': ''}).status_code == 200

@@ -252,6 +252,25 @@ def _release_held_replication(plan, vm):
     return cur.rowcount
 
 
+def _replication_job_refusal(plan, vmid, job_id):
+    """Why `job_id` cannot be linked to guest `vmid` of `plan`, None when it can (or is empty).
+
+    MK Oct 2026 - the link is what the auto-failover asks about the guest's replica, what
+    holds a job while the guest is failed over and what switches it off when the guest
+    leaves the plan. It took any id, so a plan could lean on another guest's healthy job, or
+    hold and switch off a job of other clusters."""
+    if job_id in (None, ''):
+        return None
+    if not isinstance(job_id, str) or len(job_id) > 128:
+        return 'replication_job_id is the id of a replication job'
+    job = get_db().query_one('SELECT vmid, source_cluster, target_cluster FROM cross_cluster_replications '
+                             'WHERE id = ?', (job_id,))
+    if not job or str(job['vmid']) != str(vmid) or job['source_cluster'] != plan['source_cluster'] \
+            or job['target_cluster'] != plan['target_cluster']:
+        return "replication_job_id names no replication job of this guest between the plan's clusters"
+    return None
+
+
 def _vmid_list(vmids, cap=20):
     vmids = list(vmids)
     text = ', '.join(str(v) for v in vmids[:cap])
@@ -540,6 +559,10 @@ def add_plan_vm(plan_id):
     if not user_can_access_vm(user, plan['source_cluster'], data['vmid'], 'vm.view', vm_type):
         return jsonify({'error': 'Access denied: you do not have permission to add this VM to the plan'}), 403
 
+    _jerr = _replication_job_refusal(plan, data['vmid'], data.get('replication_job_id'))
+    if _jerr:
+        return jsonify({'error': _jerr}), 400
+
     vm_id = str(uuid.uuid4())[:8]
     db = get_db()
 
@@ -588,6 +611,10 @@ def update_plan_vm(plan_id, vm_id):
         return jsonify({'error': 'VM not found in plan'}), 404
 
     data = request.json or {}
+    if 'replication_job_id' in data:
+        _jerr = _replication_job_refusal(plan, row['vmid'], data['replication_job_id'])
+        if _jerr:
+            return jsonify({'error': _jerr}), 400
     allowed = {'boot_group', 'boot_delay', 'replication_job_id', 'notes', 'vm_name'}
     updates = []
     params = []
