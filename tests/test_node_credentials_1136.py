@@ -994,3 +994,35 @@ def test_a_failed_read_of_the_passwords_is_not_kept(monkeypatch):
     assert node_creds._loaded(CID) == ({}, {})
     assert node_creds._loaded(CID) == ({'pve2': 'own-pw'}, {'pve2': '10.0.0.2'})
     assert len(calls) == 2
+
+
+# --- the config backup ------------------------------------------------------------------
+
+def test_a_backup_with_the_secrets_carries_the_node_passwords_and_a_restore_brings_them_back(api, seed, stored):
+    import pegaprox.api.settings as settings_api
+    from test_sec_low_migrations import _ADMIN_PW, _BACKUP_PW, _admin_with_password
+    stored.save_cluster(CID, {'name': 'lab', 'host': A, 'user': 'root@pam', 'pass': 'x'})
+    admin = _admin_with_password(api, seed)
+
+    def export(secrets):
+        r = admin.post('/api/config/backup', json={'user_password': _ADMIN_PW, 'backup_password': _BACKUP_PW,
+                                                    'include_secrets': secrets})
+        assert r.status_code == 200, r.get_data(as_text=True)[:300]
+        return r.get_data(), json.loads(settings_api._decrypt_backup(r.get_data(), _BACKUP_PW))
+
+    _blob, plain = export(False)
+    assert 'node_credentials' not in plain and PW_B not in json.dumps(plain)
+    blob, full = export(True)
+    assert full['node_credentials'] == {CID: {'pve2': PW_B, 'pve3': PW_C}}
+
+    # a fresh instance: the rows are gone, the restore seals them again with its key
+    stored.delete_node_credential(CID, 'pve2')
+    stored.delete_node_credential(CID, 'pve3')
+    node_creds.invalidate()
+    r = admin.post('/api/config/restore', content_type='multipart/form-data',
+                   data={'user_password': _ADMIN_PW, 'backup_password': _BACKUP_PW,
+                         'backup_file': (io.BytesIO(blob), 'x.pegabackup')})
+    assert r.status_code == 200 and r.get_json()['restored']['node_credentials'] == 2, r.get_data(as_text=True)
+    assert node_creds.secrets_of(CID) == {'pve2': PW_B, 'pve3': PW_C}
+    raw = stored.conn.execute("SELECT password_encrypted FROM cluster_node_credentials WHERE node='pve2'").fetchone()[0]
+    assert raw.startswith('aes256:') and PW_B not in raw

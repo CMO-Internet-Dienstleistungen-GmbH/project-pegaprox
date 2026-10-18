@@ -2513,6 +2513,12 @@ def backup_config():
                 if isinstance(cluster_data, dict):
                     _strip_cluster_secrets(cluster_data)
         backup_data['clusters'] = clusters
+        # MK Oct 2026 - a node's own root password (#1136) goes where the cluster's goes: in
+        # a backup with the secrets only, sealed again with this instance's key on restore
+        if include_secrets:
+            from pegaprox.core import node_creds
+            backup_data['node_credentials'] = {cid: creds for cid in clusters
+                                               if (creds := node_creds.secrets_of(cid))}
         
         # Users (optional)
         if include_users:
@@ -2898,6 +2904,23 @@ def restore_config():
                     cluster_id_str = cluster.get('id', 'unknown') if isinstance(cluster, dict) else str(cluster)[:20]
                     results['errors'].append(f"Cluster {cluster_id_str}: {str(e)}")
             results['restored']['clusters'] = cluster_count
+
+        # the nodes' own passwords, of clusters this instance has now; a node without one in
+        # the backup keeps what it has
+        if isinstance(data.get('node_credentials'), dict):
+            from pegaprox.core import node_creds
+            cred_count = 0
+            for cid, creds in data['node_credentials'].items():
+                if not isinstance(creds, dict) or not database.get_cluster(cid):
+                    continue
+                for node, value in creds.items():
+                    if not node_creds.node_name_ok(node) or node_creds.value_problem(value):
+                        results['errors'].append(f"Cluster {cid}: the password of a node was not restored")
+                        continue
+                    if not dry_run:
+                        node_creds.store(cid, node, value, username)
+                    cred_count += 1
+            results['restored']['node_credentials'] = cred_count
         
         # Users (only if explicitly requested)
         if restore_users and 'users' in data:
