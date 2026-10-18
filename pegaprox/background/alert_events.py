@@ -206,7 +206,9 @@ def check_pattern(pattern):
                 if in_repeat:
                     raise ValueError('a repeat inside a repeat can take very long to fail')
                 repeats[0] += 1
-                walk(sub, True)
+                # x? matches once or not at all: what is inside it, alternatives too, is no
+                # more inside a repeat than it was (vz(dump|restore)? is fine); a * or + is
+                walk(sub, in_repeat if hi == 1 else True)
             elif name == 'BRANCH':
                 if in_repeat:
                     raise ValueError('alternatives inside a repeat can take very long to fail')

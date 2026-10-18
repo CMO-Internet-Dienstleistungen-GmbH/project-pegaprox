@@ -739,7 +739,8 @@ def test_a_metric_rule_that_asks_hears_its_incident_is_over(db, sent, monkeypatc
 # --- patterns --------------------------------------------------------------------------
 
 @pytest.mark.parametrize('pattern', ['vzdump', 'qm.*|vz.*', '.*error.*', 'job errors|unexpected',
-                                     '^vz(dump|migrate)$', '(?:qm)?start', '[a-z]+ failed'])
+                                     '^vz(dump|migrate)$', '(?:qm)?start', '[a-z]+ failed',
+                                     'vz(dump|restore)?', '(OK|WARNINGS)?', '(qm|vz)?(start|stop)'])
 def test_patterns_people_write_are_taken(pattern):
     assert E.check_pattern(pattern)
 
