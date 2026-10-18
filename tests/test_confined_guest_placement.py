@@ -160,6 +160,25 @@ def test_a_new_guest_from_a_restore_keeps_to_the_tenant_range(api, seed):
     assert post.call_count == 2
 
 
+def test_a_restore_over_a_gone_guest_keeps_to_the_tenant_range(api, seed):
+    # VM 555 is not there: "into the same VMID" makes it anew, as another VMID would
+    seed.db.save_tenant('ranged', {'name': 'ranged', 'clusters': [CID],
+                                   'vmid_range_start': 1000, 'vmid_range_end': 1999})
+    u = seed.user('ranged_op', role='viewer', tenant_id='ranged',
+                  permissions=['backup.restore', 'vm.backup', 'vm.view', 'cluster.view'])
+    m = _restore_manager(api)
+    post = m._create_session.return_value.post
+    gone = 'pbs:backup/vm/555/2026-10-01T00:00:00Z'
+    r = api.as_user(u).post(f'/api/clusters/{CID}/vms/pve2/qemu/555/backups/restore', json={'volid': gone})
+    assert r.status_code == 403 and '1000-1999' in r.get_json()['error'], r.data
+    r = api.as_user(u).post(f'/api/clusters/{CID}/backup-restore', json={
+        'mode': 'overwrite', 'volid': gone, 'target_node': 'pve2', 'target_vmid': 555})
+    assert r.status_code == 403 and '1000-1999' in r.get_json()['error'], r.data
+    assert not post.called
+    # VM 100 is there: over it, it stays an overwrite
+    assert _restore(api.as_user(u), 'pve1', 100).status_code == 200
+
+
 # --- cross-cluster migration --------------------------------------------------------------------
 
 def _xc(client, **extra):

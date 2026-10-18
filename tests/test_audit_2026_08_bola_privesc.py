@@ -104,6 +104,8 @@ def test_restore_backup_allows_own_source(api, seed):
     fake.is_connected = True; fake.host = 'h'; fake.api_port = 8006
     fake.config = MagicMock(); fake.config.name = 'cluster_1'
     fake._api_post.return_value = resp
+    # VM 100 is there: over a guest that is gone the restore is a new guest (range, node)
+    fake.get_vm_resources.return_value = [{'vmid': 100, 'node': 'node1', 'type': 'qemu'}]
     api.set_manager('cluster_1', fake)
 
     r = api.as_user(bob).post('/api/clusters/cluster_1/backup-restore', json={

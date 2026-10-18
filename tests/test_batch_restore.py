@@ -427,6 +427,22 @@ def test_new_guests_keep_to_the_tenant_range(api, seed):
     pve.finish_all()
 
 
+def test_an_overwrite_of_a_gone_guest_keeps_to_the_tenant_range(api, seed):
+    # 5000 is in no live list: restoring "over" it makes it anew, outside the range
+    pve = _Pve(api)
+    seed.db.save_tenant('ranged', {'name': 'ranged', 'clusters': [CID],
+                                   'vmid_range_start': 1000, 'vmid_range_end': 1999})
+    ops = api.as_user(seed.user('ranged_op', role='user', tenant_id='ranged'))
+    r = _post(ops, items=[{'volid': _vol(5000)}], mode='overwrite', confirm=True, target_node='pve1')
+    assert r.status_code == 403 and '1000-1999' in r.get_json()['refused'][0]['error'], r.data
+    assert pve.started == []
+    # over a guest that is there it stays an overwrite, wherever its VMID lies
+    run = _start(ops, [_vol(1000)], mode='overwrite', confirm=True)
+    assert [x['target_vmid'] for x in run['rows']] == [1000] and not run['rows'][0].get('creates')
+    _wait(lambda: pve.running() == [1000])
+    pve.finish_all()
+
+
 def test_a_caller_without_vm_backup_starts_nothing(api, seed):
     pve = _Pve(api)
     c = api.as_user(seed.user('looker', role='viewer'))

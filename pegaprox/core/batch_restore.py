@@ -252,7 +252,8 @@ def cancel(run, by):
 
 def _may(run, row):
     """Whoever started the batch may still restore this one: the source backup, and the guest
-    it overwrites or the VMID range it creates in. Asked again at most once a minute."""
+    it overwrites or the VMID range it creates in (also over a guest that is gone). Asked
+    again at most once a minute."""
     from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import user_can_access_vm, acts_as_admin, check_tenant_vmid, DEFAULT_TENANT_ID
     now = time.time()
@@ -265,7 +266,7 @@ def _may(run, row):
         return 'Permission denied: the account that started it is gone or disabled'
     if not acts_as_admin(u) and not user_can_access_vm(u, run.cluster_id, row['vmid'], 'vm.backup', row['type']):
         return 'Permission denied for source backup'
-    if run.mode == 'overwrite':
+    if run.mode == 'overwrite' and not row.get('creates'):
         if not user_can_access_vm(u, run.cluster_id, row['target_vmid'], 'vm.backup', row['type']):
             return 'Permission denied for target VM'
     elif not acts_as_admin(u):

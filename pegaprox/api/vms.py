@@ -1754,10 +1754,11 @@ def restore_vm_backup(cluster_id, node, vm_type, vmid):
             return jsonify({'error': 'Permission denied for source backup'}), 403
         # another VMID makes this a new guest, which keeps to what the PBS twin asks of one
         # (restore_backup, mode 'new'): the tenant's VMID range, and for a confined caller a
-        # node one of their guests lives on (#1081)
-        if str(target_vmid) != str(vmid):
+        # node one of their guests lives on (#1081). MK Oct 2026 - so does the same VMID when
+        # that guest is gone: the restore makes it anew, on the node in the URL
+        from pegaprox.api.pbs import _authz_restore_node, guest_is_there
+        if str(target_vmid) != str(vmid) or not guest_is_there(cluster_id, vmid):
             from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID
-            from pegaprox.api.pbs import _authz_restore_node
             _rok, _rmsg = check_tenant_vmid(_authz_user.get('tenant_id') or DEFAULT_TENANT_ID, target_vmid)
             if not _rok:
                 return jsonify({'error': _rmsg}), 403

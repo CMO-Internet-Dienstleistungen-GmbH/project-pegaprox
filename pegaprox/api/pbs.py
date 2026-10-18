@@ -4525,6 +4525,16 @@ def restore_backup(cluster_id):
         return jsonify({'error': safe_error(e)}), 500
 
 
+def guest_is_there(cluster_id, vmid):
+    """Whether the live view of the cluster has this VMID. A list that cannot be read counts
+    as not there, so a restore over it is asked what a new guest is."""
+    try:
+        return any(str(g.get('vmid')) == str(vmid)
+                   for g in (cluster_managers[cluster_id].get_vm_resources(max_age=5) or []))
+    except Exception:
+        return False
+
+
 def _restore_refusal(cluster_id, user, volid, target_node, target_vmid, mode, node_checked=False):
     """The checks of a restore: an error response when `user` may not restore `volid` into
     `target_vmid` on `target_node` this way, else None. node_checked: the caller asked
@@ -4550,7 +4560,11 @@ def _restore_refusal(cluster_id, user, volid, target_node, target_vmid, mode, no
     # including one inside another tenant's configured VMID range, and onto storage they have
     # no claim to. vms.py has enforced the range on create since the tenant-limits work; the
     # restore path never learned about it.
-    if mode == 'new' and not acts_as_admin(user):
+    # MK Oct 2026 - and so does an overwrite of a guest that is gone: it makes the guest anew,
+    # in the backup's VMID, on the node named
+    creates = mode == 'new' or (mode == 'overwrite' and not acts_as_admin(user)
+                                and not guest_is_there(cluster_id, target_vmid))
+    if creates and not acts_as_admin(user):
         from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID as _DT
         _rok, _rmsg = check_tenant_vmid(user.get('tenant_id') or _DT, target_vmid)
         if not _rok:
@@ -4650,6 +4664,8 @@ def _batch_items(cluster_id, cm, body):
             clash = (jsonify({'error': 'Another batch restore is restoring one of these guests'}), 409)
         for volid, src, kind, _want in picked:
             rows.append(batch.new_row(src, kind, volid, src, where.get(src) or body['target_node']))
+            if src not in where:
+                rows[-1]['creates'] = True       # the guest is gone: this makes it anew
         return rows, storage, None, clash
     taken = set(where) | busy
     if taken & set(wanted):
@@ -4734,8 +4750,9 @@ def restore_backup_batch(cluster_id):
         if _nerr:
             return _nerr
     for row in rows:
+        # an overwrite of a guest that is gone asks for its node itself
         r = _restore_refusal(cluster_id, user, row['volid'], row['node'], row['target_vmid'],
-                             body['mode'], node_checked=True)
+                             body['mode'], node_checked=body['mode'] == 'new')
         if r:
             refused.append({'volid': row['volid'], 'vmid': row['vmid'],
                             'error': (r[0].get_json(silent=True) or {}).get('error') or 'Refused'})
