@@ -1000,7 +1000,11 @@ def get_timeline_evidence():
     # once it is full the next cluster is read no deeper than the oldest event kept. Each
     # walked to a cap of its own, 50 busy clusters held a million events for 20000.
     events, sources, truncated = [], {}, False
+    from pegaprox.utils.concurrent import HubTurns
+    turns = HubTurns()
     for cid in ids:
+        # up to 50 clusters, each read and sorted here: the others get the hub in between
+        turns.take()
         floor = tl.order(events[-1]) if len(events) >= fr.EVENTS_MAX else None
         got, notes, more = _walk_cluster(cid, cluster_managers[cid], user, since, until, kinds, severities,
                                          fr.EVENTS_MAX, floor=floor)

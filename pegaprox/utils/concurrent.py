@@ -51,6 +51,42 @@ def _carried(tasks):
     return [ha.carry(task) for task in tasks]
 
 
+def yield_to_hub():
+    """Let the other greenlets of this thread run. MK Oct 2026 - for a long loop of plain
+    Python in a request: on the hub it holds every other request, event stream and console
+    of the process until it is through (and the HA lease renewal with them), so it lets
+    them in between its steps. Nothing where this thread has no hub (a pool thread).
+
+    A millisecond, not sleep(0) or idle(): sleep(0) comes straight back before the loop looks
+    at its timers and sockets (a ranking that yielded that way still held them almost a
+    second), and idle() waits for a loop with nothing pending, which a busy one never is.
+    A timer makes the loop go round once and always comes back."""
+    try:
+        from gevent import getcurrent, sleep
+        from gevent._hub_local import get_hub_if_exists
+    except ImportError:
+        return
+    hub = get_hub_if_exists()
+    if hub is not None and getcurrent() is not hub:
+        sleep(0.001)
+
+
+class HubTurns:
+    """yield_to_hub() from a loop at most every `every` seconds: a step costs a clock read,
+    a turn a millisecond, so a loop of a thousand quick steps does not pay a second for it
+    and none holds the hub much longer than `every` plus one step."""
+
+    def __init__(self, every=0.02):
+        import time
+        self._clock = time.monotonic
+        self.every, self.last = every, self._clock()
+
+    def take(self):
+        if self._clock() - self.last >= self.every:
+            yield_to_hub()
+            self.last = self._clock()
+
+
 def run_concurrent(tasks: list, timeout: float = 30.0) -> list:
     """Run tasks concurrently with gevent pool"""
     # NS: chatgpt helped with this one, i was mass confused about greenlets

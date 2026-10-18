@@ -3303,8 +3303,11 @@ def _guest_text_filter(rows, text):
     # per cluster and only when a term asks for them
     indexes = {}
     wants_index = any(t.field in ('ip', 'mac', 'notes') for t in reading.terms)
+    from pegaprox.utils.concurrent import HubTurns
+    turns = HubTurns()         # as the global search: many terms over 10k guests take a while
     out = []
     for g in rows:
+        turns.take()
         entry = None
         if wants_index:
             cid = g['cluster_id']

@@ -1109,7 +1109,10 @@ def _maintenance(run):
     placed = {_sid(vm): vm.get('node') for vm in run.running}
     if not avail and going:
         run.limit('no_target', _KNOWN, guests=[int(v['vmid']) for v in going])
+    from pegaprox.utils.concurrent import HubTurns
+    turns = HubTurns()          # every guest of the nodes, each weighed against every target
     for vm in going:
+        turns.take()
         vmid, node = int(vm['vmid']), vm['node']
         facts = run.facts.get(vmid)
         if not avail:
@@ -1288,7 +1291,11 @@ def _headroom(run):
         placed_sets = sets[:PAIRS_PLACED]
         if len(sets) > len(placed_sets):
             run.assume('headroom_pairs', placed=len(placed_sets), total=len(sets))
+    # MK Oct 2026 - at 200 nodes the pairs alone are 19900: the hub gets turns in between
+    from pegaprox.utils.concurrent import HubTurns
+    turns = HubTurns()
     for failed in placed_sets:
+        turns.take()
         row, load = simulate(failed)
         combos.append(row)
         for n in candidates:
@@ -1305,6 +1312,7 @@ def _headroom(run):
                 for n in candidates}
         total_free = sum(free.values())
         for failed in sets[len(placed_sets):]:
+            turns.take()
             moved = sum(g[0] for f in failed for g in per_node[f])
             room = total_free - sum(free[f] for f in failed)
             quorate, left, need = _vote_math(run, [n for n in run.online if n not in failed])
@@ -1896,10 +1904,15 @@ def ranking(mgr, thresholds=None, critical_tags=None):
     budget = {'left': RANK_CONFIG_READS}
     deadline = time.monotonic() + RANK_SECONDS
     ranked, skipped, cut, unread = [], [], None, 0
+    from pegaprox.utils.concurrent import HubTurns
+    turns = HubTurns()
     for i, (kind, name, sc) in enumerate(todo):
         if time.monotonic() > deadline:
             cut = {'ranked': len(ranked) + len(skipped), 'left': len(todo) - i}
             break
+        # MK Oct 2026 - each candidate walks every guest (about 20 ms at 10k): the others
+        # get the hub in between, or a hundred nodes held the process for two seconds
+        turns.take()
         try:
             sim = _Run(mgr, sc, thresholds, budget)
             rep = _SCENARIO_FN[sc['type']](sim)

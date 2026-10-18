@@ -863,7 +863,13 @@ def intra(cluster_id, mgr, vmids, target=None, online=True, with_local_disks=Fal
             run_per_node({n: (lambda nm: side.bridges(nm)) for n in pool}, max_concurrent=CONFIG_FANOUT,
                          timeout=max(30, len(pool) // CONFIG_FANOUT * 10 + 30))
 
+    from pegaprox.utils.concurrent import HubTurns
+    turns = HubTurns()
     for gv in todo:
+        # MK Oct 2026 - without a target every guest tries every node of the pool: a
+        # thousand guests on a hundred nodes held the hub four seconds, now it is let go
+        # between them
+        turns.take()
         t = target or _pick(side, sim, gv, pool, online, with_local_disks)
         gv.row['to'] = t
         if not t:

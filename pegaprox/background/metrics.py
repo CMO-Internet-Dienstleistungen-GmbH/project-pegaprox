@@ -250,6 +250,10 @@ def load_metrics_history(days=None, totals_only=False):
 # the worker thread, so the multi-MB snapshots never pile up.
 _RANGE_ROWS = 200
 _RANGE_MAX_SECONDS = 366 * 86400
+# MK Oct 2026 - one range parse at a time. A range is up to 200 whole snapshots, seconds of
+# parsing at 10k guests, and each took one of the slots the cached report reads share: a
+# few chart drags at once held all of them, and the power, cost and insight pages waited
+_range_slot = []
 
 
 def history_range(args, now=None):
@@ -274,6 +278,16 @@ def history_range(args, now=None):
         return None, None, 'A range spans a year at most'
     now = time.time() if now is None else now
     return max(start, now - _retention_days() * 86400), min(end, now), None
+
+
+def _range_sem():
+    if not _range_slot:
+        try:
+            from gevent.lock import BoundedSemaphore
+            _range_slot.append(BoundedSemaphore(1))
+        except Exception:
+            _range_slot.append(None)
+    return _range_slot[0]
 
 
 def load_metrics_range(start, end, pick):
@@ -305,11 +319,10 @@ def load_metrics_range(start, end, pick):
            'ORDER BY timestamp ASC LIMIT ?')
     params = (lo, hi, lo, hi, lo, hi, _RANGE_ROWS, _RANGE_ROWS, _RANGE_ROWS * 2)
     try:
-        # the same cap the cached heavy reads take: no more parses at once than those
+        # the same cap the cached heavy reads take, and never more than one of its slots
+        from contextlib import nullcontext
         sem = _heavy_sem()
-        if sem is None:
-            return run_heavy_read(sql, params, transform=_parse)
-        with sem:
+        with (_range_sem() or nullcontext()), (sem or nullcontext()):
             return run_heavy_read(sql, params, transform=_parse)
     except Exception as e:
         logging.error(f"Error loading a metrics range: {e}")

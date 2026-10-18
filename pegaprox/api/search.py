@@ -341,8 +341,11 @@ def _search_facts(r, cluster_id, cluster_name, indexed):
 
 def _search_results(reading, guests, nodes, search_type):
     """The rows global_search answers with for one reading of the query."""
+    from pegaprox.utils.concurrent import HubTurns
+    turns = HubTurns()         # 20 terms over 10k guests is half a second (MK Oct 2026)
     results = []
     for g in guests:
+        turns.take()
         hits = reading.match(search_query.guest_hit, g)
         if hits is None:
             continue
