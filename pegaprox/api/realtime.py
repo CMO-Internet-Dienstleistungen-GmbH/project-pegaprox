@@ -108,7 +108,14 @@ def ws_live_updates(ws):
             ws.send(json.dumps({'type': 'error', 'message': 'Authentication required'}))
             return
         _allowed = get_user_clusters(_user_data)  # None = admin (all clusters)
-        subscribed_clusters = _scope_ws_clusters(_allowed, auth_data.get('clusters', None))
+        # MK Oct 2026 - the connect message is checked like the subscribe message below: an
+        # unrestricted caller's list went into the registry as sent, and one unhashable entry
+        # stalls the broadcaster for every client
+        _requested = _cluster_id_list(auth_data.get('clusters', None))
+        if _requested is False:
+            ws.send(json.dumps({'type': 'error', 'message': 'clusters must be a list of cluster ids'}))
+            return
+        subscribed_clusters = _scope_ws_clusters(_allowed, _requested)
 
         # sec (audit): the delivery loop now filters per-VM 'action' frames for non-admins, and
         # `subscribed is None` does NOT mean admin (get_user_clusters returns None for a
