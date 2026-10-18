@@ -107,3 +107,14 @@ def test_an_admin_resets_as_before(api, estate, db):
     r = api.as_user(estate.user('root', role='admin')).post(f'/api/clusters/{CL}/drift/baseline')
     assert r.status_code == 200, r.get_data(as_text=True)
     assert set(_baselines(db)) == {('storage', 'local'), ('cluster_options', 'cluster')}
+
+
+def test_a_policy_violation_is_acknowledged_by_whoever_may_change_the_cluster(auditor, operator, db):
+    # acknowledged, it is not raised again while the offenders stay the same
+    db.conn.execute("UPDATE drift_events SET category = 'policy_violation' WHERE id = 7")
+    db.conn.commit()
+    r = auditor.post('/api/drift/events/7/acknowledge', json={})
+    assert r.status_code == 403 and 'policy violation' in r.get_json()['error'], r.get_data(as_text=True)
+    assert _event(db)['status'] == 'open'
+    assert operator.post('/api/drift/events/7/acknowledge', json={}).status_code == 200
+    assert dict(_event(db)) == {'status': 'acknowledged', 'acknowledged_by': 'op'}

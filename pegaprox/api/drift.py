@@ -629,7 +629,7 @@ def _record_event(cluster_id, kind, scope, diffs, severity, summary, category=CA
         return None
 
 
-def _refuse_baseline_write():
+def _refuse_baseline_write(what='changing a drift baseline'):
     """403 unless the caller may also change the cluster's configuration, else None.
 
     NS Oct 2026 - admin.audit reads drift. Rewriting a baseline accepts whatever changed
@@ -638,7 +638,7 @@ def _refuse_baseline_write():
     from pegaprox.utils.auth import build_authz_user
     from pegaprox.utils.rbac import has_permission
     if not has_permission(build_authz_user(_current_user(), request.session), 'cluster.config'):
-        return jsonify({'error': 'Permission denied: changing a drift baseline needs cluster.config',
+        return jsonify({'error': f'Permission denied: {what} needs cluster.config',
                         'code': 'MISSING_PERMISSION', 'required': 'cluster.config'}), 403
     return None
 
@@ -1444,6 +1444,14 @@ def acknowledge_event(eid):
         _cerr = require_unconfined(ev['cluster_id'])
         if _cerr:
             return _cerr
+        # MK Oct 2026 - a policy violation is not raised again while its offenders stay the
+        # same, and an acknowledged one no longer counts as open: acknowledging it silences
+        # the rule, which is the configuration's business, not a reader's (a deviation comes
+        # back with the next scan and stays the auditor's to acknowledge)
+        if (ev['category'] if 'category' in ev.keys() else '') == CATEGORY_POLICY:
+            _werr = _refuse_baseline_write('acknowledging a policy violation')
+            if _werr:
+                return _werr
         if promote:
             if (ev['category'] if 'category' in ev.keys() else '') == CATEGORY_POLICY:
                 # a violation of a rule has no baseline to rebase onto
