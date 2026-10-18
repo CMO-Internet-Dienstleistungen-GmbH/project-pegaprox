@@ -137,9 +137,10 @@ def test_a_report_past_the_keep_window_is_waited_for(api, seed, monkeypatch):
 
 def test_changed_rates_are_worked_out_before_the_answer(api, seed, monkeypatch):
     _cluster(api, monkeypatch)
+    monkeypatch.setattr(costs, '_load_history', lambda *a, **k: _history(2))
     c = api.as_user(_admin(seed))
     before = c.get('/api/clusters/cluster_1/costs/summary?days=1')
-    assert before.status_code == 200, before.get_data(as_text=True)
+    assert before.status_code == 200 and before.get_json()['enough_data'], before.get_data(as_text=True)
     r = c.put('/api/cost/rates/cluster_1', json={'cpu_per_core_h': 1.0, 'mem_per_gb_h': 0.0,
                                                   'storage_per_gb_month': 0.0, 'currency': 'EUR'})
     assert r.status_code == 200, r.get_data(as_text=True)
