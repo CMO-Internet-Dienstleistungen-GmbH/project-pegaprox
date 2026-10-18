@@ -442,6 +442,38 @@ def test_a_test_guest_kept_through_backup_verify_counts_against_the_quota(api, s
     assert r.status_code == 403 or not kept, (r.status_code, kept)
 
 
+def test_a_manual_restore_test_names_its_guest_once(report, monkeypatch):
+    seen = []
+    monkeypatch.setattr(bv, 'start_verification', lambda mgr, data: seen.append(dict(data)) or 'task1')
+    volid = 'pbs:backup/vm/100/2026-10-01T00:00:00Z'
+    r = report.admin.post('/api/clusters/c1/backup-verify', json={'node': 'pve1', 'vmid': '100', 'backup_volid': volid})
+    assert r.status_code == 200, r.data
+    assert seen[0]['vmid'] == 100
+    # "100" and 100 are one guest for the check that lets one copy of it run at a time
+    monkeypatch.setattr(bv, '_active_verifications', {})
+    bv._register({'cluster_id': 'c1', 'vmid': 100})
+    with pytest.raises(Exception, match='already running'):
+        bv._register({'cluster_id': 'c1', 'vmid': '100'})
+
+
+def test_a_confined_caller_tests_a_restore_on_its_own_nodes_and_the_set_storage(report, monkeypatch):
+    seen = []
+    monkeypatch.setattr(bv, 'start_verification', lambda mgr, data: seen.append(dict(data)) or 'task1')
+    report.seed.tenant('t_confined', [])
+    report.seed.vm_acl('c1', 100, ['portal'], permissions=['vm.view', 'vm.backup'])
+    c = report.api.as_user(report.seed.user('portal', role='user', tenant_id='t_confined', permissions=['vm.backup']))
+    body = {'vmid': 100, 'backup_volid': 'pbs:backup/vm/100/2026-10-01T00:00:00Z', 'storage': 'big-ssd'}
+    # VM 100 lives on pve1: pve2 is no node of theirs
+    r = c.post('/api/clusters/c1/backup-verify', json=dict(body, node='pve2'))
+    assert r.status_code == 403 and 'node' in r.get_json()['error'], r.data
+    assert seen == []
+    assert c.post('/api/clusters/c1/backup-verify', json=dict(body, node='pve1')).status_code == 200
+    assert 'storage' not in seen[0]
+    # counterproof: an admin picks both
+    assert report.admin.post('/api/clusters/c1/backup-verify', json=dict(body, node='pve2')).status_code == 200
+    assert seen[1]['storage'] == 'big-ssd' and seen[1]['node'] == 'pve2'
+
+
 def test_the_verification_routes_do_not_show_the_command_either(report, db):
     """The same caller with vm.backup on its guest: the settings mask the command, the
     status and history of a verification hand it back in the checks and the logs."""

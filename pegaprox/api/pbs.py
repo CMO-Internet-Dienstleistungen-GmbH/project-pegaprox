@@ -2789,6 +2789,18 @@ def start_backup_verification(cluster_id):
     # foreign archive in an odd format and the bind is skipped.
     if _volid and (not _m or int(_m.group(1)) != _vmid):
         return jsonify({'error': 'Access denied: backup_volid does not belong to the given VM'}), 403
+    # MK Oct 2026 - the number, not the text: "100" and " 100" each passed the one-at-a-time
+    # check of the guest, and each started a copy of it
+    data['vmid'] = _vmid
+    # a confined caller places the copy as a new guest of theirs: on a node one of their
+    # guests lives on, and on the storage the restore tests are set to, not one they name
+    _au = build_authz_user(request.session.get('user', ''), request.session)
+    from pegaprox.api.helpers import caller_is_scoped
+    if caller_is_scoped(_au, cluster_id):
+        _nerr = _authz_restore_node(cluster_id, data['node'], _au)
+        if _nerr:
+            return _nerr
+        data.pop('storage', None)
 
     data['cluster_id'] = cluster_id
     pve_mgr = cluster_managers[cluster_id]

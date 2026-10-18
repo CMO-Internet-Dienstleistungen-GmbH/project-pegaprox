@@ -104,7 +104,7 @@ def _register(params):
     _prune_done()
     with _verify_lock:
         for v in _active_verifications.values():
-            if v.get('vmid') == params.get('vmid') and v.get('cluster_id') == params.get('cluster_id') \
+            if str(v.get('vmid')) == str(params.get('vmid')) and v.get('cluster_id') == params.get('cluster_id') \
                     and v['status'] == 'running':
                 raise Exception(f"Verification already running for VM {params.get('vmid')}")
         task_id = str(uuid.uuid4())[:12]
