@@ -3091,8 +3091,10 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         "echo 'INJECTION_OK'\n"
     )
 
+    # Fork patch #15 - node_exec only when a caller supplied one, so the VMware direction
+    # calls _write_node_script exactly as upstream does.
     sf = _write_node_script(pve_mgr, node, script, f"virtio-inject-{task.proxmox_vmid}",
-                           node_exec=run_on_node)
+                           **({'node_exec': node_exec} if node_exec else {}))
     if not sf:
         task.log("[VirtIO] ✗ the injection script could not be written on the node")
         return False
