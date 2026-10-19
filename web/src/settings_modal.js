@@ -2870,6 +2870,7 @@
                 smtp_from_name: 'PegaProx Alerts',
                 smtp_tls: true,
                 smtp_ssl: false,
+                smtp_verify_tls: true,
                 alert_email_recipients: [],
                 alert_cooldown: 300,
                 alert_update_available: false,
@@ -3712,6 +3713,7 @@
                             smtp_from_name: data.smtp_from_name || 'PegaProx Alerts',
                             smtp_tls: data.smtp_tls !== false,
                             smtp_ssl: data.smtp_ssl || false,
+                            smtp_verify_tls: data.smtp_verify_tls !== false,
                             // Alert settings
                             alert_email_recipients: data.alert_email_recipients || [],
                             alert_cooldown: data.alert_cooldown || 300,
@@ -4098,6 +4100,7 @@
                             smtp_from_name: serverSettings.smtp_from_name,
                             smtp_tls: serverSettings.smtp_tls,
                             smtp_ssl: serverSettings.smtp_ssl,
+                            smtp_verify_tls: serverSettings.smtp_verify_tls !== false,
                             alert_email_recipients: serverSettings.alert_email_recipients,
                             alert_cooldown: serverSettings.alert_cooldown,
                             alert_update_available: !!serverSettings.alert_update_available,
@@ -4151,7 +4154,8 @@
                             smtp_from_email: serverSettings.smtp_from_email,
                             smtp_from_name: serverSettings.smtp_from_name || 'PegaProx Alerts',
                             smtp_tls: serverSettings.smtp_tls !== false,
-                            smtp_ssl: serverSettings.smtp_ssl || false
+                            smtp_ssl: serverSettings.smtp_ssl || false,
+                            smtp_verify_tls: serverSettings.smtp_verify_tls !== false
                         })
                     });
                     
@@ -8666,6 +8670,27 @@
                                                         <span className="text-sm text-gray-300">{t('smtpSsl')} (SSL/TLS)</span>
                                                     </label>
                                                 </div>
+                                                
+                                                {/* LW Oct 2026: check the relay's certificate, off only for a self-signed relay */}
+                                                {(serverSettings.smtp_tls || serverSettings.smtp_ssl) && (
+                                                    <div className="space-y-2">
+                                                        <label className="flex items-center gap-2 cursor-pointer">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={serverSettings.smtp_verify_tls !== false}
+                                                                onChange={e => setServerSettings({...serverSettings, smtp_verify_tls: e.target.checked})}
+                                                                className="rounded"
+                                                            />
+                                                            <span className="text-sm text-gray-300">{t('smtpVerifyTls')}</span>
+                                                        </label>
+                                                        {serverSettings.smtp_verify_tls === false && (
+                                                            <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg">
+                                                                <p className="text-sm text-red-400 font-medium mb-1">⚠ {t('securityWarning')}</p>
+                                                                <p className="text-xs text-red-400/80">{t('smtpVerifyTlsWarning')}</p>
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
                                                 
                                                 {/* Test Email */}
                                                 <div className="pt-3 border-t border-proxmox-border">

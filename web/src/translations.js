@@ -6646,6 +6646,9 @@
                 maintDlgAck: 'Ich habe verstanden, Wartung trotzdem aktivieren',
                 maintDlgEnable: 'Wartung aktivieren',
                 maintDlgMore: 'und {n} weitere',
+                // LW Oct 2026 - SMTP: check the mail server certificate
+                smtpVerifyTls: 'Serverzertifikat prüfen',
+                smtpVerifyTlsWarning: 'Das Zertifikat des Mailservers wird nicht geprüft. Jeder im Netzwerkpfad kann sich als Server ausgeben und das SMTP-Passwort und jede Mail mitlesen. Nur für ein Relay mit selbst-signiertem Zertifikat in einem vertrauenswürdigen Netz abschalten.',
                 // LW Oct 2026 (#625) - the banners of a group that fails over automatically, for every user
                 haNoLeader: 'Zurzeit kein Leader - Änderungen und Automatisierung pausieren. Konsolen funktionieren weiter.',
                 haTakeover: 'Leader {leader} übernimmt - Änderungen gehen in {n} s weiter.',
@@ -13777,6 +13780,9 @@
                 maintDlgAck: 'I understand, enable maintenance anyway',
                 maintDlgEnable: 'Enable maintenance',
                 maintDlgMore: 'and {n} more',
+                // LW Oct 2026 - SMTP: check the mail server certificate
+                smtpVerifyTls: 'Verify the server certificate',
+                smtpVerifyTlsWarning: 'The certificate of the mail server is not checked. Anyone on the network path can pose as the server and read the SMTP password and every mail. Turn this off only for a relay with a self-signed certificate in a trusted network.',
                 // LW Oct 2026 (#625) - the banners of a group that fails over automatically, for every user
                 haNoLeader: 'No leader at the moment - changes and automation are paused. Consoles keep working.',
                 haTakeover: 'Leader {leader} is taking over - changes resume in {n} s.',
@@ -20456,6 +20462,9 @@
                 maintDlgAck: '我已了解,仍然启用维护模式',
                 maintDlgEnable: '启用维护模式',
                 maintDlgMore: '另有 {n} 个',
+                // LW Oct 2026 - SMTP: check the mail server certificate
+                smtpVerifyTls: '验证服务器证书',
+                smtpVerifyTlsWarning: '不检查邮件服务器的证书。网络路径上的任何人都可以冒充该服务器，读取 SMTP 密码和每一封邮件。仅在受信任网络中使用自签名证书的中继时才关闭此项。',
                 // LW Oct 2026 (#625) - the banners of a group that fails over automatically, for every user
                 haNoLeader: '当前没有主实例 - 更改和自动化已暂停。控制台仍可继续使用。',
                 haTakeover: '主实例 {leader} 正在接管 - 更改将在 {n} 秒后恢复。',
@@ -27125,6 +27134,9 @@
                 maintDlgAck: 'Rozumiem, włącz tryb serwisowy mimo to',
                 maintDlgEnable: 'Włącz tryb serwisowy',
                 maintDlgMore: 'i {n} więcej',
+                // LW Oct 2026 - SMTP: check the mail server certificate
+                smtpVerifyTls: 'Weryfikuj certyfikat serwera',
+                smtpVerifyTlsWarning: 'Certyfikat serwera poczty nie jest sprawdzany. Każdy na trasie połączenia może podszyć się pod serwer i odczytać hasło SMTP oraz każdą wiadomość. Wyłączaj tylko dla przekaźnika z certyfikatem samopodpisanym w zaufanej sieci.',
                 // LW Oct 2026 (#625) - the banners of a group that fails over automatically, for every user
                 haNoLeader: 'Obecnie brak lidera - zmiany i automatyzacja są wstrzymane. Konsole działają dalej.',
                 haTakeover: 'Lider {leader} przejmuje - zmiany wrócą za {n} s.',
@@ -34224,6 +34236,9 @@
                 maintDlgAck: 'J\'ai compris, activer quand même la maintenance',
                 maintDlgEnable: 'Activer la maintenance',
                 maintDlgMore: 'et {n} de plus',
+                // LW Oct 2026 - SMTP: check the mail server certificate
+                smtpVerifyTls: 'Vérifier le certificat du serveur',
+                smtpVerifyTlsWarning: 'Le certificat du serveur de messagerie n\'est pas vérifié. N\'importe qui sur le trajet réseau peut se faire passer pour le serveur et lire le mot de passe SMTP et chaque e-mail. À désactiver uniquement pour un relais avec un certificat auto-signé dans un réseau de confiance.',
                 // LW Oct 2026 (#625) - the banners of a group that fails over automatically, for every user
                 haNoLeader: 'Aucun leader pour le moment - les modifications et l\'automatisation sont en pause. Les consoles continuent de fonctionner.',
                 haTakeover: 'Le leader {leader} prend le relais - les modifications reprennent dans {n} s.',
@@ -41337,6 +41352,9 @@
                 maintDlgAck: 'Lo entiendo, activar el mantenimiento de todos modos',
                 maintDlgEnable: 'Activar mantenimiento',
                 maintDlgMore: 'y {n} más',
+                // LW Oct 2026 - SMTP: check the mail server certificate
+                smtpVerifyTls: 'Verificar el certificado del servidor',
+                smtpVerifyTlsWarning: 'No se comprueba el certificado del servidor de correo. Cualquiera en la ruta de red puede hacerse pasar por el servidor y leer la contraseña SMTP y cada correo. Desactívelo solo para un relay con certificado autofirmado en una red de confianza.',
                 // LW Oct 2026 (#625) - the banners of a group that fails over automatically, for every user
                 haNoLeader: 'Ahora mismo no hay líder - los cambios y la automatización están en pausa. Las consolas siguen funcionando.',
                 haTakeover: 'El líder {leader} está tomando el relevo - los cambios se reanudan en {n} s.',
@@ -48295,6 +48313,9 @@
                 maintDlgAck: 'Entendi, ativar a manutenção mesmo assim',
                 maintDlgEnable: 'Ativar manutenção',
                 maintDlgMore: 'e mais {n}',
+                // LW Oct 2026 - SMTP: check the mail server certificate
+                smtpVerifyTls: 'Verificar o certificado do servidor',
+                smtpVerifyTlsWarning: 'O certificado do servidor de e-mail não é verificado. Qualquer um no caminho da rede pode se passar pelo servidor e ler a senha SMTP e cada e-mail. Desative apenas para um relay com certificado auto-assinado em uma rede confiável.',
                 // LW Oct 2026 (#625) - the banners of a group that fails over automatically, for every user
                 haNoLeader: 'Sem líder no momento - alterações e automação estão pausadas. Os consoles continuam funcionando.',
                 haTakeover: 'O líder {leader} está assumindo - as alterações voltam em {n} s.',
@@ -55482,6 +55503,9 @@
                 maintDlgAck: '이해했습니다. 그래도 유지보수를 켭니다',
                 maintDlgEnable: '유지보수 켜기',
                 maintDlgMore: '외 {n}개',
+                // LW Oct 2026 - SMTP: check the mail server certificate
+                smtpVerifyTls: '서버 인증서 확인',
+                smtpVerifyTlsWarning: '메일 서버 인증서를 확인하지 않습니다. 네트워크 경로상의 누구든 서버로 위장하여 SMTP 비밀번호와 모든 메일을 읽을 수 있습니다. 신뢰할 수 있는 네트워크에서 자체 서명 인증서를 쓰는 릴레이에만 끄세요.',
                 // LW Oct 2026 (#625) - the banners of a group that fails over automatically, for every user
                 haNoLeader: '현재 리더 없음 - 변경과 자동화가 일시 중지됨. 콘솔은 계속 작동합니다.',
                 haTakeover: '리더 {leader}이(가) 넘겨받는 중 - {n}초 후 변경이 재개됩니다.',
@@ -62556,6 +62580,9 @@
                 maintDlgAck: 'Ho capito, attiva comunque la manutenzione',
                 maintDlgEnable: 'Attiva manutenzione',
                 maintDlgMore: 'e altri {n}',
+                // LW Oct 2026 - SMTP: check the mail server certificate
+                smtpVerifyTls: 'Verifica il certificato del server',
+                smtpVerifyTlsWarning: 'Il certificato del server di posta non viene verificato. Chiunque sul percorso di rete può spacciarsi per il server e leggere la password SMTP e ogni e-mail. Disattivare solo per un relay con certificato auto-firmato in una rete fidata.',
                 // LW Oct 2026 (#625) - the banners of a group that fails over automatically, for every user
                 haNoLeader: 'Al momento nessun leader - modifiche e automazione sono in pausa. Le console continuano a funzionare.',
                 haTakeover: 'Il leader {leader} sta subentrando - le modifiche riprendono tra {n} s.',
