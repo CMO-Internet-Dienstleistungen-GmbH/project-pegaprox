@@ -775,6 +775,23 @@ def test_optional_parts_count_as_repeats():
     assert E.check_pattern('x{3}.*y')
 
 
+@pytest.mark.parametrize('pattern', ['(.*a){10}', '(a|aa){25}', r'(\w+\s?){12}Z', '(?:x?){20}Z'])
+def test_a_fixed_count_of_a_part_that_varies_is_refused(pattern):
+    # {n} is no choice of its own, but the part it repeats chooses n times over
+    with pytest.raises(ValueError):
+        E.check_pattern(pattern)
+
+
+def test_a_fixed_count_of_a_plain_part_is_taken_and_the_refused_ones_are_slow():
+    import re
+    for slow, subject in (('(.*a){10}Z', 'a' * 28), ('(a|aa){25}Z', 'a' * 36)):
+        t = time.monotonic()
+        re.search(slow, subject)
+        assert time.monotonic() - t > 0.05, f'the counterproof {slow} got fast - pick another'
+    for pattern in (r'UPID:\w+:[0-9A-F]{8}', r'\d{4}-\d{2}', '(ab){3}', '(vz(dump|restore)){1}', 'x{3}.*y'):
+        assert E.check_pattern(pattern), pattern
+
+
 # --- the routes ------------------------------------------------------------------------
 
 def _store(monkeypatch, rules=None):

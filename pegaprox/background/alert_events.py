@@ -198,10 +198,12 @@ def check_pattern(pattern):
             name = str(op)
             if name in ('MAX_REPEAT', 'MIN_REPEAT', 'POSSESSIVE_REPEAT'):
                 lo, hi, sub = av
-                # x{n} - a fixed count, nothing to backtrack over. x? is a choice like any other
-                # repeat: '.?' * 20 + 'Z' takes seconds to fail on a 66-character task status
+                # x{n} - a fixed count is no choice, but what it repeats is repeated all the
+                # same: (.*a){10} or (a|aa){25} take seconds to fail on 30 characters. x? is
+                # a choice like any other repeat: '.?' * 20 + 'Z' takes seconds to fail on a
+                # 66-character task status
                 if lo == hi:
-                    walk(sub, in_repeat)
+                    walk(sub, in_repeat if hi <= 1 else True)
                     continue
                 if in_repeat:
                     raise ValueError('a repeat inside a repeat can take very long to fail')
