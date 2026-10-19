@@ -18973,7 +18973,7 @@
                         // rollup and has no Proxmox status route; asking anyway put a
                         // standing WinRM load on a customer's hypervisor for numbers no
                         // view shows.
-                        const connectedClusters = data.filter(c => c.connected && c.cluster_type !== 'esxi' && hvType(c) !== 'hyperv');
+                        const connectedClusters = data.filter(c => c.connected && c.cluster_type !== 'esxi').filter(c => hvType(c) !== 'hyperv');
                         const allGuests = [];
                         
                         // NS #594 — this used to be a serial await-loop: one slow cluster

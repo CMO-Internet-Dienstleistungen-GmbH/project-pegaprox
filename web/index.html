@@ -9694,7 +9694,7 @@ const currentSelected=selectedClusterRef.current;if(currentSelected){const updat
 // rollup and has no Proxmox status route; asking anyway put a
 // standing WinRM load on a customer's hypervisor for numbers no
 // view shows.
-const connectedClusters=data.filter(c=>c.connected&&c.cluster_type!=='esxi'&&hvType(c)!=='hyperv');const allGuests=[];// NS #594 — this used to be a serial await-loop: one slow cluster
+const connectedClusters=data.filter(c=>c.connected&&c.cluster_type!=='esxi').filter(c=>hvType(c)!=='hyperv');const allGuests=[];// NS #594 — this used to be a serial await-loop: one slow cluster
 // stalled every cluster behind it and made the whole overview lag.
 // Run the clusters concurrently (each still does its two reads in order).
 await Promise.allSettled(connectedClusters.map(async cluster=>{// NS May 2026 — skip clusters that recently 503'd/timed out until cooldown
