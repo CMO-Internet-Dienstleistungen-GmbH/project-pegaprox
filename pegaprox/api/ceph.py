@@ -491,6 +491,10 @@ def get_node_ceph_config(cluster_id, node):
 def get_node_ceph_log(cluster_id, node):
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # the cluster log of the whole Ceph, same as the node syslog
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     manager, error = get_connected_manager(cluster_id)
     if error: return error
@@ -1101,12 +1105,23 @@ def init_ceph(cluster_id, node):
 # so we SSH into a node and run rbd CLI commands directly.
 # ============================================
 
+# MK Oct 2026 - Ceph is the cluster's storage, a pool or a guest grant does not cover
+# its mirroring either: pools, peers and sites of the whole cluster. A confined caller
+# gets an empty answer before any SSH, so the mirroring pane just shows no pools.
+def _mirror_confined(cluster_id):
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.api.helpers import caller_is_scoped
+    return caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session), cluster_id)
+
+
 @bp.route('/api/clusters/<cluster_id>/ceph/mirror/overview', methods=['GET'])
 @require_auth(perms=['cluster.view'])
 def get_mirror_overview(cluster_id):
     """LW: overview of mirroring status across all pools"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    if _mirror_confined(cluster_id):
+        return jsonify({'pools': [], 'node': None, 'confined': True})
 
     manager, error = get_connected_manager(cluster_id)
     if error: return error
@@ -1165,6 +1180,8 @@ def get_mirror_pool_status(cluster_id, pool):
     if not ok: return err
     if not _valid_pool(pool):
         return jsonify({'error': 'Invalid pool name'}), 400
+    if _mirror_confined(cluster_id):
+        return jsonify({'summary': {}, 'confined': True})
 
     manager, error = get_connected_manager(cluster_id)
     if error: return error
@@ -1573,6 +1590,8 @@ def get_mirror_schedules(cluster_id, pool):
     if not ok: return err
     if not _valid_pool(pool):
         return jsonify({'error': 'Invalid pool name'}), 400
+    if _mirror_confined(cluster_id):
+        return jsonify([])      # the answer is a list, "no schedules" is the empty one
 
     manager, error = get_connected_manager(cluster_id)
     if error: return error

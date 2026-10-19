@@ -988,6 +988,11 @@ def get_node_syslog_api(cluster_id, node):
     """Get node system log"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # MK Oct 2026 - the host journal: sshd logins, other accounts, every guest on the node.
+    # Not for a caller confined to a pool or a few guests, like the node-level task logs.
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
