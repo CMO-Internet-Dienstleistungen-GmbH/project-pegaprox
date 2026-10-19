@@ -7697,11 +7697,11 @@
                                             </div>
                                         ) : (
                                             <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg">
-                                                <p className="text-xs text-green-400">✓ {t('oidcPrivateIpDisabled') || 'SSRF guard active — private/loopback IPs rejected. Turn on only if your IdP runs on an internal network (10.x / 192.168.x / 172.16-31.x).'}</p>
+                                                <p className="text-xs text-green-400">✓ {t('oidcPrivateIpDisabled') || 'SSRF guard active: private and loopback addresses are refused. Turn on only if your IdP runs on an internal network (10.x, 172.16-31.x, 192.168.x, or 100.64.0.0/10 such as Tailscale or CGNAT, which is refused too since 1.4.0).'}</p>
                                             </div>
                                         )}
                                         <p className="text-[11px] text-gray-500 leading-snug">
-                                            {t('oidcPrivateIpHint') || 'Affects: the /.well-known/openid-configuration discovery call only. Other outbound paths (webhooks, plugin upstreams, SAML metadata) keep the strict guard.'}
+                                            {t('oidcPrivateIpHint') || 'Affects: discovery, the authorization, token and userinfo endpoints and the signing keys of the IdP. Other outbound paths (webhooks, plugin upstreams, SAML metadata) keep the strict guard.'}
                                         </p>
                                     </div>
 
@@ -8287,8 +8287,8 @@
                                                                 onChange={e => setServerSettings({...serverSettings, acme_allow_private_ca: e.target.checked})}
                                                                 className="rounded border-proxmox-border bg-proxmox-darker"
                                                             />
-                                                            <span className="text-sm text-gray-300">{t('acmeAllowPrivateCa') || 'Allow private/internal ACME CA'}</span>
-                                                            <span className="text-xs text-gray-500">({t('acmeAllowPrivateCaHint') || 'permit an RFC1918/loopback directory, e.g. an internal StepCA'})</span>
+                                                            <span className="text-sm text-gray-300">{t('acmeAllowPrivateCa') || 'Allow a private or internal ACME CA'}</span>
+                                                            <span className="text-xs text-gray-500">({t('acmeAllowPrivateCaHint') || 'a directory on a private address (10.x, 172.16-31.x, 192.168.x, 100.64.0.0/10) or loopback, e.g. an internal step-ca'})</span>
                                                         </label>
                                                     </div>
                                                 )}
