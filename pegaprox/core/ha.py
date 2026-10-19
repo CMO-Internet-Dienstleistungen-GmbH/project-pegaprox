@@ -327,6 +327,9 @@ SYNC_TABLES = (
     'custom_cloud_templates', 'power_rates', 'power_host_profiles', 'cost_rates',
     'auto_install_profiles',
     'pegaprox_kv',
+    # Hyper-V migration sources: the hosts with their credentials, and which Proxmox VMID each
+    # source guest was given, so a standby that takes over does not hand the same one out again
+    'hyperv_hosts', 'hyperv_vmid_map', 'hyperv_vmid_sequence',
     # Proxmox HA rules a rolling update switched off: whoever acts next switches them on (#954)
     'suspended_ha_rules',
     # a rolling update and the phase each node is in: the next active pauses a run it finds
@@ -356,6 +359,8 @@ LOCAL_TABLES = (
     'node_state_history',
     # who wrote what on the active, and the change counter behind cv_tick
     'ha_change_journal', 'ha_cv_dirty',
+    # the state of a Hyper-V migration that runs in this process, and the claim that keeps two apart
+    'hyperv_migrations', 'hyperv_migration_claims',
 )
 
 # server_settings keys that describe this host, not the deployment
