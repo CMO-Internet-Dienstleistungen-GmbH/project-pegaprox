@@ -395,9 +395,10 @@ class TestARunThatCompletedWithErrors:
         assert "d.status === 'completed_with_errors')));" in rows
         assert "warned ? '!'" in rows
 
-    def test_the_label_exists_in_both_languages(self):
+    def test_the_label_exists_in_every_language(self):
+        # one definition per UI language: de, en, zh, pl, fr, es, pt, ko, it
         with open(os.path.join(REPO, 'web', 'src', 'translations.js'), encoding='utf-8') as fh:
-            assert fh.read().count('xhmCompletedWithErrors:') == 2
+            assert fh.read().count('xhmCompletedWithErrors:') == 9
 
 
 class TestTheListSpeaksInWords:
