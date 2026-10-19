@@ -734,14 +734,22 @@ def update_policy(cluster_id, pid):
     # ones, and the policy then runs as whoever retargeted it, not as its old creator (#1011)
     retarget = (str(tt), str(tv)[:300]) != (cur['target_type'], cur['target_value'])
     denied = []
-    for _tt, _tvv in [(tt, tv)] + ([(cur['target_type'], cur['target_value'])] if retarget else []):
+    _walk = [(tt, tv)] + ([(cur['target_type'], cur['target_value'])] if retarget else [])
+    for _i, (_tt, _tvv) in enumerate(_walk):
         if mgr:
             try:
-                denied += [f"{t}/{v}@{n}" for n, v, t in _resolve_targets(mgr, {
-                               'target_type': _tt, 'target_value': _tvv, 'cluster_id': cluster_id})
+                _targets = _resolve_targets(mgr, {
+                    'target_type': _tt, 'target_value': _tvv, 'cluster_id': cluster_id})
+                denied += [f"{t}/{v}@{n}" for n, v, t in _targets
                            if not user_can_access_vm(creator, cluster_id, v, 'vm.snapshot', t)]
             except Exception as e:
                 return jsonify({'error': f'failed to resolve targets: {e}'}), 400
+            # the stored target is walked last. A new target may match nothing yet, the
+            # stored one matching nothing does not make the policy the caller's
+            if not _targets and _i == len(_walk) - 1:
+                from pegaprox.api.helpers import caller_is_scoped
+                if caller_is_scoped(creator, cluster_id) and not _empty_policy_is_callers(creator, cluster_id, cur):
+                    denied.append('<no current target>')
         else:
             _tv = str(_tvv).strip()
             if str(_tt).lower() in ('vm', 'vmid') and _tv.lstrip('-').isdigit():
@@ -824,11 +832,16 @@ def delete_policy(cluster_id, pid):
     if not mgr:
         return jsonify({'error': 'cluster manager not found'}), 404
     caller = build_authz_user(request.session.get('user', ''), request.session)
+    _pol = _row_to_policy(prow)
     try:
-        denied = [f"{t}/{v}@{n}" for n, v, t in _resolve_targets(mgr, _row_to_policy(prow))
+        _targets = _resolve_targets(mgr, _pol)
+        denied = [f"{t}/{v}@{n}" for n, v, t in _targets
                   if not user_can_access_vm(caller, cluster_id, v, 'vm.snapshot', t)]
     except Exception as e:
         return jsonify({'error': f'failed to resolve targets: {e}'}), 400
+    from pegaprox.api.helpers import caller_is_scoped
+    if not _targets and caller_is_scoped(caller, cluster_id) and not _empty_policy_is_callers(caller, cluster_id, _pol):
+        denied = ['<no current target>']
     if denied:
         # don't echo the specific out-of-scope VM identifiers back — that would disclose the
         # existence/ids of VMs the caller has no access to (info leak). Log server-side only.
@@ -870,11 +883,17 @@ def run_policy_now(cluster_id, pid):
     _missing = xapi_permission_missing(cluster_id, caller, 'vm.snapshot')
     if _missing:
         return jsonify({'error': f'Permission denied: {_missing}'}), 403
+    _pol = _row_to_policy(prow)
     try:
-        denied = [f"{t}/{v}@{n}" for n, v, t in _resolve_targets(mgr, _row_to_policy(prow))
+        _targets = _resolve_targets(mgr, _pol)
+        denied = [f"{t}/{v}@{n}" for n, v, t in _targets
                   if not user_can_access_vm(caller, cluster_id, v, 'vm.snapshot', t)]
     except Exception as e:
         return jsonify({'error': f'failed to resolve targets: {e}'}), 400
+    # a policy that matches nothing right now: same rule as for its run log
+    from pegaprox.api.helpers import caller_is_scoped
+    if not _targets and caller_is_scoped(caller, cluster_id) and not _empty_policy_is_callers(caller, cluster_id, _pol):
+        denied = ['<no current target>']
     if denied:
         # don't echo the specific out-of-scope VM identifiers back — that would disclose the
         # existence/ids of VMs the caller has no access to (info leak). Log server-side only.
@@ -887,6 +906,23 @@ def run_policy_now(cluster_id, pid):
                          name=f'snap-run-{pid}')
     t.start()
     return jsonify({'ok': True, 'message': 'policy run started'})
+
+
+def _empty_policy_is_callers(caller, cluster_id, policy, perm='vm.snapshot'):
+    """A policy whose targets resolve to nothing right now: may this scoped caller have it?
+
+    MK Oct 2026 - the walks over the resolved targets had nothing to deny on such a policy,
+    so a confined caller read the run log of a policy whose guests had left it, and could
+    edit, delete or run it. Now it is theirs when they made it, or when it names guests by
+    vmid and they may reach each of them. A tag no longer says which guests it had."""
+    owner = policy.get('created_by') or ''
+    if owner and owner == _current_user():
+        return True
+    if str(policy.get('target_type') or '').lower() not in ('vm', 'vmid'):
+        return False
+    ids = [x.strip() for x in str(policy.get('target_value') or '').split(',') if x.strip()]
+    return bool(ids) and all(i.isdigit() and user_can_access_vm(caller, cluster_id, int(i), perm)
+                             for i in ids)
 
 
 def _policy_targets_authorized(cluster_id, policy, perm='vm.snapshot'):
@@ -903,7 +939,10 @@ def _policy_targets_authorized(cluster_id, policy, perm='vm.snapshot'):
     mgr = cluster_managers.get(cluster_id)
     if mgr:
         try:
-            for _n, _v, _t in _resolve_targets(mgr, policy):
+            _targets = _resolve_targets(mgr, policy)
+            if not _targets:
+                return _empty_policy_is_callers(creator, cluster_id, policy, perm)
+            for _n, _v, _t in _targets:
                 if not user_can_access_vm(creator, cluster_id, _v, perm, _t):
                     return False
             return True
