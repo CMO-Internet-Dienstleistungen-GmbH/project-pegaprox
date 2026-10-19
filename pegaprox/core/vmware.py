@@ -22,6 +22,33 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from pegaprox.core.db import get_db
 from pegaprox.globals import vmware_managers
 
+
+def esxi_target_refusal(host, allow_loopback: bool = True) -> str:
+    """Why PegaProx will not dial an ESXi host somebody typed in, or '' when it may.
+
+    MK Oct 2026 - add, update and test-connection dialled any host, and the error of the
+    attempt told whether something listened there. Same rule as the PBS twin: the LAN stays
+    open, link-local and cloud metadata never, loopback for a global admin only.
+    The host goes into https://{host}:{port}/ as it is, so it has to be a bare name or
+    address (IPv6 in brackets is fine). A '/', '@' or '#' would move the URL to a host
+    the check never looked at.
+    """
+    import ipaddress
+    from pegaprox.utils.url_security import infra_target_refusal
+
+    host = host.strip() if isinstance(host, str) else ''
+    bare = host[1:-1] if host.startswith('[') and host.endswith(']') else host
+    if not re.fullmatch(r'[A-Za-z0-9._:-]+', bare):
+        return 'Invalid ESXi host'
+    # a colon or brackets only make sense around an IPv6 address
+    if ':' in bare or bare != host:
+        try:
+            ipaddress.IPv6Address(bare)
+        except ValueError:
+            return 'Invalid ESXi host'
+    return infra_target_refusal(bare, allow_loopback=allow_loopback, label='ESXi host')
+
+
 class VMwareManager:
     """Manages connection to a vCenter Server or standalone ESXi host.
     

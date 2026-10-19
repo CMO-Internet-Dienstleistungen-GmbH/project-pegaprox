@@ -48,32 +48,14 @@ def pbs_target_refusal(host: str, allow_loopback: bool = True) -> str:
     has no PBS on it, and the errors of a connection attempt tell whether anything listens
     there. Loopback only for a global admin, who may run PegaProx on the PBS host itself.
     A name that does not resolve is left to the connection, which reports it anyway.
+    The address rule lives in url_security.infra_target_refusal, ESXi uses it too.
     """
-    import ipaddress
-    import socket
-    from pegaprox.utils.url_security import _embedded_ipv4
+    from pegaprox.utils.url_security import infra_target_refusal
 
     host = (host or '').strip()
     if not _validate_pbs_host(host):
         return 'Invalid PBS host'
-    try:
-        found = socket.getaddrinfo(host, None)
-    except (OSError, UnicodeError):
-        return ''
-    for info in found:
-        try:
-            ip = ipaddress.ip_address(str(info[4][0]).split('%', 1)[0])
-        except ValueError:
-            continue
-        # the address itself and an IPv4 one carried inside it (mapped, 6to4, NAT64)
-        for addr in (ip, _embedded_ipv4(ip)):
-            if addr is None:
-                continue
-            if addr.is_link_local or str(addr) == 'fd00:ec2::254':
-                return 'The PBS host is a link-local or cloud metadata address'
-            if not allow_loopback and (addr.is_loopback or addr.is_unspecified):
-                return 'The PBS host is a loopback address of this server'
-    return ''
+    return infra_target_refusal(host, allow_loopback=allow_loopback, label='PBS host')
 
 class _PinnedFingerprintAdapter(requests.adapters.HTTPAdapter):
     """Verify the peer certificate against a configured SHA-256 fingerprint.

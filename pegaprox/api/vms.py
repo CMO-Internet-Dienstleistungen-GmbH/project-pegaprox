@@ -1393,6 +1393,8 @@ def download_iso_from_url(cluster_id, storage_name):
         # metadata-by-hostname. Delegate to the central guard, which fails CLOSED
         # (require_resolution) and blocks private/loopback/link-local/metadata. The URL is
         # fetched by the Proxmox node, so this SSRF would fire from the PVE management LAN.
+        # MK Oct 2026 - for CGNAT that only holds since url_security checks 100.64/10 itself,
+        # the stdlib does not call it private. It is refused like RFC1918 now.
         from pegaprox.utils.url_security import resolve_and_pin_url, SsrfError
         try:
             # GHSA-hmcf-9q7f-vx35 — the download is delegated to the PVE node, which re-resolves the

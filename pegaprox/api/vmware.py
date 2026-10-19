@@ -20,8 +20,8 @@ from pegaprox.utils.sanitization import sanitize_log_message as _sl
 from pegaprox.utils.rbac import user_can_access_vmware_vm, acts_as_admin
 from pegaprox.api.helpers import (check_cluster_access, check_vmware_access, caller_is_scoped,
                                   acting_user, vmware_server_reach, upstream_failure,
-                                  UPSTREAM_AUTH_STATUSES)
-from pegaprox.core.vmware import VMwareManager, load_vmware_servers, save_vmware_server
+                                  UPSTREAM_AUTH_STATUSES, caller_acts_as_admin)
+from pegaprox.core.vmware import VMwareManager, load_vmware_servers, save_vmware_server, esxi_target_refusal
 from pegaprox.core.v2p import V2PMigrationTask, _run_v2p_migration
 from pegaprox.background.broadcast import broadcast_resources_loop
 
@@ -46,6 +46,11 @@ def _esxi_failed(result):
     if isinstance(status, int) and status >= 500:
         return jsonify(result), 502
     return jsonify(result), status or 500
+
+
+def _target_refusal(host):
+    """esxi_target_refusal for the caller of this request: loopback for a global admin only."""
+    return esxi_target_refusal(host, allow_loopback=caller_acts_as_admin())
 
 # =============================================================================
 
@@ -112,6 +117,9 @@ def add_vmware_server():
         return jsonify({'error': 'Username is required'}), 400
     if not data.get('password'):
         return jsonify({'error': 'Password is required'}), 400
+    _why = _target_refusal(data.get('host'))
+    if _why:
+        return jsonify({'error': _why}), 400
     
     vmware_id = str(uuid.uuid4())[:8]
     
@@ -197,6 +205,14 @@ def update_vmware_server(vmware_id):
     elif (data.get('host') and data.get('host') != _row['host']) or \
          (data.get('port') and int(data.get('port', 443)) != int(_row['port'] or 443)):
         host_changed = True
+    if host_changed:
+        # a new port on the old host is a new target as well
+        _host = data.get('host')
+        if not _host:
+            _host = _row['host'] if _row is not None else getattr(vmware_managers.get(vmware_id), 'host', '')
+        _why = _target_refusal(_host)
+        if _why:
+            return jsonify({'error': _why}), 400
 
     # Second, "keep the password" has three spellings and the guard knew one.
     # save_vmware_server writes `pass_encrypted or <the stored one>`, so an OMITTED or an
@@ -276,6 +292,9 @@ def test_vmware_connection():
     data = request.json or {}
     if not data.get('host') or not data.get('username') or not data.get('password'):
         return jsonify({'error': 'Host, username and password required'}), 400
+    _why = _target_refusal(data.get('host'))
+    if _why:
+        return jsonify({'error': _why}), 400
     
     mgr = VMwareManager('test', data)
     if mgr.connect():
