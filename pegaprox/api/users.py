@@ -542,8 +542,9 @@ def get_locked_ips():
     _ct = _caller_tenant_or_none()
     _users_db = load_users() if _ct is not None else {}
 
-    # Get locked IPs
-    for ip, info in login_attempts_by_ip.items():
+    # Get locked IPs. MK Oct 2026 - an IP entry belongs to no tenant, and the OIDC callback
+    # limit is kept in the same store, so a tenant-scoped caller is shown none of them.
+    for ip, info in (login_attempts_by_ip.items() if _ct is None else ()):
         locked_until = info.get('locked_until', 0)
         if locked_until > current_time:
             locked_ips.append({
@@ -569,7 +570,7 @@ def get_locked_ips():
     return jsonify({
         'locked_ips': locked_ips,
         'locked_users': locked_users,
-        'total_tracked_ips': len(login_attempts_by_ip),
+        'total_tracked_ips': len(login_attempts_by_ip) if _ct is None else 0,
         'total_tracked_users': len(login_attempts_by_user)
     })
 
@@ -579,6 +580,12 @@ def get_locked_ips():
 def unlock_ip(ip_address):
     # NS: admin-only endpoint to unlock IPs manually
     global login_attempts_by_ip
+
+    # MK Oct 2026 - an IP lockout holds back every account tried from that address, in
+    # every tenant. A tenant delegate cannot lift one for its own tenant only, so it is
+    # left to a global admin. Same for the bulk route below.
+    if _caller_tenant_or_none() is not None:
+        return jsonify({'error': 'Access denied: IP lockouts are managed by a global administrator'}), 403
     
     # Normalize IP (replace URL-encoded dots if needed)
     ip_address = ip_address.replace('%2E', '.')
@@ -633,6 +640,8 @@ def unlock_all_ips():
     # copy of the import, so `= {}` left api/auth.py — the module the login path
     # reads — holding the old dict with every lockout still in it, and pointed the
     # listing and single-unlock routes at a detached empty one.
+    if _caller_tenant_or_none() is not None:
+        return jsonify({'error': 'Access denied: IP lockouts are managed by a global administrator'}), 403
     count = len(login_attempts_by_ip)
     login_attempts_by_ip.clear()
     

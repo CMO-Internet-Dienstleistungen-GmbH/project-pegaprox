@@ -929,10 +929,11 @@ def get_schedules():
     # schedules) when it was empty. get_user_clusters returns None only for a genuine admin/
     # default-tenant all-cluster user; otherwise it's the caller's reachable cluster set.
     from pegaprox.utils.rbac import get_user_clusters, user_can_access_vm
+    from pegaprox.api.helpers import caller_is_scoped
     _ud = dict(user_data)
     _ud['username'] = user
     allowed = get_user_clusters(_ud)
-    if is_admin or allowed is None:
+    if is_admin:
         return jsonify(schedules.get('actions', []))
 
     # sec (private disclosure Sep 2026 — audit M6): the cluster filter alone let a pool-/ACL-scoped
@@ -941,11 +942,22 @@ def get_schedules():
     # Plain operators keep every action on their clusters (user_can_access_vm returns True for them).
     authz = _ud
     out = []
+    _scoped = {}
     for a in schedules.get('actions', []):
-        if a.get('cluster_id') not in allowed:
+        if allowed is None:
+            # MK Oct 2026 - "all clusters" is a default-tenant account's reach, and such an
+            # account can still hold a pool grant or ACL'd guests. Then it is confined to
+            # those like anyone else; otherwise it keeps every action as before.
+            cid = a.get('cluster_id')
+            if cid not in _scoped:
+                _scoped[cid] = caller_is_scoped(authz, cid)
+            if not _scoped[cid]:
+                out.append(a)
+                continue
+        elif a.get('cluster_id') not in allowed:
             continue
         try:
-            if user_can_access_vm(authz, a['cluster_id'], int(a.get('vmid')), 'vm.view', a.get('vm_type')):
+            if user_can_access_vm(authz, a.get('cluster_id'), int(a.get('vmid')), 'vm.view', a.get('vm_type')):
                 out.append(a)
         except (TypeError, ValueError):
             continue   # malformed / non-VM action → drop from a scoped listing (fail closed)

@@ -33,11 +33,38 @@ def get_scheduled_tasks():
     # restricted bearer token was scoped as its OWNER. For an admin owner get_user_clusters
     # then answers None ("all clusters") and the filter below is skipped entirely, which is
     # how a viewer-capped token read every tenant's rows. acting_user applies the token floor.
-    from pegaprox.api.helpers import acting_user
-    _allowed = get_user_clusters(acting_user())
+    from pegaprox.api.helpers import acting_user, caller_is_scoped
+    from pegaprox.utils.rbac import acts_as_admin, user_can_access_vm
+    # MK Oct 2026 - the stored record carries no username, which the pool and ACL checks
+    # below key on
+    _who = dict(acting_user() or {})
+    _who.setdefault('username', request.session.get('user', ''))
+    _allowed = get_user_clusters(_who)
     if _allowed is not None:
         config = dict(config)
         config['tasks'] = [t for t in config.get('tasks', []) if t.get('cluster_id') in _allowed]
+    # MK Oct 2026 - a caller confined to a pool or to ACL'd guests got every task on the
+    # cluster, with the guest, node and schedule of each. They get the tasks of guests they
+    # may see; a task whose target is no guest number is left out for them.
+    if not acts_as_admin(_who):
+        _scoped, kept = {}, []
+        for t in config.get('tasks', []):
+            cid = t.get('cluster_id')
+            if cid not in _scoped:
+                _scoped[cid] = caller_is_scoped(_who, cid)
+            if not _scoped[cid]:
+                kept.append(t)
+                continue
+            try:
+                vmid = int(t.get('target_id'))
+            except (TypeError, ValueError):
+                continue
+            # legacy rows say 'vm'; the pool lookup then tries both guest types
+            vt = t.get('target_type')
+            if user_can_access_vm(_who, cid, vmid, 'vm.view', vt if vt in ('qemu', 'lxc') else None):
+                kept.append(t)
+        config = dict(config)
+        config['tasks'] = kept
     return jsonify(config)
 
 @bp.route('/api/scheduled-tasks', methods=['POST'])

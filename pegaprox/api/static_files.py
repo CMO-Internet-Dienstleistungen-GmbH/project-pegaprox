@@ -450,6 +450,13 @@ def get_user_perms(username):
     if user is None:
         return jsonify({'error': 'User not found'}), 404
     tenant_id = request.args.get('tenant_id', user.get('tenant_id', DEFAULT_TENANT_ID))
+    tenant_perms = user.get('tenant_permissions', {})
+    # MK Oct 2026 - a tenant-scoped caller sees the user from their own tenant only. The
+    # tenant_id from the query and the overrides held for other tenants went out as they
+    # were, so a tenant admin could read how another tenant's roles resolve.
+    if not caller_acts_as_admin():
+        tenant_id = user.get('tenant_id', DEFAULT_TENANT_ID)
+        tenant_perms = {t: o for t, o in (tenant_perms or {}).items() if t == tenant_id}
     
     effective = get_user_permissions(user, tenant_id)
     effective_role = get_user_effective_role(user, tenant_id)
@@ -459,7 +466,7 @@ def get_user_perms(username):
         'role': user.get('role'),
         'effective_role': effective_role,
         'tenant_id': tenant_id,
-        'tenant_permissions': user.get('tenant_permissions', {}),
+        'tenant_permissions': tenant_perms,
         'role_permissions': get_role_permissions_for_user(user, tenant_id),
         'extra_permissions': user.get('permissions', []),
         'denied_permissions': user.get('denied_permissions', []),
