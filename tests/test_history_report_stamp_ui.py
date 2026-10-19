@@ -10,6 +10,7 @@ server of tests/test_ha_ui.py; they skip where Playwright is not installed.
 import json
 import os
 import re
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -72,7 +73,16 @@ def test_no_dash_and_every_class_in_the_static_build():
 
 # -- runtime ------------------------------------------------------------------------------------
 
-AT = '2026-10-18T07:40:00+00:00'
+# the stamp leaves the date out for figures of the browser's today, so the times the
+# tests want as plain HH:MM are today's: a fixed day turned them red the day after
+_TODAY = datetime.now().astimezone().replace(hour=9, minute=40, second=0, microsecond=0)
+
+
+def _today_at(minutes=0):
+    return (_TODAY + timedelta(minutes=minutes)).isoformat()
+
+
+AT = _today_at()
 POWER = '/api/clusters/c1/power/summary'
 COSTS = '/api/clusters/c1/costs/summary'
 SIZING = '/api/clusters/c1/insights/right-sizing'
@@ -149,7 +159,7 @@ def test_runtime_power_says_how_old_and_fetches_again_until_the_new_figures_are_
     page.wait_for_timeout(300)
     assert app.server.calls.count(('GET', POWER)) == asked + 1
     # the new figures are there: no more fetching
-    app.server.extra[('GET', POWER)] = (200, _power(computed_at='2026-10-18T07:45:00+00:00', refreshing=False))
+    app.server.extra[('GET', POWER)] = (200, _power(computed_at=_today_at(5), refreshing=False))
     page.clock.run_for(16000)
     page.wait_for_timeout(300)
     assert re.fullmatch(r'As of \d\d:\d\d', _stamp(page)), _stamp(page)
@@ -235,7 +245,7 @@ def test_runtime_a_late_answer_for_the_old_window_is_dropped(open_app):
         if 'days=30' in route.request.url:
             held.append(route)
         else:
-            body = _power(computed_at='2026-10-18T09:00:00+00:00', refreshing=False)
+            body = _power(computed_at=_today_at(80), refreshing=False)
             route.fulfill(status=200, content_type='application/json', body=json.dumps(body))
     page.route('**/power/summary?days=*', hold)
     page.clock.run_for(16000)       # the follow-up asks for 30 days and waits
@@ -244,7 +254,7 @@ def test_runtime_a_late_answer_for_the_old_window_is_dropped(open_app):
     page.locator('select').first.select_option('7')
     page.wait_for_timeout(500)
     fresh = _stamp(page)
-    old = _power(computed_at='2026-10-18T07:40:00+00:00', refreshing=False)
+    old = _power(computed_at=AT, refreshing=False)
     held[0].fulfill(status=200, content_type='application/json', body=json.dumps(old))
     page.wait_for_timeout(500)
     assert _stamp(page) == fresh, (fresh, _stamp(page))
