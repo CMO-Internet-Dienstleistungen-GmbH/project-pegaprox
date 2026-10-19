@@ -109,11 +109,12 @@ def valid_upid(value) -> bool:
 
 
 def task_ref_ok(cluster_type, node, upid) -> bool:
-    """A node and task reference of a cluster as they may go into an API path: a Proxmox
-    VE node name and UPID, or for XCP-ng and ESXi a task reference without a slash."""
-    if cluster_type == 'proxmox':
-        return validate_hostname(node) and valid_upid(upid)
-    return isinstance(upid, str) and bool(re.fullmatch(r'[^/?#%\s]{1,400}', upid))
+    """A node and task reference of a cluster as they may go into an API path: for XCP-ng
+    and ESXi a task reference without a slash, for any other a Proxmox VE node name and
+    UPID (a type nobody named here gets the strict check, not the loose one)."""
+    if cluster_type in ('xcpng', 'esxi'):
+        return isinstance(upid, str) and bool(re.fullmatch(r'[^/?#%\s]{1,400}', upid))
+    return validate_hostname(node) and valid_upid(upid)
 
 
 def valid_pbs_upid(value) -> bool:

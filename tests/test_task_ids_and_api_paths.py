@@ -47,6 +47,17 @@ def test_a_task_id_has_the_form_proxmox_gives_it():
         assert not valid_upid(bad), bad
 
 
+@pytest.mark.parametrize('cluster_type', ['proxmox', 'pve', None, '', 'XCPNG'])
+def test_a_cluster_type_nobody_named_gets_the_strict_check(cluster_type):
+    from pegaprox.utils.sanitization import task_ref_ok
+    assert task_ref_ok(cluster_type, 'n1', GOOD)
+    assert not task_ref_ok(cluster_type, 'n1', 'a1b2c3d4')
+    assert not task_ref_ok(cluster_type, '..', GOOD)
+    # counterproof: XCP-ng and ESXi task references are no UPIDs and still pass
+    assert task_ref_ok('xcpng', 'h1', 'a1b2c3d4') and task_ref_ok('esxi', 'h1', 'task-17')
+    assert not task_ref_ok('xcpng', 'h1', 'a1/../b')
+
+
 class _Recorder(HTTPAdapter):
     def __init__(self):
         super().__init__()
