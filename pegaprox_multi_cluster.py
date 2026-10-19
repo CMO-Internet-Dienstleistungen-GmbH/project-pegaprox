@@ -83,6 +83,9 @@ if USE_GEVENT:
     except ImportError:
         pass
 
+# One greenlet's failed TLS write must not surface as another connection's error (see module)
+from pegaprox.utils.ssl_errqueue import install as _install_ssl_errqueue; _install_ssl_errqueue()
+
 import warnings
 warnings.filterwarnings('ignore', message='coroutine.*was never awaited')
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='asyncio')
