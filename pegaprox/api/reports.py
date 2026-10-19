@@ -228,6 +228,20 @@ def _syslog_host_clause(values, params, cached_only=False):
     return f"({' OR '.join(parts)})" if parts else "1 = 0"
 
 
+def _running_in_scope(cluster_id):
+    """Running guests of a cluster that the caller may see, from the manager's list (a
+    poll's fresh copy where there is one). 0 when the list cannot be read."""
+    mgr = cluster_managers.get(cluster_id)
+    if not mgr:
+        return 0
+    try:
+        rows = scope_vm_rows(cluster_id, mgr.get_vm_resources(max_age=15) or [])
+    except Exception as e:
+        logging.error(f"Error getting VM resources for reports: {e}")
+        return 0
+    return sum(1 for r in rows if r and r.get('status') == 'running')
+
+
 @bp.route('/api/reports/summary', methods=['GET'])
 @require_auth()
 def get_reports_summary():
@@ -270,12 +284,15 @@ def get_reports_summary():
     }
 
     # Aggregate per cluster
+    from pegaprox.api.helpers import caller_is_scoped
+    scoped = {}
     for snapshot in filtered:
         for cluster_id, cluster_data in snapshot.get('clusters', {}).items():
             # Skip clusters the user cannot access
             if accessible_clusters is not None and cluster_id not in accessible_clusters:
                 continue
             if cluster_id not in report['clusters']:
+                scoped[cluster_id] = caller_is_scoped(user_data, cluster_id)
                 report['clusters'][cluster_id] = {
                     'name': cluster_data.get('name', cluster_id),
                     'cpu_samples': [],
@@ -292,14 +309,20 @@ def get_reports_summary():
                 mem_percent = totals['mem_used'] / totals['mem_total'] * 100
                 report['clusters'][cluster_id]['mem_samples'].append(mem_percent)
             
-            vm_count = totals.get('vms_running', 0) + totals.get('cts_running', 0)
-            report['clusters'][cluster_id]['vm_samples'].append(vm_count)
+            # the history has the cluster's totals only, not a confined caller's share
+            if not scoped[cluster_id]:
+                vm_count = totals.get('vms_running', 0) + totals.get('cts_running', 0)
+                report['clusters'][cluster_id]['vm_samples'].append(vm_count)
     
     # Calculate stats
     for cluster_id, data in report['clusters'].items():
         cpu = data.pop('cpu_samples', [])
         mem = data.pop('mem_samples', [])
         vms = data.pop('vm_samples', [])
+        if scoped.get(cluster_id):
+            # MK Oct 2026 - as the cluster summary does: the running guests it may see, now
+            vms = [_running_in_scope(cluster_id)]
+            data['scoped'] = True
         
         data['cpu'] = {
             'avg': round(sum(cpu) / len(cpu), 1) if cpu else 0,
@@ -556,6 +579,8 @@ def get_reports_timeline():
         'data': {}
     }
 
+    from pegaprox.api.helpers import caller_is_scoped
+    scoped = {}
     for snapshot in filtered:
         timestamp = snapshot.get('timestamp', '')
         timeline['timestamps'].append(_with_offset(timestamp))
@@ -568,12 +593,15 @@ def get_reports_timeline():
                 continue
             
             if cluster_id not in timeline['data']:
+                scoped[cluster_id] = caller_is_scoped(user_data, cluster_id)
                 timeline['data'][cluster_id] = {
                     'name': cluster_data.get('name', cluster_id),
                     'cpu': [],
                     'memory': [],
                     'vms': []
                 }
+                if scoped[cluster_id]:
+                    timeline['data'][cluster_id]['scoped'] = True
             
             totals = cluster_data.get('totals', {})
             
@@ -591,8 +619,9 @@ def get_reports_timeline():
                     mem = round(totals['mem_used'] / totals['mem_total'] * 100, 1)
                 timeline['data'][cluster_id]['memory'].append(mem)
             
-            # VMs
-            if metric in ['all', 'vms']:
+            # VMs - MK Oct 2026: the history has the cluster's totals only, so a confined
+            # caller gets no guest count series, as in the summaries
+            if metric in ['all', 'vms'] and not scoped[cluster_id]:
                 vms = totals.get('vms_running', 0) + totals.get('cts_running', 0)
                 timeline['data'][cluster_id]['vms'].append(vms)
     
@@ -1087,6 +1116,12 @@ def get_cluster_report_summary(cluster_id):
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    # MK Oct 2026 - a caller confined to some guests counts the running ones it may see,
+    # as power and costs give it its own share. The history keeps the cluster's totals
+    # only, so it gets no samples of those. CPU and memory stay, /metrics has them too.
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.api.helpers import caller_is_scoped
+    scoped = caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session), cluster_id)
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -1141,6 +1176,8 @@ def get_cluster_report_summary(cluster_id):
         # Count running VMs
         try:
             resources = mgr.get_vm_resources() or []
+            if scoped:
+                resources = scope_vm_rows(cluster_id, resources)
             for r in resources:
                 if r and r.get('status') == 'running':
                     if r.get('type') == 'qemu':
@@ -1216,8 +1253,12 @@ def get_cluster_report_summary(cluster_id):
             report['memory']['samples'].append(mem)
 
         # VMs
-        vms = totals.get('vms_running', 0) + totals.get('cts_running', 0)
-        report['vms_running']['samples'].append(vms)
+        if not scoped:
+            vms = totals.get('vms_running', 0) + totals.get('cts_running', 0)
+            report['vms_running']['samples'].append(vms)
+
+    if scoped:
+        report['scoped'] = True
 
     # Calculate stats from historical data (keep samples for charts)
     for metric in ['cpu', 'memory', 'vms_running']:
