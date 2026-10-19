@@ -39,7 +39,32 @@ def _safe_spawn_failover(func, plan_id, *args):
                 pass
     # in an automatic group what goes out between the confirms of the run asks at its exit (#625)
     from pegaprox.core import ha
-    gevent.spawn(ha.as_job(_wrapper, f'site recovery plan {plan_id}'))
+    from pegaprox.background.site_recovery import hold_plan, hand_plan_to, let_go_of_plan
+    # MK Oct 2026 - the plan is the worker's from here, not from its first turn: a cancel or
+    # a cleanup in between found nothing running and went ahead beside it
+    kind = getattr(func, 'plan_kind', None) or (args[0] if args and isinstance(args[0], str) else 'new')
+    claim = object()
+    if not hold_plan(plan_id, kind, claim):
+        return False
+    try:
+        # spawn() runs nothing before this request yields, so the worker takes the hold over
+        worker = gevent.spawn(ha.as_job(_wrapper, f'site recovery plan {plan_id}'))
+    except Exception:
+        let_go_of_plan(plan_id, claim)
+        raise
+    hand_plan_to(plan_id, claim, worker)
+    worker.link(lambda done: let_go_of_plan(plan_id, done))
+    return True
+
+
+def _held_elsewhere(plan_id, claimed=None, back_to=None):
+    """The 409 when another worker took the plan between the check and the start, with
+    the state this request claimed put back."""
+    if claimed:
+        get_db().execute("UPDATE site_recovery_plans SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+                         (back_to, datetime.utcnow().isoformat(), plan_id, claimed))
+    return _run_under_way(plan_id) or (jsonify({'error': 'A run of this plan is still under way',
+                                                'code': 'SR_RUN_ALIVE'}), 409)
 
 
 
@@ -848,7 +873,8 @@ def execute_planned_failover(plan_id):
         return jsonify({'error': f"Cannot start failover — plan is in state '{actual}' (need ready/completed/failed)"}), 409
 
     from pegaprox.background.site_recovery import execute_failover
-    _safe_spawn_failover(execute_failover, plan_id, 'planned', _approved_vmids(plan))
+    if _safe_spawn_failover(execute_failover, plan_id, 'planned', _approved_vmids(plan)) is False:
+        return _held_elsewhere(plan_id, 'running', plan['status'])
 
     usr = getattr(request, 'session', {}).get('user', 'system')
     log_audit(usr, 'site_recovery.failover', f"Planned failover started: {plan['name']}")
@@ -921,7 +947,8 @@ def execute_emergency_failover(plan_id):
         return jsonify({'error': f"Cannot start emergency failover — plan is in state '{actual}' (need ready/completed/failed)"}), 409
 
     from pegaprox.background.site_recovery import execute_failover
-    _safe_spawn_failover(execute_failover, plan_id, 'emergency', _approved_vmids(plan), picked)
+    if _safe_spawn_failover(execute_failover, plan_id, 'emergency', _approved_vmids(plan), picked) is False:
+        return _held_elsewhere(plan_id, 'running', plan['status'])
 
     usr = getattr(request, 'session', {}).get('user', 'system')
     log_audit(usr, 'site_recovery.emergency', f"Emergency failover started: {plan['name']}"
@@ -971,7 +998,8 @@ def execute_test_failover(plan_id):
         return jsonify({'error': 'Action already in progress'}), 409
 
     from pegaprox.background.site_recovery import execute_test_failover
-    _safe_spawn_failover(execute_test_failover, plan_id, _console_vmids(plan), _approved_vmids(plan))
+    if _safe_spawn_failover(execute_test_failover, plan_id, _console_vmids(plan), _approved_vmids(plan)) is False:
+        return _held_elsewhere(plan_id, 'testing', plan['status'])
 
     usr = getattr(request, 'session', {}).get('user', 'system')
     log_audit(usr, 'site_recovery.test', f"Test failover started: {plan['name']}")
@@ -1005,7 +1033,8 @@ def cleanup_test_failover(plan_id):
         return busy
 
     from pegaprox.background.site_recovery import cleanup_test
-    _safe_spawn_failover(cleanup_test, plan_id)
+    if _safe_spawn_failover(cleanup_test, plan_id) is False:
+        return _held_elsewhere(plan_id)
 
     usr = getattr(request, 'session', {}).get('user', 'system')
     log_audit(usr, 'site_recovery.test_cleanup', f"Test cleanup started: {plan['name']}")
@@ -1076,7 +1105,8 @@ def execute_failback(plan_id):
         return jsonify({'error': 'Action already in progress'}), 409
 
     from pegaprox.background.site_recovery import execute_failover
-    _safe_spawn_failover(execute_failover, plan_id, 'failback', _approved_vmids(plan), picked)
+    if _safe_spawn_failover(execute_failover, plan_id, 'failback', _approved_vmids(plan), picked) is False:
+        return _held_elsewhere(plan_id, 'running', plan['status'])
 
     usr = getattr(request, 'session', {}).get('user', 'system')
     log_audit(usr, 'site_recovery.failback', f"Failback started: {plan['name']}"

@@ -56,12 +56,41 @@ def _stopping(plan_id):
         return bool(entry and entry['owner'] is getcurrent() and entry['stop'])
 
 
+def hold_plan(plan_id, kind, owner):
+    """The plan for a worker that is about to start, before it runs: False when another
+    holds it. Taken where the worker is spawned, so a second start or a cancel in between
+    sees it at once, not only once the worker got its first turn."""
+    with _live_lock:
+        if plan_id in _live:
+            return False
+        _live[plan_id] = {'kind': kind, 'owner': owner, 'stop': False}
+        return True
+
+
+def hand_plan_to(plan_id, holder, owner):
+    with _live_lock:
+        entry = _live.get(plan_id)
+        if entry is not None and entry['owner'] is holder:
+            entry['owner'] = owner
+
+
+def let_go_of_plan(plan_id, owner):
+    with _live_lock:
+        if (_live.get(plan_id) or {}).get('owner') is owner:
+            del _live[plan_id]
+
+
 @contextmanager
 def _running(plan_id, kind):
     from greenlet import getcurrent
     me = getcurrent()
     with _live_lock:
-        _live[plan_id] = {'kind': kind, 'owner': me, 'stop': False}
+        held = _live.get(plan_id)
+        if held is not None and held['owner'] is me:
+            # held for it when it was spawned; a cancel since then still counts
+            held['kind'] = kind
+        else:
+            _live[plan_id] = {'kind': kind, 'owner': me, 'stop': False}
     try:
         yield
     finally:
@@ -79,6 +108,7 @@ def _on_the_plan(kind=None):
             what = kind or (args[0] if args else kwargs.get('failover_type', 'planned'))
             with _running(plan_id, what):
                 return fn(plan_id, *args, **kwargs)
+        run.plan_kind = kind
         return run
     return wrap
 
@@ -1317,7 +1347,7 @@ def _heartbeat_check():
                 continue
 
             logger.error(f"[SR] AUTO-FAILOVER triggered for '{_sl(plan['name'])}' after {int(elapsed)}s")
-            _last_fail_times.pop(plan_id, None)
+            down_since = _last_fail_times.pop(plan_id, None)
             _cooldowns[plan_id] = now + 3600  # 1h cooldown
 
             # trigger emergency failover — atomic status transition via WHERE status='ready'
@@ -1336,7 +1366,15 @@ def _heartbeat_check():
                     continue
                 # NS: use crash-safe wrapper so a greenlet crash sets status to 'failed'
                 from pegaprox.api.site_recovery import _safe_spawn_failover
-                _safe_spawn_failover(execute_failover, plan_id, 'emergency')
+                if _safe_spawn_failover(execute_failover, plan_id, 'emergency') is False:
+                    # taken between the check above and here: as if the check had seen it
+                    db.execute("UPDATE site_recovery_plans SET status = 'ready' WHERE id = ? AND status = 'running'",
+                               (plan_id,))
+                    _cooldowns.pop(plan_id, None)
+                    if down_since is not None:
+                        _last_fail_times[plan_id] = down_since
+                    logger.info(f"[SR] Auto-failover for '{_sl(plan['name'])}' waits: a run of it is still under way")
+                    continue
                 log_audit('system', 'site_recovery.auto_failover',
                           f"Auto-failover triggered for '{_sl(plan['name'])}' - source unreachable for {int(elapsed)}s")
             except Exception as e:

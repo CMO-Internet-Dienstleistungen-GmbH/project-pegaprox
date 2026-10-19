@@ -741,3 +741,74 @@ def test_a_plan_whose_run_is_cancelling_is_deleted_with_force_only(api, site):
     c = _admin(api, site)
     assert c.delete('/api/site-recovery/plans/p1').status_code == 409
     assert c.delete('/api/site-recovery/plans/p1?force=1').status_code == 200
+
+
+def test_a_worker_holds_its_plan_from_the_start_not_from_its_first_turn():
+    """The plan went into the registry when the worker got its first turn. Until then a
+    cancel found nothing running and wrote 'ready' under it, and a cleanup started beside
+    it. Nothing here yields, so the worker has not run yet when the checks come."""
+    from gevent.event import Event
+    gate, seen = Event(), {}
+
+    @srw._on_the_plan('cleanup')
+    def work(plan_id):
+        gate.wait(5)
+        seen['stop'] = srw._stopping(plan_id)
+
+    srapi._safe_spawn_failover(work, 'pq')
+    assert srw.run_alive('pq') == 'cleanup'
+    assert srapi._safe_spawn_failover(work, 'pq') is False
+    assert srw.ask_to_stop('pq')              # a cancel in that window reaches the worker
+    gate.set()
+    _until(lambda: srw.run_alive('pq') is None)
+    assert seen == {'stop': True}
+    # counterproof: once it is through, the next one is held and runs
+    gate.clear()
+    seen.clear()
+    assert srapi._safe_spawn_failover(work, 'pq') is True
+    gate.set()
+    _until(lambda: srw.run_alive('pq') is None)
+    assert seen == {'stop': False}
+
+
+def test_a_worker_that_dies_before_its_first_turn_lets_go_of_the_plan():
+    worker = []
+    real = gevent.spawn
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(gevent, 'spawn', lambda run: worker.append(real(run)) or worker[-1])
+        srapi._safe_spawn_failover(lambda plan_id: None, 'pk')
+    assert srw.run_alive('pk')
+    worker[0].kill()
+    _until(lambda: srw.run_alive('pk') is None)
+
+
+def test_a_second_cleanup_right_after_the_first_is_refused(api, site, monkeypatch):
+    from gevent.event import Event
+    gate = Event()
+    real_get_plan = srw._get_plan
+
+    def slow_get_plan(plan_id):
+        gate.wait(5)
+        return real_get_plan(plan_id)
+    monkeypatch.setattr(srw, '_get_plan', slow_get_plan)
+    db, c = site.db, _admin(api, site)
+    db.execute("INSERT INTO site_recovery_events (id, plan_id, event_type, status, started_at, details) "
+               "VALUES ('t1', 'p1', 'test', 'completed', '2026-10-01T00:00:00', '{\"test_vmids\": []}')")
+    assert c.post('/api/site-recovery/plans/p1/test/cleanup').status_code == 200
+    r = c.post('/api/site-recovery/plans/p1/test/cleanup')
+    assert r.status_code == 409 and r.get_json()['code'] == 'SR_RUN_ALIVE'
+    gate.set()
+    _until(lambda: srw.run_alive('p1') is None)
+    assert c.post('/api/site-recovery/plans/p1/test/cleanup').status_code == 200
+    _until(lambda: srw.run_alive('p1') is None)
+
+
+def test_a_start_that_finds_the_plan_held_puts_back_what_it_claimed(api, site, monkeypatch):
+    monkeypatch.setattr(srapi, '_safe_spawn_failover', lambda func, plan_id, *a: False)
+    monkeypatch.setattr(srapi, '_run_under_way', lambda plan_id: None)   # the check saw nothing yet
+    db, c = site.db, _admin(api, site)
+    for status, route, claimed in (('completed', 'emergency', 'running'), ('failed', 'test', 'testing')):
+        db.execute("UPDATE site_recovery_plans SET status = ? WHERE id = 'p1'", (status,))
+        r = c.post(f'/api/site-recovery/plans/p1/{route}', json={})
+        assert r.status_code == 409 and r.get_json()['code'] == 'SR_RUN_ALIVE', (route, r.get_json())
+        assert db.query_one("SELECT status FROM site_recovery_plans WHERE id = 'p1'")['status'] == status
