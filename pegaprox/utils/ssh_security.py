@@ -32,7 +32,10 @@ import it lazily).
 """
 
 import os
+import stat
+import errno
 import logging
+import tempfile
 import threading
 
 # known_hosts lives in the REAL runtime config dir (the one that holds pegaprox.db),
@@ -92,6 +95,60 @@ def _unreadable_refusal(address):
             "the damaged line (see the log) and connect again")
 
 
+def _unwritable_refusal(address):
+    # a key we cannot store is trusted on this connect and again on the next one, with
+    # any key - so no first use without the pin on disk
+    return (f"config/.ssh_known_hosts could not be written, so the host key of {address} "
+            "cannot be pinned - refusing to trust it on first use. Check the permissions and "
+            "free space of the config folder (see the log) and connect again")
+
+
+def _known_hosts_writable():
+    # the save puts a temp file next to known_hosts and renames it over, so the folder
+    # has to take new files and an existing file must not be read-only
+    target = os.path.realpath(_KNOWN_HOSTS)
+    if os.path.exists(target) and not os.access(target, os.W_OK):
+        return False
+    return os.access(os.path.dirname(target) or '.', os.W_OK | os.X_OK)
+
+
+def _write_known_hosts(write):
+    """Replace known_hosts with what `write(path)` puts into a temp file next to it.
+
+    paramiko's save() opens the file with 'w', so a write that failed half way (disk
+    full) left the lines before it, still parsable, and every pin after them read as an
+    unknown host. A temp file renamed over it leaves either the old file or the new one."""
+    target = os.path.realpath(_KNOWN_HOSTS)
+    st = None
+    if os.path.exists(target):
+        # what the old in-place write refused, the rename would quietly get past
+        if not os.access(target, os.W_OK):
+            raise PermissionError(errno.EACCES, 'known_hosts is read-only', target)
+        st = os.stat(target)
+    fd, tmp = tempfile.mkstemp(prefix='.ssh_known_hosts.', dir=os.path.dirname(target) or '.')
+    os.close(fd)
+    try:
+        write(tmp)
+        fd = os.open(tmp, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if st is not None:
+            os.chmod(tmp, stat.S_IMODE(st.st_mode))
+            try:
+                os.chown(tmp, st.st_uid, st.st_gid)
+            except OSError:
+                pass
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _unpinned_type_refusal(paramiko, hostname, keytype):
     return paramiko.SSHException(
         f"host {hostname} is known but presented an unpinned key type "
@@ -135,6 +192,12 @@ def _make_policy(paramiko, unreadable=False):
                 raise paramiko.SSHException(
                     "strict host-key checking: unknown SSH host key for "
                     f"{hostname} ({key.get_name()} {fp}); seed config/.ssh_known_hosts first")
+            # the key is only saved after login (persist_host_keys), so check now that it
+            # can be: a pin that never reaches the disk trusts any key next time
+            if not _known_hosts_writable():
+                _log.warning("known_hosts %s is not writable - not trusting %s on first use",
+                             _KNOWN_HOSTS, hostname)
+                raise paramiko.SSHException(_unwritable_refusal(hostname))
             # TOFU: record the key on the client's in-memory store. The caller
             # persists it via persist_host_keys() so the NEXT connection to this
             # host verifies against it (reject-on-change).
@@ -268,9 +331,10 @@ def persist_host_keys(client):
                     merged.add(hostname, keytype, key)
                     added += 1
             if added:
-                merged.save(_KNOWN_HOSTS)
-    except Exception:
-        pass  # config dir might not be writable — non-fatal
+                _write_known_hosts(merged.save)
+    except Exception as e:
+        # still not fatal for this connection, but these hosts stay unpinned
+        _log.warning("could not write known_hosts (%s) - new host keys were not pinned", e)
 
 
 def _known_hosts_token_host(tok):
@@ -318,8 +382,10 @@ def remove_host_keys(hostnames):
                 else:
                     kept.append(ln)
             if removed:
-                with open(_KNOWN_HOSTS, 'w') as f:
-                    f.writelines(kept)
+                def _kept(path):
+                    with open(path, 'w') as f:
+                        f.writelines(kept)
+                _write_known_hosts(_kept)
                 try:
                     _log.info("removed %d known_hosts entr%s for %s",
                               removed, 'y' if removed == 1 else 'ies', sorted(targets))
@@ -345,6 +411,7 @@ def verify_transport_host_key(transport, hostname, paramiko, port=22):
     * unknown host, strict off -> record (TOFU) + persist
     * unknown host, strict on or on a standby -> raise SSHException
     * unknown host, known_hosts unreadable    -> raise SSHException
+    * unknown host, its key cannot be saved   -> raise SSHException
     """
     try:
         key = transport.get_remote_server_key()
@@ -420,18 +487,23 @@ def verify_transport_host_key(transport, hostname, paramiko, port=22):
             # since the lookup above, and add() used to replace that pin with our key, so a
             # racing on-path key could swap itself in. The pin on disk wins: the same key needs no
             # write, another key or key type is refused like any pinned host. Decided in
-            # here, raised below, outside the best-effort except.
+            # here, raised below, outside the except.
             pinned = fresh.lookup(lookup_name)
             if pinned is None:
                 fresh.add(lookup_name, keytype, key)
-                fresh.save(_KNOWN_HOSTS)
+                _write_known_hosts(fresh.save)
                 recorded = True
             elif keytype not in pinned:
                 refusal = _unpinned_type_refusal(paramiko, hostname, keytype)
             elif pinned[keytype] != key:
                 refusal = paramiko.BadHostKeyException(hostname, key, pinned[keytype])
-    except Exception:
-        pass
+    except Exception as e:
+        if refusal is None:
+            # MK Oct 2026 - this used to return as if pinned: the login went ahead and the
+            # next connect trusted whatever key it met, again on first use
+            _log.warning("could not write known_hosts (%s) - not trusting %s on first use",
+                         e, lookup_name)
+            refusal = paramiko.SSHException(_unwritable_refusal(lookup_name))
     if refusal is not None:
         raise refusal
     if recorded:
