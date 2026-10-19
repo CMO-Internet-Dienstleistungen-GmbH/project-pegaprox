@@ -878,6 +878,8 @@ def test_smtp():
             'smtp_from_name': data.get('smtp_from_name', 'PegaProx'),
             'smtp_tls': data.get('smtp_tls', True),
             'smtp_ssl': data.get('smtp_ssl', False),
+            # without the field, test the way the saved setting sends
+            'smtp_verify_tls': bool(data.get('smtp_verify_tls', saved_settings.get('smtp_verify_tls', True))),
         }
 
         if not smtp_settings['smtp_from_email']:

@@ -1700,6 +1700,12 @@ def update_server_settings():
                 settings['smtp_tls'] = bool(data['smtp_tls'])
             if 'smtp_ssl' in data:
                 settings['smtp_ssl'] = bool(data['smtp_ssl'])
+            if 'smtp_verify_tls' in data:
+                old_val = settings.get('smtp_verify_tls', True)
+                settings['smtp_verify_tls'] = bool(data['smtp_verify_tls'])
+                if old_val != settings['smtp_verify_tls']:
+                    log_audit(request.session.get('user', 'admin'), 'settings.smtp_verify_tls',
+                              f"SMTP certificate check {'enabled' if settings['smtp_verify_tls'] else 'disabled'}")
             
             # NS: Alert settings
             if 'alert_email_recipients' in data:

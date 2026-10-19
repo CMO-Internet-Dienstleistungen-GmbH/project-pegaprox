@@ -98,6 +98,7 @@ def load_server_settings():
         'smtp_from_name': 'PegaProx Alerts',
         'smtp_tls': True,
         'smtp_ssl': False,
+        'smtp_verify_tls': True,  # MK Oct 2026 - check the relay's certificate (see below for older setups)
         # Alert notification settings
         'alert_email_recipients': [],  # list of email addresses
         'alert_cooldown': 300,  # Don't send same alert within 5 min
@@ -195,7 +196,12 @@ def load_server_settings():
         saved = db.get_server_settings()
         if saved:
             # Merge with defaults (so new fields are always present)
-            return {**defaults, **saved}
+            merged = {**defaults, **saved}
+            # MK Oct 2026 - a relay set up before the certificate check keeps sending without
+            # it until an admin turns it on; a new setup gets the check
+            if 'smtp_verify_tls' not in saved:
+                merged['smtp_verify_tls'] = not str(saved.get('smtp_host') or '').strip()
+            return merged
     except Exception as e:
         logging.error(f"Error loading server settings from database: {e}")
         # NS May 2026 - plain-JSON SERVER_SETTINGS_FILE fallback removed (encrypted DB only).
