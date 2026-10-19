@@ -81,6 +81,36 @@ def _build_xapi_rrd_url(base_url: str, path: str) -> str:
     return urlunparse(parsed._replace(path=f"/{path}"))
 
 
+# MK Oct 2026 - how add_disk and resize_vm_disk read a size, in one place: the tenant quota
+# (api/vms.py) counts the same number XAPI is then asked for.
+
+def xapi_add_disk_gb(size):
+    """GB add_disk creates for `size`: every G dropped, the rest a whole number. None for
+    what it cannot read (add_disk fails on it as well)."""
+    try:
+        return int(str(size).replace('G', '').replace('g', ''))
+    except ValueError:
+        return None
+
+
+def xapi_resize_bytes(size):
+    """The new size resize_vm_disk asks XAPI for: '64G', '64' (a number below 4096 is GB)
+    or bytes. A '+' is read as a sign, not as 'grow by'. None for what it refuses."""
+    try:
+        sz = int(str(size).replace('G', '').replace('g', ''))
+    except ValueError:
+        return None
+    if sz < 4096:  # probably GB
+        sz = sz * 1024 * 1024 * 1024
+    return sz
+
+
+def xapi_memory_bytes(value):
+    """The memory update_vm_config sets: read as a size (xapi_resize_bytes), 128 MiB at least"""
+    mem = xapi_resize_bytes(value)
+    return None if mem is None else max(mem, 128 * 1024 * 1024)
+
+
 class XcpngManager:
     """
     XCP-ng pool manager - duck-typed to match PegaProxManager's public interface.
@@ -155,6 +185,7 @@ class XcpngManager:
         self.ha_recovery_in_progress = {}
         self._cached_node_dict = {}
         self.last_migration_log = []
+        self._vm_migration_cooldown = {}  # {vmid: when the balancer moved it}
 
         # task tracking - xapi opaque refs -> our task dicts
         self._active_tasks = {}
@@ -296,6 +327,9 @@ class XcpngManager:
     def start(self):
         if self.running:
             return
+        # MK Oct 2026 - a rolling update of this pool still open (core/rolling_runs.py)
+        from pegaprox.core import rolling_runs
+        rolling_runs.restore(self)
         self.running = True
         self.stop_event.clear()
         self.thread = threading.Thread(target=self._run_loop, daemon=True,
@@ -1568,11 +1602,9 @@ class XcpngManager:
 
             # memory
             if 'memory' in config_updates:
-                mem = int(str(config_updates['memory']).replace('G', '').replace('g', ''))
-                if mem < 4096:
-                    mem = mem * 1024 * 1024 * 1024
-                if mem < 128 * 1024 * 1024:
-                    mem = 128 * 1024 * 1024
+                mem = xapi_memory_bytes(config_updates['memory'])
+                if mem is None:
+                    raise ValueError(f"memory {config_updates['memory']!r}")
                 s = str(mem)
 
                 if power == 'Running':
@@ -1898,7 +1930,9 @@ class XcpngManager:
                 if not sr_ref or sr_ref == 'OpaqueRef:NULL':
                     return {'success': False, 'error': 'No default SR configured and no storage specified'}
 
-            size_gb = int(str(disk_config.get('size', 32)).replace('G', '').replace('g', ''))
+            size_gb = xapi_add_disk_gb(disk_config.get('size', 32))
+            if size_gb is None:
+                return {'success': False, 'error': f"Invalid size: {disk_config.get('size')}"}
             size_bytes = size_gb * 1024 * 1024 * 1024
 
             vdi_rec = {
@@ -1973,12 +2007,8 @@ class XcpngManager:
                 return {'success': False, 'error': f'Disk {disk} not found on VM {vmid}'}
 
             # parse size - accept "64G", "64", bytes
-            new_size = str(size).replace('G', '').replace('g', '')
-            try:
-                sz = int(new_size)
-                if sz < 4096:  # probably GB
-                    sz = sz * 1024 * 1024 * 1024
-            except ValueError:
+            sz = xapi_resize_bytes(size)
+            if sz is None:
                 return {'success': False, 'error': f'Invalid size: {size}'}
 
             current = int(api.VDI.get_virtual_size(target_vdi))
@@ -3161,6 +3191,26 @@ class XcpngManager:
         """Public wrapper - used by API layer for shell connections."""
         return self._get_host_ip(node_name)
 
+    def member_node_ip(self, node_name):
+        """Address of the pool host named node_name, None when no host has that name or
+        XAPI does not answer. Same contract as the Proxmox manager's: None means refuse.
+
+        MK Oct 2026 (#1143) - _get_host_ip answers config.host for a name it cannot
+        find, which is another host; a node shell must not open there.
+        """
+        if not node_name or not isinstance(node_name, str):
+            return None
+        api = self._api()
+        if not api:
+            return None
+        try:
+            for href in api.host.get_all():
+                if node_name in (api.host.get_hostname(href), api.host.get_name_label(href)):
+                    return api.host.get_address(href) or None
+        except Exception as e:
+            self.logger.warning(f"[NodeIP] XAPI host lookup for {node_name!r} failed: {e}")
+        return None
+
     def _ssh_connect(self, host, retries=3):
         """Open SSH connection to XCP-ng host."""
         import paramiko
@@ -3652,7 +3702,7 @@ class XcpngManager:
                 # MK Oct 2026 - the rolling update waits for a node only when its task says it
                 # rebooted (#715); without these an XCP-ng host still booting was passed by
                 task.reboot_issued = True
-                if getattr(self, '_rolling_update', {}).get('status') == 'running':
+                if (getattr(self, '_rolling_update', None) or {}).get('status') == 'running':
                     try:
                         from pegaprox.background.alerts import emit_rolling_update_reboot_event
                         emit_rolling_update_reboot_event(self.id, node_name)
@@ -4030,22 +4080,25 @@ echo DONE""",
         if rc == -1:
             return None
 
-        results = {}
+        # MK Oct 2026 - a control with no OK/FAIL line back was not judged: None (not
+        # checked), as on PVE, rather than left out of the answer
+        results = {cid: None for cid in self._CIS_CHECKS}
         current_id = None
         for line in out.splitlines():
             stripped = line.strip()
             if stripped.startswith('---') and stripped.endswith('---'):
                 current_id = stripped.strip('-')
                 continue
-            if current_id and stripped in ('OK', 'FAIL'):
+            if current_id in results and results[current_id] is None and stripped in ('OK', 'FAIL'):
                 results[current_id] = (stripped == 'OK')
         if verbose:
             # Same shape the PVE manager returns for audit reports, so the report builder
             # does not have to special-case the hypervisor. No separate evidence command
             # exists here, so the evidence is the verdict line itself.
             return {cid: {'status': ok,
-                          'evidence': 'OK' if ok else 'FAIL',
-                          'command': self._CIS_CHECKS.get(cid, {}).get('check', '')}
+                          'evidence': {True: 'OK', False: 'FAIL'}.get(ok, 'no verdict came back'),
+                          'command': self._CIS_CHECKS.get(cid, {}).get('check', ''),
+                          **({'not_checked': 'No output came back for this control'} if ok is None else {})}
                     for cid, ok in results.items()}
         return results
 
@@ -4440,6 +4493,13 @@ echo DONE""",
         try:
             vm_ref = self._resolve_vm(vmid)
             power = api.VM.get_power_state(vm_ref)
+            # MK Oct 2026 - only a running guest moves. The other branch shut the guest down
+            # hard and copied it within this pool (VM.copy onto no SR) under a new name: no
+            # move to the other pool, a second guest instead, and online=false took it too
+            if not online or power != 'Running':
+                return {'success': False, 'code': 'NOT_RUNNING',
+                        'error': 'Only a running guest moves to another pool from here: '
+                                 'start it first, or move it with the pool tools'}
 
             tcfg = target_pool.config
             remote_session = ha_transport.guard_xapi(XenAPI.Session(
@@ -4454,25 +4514,14 @@ echo DONE""",
             # add session ref for auth
             dest['session_id'] = remote_session._session
 
-            # live or offline?
-            live = online and power == 'Running'
-
-            if live:
-                # live migrate across pools
-                # NS: XAPI wants a dict with destination host/network info
-                dest_host_refs = remote_session.xenapi.host.get_all()
-                if not dest_host_refs:
-                    return {'success': False, 'error': 'No hosts in target pool'}
-                dest['host'] = dest_host_refs[0]  # pool master
-                # vdi_map and vif_map can be empty for default mapping
-                task_ref = api.Async.VM.migrate_send(vm_ref, dest, live, {}, {}, {})
-            else:
-                if power != 'Halted':
-                    api.VM.hard_shutdown(vm_ref)
-                    time.sleep(3)
-                # for offline, use VM.copy to remote SR
-                # this is more like clone+transfer
-                task_ref = api.Async.VM.copy(vm_ref, f'migrated-{vmid}', 'OpaqueRef:NULL')
+            # live migrate across pools
+            # NS: XAPI wants a dict with destination host/network info
+            dest_host_refs = remote_session.xenapi.host.get_all()
+            if not dest_host_refs:
+                return {'success': False, 'error': 'No hosts in target pool'}
+            dest['host'] = dest_host_refs[0]  # pool master
+            # vdi_map and vif_map can be empty for default mapping
+            task_ref = api.Async.VM.migrate_send(vm_ref, dest, True, {}, {}, {})
 
             task_id = self._track_task(task_ref, 'remote_migrate', vmid)
 
@@ -4929,6 +4978,12 @@ echo DONE""",
         if not exclude_vmids:
             exclude_vmids = set()
         excluded_vms = set(self.get_balancing_excluded_vms()) | set(exclude_vmids)
+        # MK Oct 2026 - the cluster's cooldown holds here too, a pool had none at all
+        from pegaprox.core.manager import recent_balancer_moves, balancer_cooldown_secs
+        if not isinstance(getattr(self, '_vm_migration_cooldown', None), dict):
+            self._vm_migration_cooldown = {}
+        now, cooldown = time.time(), balancer_cooldown_secs(self)
+        excluded_vms |= {v for v, ts in recent_balancer_moves(self).items() if now - ts < cooldown}
 
         vms = self._cached_vms or self.get_vms() or []
         candidates = []
@@ -4977,12 +5032,25 @@ echo DONE""",
 
     def _do_balance_migrate(self, vm_info, target_node):
         """Execute a single balancing migration. Returns True on success."""
+        from pegaprox.core.manager import BALANCE_WHY, record_balance_move
+        why = vm_info.pop(BALANCE_WHY, None)
         vmid = vm_info['vmid']
         source = vm_info['node']
+        started = time.time()
         try:
             self.logger.info(f"[BALANCE] migrating VM {vmid} ({vm_info.get('name','')}) "
                              f"{source} -> {target_node}")
             result = self.migrate_vm_manual(source, vmid, 'qemu', target_node=target_node, online=True)
+            if why:
+                ok = bool(result.get('success'))
+                error = '' if ok else str(result.get('error') or '')[:300]
+                if ok:
+                    self._vm_migration_cooldown[vmid] = time.time()
+                else:
+                    why = dict(why, details=dict(why.get('details') or {}, error=error))
+                record_balance_move(self.id, vm_info, target_node, why, 'success' if ok else 'failed',
+                                    duration=time.time() - started,
+                                    note=f"failed: {error}" if not ok else '')
             if result.get('success'):
                 self.last_migration_log.append({
                     'ts': time.time(),
@@ -4999,6 +5067,11 @@ echo DONE""",
                 self.logger.warning(f"[BALANCE] migration failed: {result.get('error')}")
         except Exception as e:
             self.logger.error(f"[BALANCE] migrate VM {vmid}: {e}")
+            if why:
+                error = str(e)[:300]
+                record_balance_move(self.id, vm_info, target_node,
+                                    dict(why, details=dict(why.get('details') or {}, error=error)),
+                                    'failed', duration=time.time() - started, note=f"failed: {error}")
         return False
 
     def run_balance_check(self):
@@ -5041,12 +5114,17 @@ echo DONE""",
             # an automatic leader that lost its lease starts no migration (#625)
             if not ha.confirm_step(f"balancing VM {candidate['vmid']}"):
                 break
+            from pegaprox.core.manager import BALANCE_WHY, balance_reason
+            candidate[BALANCE_WHY] = balance_reason(
+                'balance', max_node, target, node_status,
+                threshold=getattr(self.config, 'migration_threshold', 30))
             ok = self._do_balance_migrate(candidate, target)
             if ok:
                 migrated += 1
                 time.sleep(5)  # brief pause between migrations
-                # re-check balance after each migration
-                needs, max_node, min_node = self.check_balance_needed()
+                # re-check balance after each migration; the next reason quotes these loads
+                node_status = self.get_node_status() or node_status
+                needs, max_node, min_node = self.check_balance_needed(node_status)
                 if not needs:
                     break
 

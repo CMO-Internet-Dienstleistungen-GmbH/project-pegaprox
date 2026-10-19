@@ -36,7 +36,7 @@ def _updating_manager(back):
     m.logger = MagicMock()
     m.nodes_in_maintenance = {}
     m._get_node_ip = lambda node: '10.0.0.5'
-    m._ssh_connect = lambda ip: _ssh()
+    m._ssh_connect = lambda ip, **kw: _ssh()
     # needrestart is not installed (exit 1): the reboot is forced, as on the reported node
     m._ssh_execute = lambda ssh, cmd, task=None: (1 if 'dpkg -s needrestart' in cmd else 0, '', '')
     m._wait_for_node_online = lambda node: back
@@ -81,6 +81,9 @@ def _run(api, seed, monkeypatch, task):
     root = seed.user('root', role='admin')
     fake = api.make_fake_manager()
     fake.get_node_status.return_value = {'blade1': {'status': 'online'}}
+    # the quorum gate before the node goes down reads /cluster/status: three votes, one may go
+    fake._ha_cluster_status.return_value = [{'type': 'cluster', 'quorate': 1}] + [
+        {'type': 'node', 'name': n, 'online': 1} for n in ('blade1', 'blade2', 'blade3')]
     fake.get_ceph_health_summary.return_value = None
     fake.start_node_update.return_value = task
     fake.exit_maintenance_mode.return_value = False   # what the real one says for an untracked node

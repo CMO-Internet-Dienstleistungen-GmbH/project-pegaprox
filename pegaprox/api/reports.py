@@ -22,7 +22,8 @@ from pegaprox.models.permissions import *
 from pegaprox.utils.auth import require_auth, load_users
 from pegaprox.utils.rbac import get_user_clusters
 from pegaprox.api.helpers import check_cluster_access, load_server_settings, scope_vm_rows, require_unconfined
-from pegaprox.background.metrics import load_metrics_history, start_metrics_collector
+from pegaprox.background.metrics import (load_metrics_history, start_metrics_collector,
+                                         history_range, load_metrics_range)
 from pegaprox.background.syslog_server import DB_FILE, SEVERITY_MAP
 from pegaprox.api.schedules import start_scheduler
 
@@ -119,7 +120,19 @@ def _syslog_hostname_tokens(value):
     return tokens
 
 
-def _syslog_cluster_hostnames(cluster_id):
+def _syslog_cached_node_names(manager):
+    """The node names a manager last read (its short node status cache, else what the HA
+    monitor keeps), None when it holds none."""
+    cached = getattr(manager, '_node_status_cache', None)
+    if isinstance(cached, tuple) and len(cached) == 2 and isinstance(cached[1], dict) and cached[1]:
+        return list(cached[1])
+    nodes = getattr(manager, 'ha_node_status', None)
+    return list(nodes) if isinstance(nodes, dict) and nodes else None
+
+
+def _syslog_cluster_hostnames(cluster_id, cached_only=False):
+    """cached_only: the node names the manager already holds where it holds any, a read of
+    its nodes only where it holds none."""
     manager = cluster_managers.get(cluster_id)
     if not manager:
         return set()
@@ -133,6 +146,11 @@ def _syslog_cluster_hostnames(cluster_id):
     ):
         hostnames.update(_syslog_hostname_tokens(value))
 
+    names = _syslog_cached_node_names(manager) if cached_only else None
+    if names is not None:
+        for node_name in names:
+            hostnames.update(_syslog_hostname_tokens(node_name))
+        return hostnames
     try:
         node_status = manager.get_node_status() or {}
         for node_name in node_status.keys():
@@ -150,7 +168,7 @@ _AMBIGUOUS_HOSTS_TTL = 60.0
 _AMBIGUOUS_HOSTS_LOCK = threading.Lock()
 
 
-def _syslog_ambiguous_hostnames():
+def _syslog_ambiguous_hostnames(cached_only=False):
     """Host tokens that more than one cluster claims.
 
     MK Sep 2026 - _syslog_hostname_tokens derives a short form from every node name, so
@@ -163,6 +181,9 @@ def _syslog_ambiguous_hostnames():
 
     Memoised for a minute: node names change on the timescale of a reinstall, and
     working them out walks every cluster's node list.
+
+    MK Oct 2026 - cached_only (the timeline, which promises no read of its own): each
+    cluster's node names as its manager last read them, a read only for one that holds none.
     """
     now = time.time()
     cached = _AMBIGUOUS_HOSTS
@@ -173,7 +194,8 @@ def _syslog_ambiguous_hostnames():
             return _AMBIGUOUS_HOSTS['tokens']
         claims = {}
         for _cid in list(cluster_managers.keys()):
-            for _tok in _syslog_cluster_hostnames(_cid):
+            _toks = _syslog_cluster_hostnames(_cid, cached_only=True) if cached_only else _syslog_cluster_hostnames(_cid)
+            for _tok in _toks:
                 claims.setdefault(_tok, set()).add(_cid)
         tokens = frozenset(t for t, cids in claims.items() if len(cids) > 1)
         if tokens:
@@ -189,14 +211,14 @@ def _syslog_like_literal(value):
     return value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
 
 
-def _syslog_host_clause(values, params):
+def _syslog_host_clause(values, params, cached_only=False):
     """`(host = x OR host LIKE 'x.%' OR ...)` over the tokens that identify one cluster.
 
     NS Oct 2026 - the tokens come from the cluster name and host, which a cluster.config
     holder sets on their own cluster. A name of '%' made the LIKE half match every host
     with a dot in it, so the caller read every tenant's syslog (#1119). Only the '.%' we
     add is a wildcard now."""
-    _ambiguous = _syslog_ambiguous_hostnames()
+    _ambiguous = _syslog_ambiguous_hostnames(cached_only=cached_only)
     parts = []
     for value in sorted(set(values) - _ambiguous):
         parts.append("LOWER(logs.hostname) = ?")
@@ -204,6 +226,20 @@ def _syslog_host_clause(values, params):
         parts.append("LOWER(logs.hostname) LIKE ? ESCAPE '\\'")
         params.append(f"{_syslog_like_literal(value)}.%")
     return f"({' OR '.join(parts)})" if parts else "1 = 0"
+
+
+def _running_in_scope(cluster_id):
+    """Running guests of a cluster that the caller may see, from the manager's list (a
+    poll's fresh copy where there is one). 0 when the list cannot be read."""
+    mgr = cluster_managers.get(cluster_id)
+    if not mgr:
+        return 0
+    try:
+        rows = scope_vm_rows(cluster_id, mgr.get_vm_resources(max_age=15) or [])
+    except Exception as e:
+        logging.error(f"Error getting VM resources for reports: {e}")
+        return 0
+    return sum(1 for r in rows if r and r.get('status') == 'running')
 
 
 @bp.route('/api/reports/summary', methods=['GET'])
@@ -248,12 +284,15 @@ def get_reports_summary():
     }
 
     # Aggregate per cluster
+    from pegaprox.api.helpers import caller_is_scoped
+    scoped = {}
     for snapshot in filtered:
         for cluster_id, cluster_data in snapshot.get('clusters', {}).items():
             # Skip clusters the user cannot access
             if accessible_clusters is not None and cluster_id not in accessible_clusters:
                 continue
             if cluster_id not in report['clusters']:
+                scoped[cluster_id] = caller_is_scoped(user_data, cluster_id)
                 report['clusters'][cluster_id] = {
                     'name': cluster_data.get('name', cluster_id),
                     'cpu_samples': [],
@@ -270,14 +309,20 @@ def get_reports_summary():
                 mem_percent = totals['mem_used'] / totals['mem_total'] * 100
                 report['clusters'][cluster_id]['mem_samples'].append(mem_percent)
             
-            vm_count = totals.get('vms_running', 0) + totals.get('cts_running', 0)
-            report['clusters'][cluster_id]['vm_samples'].append(vm_count)
+            # the history has the cluster's totals only, not a confined caller's share
+            if not scoped[cluster_id]:
+                vm_count = totals.get('vms_running', 0) + totals.get('cts_running', 0)
+                report['clusters'][cluster_id]['vm_samples'].append(vm_count)
     
     # Calculate stats
     for cluster_id, data in report['clusters'].items():
         cpu = data.pop('cpu_samples', [])
         mem = data.pop('mem_samples', [])
         vms = data.pop('vm_samples', [])
+        if scoped.get(cluster_id):
+            # MK Oct 2026 - as the cluster summary does: the running guests it may see, now
+            vms = [_running_in_scope(cluster_id)]
+            data['scoped'] = True
         
         data['cpu'] = {
             'avg': round(sum(cpu) / len(cpu), 1) if cpu else 0,
@@ -534,6 +579,8 @@ def get_reports_timeline():
         'data': {}
     }
 
+    from pegaprox.api.helpers import caller_is_scoped
+    scoped = {}
     for snapshot in filtered:
         timestamp = snapshot.get('timestamp', '')
         timeline['timestamps'].append(_with_offset(timestamp))
@@ -546,12 +593,15 @@ def get_reports_timeline():
                 continue
             
             if cluster_id not in timeline['data']:
+                scoped[cluster_id] = caller_is_scoped(user_data, cluster_id)
                 timeline['data'][cluster_id] = {
                     'name': cluster_data.get('name', cluster_id),
                     'cpu': [],
                     'memory': [],
                     'vms': []
                 }
+                if scoped[cluster_id]:
+                    timeline['data'][cluster_id]['scoped'] = True
             
             totals = cluster_data.get('totals', {})
             
@@ -569,8 +619,9 @@ def get_reports_timeline():
                     mem = round(totals['mem_used'] / totals['mem_total'] * 100, 1)
                 timeline['data'][cluster_id]['memory'].append(mem)
             
-            # VMs
-            if metric in ['all', 'vms']:
+            # VMs - MK Oct 2026: the history has the cluster's totals only, so a confined
+            # caller gets no guest count series, as in the summaries
+            if metric in ['all', 'vms'] and not scoped[cluster_id]:
                 vms = totals.get('vms_running', 0) + totals.get('cts_running', 0)
                 timeline['data'][cluster_id]['vms'].append(vms)
     
@@ -868,8 +919,17 @@ def check_hardening(cluster_id, node):
     # control set of its own and a PDF naming it would be claiming a level nobody checked.
     _eff = mgr._effective_profile(profile) if hasattr(mgr, '_effective_profile') else None
     _eff = _eff or (profile or 'cis-l1')   # always a string - consumers indexed on it before
+    # MK Oct 2026 - a control whose output could not be read is null (verbose: status
+    # null), not a failure; the counts keep it apart so no score divides by it
+    _st = [(v.get('status') if isinstance(v, dict) else v)
+           for v in (result.values() if isinstance(result, dict) else [])]
+    summary = {'total': len(_st), 'passed': sum(1 for s in _st if s is True),
+               'failed': sum(1 for s in _st if s is False),
+               'not_checked': sum(1 for s in _st if s is None)}
+    summary['checked'] = summary['passed'] + summary['failed']
     return jsonify({'node': node, 'controls': result, 'verbose': verbose,
-                    'profile': _eff, 'requested_profile': profile or 'cis-l1'})
+                    'profile': _eff, 'requested_profile': profile or 'cis-l1',
+                    'summary': summary})
 
 
 @bp.route('/api/clusters/<cluster_id>/nodes/<node>/hardening', methods=['POST'])
@@ -1047,16 +1107,33 @@ def get_cluster_report_summary(cluster_id):
     """Get report summary for a specific cluster
 
     Returns both historical data (if available) and current live data
+
+    Query params:
+    - period: 'hour', 'day', 'week' (default: day)
+    - from, to: unix seconds, instead of period: a range picked on the charts, at full
+      resolution as far as the stored history reaches (a year apart at most)
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
+    # MK Oct 2026 - a caller confined to some guests counts the running ones it may see,
+    # as power and costs give it its own share. The history keeps the cluster's totals
+    # only, so it gets no samples of those. CPU and memory stay, /metrics has them too.
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.api.helpers import caller_is_scoped
+    scoped = caller_is_scoped(build_authz_user(request.session.get('user', ''), request.session), cluster_id)
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
 
     mgr = cluster_managers[cluster_id]
     period = request.args.get('period', 'day')
+    picked = None
+    if 'from' in request.args or 'to' in request.args:
+        start, end, why = history_range(request.args)
+        if why:
+            return jsonify({'error': why}), 400
+        picked, period = (start, end), 'range'
 
     # Get LIVE current data from cluster using get_node_status()
     live_cpu = 0
@@ -1099,6 +1176,8 @@ def get_cluster_report_summary(cluster_id):
         # Count running VMs
         try:
             resources = mgr.get_vm_resources() or []
+            if scoped:
+                resources = scope_vm_rows(cluster_id, resources)
             for r in resources:
                 if r and r.get('status') == 'running':
                     if r.get('type') == 'qemu':
@@ -1114,12 +1193,20 @@ def get_cluster_report_summary(cluster_id):
 
     # Load historical metrics for the requested window (oldest first, so the
     # chart below runs left-to-right and 'current' really is the newest sample)
-    window_days, cutoff = _period_cutoff(period)
-    history = load_metrics_history(days=window_days, totals_only=True)
-    snapshots = history.get('snapshots', [])
+    if picked:
+        # MK Oct 2026 - only this cluster's totals are kept of each snapshot
+        def _totals(clusters):
+            c = clusters.get(cluster_id)
+            return {cluster_id: {'totals': c.get('totals') or {}}} if isinstance(c, dict) else {}
+        filtered = [{'timestamp': ts, 'clusters': kept}
+                    for ts, kept in load_metrics_range(picked[0], picked[1], _totals)]
+    else:
+        window_days, cutoff = _period_cutoff(period)
+        history = load_metrics_history(days=window_days, totals_only=True)
+        snapshots = history.get('snapshots', [])
 
-    cutoff_str = cutoff.isoformat()
-    filtered = [s for s in snapshots if s.get('timestamp', '') >= cutoff_str]
+        cutoff_str = cutoff.isoformat()
+        filtered = [s for s in snapshots if s.get('timestamp', '') >= cutoff_str]
 
     # Extract data for this cluster only
     report = {
@@ -1142,6 +1229,8 @@ def get_cluster_report_summary(cluster_id):
             'mem_used': mem_used
         }
     }
+    if picked:
+        report['from'], report['to'] = int(picked[0]), int(picked[1])
 
     for snapshot in filtered:
         cluster_data = snapshot.get('clusters', {}).get(cluster_id)
@@ -1164,8 +1253,12 @@ def get_cluster_report_summary(cluster_id):
             report['memory']['samples'].append(mem)
 
         # VMs
-        vms = totals.get('vms_running', 0) + totals.get('cts_running', 0)
-        report['vms_running']['samples'].append(vms)
+        if not scoped:
+            vms = totals.get('vms_running', 0) + totals.get('cts_running', 0)
+            report['vms_running']['samples'].append(vms)
+
+    if scoped:
+        report['scoped'] = True
 
     # Calculate stats from historical data (keep samples for charts)
     for metric in ['cpu', 'memory', 'vms_running']:

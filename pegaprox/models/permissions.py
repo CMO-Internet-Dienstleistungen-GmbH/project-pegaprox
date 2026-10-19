@@ -184,6 +184,11 @@ PERMISSIONS = {
     # Automated installations - MK Sep 2026
     'autoinstall.view': 'View automated installation profiles and runs',
     'autoinstall.manage': 'Create, edit and revoke automated installation profiles',
+
+    # Change Guardian - NS Oct 2026
+    'changes.view': 'View planned changes and their approval state',
+    'changes.request': 'Draft, submit and cancel change plans',
+    'changes.approve': 'Approve or reject change plans (never the ones one requested)',
 }
 
 # MK Sep 2026 (#818) - permissions whose scope is wider than their name suggests.
@@ -207,6 +212,12 @@ PERMISSION_WARNINGS = {
         'installed from them, and this is the ability to decide what a new Proxmox '
         'host boots into - treat it like physical access to the rack. Only takes '
         'effect for accounts that see every cluster.'
+    ),
+    'changes.approve': (
+        'Four eyes: whoever requested a plan never approves it, with any account or token of '
+        'theirs. A holder who is not an administrator approves only plans for guests they '
+        'can reach themselves, never the ones that change nodes, storage, network, firewall, '
+        'HA, backup jobs, access or cluster options.'
     ),
     'update.manage': (
         'Not tenant-scoped. Updating or rolling back replaces and restarts this whole '

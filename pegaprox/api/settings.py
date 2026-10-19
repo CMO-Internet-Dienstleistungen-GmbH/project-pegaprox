@@ -18,7 +18,7 @@ from pegaprox.constants import *
 from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db, ENCRYPTION_AVAILABLE
-from pegaprox.core import ha
+from pegaprox.core import ha, rolling_runs
 
 import requests
 from pegaprox.utils.auth import require_auth, load_users, save_users, validate_session, TOTP_AVAILABLE, ARGON2_AVAILABLE, _check_default_password_in_use, verify_password, needs_password_rehash
@@ -31,7 +31,8 @@ from pegaprox.api.helpers import (
     get_login_settings, get_session_timeout, safe_error,
     acme_dns_config_from_settings, require_unconfined,
     evacuation_options, evacuation_options_said, rolling_options_intro, rolling_node_templates,
-    rolling_moved_templates, rolling_rules_give_way, rolling_rules_back_on,
+    rolling_moved_templates, rolling_rules_give_way, rolling_rules_back_on, rolling_in_maintenance,
+    rolling_moved_guests, rolling_wind_down, rolling_guests_left_moved,
 )
 from pegaprox.app import get_allowed_origins, add_allowed_origin
 from pegaprox.globals import _cors_origins_env, _auto_allowed_origins
@@ -343,6 +344,27 @@ def _managed_update_command(method):
     }.get(method, '')
 
 
+def _update_target(install_dir, rel_path):
+    """Where the updater writes rel_path of the new tree, None to leave it as it is.
+
+    MK Oct 2026 (#1134) - plugins/ goes to the directory the plugins are loaded from
+    (PLUGINS_DIR), which is not always the one next to the code. And a plugin's
+    config.json there holds what the admin set: the update overwrote it on every run, a
+    missing one still comes from the release.
+    """
+    parts = rel_path.replace('\\', '/').split('/')
+    # the file list comes from the update source (the tree listing, update_files): a part
+    # that climbs out, or an absolute path, writes nowhere
+    if not parts[0] or '..' in parts:
+        return None
+    if len(parts) < 2 or parts[0] != 'plugins':
+        return os.path.join(install_dir, rel_path)
+    dst = os.path.join(os.path.abspath(PLUGINS_DIR), *parts[1:])
+    if len(parts) == 3 and parts[2] == 'config.json' and os.path.lexists(dst):
+        return None
+    return dst
+
+
 # MK Oct 2026 - the update, the rollback and the restart button hand the restart to
 # `systemctl restart pegaprox` only when this process runs in that unit. A second
 # PegaProx on the host (a test instance started by hand, one in a unit of another name)
@@ -551,6 +573,7 @@ def perform_pegaprox_update():
     - config/, ssl/, certs/   (settings, encrypted data)
     - *.db, *.enc             (databases, encrypted files)
     - *.pem, *.key, *.crt    (certificates, private keys)
+    - plugins/<id>/config.json once it exists (a plugin's settings, #1134)
     """
     _uerr = _refuse_confined_updater()
     if _uerr:
@@ -748,7 +771,10 @@ def perform_pegaprox_update():
                             skipped_protected.append(rel_path)
                             continue
 
-                        dst = os.path.join(install_dir, rel_path)
+                        dst = _update_target(install_dir, rel_path)
+                        if dst is None:
+                            skipped_protected.append(rel_path)
+                            continue
                         try:
                             os.makedirs(os.path.dirname(dst), exist_ok=True)
                             shutil.copy2(os.path.join(root, fname), dst)
@@ -812,7 +838,10 @@ def perform_pegaprox_update():
                 if remote_path.endswith('.pyc') or '/__pycache__/' in remote_path:
                     continue
 
-                dst = os.path.join(install_dir, remote_path)
+                dst = _update_target(install_dir, remote_path)
+                if dst is None:
+                    skipped_protected.append(remote_path)
+                    continue
 
                 # try GitHub first, then mirror.
                 # MK 2026-06-02: bare `except: continue` here used to swallow
@@ -859,7 +888,9 @@ def perform_pegaprox_update():
             for _rp, _err in failed_files:
                 if is_protected(_rp) or _rp.endswith('.pyc'):
                     continue
-                _dst = os.path.join(install_dir, _rp)
+                _dst = _update_target(install_dir, _rp)
+                if _dst is None:
+                    continue
                 _ok = False
                 for _bu in [GITHUB_RAW_URL, MIRROR_RAW_URL]:
                     try:
@@ -1471,6 +1502,27 @@ def update_server_settings():
         # check if JSON or form-data
         if request.is_json:
             data = request.get_json() or {}
+            # NS Oct 2026 (#1149) - a username claim outside the list is refused before anything
+            # is saved, rather than stored as the old order without a word
+            if 'oidc_username_claim' in data:
+                from pegaprox.utils.oidc import OIDC_USERNAME_CLAIMS
+                _claim = str(data.get('oidc_username_claim') or '').strip()
+                if _claim and _claim not in OIDC_USERNAME_CLAIMS:
+                    return jsonify({'error': 'oidc_username_claim is empty or one of '
+                                             + ', '.join(OIDC_USERNAME_CLAIMS)}), 400
+            # email from Entra is the mail attribute, which any admin of a tenant can set and
+            # Entra does not verify: it never names an Entra account, whichever of the two
+            # this save changes
+            if 'oidc_username_claim' in data or 'oidc_provider' in data:
+                _claim = (str(data.get('oidc_username_claim') or '').strip()
+                          if 'oidc_username_claim' in data else settings.get('oidc_username_claim') or '')
+                _provider = ((data['oidc_provider'] if data['oidc_provider'] in ('entra', 'okta', 'generic')
+                              else 'entra') if 'oidc_provider' in data
+                             else settings.get('oidc_provider', 'entra'))
+                if _claim == 'email' and _provider == 'entra':
+                    return jsonify({'error': 'email cannot name Entra accounts: it is the mail '
+                                             'attribute, which Entra does not verify. Pick '
+                                             'preferred_username or upn.'}), 400
             
             # server config
             if 'domain' in data:
@@ -1648,6 +1700,12 @@ def update_server_settings():
                 settings['smtp_tls'] = bool(data['smtp_tls'])
             if 'smtp_ssl' in data:
                 settings['smtp_ssl'] = bool(data['smtp_ssl'])
+            if 'smtp_verify_tls' in data:
+                old_val = settings.get('smtp_verify_tls', True)
+                settings['smtp_verify_tls'] = bool(data['smtp_verify_tls'])
+                if old_val != settings['smtp_verify_tls']:
+                    log_audit(request.session.get('user', 'admin'), 'settings.smtp_verify_tls',
+                              f"SMTP certificate check {'enabled' if settings['smtp_verify_tls'] else 'disabled'}")
             
             # NS: Alert settings
             if 'alert_email_recipients' in data:
@@ -1781,6 +1839,7 @@ def update_server_settings():
                     logging.warning(f"[LDAP] DB verification failed: {ve}")
             
             # NS: Feb 2026 - OIDC / Entra ID settings
+            from pegaprox.utils.oidc import OIDC_USERNAME_CLAIMS
             oidc_keys = {
                 'oidc_enabled': lambda v: bool(v),
                 'oidc_provider': lambda v: str(v) if v in ('entra', 'okta', 'generic') else 'entra',
@@ -1804,8 +1863,11 @@ def update_server_settings():
                 # NS May 2026 (PVE 9.2 parity) — extra audiences accepted on
                 # JWT verify, comma-separated. Empty = client_id only.
                 'oidc_audiences': lambda v: str(v or '').strip(),
+                # NS Oct 2026 (#1149) - only a claim from the list, anything else is the old order
+                'oidc_username_claim': lambda v: str(v or '').strip() if str(v or '').strip() in OIDC_USERNAME_CLAIMS else '',
             }
             
+            _old_claim = settings.get('oidc_username_claim') or ''
             for key, transform in oidc_keys.items():
                 if key in data:
                     settings[key] = transform(data[key])
@@ -1837,7 +1899,8 @@ def update_server_settings():
             
             if any(k in data for k in oidc_keys):
                 log_audit(request.session.get('user', 'admin'), 'settings.oidc', 
-                         f"OIDC settings updated (enabled={settings.get('oidc_enabled', False)}, provider={settings.get('oidc_provider', 'entra')})")
+                         f"OIDC settings updated (enabled={settings.get('oidc_enabled', False)}, provider={settings.get('oidc_provider', 'entra')}, "
+                         f"username_claim={_old_claim or 'auto'}->{settings.get('oidc_username_claim') or 'auto'})")
             
         else:
             # form-data (for file uploads)
@@ -2368,7 +2431,7 @@ def backup_config():
         logging.info(f"[Backup] User from session: {username}")
         if not username:
             logging.warning("[Backup] No user in session")
-            return jsonify({'error': 'Not authenticated'}), 401
+            return jsonify({'error': 'Not authenticated', 'code': 'AUTH_REQUIRED'}), 401
         
         users = load_users()
         
@@ -2456,6 +2519,12 @@ def backup_config():
                 if isinstance(cluster_data, dict):
                     _strip_cluster_secrets(cluster_data)
         backup_data['clusters'] = clusters
+        # MK Oct 2026 - a node's own root password (#1136) goes where the cluster's goes: in
+        # a backup with the secrets only, sealed again with this instance's key on restore
+        if include_secrets:
+            from pegaprox.core import node_creds
+            backup_data['node_credentials'] = {cid: creds for cid in clusters
+                                               if (creds := node_creds.secrets_of(cid))}
         
         # Users (optional)
         if include_users:
@@ -2650,7 +2719,7 @@ def restore_config():
         username = getattr(request, 'session', {}).get('user')
         logging.debug(f"[Restore] User from session: {username}")
         if not username:
-            return jsonify({'error': 'Not authenticated'}), 401
+            return jsonify({'error': 'Not authenticated', 'code': 'AUTH_REQUIRED'}), 401
         
         users = load_users()
         
@@ -2841,6 +2910,23 @@ def restore_config():
                     cluster_id_str = cluster.get('id', 'unknown') if isinstance(cluster, dict) else str(cluster)[:20]
                     results['errors'].append(f"Cluster {cluster_id_str}: {str(e)}")
             results['restored']['clusters'] = cluster_count
+
+        # the nodes' own passwords, of clusters this instance has now; a node without one in
+        # the backup keeps what it has
+        if isinstance(data.get('node_credentials'), dict):
+            from pegaprox.core import node_creds
+            cred_count = 0
+            for cid, creds in data['node_credentials'].items():
+                if not isinstance(creds, dict) or not database.get_cluster(cid):
+                    continue
+                for node, value in creds.items():
+                    if not node_creds.node_name_ok(node) or node_creds.value_problem(value):
+                        results['errors'].append(f"Cluster {cid}: the password of a node was not restored")
+                        continue
+                    if not dry_run:
+                        node_creds.store(cid, node, value, username)
+                    cred_count += 1
+            results['restored']['node_credentials'] = cred_count
         
         # Users (only if explicitly requested)
         if restore_users and 'users' in data:
@@ -3481,13 +3567,22 @@ def verify_audit_integrity():
     - unsigned: Old entries without signature (pre-upgrade)
     - potentially_tampered: Entries with invalid signature (WARNING!)
     - integrity_percentage: Percentage of verified entries
+    - chain: the hash chain - edited, missing (deleted) and broken-link entries, whether
+      the end was cut off below the last signed checkpoint, how many entries came after
+      it, how far retention pruned
+    - legacy: entries from before the chain, and whether they changed since it started
+    - intact: none of the above found anything
     """
     database = get_db()
     result = database.verify_audit_log_integrity()
     
     # Log this check itself
     usr = getattr(request, 'session', {}).get('user', 'system')
-    log_audit(usr, 'audit.integrity_check', f"Audit integrity check: {result['verified']}/{result['total_entries']} verified, {result['potentially_tampered']} potentially tampered")
+    _ch = result.get('chain') or {}
+    log_audit(usr, 'audit.integrity_check',
+              f"Audit integrity check: {result['verified']}/{result['total_entries']} verified, "
+              f"{result['potentially_tampered']} potentially tampered, {_ch.get('missing', 0)} missing, "
+              f"{_ch.get('broken_links', 0)} broken links")
     
     return jsonify(result)
 
@@ -3532,38 +3627,146 @@ def rotate_encryption_key():
         log_audit(usr, 'security.key_rotation_failed', f"Key rotation failed: {result.get('error', 'Unknown error')}")
         return jsonify(result), 500
 
+
+# the newest audit entries the compliance check verifies
+AUDIT_SPOT_CHECK = 100
+
+
 @bp.route('/api/security/compliance', methods=['GET'])
 @require_auth(perms=['security.settings.manage'])
 def get_compliance_status():
     """Get security compliance status (admin only)
     
-    Returns overview of security features for HIPAA/ISO 27001 compliance.
+    Returns overview of security features for HIPAA/ISO 27001 compliance. Each control
+    is passed, failed or not_checked (with the reason); the score counts the checked ones
+    only, checked/total say how many. `checks` maps each control to True, False or None.
     """
+    # MK Oct 2026 - two of the eight checks were the constant True and every check counted,
+    # so a fresh install scored a quarter of its points for nothing. Each control now looks
+    # at what this instance runs with, or says why it could not.
     try:
-        settings = load_server_settings()
         database = get_db()
         key_info = database.get_key_info()
-        
-        # Calculate compliance score
-        # MK: each check is worth the same, simple but effective
-        checks = {
-            'encryption_enabled': ENCRYPTION_AVAILABLE and key_info.get('exists', False),
-            # MK: Apr 2026 - behind reverse proxy, HTTPS is handled by the proxy (#281)
-            'https_enabled': os.path.exists(SSL_CERT_FILE) and os.path.exists(SSL_KEY_FILE)
-                or settings.get('reverse_proxy_enabled', False)
-                or request.headers.get('X-Forwarded-Proto') == 'https',
-            'password_policy_enabled': settings.get('password_min_length', 8) >= 8,
-            'session_timeout_compliant': settings.get('session_timeout', SESSION_TIMEOUT) <= 28800,  # 8h max for HIPAA
-            '2fa_available': TOTP_AVAILABLE,
-            'audit_logging_enabled': True,  # Always enabled
-            'rate_limiting_enabled': API_RATE_LIMIT > 0,
-            'brute_force_protection': True,  # Always enabled
-        }
-        
-        score = sum(1 for v in checks.values() if v) / len(checks) * 100
-        
+        # the store itself, not load_server_settings: that one answers defaults when the
+        # table cannot be read, and defaults would pass most of what is asked below
+        try:
+            saved = database.get_server_settings()
+            settings = {**load_server_settings(), **(saved or {})}
+            settings_err = ''
+        except Exception as e:
+            logging.error(f"compliance: server settings unreadable: {e}")
+            settings, settings_err = {}, 'The server settings could not be read'
+
+        controls = []
+
+        def add(cid, status, detail='', reason=''):
+            controls.append({'id': cid, 'status': status, 'detail': detail, 'reason': reason})
+
+        def from_settings(cid, judge):
+            if settings_err:
+                add(cid, 'not_checked', reason=settings_err)
+            else:
+                ok, detail = judge()
+                add(cid, 'passed' if ok else 'failed', detail)
+
+        # field encryption: a key on disk and one this process signs and seals with
+        enc_ok = bool(ENCRYPTION_AVAILABLE and key_info.get('exists') and database.aes_key)
+        add('encryption_enabled', 'passed' if enc_ok else 'failed',
+            'AES-256-GCM field key loaded' if enc_ok else 'No field encryption key is loaded')
+
+        # TLS: the request this answers came over it, or a trusted proxy said the client's
+        # did. Behind a proxy that says nothing the client side is out of sight.
+        from pegaprox.utils.audit import _is_trusted_proxy
+        from pegaprox.api.helpers import effective_reverse_proxy
+        behind_proxy = effective_reverse_proxy(settings or None)
+        fwd = (request.headers.get('X-Forwarded-Proto') or '').split(',')[0].strip().lower()
+        if request.is_secure:
+            add('https_enabled', 'passed', 'This request arrived over HTTPS')
+        elif fwd and _is_trusted_proxy(request.remote_addr or ''):
+            add('https_enabled', 'passed' if fwd == 'https' else 'failed',
+                f'The reverse proxy reports the client connected over {fwd.upper()}')
+        elif behind_proxy:
+            add('https_enabled', 'not_checked',
+                reason='Behind a reverse proxy that does not report which scheme the client used '
+                       '(X-Forwarded-Proto from a trusted proxy)')
+        else:
+            add('https_enabled', 'failed', 'This request arrived over plain HTTP')
+
+        from_settings('password_policy_enabled', lambda: (
+            int(settings.get('password_min_length', 8) or 0) >= 8,
+            f"Minimum password length {settings.get('password_min_length', 8)}"))
+        # every sign-in may tick "remember me", and such a session idles 30 days (7 at most,
+        # utils/auth.validate_session) whatever session_timeout says; nothing turns that off
+        # yet, so the timeout alone does not make the control pass
+        def _session():
+            mins = int(settings.get('session_timeout', SESSION_TIMEOUT) or 0) // 60
+            if mins * 60 > 28800:
+                return False, f"Sessions expire after {mins} minutes"
+            return False, (f"Sessions expire after {mins} minutes, but a sign-in with "
+                           f"Remember me stays valid for 30 days idle (7 days at most)")
+        from_settings('session_timeout_compliant', _session)
+
+        # 2FA being installable says nothing; whether it is required does - for the admins
+        # too, they are the accounts it matters most for
+        if not TOTP_AVAILABLE:
+            add('two_factor_enforced', 'failed', 'TOTP support is not installed on this server')
+        else:
+            def _two_factor():
+                if not settings.get('force_2fa'):
+                    return False, 'Two-factor sign-in is not required'
+                if settings.get('force_2fa_exclude_admins'):
+                    return False, 'Required for every account except the admins'
+                return True, 'Required for every account'
+            from_settings('two_factor_enforced', _two_factor)
+
+        # the audit trail: the newest entry is signed and in the hash chain
+        try:
+            last = database.conn.execute(
+                'SELECT hmac_signature, chain_seq FROM audit_log ORDER BY id DESC LIMIT 1').fetchone()
+            if last is None:
+                add('audit_logging_enabled', 'not_checked', reason='No audit entry has been written yet')
+            elif not (last['hmac_signature'] and last['chain_seq'] is not None):
+                add('audit_logging_enabled', 'failed', 'The newest audit entry is not signed into the chain')
+            else:
+                # MK Oct 2026 - and the signatures hold: a signature field that is only filled
+                # in passed as well. The newest entries, off the hub, as the integrity check
+                # walks them
+                res = database.verify_audit_log_integrity(limit=AUDIT_SPOT_CHECK)
+                ch = res.get('chain') or {}
+                bad = int(res.get('potentially_tampered') or 0) + int(ch.get('broken_links') or 0)
+                add('audit_logging_enabled', 'failed' if bad else 'passed',
+                    f'{bad} of the newest audit entries do not verify against their signature or chain'
+                    if bad else 'Entries are signed and hash-chained, the newest verify')
+        except Exception as e:
+            logging.error(f"compliance: audit log unreadable: {e}")
+            add('audit_logging_enabled', 'not_checked', reason='The audit log could not be read')
+
+        # read at start from PEGAPROX_API_RATE_LIMIT, what the limiter runs with
+        add('rate_limiting_enabled', 'passed' if API_RATE_LIMIT > 0 else 'failed',
+            f'{API_RATE_LIMIT} API requests per {API_RATE_WINDOW}s per client' if API_RATE_LIMIT > 0
+            else 'API rate limiting is switched off (PEGAPROX_API_RATE_LIMIT=0)')
+
+        def _lockout():
+            ls = get_login_settings()
+            attempts, lock = int(ls['max_attempts'] or 0), int(ls['lockout_time'] or 0)
+            return (1 <= attempts <= 10 and lock >= 60,
+                    f'Lockout after {attempts} failed sign-ins for {lock}s')
+        from_settings('brute_force_protection', _lockout)
+
+        checks = {c['id']: {'passed': True, 'failed': False}.get(c['status']) for c in controls}
+        checked = [c for c in controls if c['status'] != 'not_checked']
+        passed = sum(1 for c in checked if c['status'] == 'passed')
+        score = round(passed / len(checked) * 100, 1) if checked else None
+        st = {c['id']: c['status'] for c in controls}
+        default_pw = _check_default_password_in_use()
+
         return jsonify({
-            'compliance_score': round(score, 1),
+            'compliance_score': score,
+            'checked': len(checked),
+            'total': len(controls),
+            'passed': passed,
+            'not_checked': len(controls) - len(checked),
+            'controls': controls,
             'checks': checks,
             'encryption': {
                 'algorithm': 'AES-256-GCM',
@@ -3587,15 +3790,23 @@ def get_compliance_status():
             },
             'recommendations': [
                 r for r in [
-                    None if checks['https_enabled'] else 'Enable HTTPS with valid certificates (or enable reverse proxy mode if using nginx/Traefik)',
-                    None if checks['session_timeout_compliant'] else 'Reduce session timeout to 8 hours or less',
-                    None if settings.get('password_require_special') else 'Consider requiring special characters in passwords',
-                    None if settings.get('password_expiry_enabled') else 'Consider enabling password expiry',
+                    'Enable HTTPS with valid certificates (or enable reverse proxy mode if using nginx/Traefik)'
+                    if st.get('https_enabled') == 'failed' else None,
+                    'Reduce session timeout to 8 hours or less'
+                    if st.get('session_timeout_compliant') == 'failed'
+                    and int(settings.get('session_timeout', SESSION_TIMEOUT) or 0) > 28800 else None,
+                    ('Require two-factor sign-in for the admins too (Settings > Security)'
+                     if settings.get('force_2fa') else 'Require two-factor sign-in (Settings > Security)')
+                    if st.get('two_factor_enforced') == 'failed' and TOTP_AVAILABLE else None,
+                    'Lock accounts after at most 10 failed sign-ins, for at least a minute'
+                    if st.get('brute_force_protection') == 'failed' else None,
+                    None if settings_err or settings.get('password_require_special') else 'Consider requiring special characters in passwords',
+                    None if settings_err or settings.get('password_expiry_enabled') else 'Consider enabling password expiry',
                     None if key_info.get('backups') else 'Perform initial key rotation to create backup',
-                    None if not _check_default_password_in_use() else 'CRITICAL: Default admin password is still in use! Change it immediately.',
+                    'CRITICAL: Default admin password is still in use! Change it immediately.' if default_pw else None,
                 ] if r is not None
             ],
-            'default_password_warning': _check_default_password_in_use()
+            'default_password_warning': default_pw
         })
     except Exception as e:
         logging.exception(f"Error getting compliance status: {e}")
@@ -3708,9 +3919,10 @@ def status_page():
     """Serve public status page — only if plugin is enabled"""
     if not _plugin_page_here('status_page'):
         return '<h1>Status Page not available</h1><p>The Status Page plugin is not enabled.</p>', 404
-    import os
-    path = os.path.join(os.path.dirname(__file__), '..', '..', 'plugins', 'status_page', 'status.html')
-    if os.path.exists(path):
+    # from where the plugin is loaded, not next to the code (#1134)
+    from pegaprox.api.plugins import plugin_file
+    path = plugin_file('status_page', 'status.html')
+    if path:
         return send_file(path)
     return '<h1>Status Page not installed</h1>', 404
 
@@ -3736,9 +3948,9 @@ def client_portal_page(subpath=None):
     """Serve client portal — only if plugin is enabled"""
     if not _plugin_page_here('client_portal'):
         return '<h1>Client Portal not available</h1><p>The Client Portal plugin is not enabled.</p>', 404
-    import os
-    portal_path = os.path.join(os.path.dirname(__file__), '..', '..', 'plugins', 'client_portal', 'portal.html')
-    if os.path.exists(portal_path):
+    from pegaprox.api.plugins import plugin_file
+    portal_path = plugin_file('client_portal', 'portal.html')
+    if portal_path:
         return send_file(portal_path)
     return '<h1>Client Portal not installed</h1>', 404
 
@@ -3976,6 +4188,9 @@ def generate_support_bundle():
                 line = re.sub(r'(password["\']?\s*[:=]\s*["\']?)[^"\'&\s]+', r'\1[REDACTED]', line, flags=re.IGNORECASE)
                 line = re.sub(r'(token["\']?\s*[:=]\s*["\']?)[^"\'&\s]+', r'\1[REDACTED]', line, flags=re.IGNORECASE)
                 line = re.sub(r'(secret["\']?\s*[:=]\s*["\']?)[^"\'&\s]+', r'\1[REDACTED]', line, flags=re.IGNORECASE)
+                # MK Oct 2026 - mail addresses: alice@corp.example -> ***@corp.example
+                # (a dotted name ending in letters, so root@pam and root@10.0.0.5 stay)
+                line = re.sub(r'[\w.%+-]+@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})\b', r'***@\1', line)
                 # redact IPs: 192.168.1.100 -> 192.x.x.x
                 line = re.sub(r'(\d{1,3})\.\d{1,3}\.\d{1,3}\.\d{1,3}', r'\1.x.x.x', line)
                 return line
@@ -4190,6 +4405,89 @@ Generated by: {username}
 _UPDATE_CHECK_TTL = 24 * 60 * 60  # 24h
 _update_check_cache = {}
 
+# MK Oct 2026 - where a host takes its packages from, read along with each check for the
+# overview of all clusters (/api/updates-overview). Only the product's own standard repos
+# decide the channel; the Ceph ones (ceph-squid-enterprise, ...) do not.
+_PRODUCT_REPOS = ('enterprise', 'no-subscription', 'test')
+_SUBSCRIPTION_STATES = ('active', 'notfound', 'new', 'invalid', 'expired', 'suspended')
+_KERNEL_PACKAGES = ('linux-image', 'pve-kernel', 'proxmox-kernel')
+_NO_SOURCE = {'channel': None, 'repo_warnings': None, 'subscription': None}
+
+
+def apt_channel(data):
+    """{'channel', 'repo_warnings'} from an /apt/repositories answer of PVE or PBS. The channel
+    is the one standard repository that is on, 'mixed' for several, 'none' for none; None
+    for both when the answer has no standard-repos list."""
+    if not isinstance(data, dict) or not isinstance(data.get('standard-repos'), list):
+        return {'channel': None, 'repo_warnings': None}
+    on = [r['handle'] for r in data['standard-repos']
+          if isinstance(r, dict) and r.get('handle') in _PRODUCT_REPOS and r.get('status') == 1]
+    channel = on[0] if len(on) == 1 else ('mixed' if on else 'none')
+    infos = data.get('infos') if isinstance(data.get('infos'), list) else []
+    return {'channel': channel,
+            'repo_warnings': sum(1 for i in infos if isinstance(i, dict) and i.get('kind') == 'warning')}
+
+
+def subscription_state(data):
+    """The status of a /subscription answer, nothing else of it (the key stays where it is)."""
+    if not isinstance(data, dict):
+        return None
+    status = str(data.get('status') or '').strip().lower()
+    if not status:
+        return None
+    return status if status in _SUBSCRIPTION_STATES else 'unknown'
+
+
+def _node_package_source(mgr, node):
+    from urllib.parse import quote
+    base = f"https://{mgr.host}:{mgr.api_port}/api2/json/nodes/{quote(node, safe='')}"
+    out = dict(_NO_SOURCE)
+    try:
+        r = mgr._api_get(f"{base}/apt/repositories", timeout=8)
+        if r.status_code == 200:
+            out.update(apt_channel((r.json() or {}).get('data')))
+    except Exception as e:
+        logging.debug(f"[UpdateCheck] {node}: repositories unreadable: {e}")
+    try:
+        r = mgr._api_get(f"{base}/subscription", timeout=8)
+        if r.status_code == 200:
+            out['subscription'] = subscription_state((r.json() or {}).get('data'))
+    except Exception as e:
+        logging.debug(f"[UpdateCheck] {node}: subscription unreadable: {e}")
+    return out
+
+
+def _pbs_package_source(pmgr):
+    out = dict(_NO_SOURCE)
+    try:
+        repos = pmgr.api_get('/nodes/localhost/apt/repositories', timeout=8)
+        if isinstance(repos, dict) and 'error' not in repos:
+            out.update(apt_channel(repos.get('data')))
+        sub = pmgr.api_get('/nodes/localhost/subscription', timeout=8)
+        if isinstance(sub, dict) and 'error' not in sub:
+            out['subscription'] = subscription_state(sub.get('data'))
+    except Exception as e:
+        logging.debug(f"[UpdateCheck] PBS {getattr(pmgr, 'name', '?')}: package source unreadable: {e}")
+    return out
+
+
+def _overview_host(res, kind):
+    """One row of the update overview from what the check stored for a host. Security is None
+    where the list does not say: PVE and PBS give a package's origin ('Debian') but not its
+    suite, so a security update reads like any other there."""
+    res = res if isinstance(res, dict) else {}
+    count = res.get('count')
+    ok = res.get('success', True) is not False and isinstance(count, int) and count >= 0
+    updates = [u for u in (res.get('updates') or []) if isinstance(u, dict)] if ok else []
+    marked = sum(1 for u in updates if any('security' in str(u.get(k) or '').lower()
+                                           for k in ('Origin', 'Section', 'Label', 'Archive')))
+    security = marked if ok and (marked or kind == 'xcpng') else None
+    names = [str(u.get('Package') or '') for u in updates]
+    kernel = any(k in n for n in names for k in _KERNEL_PACKAGES) or (kind == 'xcpng' and 'kernel' in names)
+    return {'ok': ok, 'count': count if ok else None, 'security': security, 'kernel': kernel,
+            'channel': res.get('channel'), 'repo_warnings': res.get('repo_warnings'),
+            'subscription': res.get('subscription')}
+
 
 @bp.route('/api/clusters/<cluster_id>/updates/check', methods=['POST'])
 @require_auth(perms=['node.update'])
@@ -4365,6 +4663,14 @@ def check_cluster_updates(cluster_id):
         }
         logging.warning(f"[UpdateCheck] rejecting node name outside allow-list: {node_name!r}")
 
+    # two short reads per node after the check, a failed one included: an enterprise repo
+    # without a subscription is the usual reason its refresh failed
+    if getattr(mgr, 'cluster_type', 'proxmox') == 'proxmox' and safe_node_names:
+        sources = run_concurrent_dict(
+            {n: (lambda nn=n: _node_package_source(mgr, nn)) for n in safe_node_names}, timeout=20)
+        for node_name, src in sources.items():
+            results[node_name].update(src or _NO_SOURCE)
+
     # MK: count > 0 for updates, ignore -1 (failed checks)
     total_updates = sum(max(r.get('count', 0), 0) for r in results.values())
     nodes_with_updates = sum(1 for r in results.values() if r.get('count', 0) > 0)
@@ -4390,7 +4696,8 @@ def check_cluster_updates(cluster_id):
                     'success': 'error' not in pbs_upd,
                     'pbs_id': pid,
                     'updates': upd_list,
-                    'count': len(upd_list)
+                    'count': len(upd_list),
+                    **_pbs_package_source(pmgr),
                 }
             except Exception as pe:
                 pbs_results[pmgr.name or pid] = {'success': False, 'pbs_id': pid, 'error': str(pe), 'updates': [], 'count': -1}
@@ -4433,11 +4740,19 @@ def get_cluster_update_status(cluster_id):
         return jsonify({'error': 'Cluster not found'}), 404
     
     mgr = cluster_managers[cluster_id]
-    rolling_update = getattr(mgr, '_rolling_update', None)
+    rolling_update = rolling_runs.view(mgr)
+    if rolling_update is None:
+        # MK Oct 2026 - a run the table holds open and this manager has not loaded (the row came
+        # with a sync after it started): shown, so it can be continued or cancelled
+        opened = rolling_runs.open_run(mgr, cluster_id)
+        if opened is not None:
+            rolling_runs.adopt(mgr, opened)
+            rolling_update = rolling_runs.view(mgr)
     
-    # Auto-clear completed/failed/cancelled status - NS Jan 2026
-    if rolling_update and rolling_update.get('status') in ['completed', 'failed', 'cancelled']:
+    # Auto-clear completed/failed/cancelled status - NS Jan 2026. The run stays in the history.
+    if rolling_update and rolling_update.get('status') in rolling_runs.OVER:
         completed_at = rolling_update.get('completed_at', '')
+        clear = True
         if completed_at:
             try:
                 from datetime import datetime
@@ -4445,16 +4760,11 @@ def get_cluster_update_status(cluster_id):
                 age_seconds = (datetime.now() - completed_time).total_seconds()
                 # Auto-clear after 5 minutes for completed, 30 minutes for failed
                 clear_after = 1800 if rolling_update.get('status') == 'failed' else 300
-                if age_seconds > clear_after:
-                    mgr._rolling_update = None
-                    rolling_update = None
-            except:
-                # Invalid timestamp - clear it
-                mgr._rolling_update = None
-                rolling_update = None
-        else:
-            # No completed_at timestamp - this is legacy or broken data, clear it
-            mgr._rolling_update = None
+                clear = age_seconds > clear_after
+            except (TypeError, ValueError):
+                pass   # Invalid timestamp - clear it
+        # No completed_at timestamp - this is legacy or broken data, clear it
+        if clear and rolling_runs.dismiss(mgr):
             rolling_update = None
     
     # sec (audit): the evacuation log names each VM that failed to migrate ("✗ Failed: <name>
@@ -4467,13 +4777,80 @@ def get_cluster_update_status(cluster_id):
         if not sees_whole_maintenance(build_authz_user(request.session.get('user', ''), request.session),
                                       cluster_id):
             rolling_update = {k: v for k, v in rolling_update.items()
-                              if k not in ('logs', 'paused_details')}
+                              if k not in rolling_runs.CONFINED_HIDDEN}
 
     return jsonify({
         'success': True,
         'rolling_update': rolling_update,
         'last_check': getattr(mgr, '_last_update_check', None)
     })
+
+
+# MK Oct 2026 - the pending updates of every node and backup server on the clusters the
+# caller reaches, in one table. Read from what each cluster's last check left in
+# _update_check_cache: no node is asked anything here, and a cluster nobody has checked since
+# the last restart says so (its update manager runs the check). The checks run on the active,
+# so a standby reads this there (ha.FORWARDED_READS).
+@bp.route('/api/updates-overview', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_updates_overview():
+    """Pending package updates of all nodes and PBS servers, from the cached update checks"""
+    from pegaprox.api.helpers import caller_is_scoped, check_pbs_access
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import has_permission
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    now = time.time()
+
+    def _name(cid, mgr):
+        name = getattr(getattr(mgr, 'config', None), 'name', None)
+        return name if isinstance(name, str) and name else cid
+
+    hosts, clusters, backup = [], [], {}
+    for cid, mgr in sorted(list(cluster_managers.items()), key=lambda kv: _name(*kv).lower()):
+        kind = getattr(mgr, 'cluster_type', 'proxmox')
+        if kind not in ('proxmox', 'xcpng'):
+            continue
+        ok, _err = check_cluster_access(cid)
+        if not ok:
+            continue
+        name = _name(cid, mgr)
+        entry = {'cluster_id': cid, 'cluster_name': name, 'state': 'ok', 'count': 0,
+                 'checked_at': None, 'stale': False, 'rolling': None}
+        clusters.append(entry)
+        # the packages of the nodes are the cluster's: a pool or a guest grant does not cover them
+        if caller_is_scoped(user, cid):
+            entry['state'] = 'confined'
+            continue
+        rolling = rolling_runs.current(mgr)
+        if rolling is not None and rolling.get('status') in rolling_runs.ACTIVE:
+            entry['rolling'] = rolling['status']
+        cached = _update_check_cache.get(cid)
+        payload = cached.get('payload') if isinstance(cached, dict) else None
+        if not isinstance(payload, dict):
+            entry['state'] = 'unchecked'
+            continue
+        at = float(cached.get('at') or 0)
+        entry['checked_at'], entry['stale'] = int(at), now - at >= _UPDATE_CHECK_TTL
+        for node, res in sorted((payload.get('nodes') or {}).items()):
+            row = _overview_host(res, kind)
+            row.update(cluster_id=cid, cluster_name=name, kind='node', name=str(node), pbs_id=None,
+                       checked_at=entry['checked_at'], stale=entry['stale'])
+            entry['count'] += row['count'] or 0
+            hosts.append(row)
+        for pname, res in (payload.get('pbs') or {}).items():
+            pid = res.get('pbs_id') if isinstance(res, dict) else None
+            # a PBS linked to no cluster is in the check of each: the newest one tells
+            if pid and (pid not in backup or at > backup[pid][0]):
+                backup[pid] = (at, entry, str(pname), res)
+    if backup and has_permission(user, 'pbs.view'):
+        for pid, (at, entry, pname, res) in sorted(backup.items(), key=lambda kv: kv[1][2].lower()):
+            if pid not in pbs_managers or not check_pbs_access(pid)[0]:
+                continue
+            row = _overview_host(res, 'pbs')
+            row.update(cluster_id=entry['cluster_id'], cluster_name=entry['cluster_name'], kind='pbs',
+                       name=pname, pbs_id=pid, checked_at=int(at), stale=now - at >= _UPDATE_CHECK_TTL)
+            hosts.append(row)
+    return jsonify({'hosts': hosts, 'clusters': clusters})
 
 
 # NS 2026-07-17 (#403 part 2, proxforge): decide whether a DEPLOYED Ceph is unsafe
@@ -4553,6 +4930,32 @@ def _ceph_recovery_pending(summary):
     return False
 
 
+def _rolling_flag(data, key, default):
+    """A switch of the start body: true or false (0 and 1 too), the default when it is absent."""
+    value = data.get(key, default)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise ValueError(f'{key} must be true or false')
+
+
+def _rolling_seconds(data, key, default):
+    """A timeout of the start body in seconds, held to 60 s .. 2 h."""
+    value = data.get(key, default)
+    if value is None:
+        value = default
+    if isinstance(value, bool):
+        raise ValueError(f'{key} must be a number of seconds')
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f'{key} must be a number of seconds')
+    return max(60, min(7200, value))
+
+
 @bp.route('/api/clusters/<cluster_id>/updates/rolling', methods=['POST'])
 @require_auth(perms=['node.update'])
 def start_rolling_update(cluster_id):
@@ -4568,6 +4971,9 @@ def start_rolling_update(cluster_id):
     - evacuation_timeout: int - Timeout in seconds for VM evacuation (default: 1800 = 30 min)
     - update_timeout: int - Timeout in seconds for apt upgrade (default: 900 = 15 min)
     - reboot_timeout: int - Timeout in seconds for node reboot (default: 600 = 10 min)
+
+    MK Oct 2026 - the run is kept in rolling_update_runs (core/rolling_runs.py) and refused
+    while another one of the cluster is running or paused, across restarts too.
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
@@ -4579,7 +4985,11 @@ def start_rolling_update(cluster_id):
         return jsonify({'error': 'Cluster not found'}), 404
     
     mgr = cluster_managers[cluster_id]
-    data = request.get_json() or {}
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'The body must be a JSON object'}), 400
 
     # MK Sep 2026 (#716) - alert channels to tell about this run, so the
     # on-call monitoring can be muted for its actual duration instead of a guessed
@@ -4587,11 +4997,28 @@ def start_rolling_update(cluster_id):
     notify_channels = data.get('notify_channels', [])
     if notify_channels is None:
         notify_channels = []
-    if not isinstance(notify_channels, list) or not all(isinstance(c, str) for c in notify_channels):
+    if (not isinstance(notify_channels, list) or len(notify_channels) > 100
+            or not all(isinstance(c, str) and len(c) <= 128 for c in notify_channels)):
         return jsonify({'error': 'notify_channels must be a list of channel ids'}), 400
     
     # Configuration options
-    include_reboot = data.get('include_reboot', False)
+    try:
+        include_reboot = _rolling_flag(data, 'include_reboot', False)
+        skip_up_to_date = _rolling_flag(data, 'skip_up_to_date', True)
+        force_all = _rolling_flag(data, 'force_all', False)
+        skip_evacuation = _rolling_flag(data, 'skip_evacuation', False)  # MK: Issue #22 - skip VM evacuation (NOT RECOMMENDED)
+        wait_for_reboot = _rolling_flag(data, 'wait_for_reboot', True)  # NS: GitHub #40
+        pause_on_evacuation_error = _rolling_flag(data, 'pause_on_evacuation_error', True)  # NS: GitHub #40
+        # NS Apr 2026 (#330): lets evacuation migrate local-disk VMs via --with-local-disks
+        # instead of skipping them outright. Off by default - it copies blocks over the
+        # cluster network and can take ages on bigger VMs.
+        allow_local_disks = _rolling_flag(data, 'allow_local_disks', False)
+        # MK: Configurable timeouts (GitHub Issue fix), 30 min / 15 min / 10 min by default
+        evacuation_timeout = _rolling_seconds(data, 'evacuation_timeout', 1800)
+        update_timeout = _rolling_seconds(data, 'update_timeout', 900)
+        reboot_timeout = _rolling_seconds(data, 'reboot_timeout', 600)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
     # MK Sep 2026 - node.reboot is a permission this product defines, ships in the
     # tenant-admin template and enforced in exactly no route, so an operator who built a
     # role with node.update and deliberately withheld node.reboot still got their nodes
@@ -4603,15 +5030,9 @@ def start_rolling_update(cluster_id):
         if not _hasp(_bau(request.session.get('user', ''), request.session), 'node.reboot'):
             return jsonify({'error': 'Rebooting nodes needs the node.reboot permission'}), 403
     node_order = data.get('node_order', None)
-    skip_up_to_date = data.get('skip_up_to_date', True)
-    force_all = data.get('force_all', False)
-    skip_evacuation = data.get('skip_evacuation', False)  # MK: Issue #22 - skip VM evacuation (NOT RECOMMENDED)
-    wait_for_reboot = data.get('wait_for_reboot', True)  # NS: GitHub #40
-    pause_on_evacuation_error = data.get('pause_on_evacuation_error', True)  # NS: GitHub #40
-    # NS Apr 2026 (#330): lets evacuation migrate local-disk VMs via --with-local-disks
-    # instead of skipping them outright. Off by default — it copies blocks over the
-    # cluster network and can take ages on bigger VMs.
-    allow_local_disks = bool(data.get('allow_local_disks', False))
+    if node_order is not None and (not isinstance(node_order, list) or len(node_order) > 1000 or not all(
+            isinstance(n, str) and 0 < len(n) <= 255 for n in node_order)):
+        return jsonify({'error': 'node_order must be a list of node names'}), 400
     # NS 2026-07-17 (#403 part 2, proxforge): opt-in Ceph-health gate. When a
     # DEPLOYED Ceph doesn't return to a safe state after a node, HOLD the rolling
     # update instead of pulling the next node (which can drop copies below
@@ -4628,19 +5049,10 @@ def start_rolling_update(cluster_id):
     # Proxmox only - XCP-ng has neither the templates nor the HA rules meant here.
     migrate_templates, relax_anti_affinity = evacuation_options(mgr, data)
 
-    # MK: Configurable timeouts (GitHub Issue fix)
-    evacuation_timeout = data.get('evacuation_timeout', 1800)  # 30 minutes default (was 5 min!)
-    update_timeout = data.get('update_timeout', 900)  # 15 minutes default
-    reboot_timeout = data.get('reboot_timeout', 600)  # 10 minutes default
-    
-    # Validate timeouts (min 60s, max 2 hours)
-    evacuation_timeout = max(60, min(7200, int(evacuation_timeout)))
-    update_timeout = max(60, min(7200, int(update_timeout)))
-    reboot_timeout = max(60, min(7200, int(reboot_timeout)))
-    
-    # check already running
-    if hasattr(mgr, '_rolling_update') and mgr._rolling_update and mgr._rolling_update.get('status') == 'running':
-        return jsonify({'error': 'Rolling update already in progress'}), 400
+    # a run of this cluster running or paused, here or in the table: one at a time
+    why = rolling_runs.busy(mgr, cluster_id)
+    if why:
+        return jsonify({'error': why}), 400
     
     # Get nodes from cluster status
     try:
@@ -4662,70 +5074,576 @@ def start_rolling_update(cluster_id):
     if not nodes_to_update:
         return jsonify({'error': 'No nodes available for update'}), 400
     
-    # init rolling update state
-    mgr._rolling_update = {
-        'status': 'running',
-        'started_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-        'include_reboot': include_reboot,
-        'skip_up_to_date': skip_up_to_date,
-        'skip_evacuation': skip_evacuation,  # MK: Issue #22
-        'wait_for_reboot': wait_for_reboot,  # NS: GitHub #40
-        'pause_on_evacuation_error': pause_on_evacuation_error,  # NS: GitHub #40
-        'allow_local_disks': allow_local_disks,  # NS #330
-        'ceph_health_gate': ceph_health_gate,  # NS #403 part 2
-        'migrate_templates': migrate_templates,  # #763
-        'relax_anti_affinity': relax_anti_affinity,  # #954
-        'force_all': force_all,
-        'evacuation_timeout': evacuation_timeout,
-        'update_timeout': update_timeout,
-        'reboot_timeout': reboot_timeout,
-        'nodes': nodes_to_update,
-        'current_index': 0,
-        'current_node': nodes_to_update[0],
-        'current_step': 'starting',
-        'completed_nodes': [],
-        'skipped_nodes': [],  # MK: Track skipped nodes
-        'failed_nodes': [],
-        'rebooting_nodes': [],
-        'paused_reason': None,
-        'paused_details': None,
-        'logs': []
-    }
-    
     usr = request.session.get('user', 'system')
+    # init rolling update state, in the table before the first step
+    try:
+        state = rolling_runs.begin(mgr, cluster_id, {
+            'status': 'running',
+            'started_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'include_reboot': include_reboot,
+            'skip_up_to_date': skip_up_to_date,
+            'skip_evacuation': skip_evacuation,  # MK: Issue #22
+            'wait_for_reboot': wait_for_reboot,  # NS: GitHub #40
+            'pause_on_evacuation_error': pause_on_evacuation_error,  # NS: GitHub #40
+            'allow_local_disks': allow_local_disks,  # NS #330
+            'ceph_health_gate': ceph_health_gate,  # NS #403 part 2
+            'migrate_templates': migrate_templates,  # #763
+            'relax_anti_affinity': relax_anti_affinity,  # #954
+            'force_all': force_all,
+            'evacuation_timeout': evacuation_timeout,
+            'update_timeout': update_timeout,
+            'reboot_timeout': reboot_timeout,
+            'notify_channels': notify_channels,  # #716, for the end of a run that outlived a restart
+            'nodes': nodes_to_update,
+            'current_index': 0,
+            'current_node': nodes_to_update[0],
+            'current_step': 'starting',
+            'completed_nodes': [],
+            'skipped_nodes': [],  # MK: Track skipped nodes
+            'failed_nodes': [],
+            'rebooting_nodes': [],
+            'paused_reason': None,
+            'paused_details': None,
+            'logs': []
+        }, usr)
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Could not record the rolling update')}), 500
+    if state is None:
+        return jsonify({'error': rolling_runs.busy(mgr, cluster_id) or 'Rolling update already in progress'}), 400
+    
     log_audit(usr, 'node.rolling_update_started',
               f"Rolling update of {len(nodes_to_update)} node(s) started"
               + evacuation_options_said(migrate_templates, relax_anti_affinity),
               cluster=mgr.config.name)
 
-    # helper: one-line log with a timestamp prefix
+    _launch_rolling_update(mgr, cluster_id, usr)
+
+    return jsonify({
+        'success': True,
+        'message': 'Rolling update started',
+        'nodes': nodes_to_update,
+        'include_reboot': include_reboot,
+        'skip_up_to_date': skip_up_to_date,
+        'evacuation_timeout': evacuation_timeout,
+        'update_timeout': update_timeout,
+        'reboot_timeout': reboot_timeout
+    })
+
+
+# MK Oct 2026 - the worker of a rolling update started by hand, and of every run that goes on
+# after a pause no worker here waited out (a restart, or another instance took over, #625):
+# Continue starts it again with resume = {'index', 'phase'} of the node to go on with, and that
+# node is looked at again first. All the run needs is in its state, and every change goes
+# through rolling_runs.change, so the run's row says at any moment which node is in which phase.
+def run_rolling_update(mgr, cluster_id, who, resume=None):
+    from pegaprox.utils.webhooks import notify_lifecycle   # #716
+    state = rolling_runs.current(mgr) or {}
+    nodes_to_update = list(state.get('nodes') or [])
+    total = len(nodes_to_update)
+    include_reboot = bool(state.get('include_reboot'))
+    skip_up_to_date = state.get('skip_up_to_date', True) is not False
+    force_all = bool(state.get('force_all'))
+    skip_evacuation = bool(state.get('skip_evacuation'))
+    wait_for_reboot = state.get('wait_for_reboot', True) is not False
+    pause_on_evacuation_error = state.get('pause_on_evacuation_error', True) is not False
+    allow_local_disks = bool(state.get('allow_local_disks'))
+    ceph_health_gate = state.get('ceph_health_gate') or 'off'
+    migrate_templates = bool(state.get('migrate_templates'))
+    relax_anti_affinity = bool(state.get('relax_anti_affinity'))
+    evacuation_timeout = int(state.get('evacuation_timeout') or 1800)
+    update_timeout = int(state.get('update_timeout') or 900)
+    reboot_timeout = int(state.get('reboot_timeout') or 600)
+    notify_channels = list(state.get('notify_channels') or [])
+    is_xcpng = getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng'
+
+    def _set(**kw):
+        return rolling_runs.change(mgr, **kw)
+
     def _log(msg):
+        rolling_runs.change(mgr, log=msg)
+
+    def _status():
+        return (rolling_runs.current(mgr) or {}).get('status')
+
+    def _phase(node_name, phase, line=None):
+        # in the run's row, and in an automatic group with the members, before its step goes out
+        _set(current_step=phase, node=(node_name, {'phase': phase}), log=line)
+
+    def _hold(reason, step, details, resume_at, line):
+        """Paused until Continue or Cancel; the status then. resume_at is where a Continue goes
+        on that comes when no worker waits here any more."""
+        _set(status='paused', current_step=step, paused_reason=reason, paused_details=details,
+             resume_at=resume_at, log=line)
+        while _status() == 'paused':
+            time.sleep(2)
+        status = _status()
+        if status == 'running':
+            at = resume_at['index']
+            _set(paused_reason=None, paused_details=None, resume_at=None, current_index=at,
+                 current_node=nodes_to_update[at] if at < total else '', current_step=resume_at['phase'])
+        return status
+
+    def _quorum_holds(idx, node_name, phase):
+        """MK Oct 2026 - before node_name goes into maintenance and before its update: the
+        cluster keeps its quorum with it down, or the run waits (paused, reason 'quorum'), and
+        each Continue looks again. A node an admin let go anyway (Continue anyway) goes on with a
+        warning. False when the run was cancelled meanwhile."""
+        while True:
+            verdict = rolling_runs.quorum_gate(mgr, node_name, sleep=time.sleep,
+                                               stop=lambda: _status() != 'running')
+            if verdict['ok']:
+                if not verdict.get('skipped'):
+                    _log(rolling_runs.quorum_said(verdict))
+                return True
+            if _status() != 'running':
+                return False
+            accepted = (rolling_runs.current(mgr) or {}).get('quorum_risk_accepted') or []
+            if node_name in accepted:
+                _log(f"⚠ {rolling_runs.quorum_said(verdict)} - going on, the risk was accepted for {node_name}")
+                return True
+            details, line = rolling_runs.quorum_hold(verdict, phase)
+            logging.warning(f"[RollingUpdate] Paused before {node_name} ({phase}): quorum {verdict.get('reason')}")
+            status = _hold(rolling_runs.QUORUM, 'paused_quorum', details, {'index': idx, 'phase': phase}, line)
+            if status != 'running':
+                return False
+            _log(f"▶ Continued - looking at the quorum again before {node_name} goes on")
+
+    def _pending(node_name):
+        """How many updates the node has, None when that could not be read."""
+        # First refresh apt/yum cache
         try:
-            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+            mgr.refresh_node_apt(node_name)
+            # NS: yum makecache takes way longer than apt update
+            time.sleep(10 if is_xcpng else 3)
         except Exception:
             pass
-
-    # #763, #954 - shared with the scheduled run (api/helpers.py): off before the first
-    # evacuation, on again when the run ends however it ends
-    def _log_templates(task):
-        rolling_moved_templates(mgr, task)
-
-    def _rules_give_way():
-        rolling_rules_give_way(mgr, usr)
-
-    def _rules_back_on():
-        rolling_rules_back_on(mgr, usr)
-
-    # Start the rolling update in a background thread
-    def run_rolling_update():
-        from pegaprox.utils.webhooks import notify_lifecycle   # #716
         try:
+            available_updates = mgr.get_node_apt_updates(node_name)
+        except Exception as e:
+            _log(f"⚠ Failed to check updates on {node_name}: {e}")
+            logging.warning(f"[RollingUpdate] Update check failed for {node_name}: {e}")
+            return None
+        return len(available_updates) if available_updates else 0
+
+    def _recheck(node_name, phase, info):
+        """A node no worker followed through its phase (a restart came in between): what it
+        looks like now decides where the run goes on. Returns (phase, in maintenance)."""
+        try:
+            ns = mgr.get_node_status() or {}
+        except Exception:
+            ns = {}
+        row = ns.get(node_name) if isinstance(ns, dict) else None
+        row = row if isinstance(row, dict) else {}
+        online = row.get('status') == 'online'
+        held = rolling_in_maintenance(mgr, node_name, ns)
+        rebooted = False
+        try:
+            # booted after the phase began: the reboot happened while nobody watched
+            up, since = float(row.get('uptime') or 0), float(info.get('phase_at') or 0)
+            rebooted = bool(up and since and time.time() - up > since)
+        except (TypeError, ValueError):
+            pass
+        _log(f"Re-check of {node_name}: {'online' if online else 'not online'}, "
+             f"{'in' if held else 'not in'} maintenance" + (', rebooted since' if rebooted else ''))
+        if not online:
+            if phase in ('updating', 'rebooting') and include_reboot:
+                _log(f"{node_name} is down, most likely in its reboot - waiting for it to come back")
+                return 'rebooting', held
+            raise Exception(f"{node_name} is not online")
+        if phase in ('maintenance', 'evacuating'):
+            return 'maintenance', held
+        if phase in ('updating', 'rebooting'):
+            if phase == 'rebooting' and rebooted:
+                _log(f"✓ {node_name} rebooted and is back online")
+                return 'finishing', held
+            pending = _pending(node_name)
+            if pending == 0 and (rebooted or not include_reboot):
+                _log(f"{node_name} has no update left - going on with taking it out of maintenance")
+                return 'finishing', held
+            if pending:
+                _log(f"{node_name} still has {pending} update(s) pending - the update runs again")
+            elif pending is None:
+                _log(f"Pending updates of {node_name} unknown - the update runs again")
+            else:
+                _log(f"{node_name} has no update left - the update runs once more so the node says "
+                     f"whether it needs its reboot")
+            # the update wants the node empty: back through maintenance when it left it
+            return ('updating' if held or skip_evacuation else 'maintenance'), held
+        return phase, held
+
+    def run_node(idx, node_name, from_phase, recheck):
+        """One node from from_phase on: 'done', 'skipped' or 'stop'. Raises when it failed."""
+        info = ((rolling_runs.current(mgr) or {}).get('node_state') or {}).get(node_name) or {}
+        held = False
+        if recheck:
+            from_phase, held = _recheck(node_name, from_phase, info)
+        start = rolling_runs.PHASES.index(from_phase)
+
+        def todo(phase):
+            return rolling_runs.PHASES.index(phase) >= start
+
+        node_rebooted = from_phase == 'rebooting' or bool(info.get('rebooted'))
+        back_online = False
+
+        # MK: Step 0 - Check if node has updates available (GitHub Issue fix)
+        if todo('checking') and skip_up_to_date and not force_all:
+            _log(f"Checking for available updates on {node_name}...")
+            update_count = _pending(node_name)
+            if update_count == 0:
+                _set(add={'skipped_nodes': node_name}, node=(node_name, {'phase': 'done', 'result': 'skipped'}),
+                     log=f"⏭ {node_name} is already up-to-date - SKIPPING")
+                logging.info(f"[RollingUpdate] Node {node_name} is up-to-date, skipping")
+                return 'skipped'
+            elif update_count is None:
+                _log("Check failed, proceeding with update anyway")
+            else:
+                _log(f"Found {update_count} updates available on {node_name}")
+                logging.info(f"[RollingUpdate] Node {node_name} has {update_count} updates available")
+
+        if todo('maintenance'):
+            if not _quorum_holds(idx, node_name, 'maintenance'):
+                return 'stop'
+            # NS: force-refresh maintenance state from PVE before each node (#141)
+            refresh = getattr(mgr, 'refresh_maintenance_status', None)
+            if callable(refresh):
+                refresh()
+            # MK #181 - list the VMs about to move. Nothing is more reassuring to an admin
+            # at 02:00 than seeing the names roll past before evacuation kicks off.
+            running = []
+            if not skip_evacuation:
+                # MK Oct 2026 - no manager has get_node_vms or get_cluster_resources, so
+                # this always read "0 guests present"
+                try:
+                    vms_here = [r for r in (mgr.get_vm_resources() or [])
+                                if r.get('node') == node_name and r.get('type') in ('qemu', 'lxc')]
+                except Exception:
+                    vms_here = []
+                running = [v for v in vms_here if (v.get('status') or '').lower() == 'running']
+                _log(f"{node_name}: {len(vms_here)} guests present ({len(running)} running, {len(vms_here) - len(running)} stopped)")
+                lines = [f"  → will evacuate: {vm.get('name') or (vm.get('type', 'vm') + ' ' + str(vm.get('vmid', '?')))} "
+                         f"(VMID {vm.get('vmid', '?')}, {vm.get('type', '?')})" for vm in running[:8]]
+                if len(running) > 8:
+                    lines.append(f"  → …and {len(running) - 8} more")
+                if lines:
+                    _set(log=lines)
+                rolling_node_templates(mgr, vms_here)   # #763
+
+            # Step 1: Enable maintenance mode (evacuate VMs unless skip_evacuation is set)
+            # enter_maintenance_mode() internally calls _set_ceph_maintenance_flags()
+            # - we only log the intent here so the user sees it in the task view.
+            if skip_evacuation:
+                _phase(node_name, 'maintenance', f"Enabling maintenance mode on {node_name} (SKIP EVACUATION)")
+                logging.info(f"[RollingUpdate] Enabling maintenance mode on {node_name} (skip_evacuation=True)")
+            else:
+                _phase(node_name, 'maintenance', [f"Enabling maintenance mode on {node_name}",
+                                                  f"  → Ceph (if present): noout + norebalance will be set on {node_name} to prevent rebalancing"])
+                logging.info(f"[RollingUpdate] Enabling maintenance mode on {node_name}")
+            if recheck and held:
+                # still in maintenance from before: its evacuation ended with the process, so it
+                # runs again for whatever is left on the node
+                with mgr.maintenance_lock:
+                    old = mgr.nodes_in_maintenance.get(node_name)
+                    if old is not None and getattr(old, 'status', '') in ('completed', 'completed_with_errors', 'failed'):
+                        mgr.nodes_in_maintenance.pop(node_name, None)
+                _log(f"{node_name} is still in maintenance - its evacuation runs again for what is left on it")
+            if not skip_evacuation:
+                rolling_rules_give_way(mgr, who)   # #954, once, before the first evacuation
+            # whatever happens next, the end of the run takes this node out of maintenance again
+            _set(node=(node_name, {'in_maintenance': True}))
+            # before each node's evacuation and its update (design 5.2, #625)
+            if not ha.confirm_step(f'rolling update of {node_name}'):
+                raise Exception('this instance does not hold the lease of its group')
+            maintenance_task = mgr.enter_maintenance_mode(
+                node_name,
+                skip_evacuation=skip_evacuation,
+                allow_local_disks=allow_local_disks,  # NS #330
+                **({'migrate_templates': True} if migrate_templates else {}),  # #763
+            )
+
+            if not maintenance_task:
+                logging.error(f"[RollingUpdate] Failed to start maintenance mode on {node_name}")
+                raise Exception(f"Failed to start maintenance mode")
+
+            # Wait for evacuation to complete (unless skipped)
+            if skip_evacuation:
+                _log("⚠️ Skipping VM evacuation - VMs remain on node")
+            else:
+                _phase(node_name, 'evacuating', f"Waiting for VM evacuation (timeout: {evacuation_timeout}s)...")
+                waited = 0
+                evacuation_completed = False
+                last_progress_log = 0
+
+                while waited < evacuation_timeout:
+                    if _status() not in ['running', 'paused']:
+                        break
+                    if node_name in mgr.nodes_in_maintenance:
+                        maintenance_task = mgr.nodes_in_maintenance[node_name]
+                        if maintenance_task.status == 'completed':
+                            _log("✓ Evacuation completed - all VMs migrated")
+                            rolling_moved_templates(mgr, maintenance_task)
+                            evacuation_completed = True
+                            break
+                        elif maintenance_task.status == 'completed_with_errors':
+                            rolling_moved_templates(mgr, maintenance_task)
+                            failed_vm_list = getattr(maintenance_task, 'failed_vms', [])
+                            failed_names = [f"{v.get('name', 'VM')} (VMID: {v.get('vmid', '?')})" for v in failed_vm_list]
+                            migrated = getattr(maintenance_task, 'migrated_vms', 0)
+                            total_vms = getattr(maintenance_task, 'total_vms', 0)
+                            _set(log=[f"⚠️ Evacuation: {migrated}/{total_vms} migrated, {len(failed_vm_list)} failed"]
+                                 + [f"  ✗ Failed: {fn}" for fn in failed_names])
+
+                            if pause_on_evacuation_error:
+                                logging.warning(f"[RollingUpdate] Paused on {node_name}: {len(failed_vm_list)} VMs failed to migrate")
+                                status = _hold('evacuation_failures', 'paused_evacuation', {
+                                    'node': node_name, 'migrated': migrated, 'total': total_vms,
+                                    'failed_vms': [{'vmid': v.get('vmid'), 'name': v.get('name', 'VM'), 'error': v.get('error', '')} for v in failed_vm_list],
+                                    'message': f"{len(failed_vm_list)} VM(s) failed to migrate from {node_name}. Manually migrate/shutdown these VMs, then click Continue or Cancel."
+                                }, {'index': idx, 'phase': 'updating'}, "⏸ PAUSED - Waiting for user action.")
+                                if status == 'cancelled':
+                                    _log("Rolling update cancelled by user during pause")
+                                elif status == 'running':
+                                    _log(f"▶ Resumed by user - continuing update on {node_name}")
+                                    evacuation_completed = True
+                                break
+                            _log("⚠️ Continuing despite failures (pause_on_evacuation_error=False)")
+                            evacuation_completed = True
+                            break
+                        elif maintenance_task.status == 'failed':
+                            error_msg = getattr(maintenance_task, 'error', 'Unknown error')
+                            _log(f"✗ Evacuation failed: {error_msg}")
+                            raise Exception(f"Evacuation failed: {error_msg}")
+                        else:
+                            if waited - last_progress_log >= 30:
+                                if hasattr(maintenance_task, 'migrated_vms') and hasattr(maintenance_task, 'total_vms'):
+                                    _log(f"Evacuating: {maintenance_task.migrated_vms}/{maintenance_task.total_vms} VMs ({waited}s)")
+                                else:
+                                    _log(f"Evacuation in progress... ({waited}s)")
+                                last_progress_log = waited
+                    time.sleep(5)
+                    waited += 5
+                if _status() == 'cancelled':
+                    return 'stop'
+                if not evacuation_completed:
+                    raise Exception(f"Evacuation timed out after {evacuation_timeout}s")
+                rolling_moved_guests(mgr, node_name, running, maintenance_task)
+
+        if todo('updating'):
+            if not _quorum_holds(idx, node_name, 'updating'):
+                return 'stop'
+            # Step 2: Run apt update/upgrade
+            _phase(node_name, 'updating', f"Installing updates on {node_name}")
+            logging.info(f"[RollingUpdate] Installing updates on {node_name}")
+
+            if not ha.confirm_step(f'update of {node_name}'):
+                raise Exception('this instance does not hold the lease of its group')
+            update_task = mgr.start_node_update(node_name, reboot=include_reboot)
+
+            if not update_task:
+                logging.error(f"[RollingUpdate] start_node_update returned None for {node_name}")
+                raise Exception(f"Update failed: Could not start update task")
+
+            # Step 3: Wait for update task to complete
+            _log(f"Waiting for update task (timeout: {update_timeout}s)...")
+            update_waited = 0
+            last_phase = None
+            while update_waited < update_timeout:
+                if update_task.status in ['completed', 'failed'] or _status() == 'cancelled':
+                    break
+                # Log phase changes
+                if hasattr(update_task, 'phase') and update_task.phase != last_phase:
+                    last_phase = update_task.phase
+                    # the 'reboot' phase is over in seconds and rarely seen by this poll (#953)
+                    _note = ' (reboot sent)' if last_phase == 'wait_online' and getattr(update_task, 'reboot_issued', False) else ''
+                    _log(f"Update phase: {last_phase}{_note}")
+                time.sleep(10)
+                update_waited += 10
+
+            if _status() == 'cancelled' and update_task.status not in ('completed', 'failed'):
+                _log(f"Cancelled while {node_name} updates - the update goes on on the node until it is done")
+                return 'stop'
+
+            if update_task.status == 'failed':
+                raise Exception(f"Update failed: {update_task.error or 'Unknown error'}")
+
+            if update_task.status != 'completed':
+                raise Exception(f"Update timed out after {update_timeout}s (status: {update_task.status})")
+
+            # Step 4: only wait for a reboot if one was ACTUALLY issued for THIS node.
+            # #715 (robertdahlem) - include_reboot is the global toggle; the per-node needrestart
+            # check inside start_node_update decides whether the node actually rebooted and
+            # records it on the task. A node that needs no reboot must NOT enter the offline-wait,
+            # or it logs a phantom "rebooting", sits 120s waiting for an offline that never comes,
+            # then "back online (0s)".
+            node_rebooted = include_reboot and getattr(update_task, 'reboot_issued', False)
+            back_online = bool(getattr(update_task, 'back_online', False))
+            _set(node=(node_name, {'updated': True, 'rebooted': bool(node_rebooted)}), log="✓ Updates installed")
+            if include_reboot and not node_rebooted:
+                _log(f"Node {node_name} did not require a reboot - skipping reboot wait")
+            elif node_rebooted and back_online:
+                # MK Oct 2026 (#953) - the update task rebooted the node and waited for it
+                # itself; waiting again looked for an offline that ended minutes ago
+                _log(f"✓ {node_name} rebooted during the update and is back online")
+
+        if todo('rebooting') and node_rebooted and not back_online:
+            if from_phase == 'rebooting' and recheck:
+                _phase(node_name, 'rebooting', f"Waiting for {node_name} to come back from its reboot (timeout: {reboot_timeout}s)...")
+            else:
+                _phase(node_name, 'rebooting', f"Node {node_name} requires a reboot - rebooting (timeout: {reboot_timeout}s)...")
+            _set(add={'rebooting_nodes': node_name})
+
+            # Phase 1: Wait for offline - not for one that went down while nobody watched
+            node_went_offline = from_phase == 'rebooting' and recheck
+            offline_waited = 0
+            while not node_went_offline and offline_waited < 120 and _status() != 'cancelled':
+                try:
+                    ns = mgr.get_node_status()
+                    if node_name not in ns or ns[node_name].get('status') != 'online':
+                        node_went_offline = True
+                        _log(f"{node_name} is now offline")
+                        break
+                except Exception:
+                    node_went_offline = True
+                    break
+                time.sleep(5)
+                offline_waited += 5
+
+            if not node_went_offline and _status() != 'cancelled':
+                _log(f"⚠️ {node_name} did not go offline within 120s")
+
+            if wait_for_reboot:
+                # Phase 2: Wait for online
+                _log(f"Waiting for {node_name} to come back online...")
+                waited = 0
+                node_back_online = False
+                while waited < reboot_timeout:
+                    if _status() == 'cancelled':
+                        break
+                    try:
+                        ns = mgr.get_node_status()
+                        if node_name in ns and ns[node_name].get('status') == 'online':
+                            node_back_online = True
+                            _set(drop={'rebooting_nodes': node_name}, log=f"✓ {node_name} back online ({waited}s)")
+                            time.sleep(10)
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(10)
+                    waited += 10
+                    if waited % 60 == 0:
+                        _log(f"Still waiting for {node_name} ({waited}s/{reboot_timeout}s)...")
+
+                if not node_back_online and _status() != 'cancelled':
+                    status = _hold('reboot_timeout', 'paused_reboot', {
+                        'node': node_name, 'timeout': reboot_timeout,
+                        'message': f"{node_name} did not come back online within {reboot_timeout}s. Check manually, then Continue or Cancel."
+                    }, {'index': idx, 'phase': 'finishing'}, f"✗ {node_name} reboot timeout ({reboot_timeout}s). Pausing.")
+                    if status == 'running':
+                        _set(drop={'rebooting_nodes': node_name}, log="▶ Resumed after reboot timeout")
+            else:
+                _log(f"Not waiting for {node_name} (wait_for_reboot=False)")
+
+        if _status() == 'cancelled':
+            return 'stop'
+
+        if todo('finishing'):
+            # Step 5: Disable maintenance mode. A node that came back while nobody watched is a
+            # target for migrations again as well
+            _set(current_step='finishing', node=(node_name, {'phase': 'finishing'}), drop={'rebooting_nodes': node_name},
+                 log=f"Disabling maintenance mode on {node_name}")
+            # NS May 2026 - give HA services 30s to come back after reboot
+            # before we try to disable maintenance. Otherwise ha-manager
+            # rejects the call and the node stays stuck.
+            # #715 - only sleep when the node actually rebooted; a no-reboot node's HA services
+            # never went down, so the 30s wait is pointless and delays the maintenance exit.
+            # #953 - the update task exits maintenance itself once the node is back;
+            # a node it already took out is not a failed exit
+            _still_in_maint = node_name in mgr.nodes_in_maintenance or (recheck and held)
+            if node_rebooted and _still_in_maint:
+                time.sleep(30)
+            if _still_in_maint and not mgr.exit_maintenance_mode(node_name):
+                _log(f"⚠ {node_name} maintenance exit failed (will retry at end of run)")
+            else:
+                _set(node=(node_name, {'in_maintenance': False}))
+            _log(f"  → Ceph (if present): noout + norebalance cleared for {node_name}")
+
+        if todo('ceph'):
+            # MK #181 - wait for Ceph to finish rebalancing/peering before we pull the
+            # next node. This is the bit that stops a rolling update from becoming a
+            # rolling outage on HCI clusters.
+            _phase(node_name, 'ceph')
+            try:
+                ceph_after = mgr.get_ceph_health_summary()
+            except Exception:
+                ceph_after = None
+            if ceph_after is not None:
+                status = ceph_after.get('status', 'unknown')
+                badge = '✓' if status == 'HEALTH_OK' else ('⚠' if status == 'HEALTH_WARN' else '✗')
+                _log(f"Ceph after {node_name}: {badge} {status} · {ceph_after.get('osd_up', 0)}/{ceph_after.get('osd_in', 0)} OSDs up")
+                if status != 'HEALTH_OK' and idx < total - 1:
+                    # #747 (robertdahlem) - only spin here while Ceph is actually recovering
+                    # or has data at risk. A settled cluster on a benign HEALTH_WARN (slow ops
+                    # in BlueStore, clock skew, a leftover flag) never returns to HEALTH_OK, so
+                    # the old `!= HEALTH_OK` wait burned the full 120s per node. The opt-in gate
+                    # below still evaluates whatever status remains, either way.
+                    ceph_waited = 0
+                    if _ceph_recovery_pending(ceph_after):
+                        _log(f"Ceph is {status} and still settling - waiting up to 120s for recovery to finish before next node…")
+                        while ceph_waited < 120 and _ceph_recovery_pending(ceph_after) and _status() != 'cancelled':
+                            time.sleep(10); ceph_waited += 10
+                            try:
+                                ceph_after = mgr.get_ceph_health_summary() or {}
+                                status = ceph_after.get('status', 'unknown')
+                            except Exception:
+                                break
+                        _log(f"Ceph {'still recovering' if _ceph_recovery_pending(ceph_after) else 'settled'} ({status}) after {ceph_waited}s")
+                    else:
+                        _log(f"Ceph is {status} but settled (no recovery in progress) - continuing without the HEALTH_OK wait")
+                    if _status() == 'cancelled':
+                        return 'stop'
+                    if status != 'HEALTH_OK':
+                        # NS 2026-07-17 (#403 part 2, proxforge): opt-in gate - don't pull
+                        # the next node while a deployed Ceph is still at risk.
+                        gate_reason = _ceph_gate_unsafe(ceph_after, ceph_health_gate) if ceph_health_gate != 'off' else None
+                        if gate_reason:
+                            status_after = _hold('ceph_unhealthy', 'paused_ceph', {
+                                'node': node_name,
+                                'ceph_status': status,
+                                'pgs': ceph_after.get('pgs', ''),
+                                'reason': gate_reason,
+                                'message': (f"Ceph is {status} ({gate_reason}) after updating {node_name}. Pulling the "
+                                            f"next node now could drop data below min_size and take it offline. Restore "
+                                            f"Ceph health, then Continue - or Cancel.")
+                            }, {'index': idx, 'phase': 'ceph'},
+                                f"⛔ Ceph is {status} ({gate_reason}) - HOLDING the rolling update before the next node "
+                                f"(ceph_health_gate={ceph_health_gate}). Fix Ceph, then Continue or Cancel.")
+                            if status_after == 'cancelled':
+                                return 'stop'
+                            try:
+                                _c = mgr.get_ceph_health_summary() or {}
+                                _log(f"▶ Resumed after Ceph-health hold - Ceph now {_c.get('status', 'unknown')} · "
+                                     f"{_c.get('osd_up', 0)}/{_c.get('osd_in', 0)} OSDs up")
+                            except Exception:
+                                _log("▶ Resumed after Ceph-health hold")
+                        elif ceph_health_gate != 'off':
+                            _log(f"⚠ Ceph still {status} after {ceph_waited}s but data redundancy looks intact - "
+                                 f"continuing (ceph_health_gate={ceph_health_gate})")
+                        else:
+                            _log(f"⚠ Ceph still {status} after {ceph_waited}s - continuing, but verify cluster health after completion")
+
+        # the guests of a finished node are counted, not named: the row stays small at 100 nodes
+        _set(add={'completed_nodes': node_name}, node=(node_name, {'phase': 'done', 'result': 'done', 'moved': []}),
+             log=f"✓ {node_name} updated successfully")
+        logging.info(f"[RollingUpdate] Node {node_name} updated successfully")
+        return 'done'
+
+    try:
+        if resume is None:
             logging.info(f"[RollingUpdate] Starting rolling update for cluster, nodes: {nodes_to_update}")
             _log("Rolling update started")
             # #716 - the signal the monitoring mutes on
             notify_lifecycle('rolling_update.started',
                              f"Rolling update started on {mgr.config.name}",
-                             f"{len(nodes_to_update)} node(s) queued: {', '.join(nodes_to_update)}"
+                             f"{total} node(s) queued: {', '.join(nodes_to_update)}"
                              + (" · reboots included" if include_reboot else ""),
                              cluster_id=cluster_id, channel_ids=notify_channels)
             _log(f"Settings: skip_up_to_date={skip_up_to_date}, skip_evacuation={skip_evacuation}, evacuation_timeout={evacuation_timeout}s, reboot_timeout={reboot_timeout}s, allow_local_disks={allow_local_disks}, ceph_health_gate={ceph_health_gate}, migrate_templates={migrate_templates}, relax_anti_affinity={relax_anti_affinity}")
@@ -4734,7 +5652,7 @@ def start_rolling_update(cluster_id):
                 _log("⚠️ WARNING: VM evacuation disabled - VMs may be affected if update fails!")
             rolling_options_intro(mgr)   # #763, #954
 
-            # MK #181 — pre-flight summary so admins see cluster-wide safety state up front,
+            # MK #181 - pre-flight summary so admins see cluster-wide safety state up front,
             # not just per-node ticks.
             try:
                 ns = mgr.get_node_status() or {}
@@ -4758,509 +5676,153 @@ def start_rolling_update(cluster_id):
                     if ceph.get('warnings'):
                         _log(f"Ceph warnings: {', '.join(ceph['warnings'])}")
                     if status == 'HEALTH_ERR':
-                        _log("⚠️ Ceph is in HEALTH_ERR. Proceeding may put replicas at further risk — consider aborting.")
+                        _log("⚠️ Ceph is in HEALTH_ERR. Proceeding may put replicas at further risk - consider aborting.")
             except Exception as e:
                 _log(f"Ceph health check skipped: {e}")
+            start_index, start_phase = 0, rolling_runs.PHASES[0]
+        else:
+            start_index = int(resume.get('index') or 0)
+            start_phase = resume.get('phase') or rolling_runs.PHASES[0]
+            logging.info(f"[RollingUpdate] Continuing the rolling update of {cluster_id} at node "
+                         f"{start_index + 1}/{total}, phase {start_phase}")
             
-            for idx, node_name in enumerate(nodes_to_update):
-                if not hasattr(mgr, '_rolling_update') or mgr._rolling_update.get('status') != 'running':
-                    logging.info(f"[RollingUpdate] Update cancelled or stopped")
-                    break
-                
-                mgr._rolling_update['current_index'] = idx
-                mgr._rolling_update['current_node'] = node_name
-                mgr._rolling_update['current_step'] = 'checking'
-                mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] === Processing {node_name} ({idx+1}/{len(nodes_to_update)}) ===")
-                logging.info(f"[RollingUpdate] Processing node: {node_name}")
-                
-                try:
-                    # MK: Step 0 - Check if node has updates available (GitHub Issue fix)
-                    is_xcpng = getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng'
-                    if skip_up_to_date and not force_all:
-                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Checking for available updates on {node_name}...")
+        for idx in range(start_index, total):
+            node_name = nodes_to_update[idx]
+            if _status() != 'running':
+                logging.info(f"[RollingUpdate] Update cancelled or stopped")
+                break
+            resuming = resume is not None and idx == start_index and start_phase in rolling_runs.PHASES
+            from_phase = start_phase if resuming else rolling_runs.PHASES[0]
+            _set(current_index=idx, current_node=node_name, current_step=from_phase,
+                 node=(node_name, {'phase': from_phase}),
+                 log=(f"=== Continuing {node_name} ({idx+1}/{total}) from phase {from_phase} ===" if resuming
+                      else f"=== Processing {node_name} ({idx+1}/{total}) ==="))
+            logging.info(f"[RollingUpdate] Processing node: {node_name}")
 
-                        # First refresh apt/yum cache
-                        try:
-                            mgr.refresh_node_apt(node_name)
-                            # NS: yum makecache takes way longer than apt update
-                            time.sleep(10 if is_xcpng else 3)
-                        except:
-                            pass
-
-                        check_failed = False
-                        try:
-                            available_updates = mgr.get_node_apt_updates(node_name)
-                        except Exception as e:
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠ Failed to check updates on {node_name}: {e}")
-                            logging.warning(f"[RollingUpdate] Update check failed for {node_name}: {e}")
-                            available_updates = []
-                            check_failed = True
-                        update_count = len(available_updates) if available_updates else 0
-
-                        if update_count == 0 and not check_failed:
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⏭ {node_name} is already up-to-date - SKIPPING")
-                            mgr._rolling_update['skipped_nodes'].append(node_name)
-                            logging.info(f"[RollingUpdate] Node {node_name} is up-to-date, skipping")
-                            continue
-                        elif check_failed:
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Check failed, proceeding with update anyway")
-                        else:
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Found {update_count} updates available on {node_name}")
-                            logging.info(f"[RollingUpdate] Node {node_name} has {update_count} updates available")
-                    
-                    # NS: force-refresh maintenance state from PVE before each node (#141)
-                    mgr.refresh_maintenance_status()
-
-                    # MK #181 — list the VMs about to move. Nothing is more reassuring to an admin
-                    # at 02:00 than seeing the names roll past before evacuation kicks off.
-                    if not skip_evacuation:
-                        # MK Oct 2026 - no manager has get_node_vms or get_cluster_resources, so
-                        # this always read "0 guests present"
-                        try:
-                            vms_here = [r for r in (mgr.get_vm_resources() or [])
-                                        if r.get('node') == node_name and r.get('type') in ('qemu', 'lxc')]
-                        except Exception:
-                            vms_here = []
-                        running = [v for v in vms_here if (v.get('status') or '').lower() == 'running']
-                        _log(f"{node_name}: {len(vms_here)} guests present ({len(running)} running, {len(vms_here) - len(running)} stopped)")
-                        for vm in running[:8]:
-                            label = vm.get('name') or f"{vm.get('type','vm')} {vm.get('vmid','?')}"
-                            _log(f"  → will evacuate: {label} (VMID {vm.get('vmid','?')}, {vm.get('type','?')})")
-                        if len(running) > 8:
-                            _log(f"  → …and {len(running) - 8} more")
-                        rolling_node_templates(mgr, vms_here)   # #763
-
-                    # Step 1: Enable maintenance mode (evacuate VMs unless skip_evacuation is set)
-                    # enter_maintenance_mode() internally calls _set_ceph_maintenance_flags()
-                    # — we only log the intent here so the user sees it in the task view.
-                    mgr._rolling_update['current_step'] = 'maintenance'
-                    if skip_evacuation:
-                        _log(f"Enabling maintenance mode on {node_name} (SKIP EVACUATION)")
-                        logging.info(f"[RollingUpdate] Enabling maintenance mode on {node_name} (skip_evacuation=True)")
-                    else:
-                        _log(f"Enabling maintenance mode on {node_name}")
-                        _log(f"  → Ceph (if present): noout + norebalance will be set on {node_name} to prevent rebalancing")
-                        logging.info(f"[RollingUpdate] Enabling maintenance mode on {node_name}")
-                    
-                    if not skip_evacuation:
-                        _rules_give_way()   # #954, once, before the first evacuation
-                    # before each node's evacuation and its update (design 5.2, #625)
-                    if not ha.confirm_step(f'rolling update of {node_name}'):
-                        raise Exception('this instance does not hold the lease of its group')
-                    maintenance_task = mgr.enter_maintenance_mode(
-                        node_name,
-                        skip_evacuation=skip_evacuation,
-                        allow_local_disks=allow_local_disks,  # NS #330
-                        **({'migrate_templates': True} if migrate_templates else {}),  # #763
-                    )
-                    
-                    if not maintenance_task:
-                        logging.error(f"[RollingUpdate] Failed to start maintenance mode on {node_name}")
-                        raise Exception(f"Failed to start maintenance mode")
-                    
-                    # Wait for evacuation to complete (unless skipped)
-                    if skip_evacuation:
-                        mgr._rolling_update['current_step'] = 'updating'
-                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠️ Skipping VM evacuation - VMs remain on node")
-                        evacuation_completed = True
-                    else:
-                        mgr._rolling_update['current_step'] = 'evacuating'
-                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Waiting for VM evacuation (timeout: {evacuation_timeout}s)...")
-                        waited = 0
-                        evacuation_completed = False
-                        last_progress_log = 0
-                        
-                        while waited < evacuation_timeout:
-                            if mgr._rolling_update.get('status') not in ['running', 'paused']:
-                                break
-                            if node_name in mgr.nodes_in_maintenance:
-                                maintenance_task = mgr.nodes_in_maintenance[node_name]
-                                if maintenance_task.status == 'completed':
-                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ Evacuation completed - all VMs migrated")
-                                    _log_templates(maintenance_task)
-                                    evacuation_completed = True
-                                    break
-                                elif maintenance_task.status == 'completed_with_errors':
-                                    _log_templates(maintenance_task)
-                                    failed_vm_list = getattr(maintenance_task, 'failed_vms', [])
-                                    failed_names = [f"{v.get('name', 'VM')} (VMID: {v.get('vmid', '?')})" for v in failed_vm_list]
-                                    migrated = getattr(maintenance_task, 'migrated_vms', 0)
-                                    total = getattr(maintenance_task, 'total_vms', 0)
-                                    mgr._rolling_update['logs'].append(
-                                        f"[{time.strftime('%H:%M:%S')}] ⚠️ Evacuation: {migrated}/{total} migrated, {len(failed_vm_list)} failed")
-                                    for fn in failed_names:
-                                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}]   ✗ Failed: {fn}")
-                                    
-                                    if pause_on_evacuation_error:
-                                        mgr._rolling_update['status'] = 'paused'
-                                        mgr._rolling_update['current_step'] = 'paused_evacuation'
-                                        mgr._rolling_update['paused_reason'] = 'evacuation_failures'
-                                        mgr._rolling_update['paused_details'] = {
-                                            'node': node_name, 'migrated': migrated, 'total': total,
-                                            'failed_vms': [{'vmid': v.get('vmid'), 'name': v.get('name', 'VM'), 'error': v.get('error', '')} for v in failed_vm_list],
-                                            'message': f"{len(failed_vm_list)} VM(s) failed to migrate from {node_name}. Manually migrate/shutdown these VMs, then click Continue or Cancel."
-                                        }
-                                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⏸ PAUSED - Waiting for user action.")
-                                        logging.warning(f"[RollingUpdate] Paused on {node_name}: {len(failed_vm_list)} VMs failed to migrate")
-                                        while mgr._rolling_update.get('status') == 'paused':
-                                            time.sleep(2)
-                                        if mgr._rolling_update.get('status') == 'cancelled':
-                                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Rolling update cancelled by user during pause")
-                                            break
-                                        elif mgr._rolling_update.get('status') == 'running':
-                                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ▶ Resumed by user - continuing update on {node_name}")
-                                            mgr._rolling_update['paused_reason'] = None
-                                            mgr._rolling_update['paused_details'] = None
-                                            evacuation_completed = True
-                                            break
-                                    else:
-                                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠️ Continuing despite failures (pause_on_evacuation_error=False)")
-                                        evacuation_completed = True
-                                        break
-                                elif maintenance_task.status == 'failed':
-                                    error_msg = getattr(maintenance_task, 'error', 'Unknown error')
-                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ Evacuation failed: {error_msg}")
-                                    raise Exception(f"Evacuation failed: {error_msg}")
-                                else:
-                                    if waited - last_progress_log >= 30:
-                                        if hasattr(maintenance_task, 'migrated_vms') and hasattr(maintenance_task, 'total_vms'):
-                                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Evacuating: {maintenance_task.migrated_vms}/{maintenance_task.total_vms} VMs ({waited}s)")
-                                        else:
-                                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Evacuation in progress... ({waited}s)")
-                                        last_progress_log = waited
-                            time.sleep(5)
-                            waited += 5
-                        if mgr._rolling_update.get('status') == 'cancelled':
-                            break
-                        if not evacuation_completed:
-                            raise Exception(f"Evacuation timed out after {evacuation_timeout}s")
-                    
-                    # Step 2: Run apt update/upgrade
-                    mgr._rolling_update['current_step'] = 'updating'
-                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Installing updates on {node_name}")
-                    logging.info(f"[RollingUpdate] Installing updates on {node_name}")
-                    
-                    if not ha.confirm_step(f'update of {node_name}'):
-                        raise Exception('this instance does not hold the lease of its group')
-                    update_task = mgr.start_node_update(node_name, reboot=include_reboot)
-
-                    if not update_task:
-                        logging.error(f"[RollingUpdate] start_node_update returned None for {node_name}")
-                        raise Exception(f"Update failed: Could not start update task")
-                    
-                    # Step 3: Wait for update task to complete
-                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Waiting for update task (timeout: {update_timeout}s)...")
-                    update_waited = 0
-                    last_phase = None
-                    while update_waited < update_timeout:
-                        if update_task.status in ['completed', 'failed']:
-                            break
-                        # Log phase changes
-                        if hasattr(update_task, 'phase') and update_task.phase != last_phase:
-                            last_phase = update_task.phase
-                            # the 'reboot' phase is over in seconds and rarely seen by this poll (#953)
-                            _note = ' (reboot sent)' if last_phase == 'wait_online' and getattr(update_task, 'reboot_issued', False) else ''
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Update phase: {last_phase}{_note}")
-                        time.sleep(10)
-                        update_waited += 10
-                    
-                    if update_task.status == 'failed':
-                        raise Exception(f"Update failed: {update_task.error or 'Unknown error'}")
-                    
-                    if update_task.status != 'completed':
-                        raise Exception(f"Update timed out after {update_timeout}s (status: {update_task.status})")
-                    
-                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ Updates installed")
-                    
-                    # Step 4: only wait for a reboot if one was ACTUALLY issued for THIS node.
-                    # #715 (robertdahlem) — include_reboot is the global toggle; the per-node needrestart
-                    # check inside start_node_update decides whether the node actually rebooted and
-                    # records it on the task. A node that needs no reboot must NOT enter the offline-wait,
-                    # or it logs a phantom "rebooting", sits 120s waiting for an offline that never comes,
-                    # then "back online (0s)".
-                    _node_rebooted = include_reboot and getattr(update_task, 'reboot_issued', False)
-                    if include_reboot and not _node_rebooted:
-                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Node {node_name} did not require a reboot — skipping reboot wait")
-                    elif _node_rebooted and getattr(update_task, 'back_online', False):
-                        # MK Oct 2026 (#953) - the update task rebooted the node and waited for it
-                        # itself; waiting again looked for an offline that ended minutes ago
-                        _log(f"✓ {node_name} rebooted during the update and is back online")
-                    elif _node_rebooted:
-                        mgr._rolling_update['current_step'] = 'rebooting'
-                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Node {node_name} requires a reboot — rebooting (timeout: {reboot_timeout}s)...")
-                        if 'rebooting_nodes' not in mgr._rolling_update:
-                            mgr._rolling_update['rebooting_nodes'] = []
-                        mgr._rolling_update['rebooting_nodes'].append(node_name)
-                        
-                        # Phase 1: Wait for offline
-                        offline_waited = 0
-                        node_went_offline = False
-                        while offline_waited < 120:
-                            try:
-                                ns = mgr.get_node_status()
-                                if node_name not in ns or ns[node_name].get('status') != 'online':
-                                    node_went_offline = True
-                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] {node_name} is now offline")
-                                    break
-                            except:
-                                node_went_offline = True
-                                break
-                            time.sleep(5)
-                            offline_waited += 5
-                        
-                        if not node_went_offline:
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {node_name} did not go offline within 120s")
-                        
-                        if wait_for_reboot:
-                            # Phase 2: Wait for online
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Waiting for {node_name} to come back online...")
-                            waited = 0
-                            node_back_online = False
-                            while waited < reboot_timeout:
-                                if mgr._rolling_update.get('status') == 'cancelled':
-                                    break
-                                try:
-                                    ns = mgr.get_node_status()
-                                    if node_name in ns and ns[node_name].get('status') == 'online':
-                                        node_back_online = True
-                                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ {node_name} back online ({waited}s)")
-                                        if node_name in mgr._rolling_update.get('rebooting_nodes', []):
-                                            mgr._rolling_update['rebooting_nodes'].remove(node_name)
-                                        time.sleep(10)
-                                        break
-                                except:
-                                    pass
-                                time.sleep(10)
-                                waited += 10
-                                if waited % 60 == 0:
-                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Still waiting for {node_name} ({waited}s/{reboot_timeout}s)...")
-                            
-                            if not node_back_online and mgr._rolling_update.get('status') != 'cancelled':
-                                mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ {node_name} reboot timeout ({reboot_timeout}s). Pausing.")
-                                mgr._rolling_update['status'] = 'paused'
-                                mgr._rolling_update['current_step'] = 'paused_reboot'
-                                mgr._rolling_update['paused_reason'] = 'reboot_timeout'
-                                mgr._rolling_update['paused_details'] = {
-                                    'node': node_name, 'timeout': reboot_timeout,
-                                    'message': f"{node_name} did not come back online within {reboot_timeout}s. Check manually, then Continue or Cancel."
-                                }
-                                while mgr._rolling_update.get('status') == 'paused':
-                                    time.sleep(2)
-                                if mgr._rolling_update.get('status') == 'cancelled':
-                                    break
-                                elif mgr._rolling_update.get('status') == 'running':
-                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ▶ Resumed after reboot timeout")
-                                    mgr._rolling_update['paused_reason'] = None
-                                    mgr._rolling_update['paused_details'] = None
-                                    if node_name in mgr._rolling_update.get('rebooting_nodes', []):
-                                        mgr._rolling_update['rebooting_nodes'].remove(node_name)
-                        else:
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Not waiting for {node_name} (wait_for_reboot=False)")
-                    
-                    if mgr._rolling_update.get('status') == 'cancelled':
-                        break
-                    
-                    # Step 5: Disable maintenance mode
-                    mgr._rolling_update['current_step'] = 'finishing'
-                    _log(f"Disabling maintenance mode on {node_name}")
-                    # NS May 2026 — give HA services 30s to come back after reboot
-                    # before we try to disable maintenance. Otherwise ha-manager
-                    # rejects the call and the node stays stuck.
-                    # #715 — only sleep when the node actually rebooted; a no-reboot node's HA services
-                    # never went down, so the 30s wait is pointless and delays the maintenance exit.
-                    # #953 - the update task exits maintenance itself once the node is back;
-                    # a node it already took out is not a failed exit
-                    _still_in_maint = node_name in mgr.nodes_in_maintenance
-                    if _node_rebooted and _still_in_maint:
-                        time.sleep(30)
-                    if _still_in_maint and not mgr.exit_maintenance_mode(node_name):
-                        _log(f"⚠ {node_name} maintenance exit failed (will retry at end of run)")
-                    _log(f"  → Ceph (if present): noout + norebalance cleared for {node_name}")
-
-                    # MK #181 — wait for Ceph to finish rebalancing/peering before we pull the
-                    # next node. This is the bit that stops a rolling update from becoming a
-                    # rolling outage on HCI clusters.
-                    try:
-                        ceph_after = mgr.get_ceph_health_summary()
-                    except Exception:
-                        ceph_after = None
-                    if ceph_after is not None:
-                        status = ceph_after.get('status', 'unknown')
-                        badge = '✓' if status == 'HEALTH_OK' else ('⚠' if status == 'HEALTH_WARN' else '✗')
-                        _log(f"Ceph after {node_name}: {badge} {status} · {ceph_after.get('osd_up', 0)}/{ceph_after.get('osd_in', 0)} OSDs up")
-                        if status != 'HEALTH_OK' and idx < len(nodes_to_update) - 1:
-                            # #747 (robertdahlem) — only spin here while Ceph is actually recovering
-                            # or has data at risk. A settled cluster on a benign HEALTH_WARN (slow ops
-                            # in BlueStore, clock skew, a leftover flag) never returns to HEALTH_OK, so
-                            # the old `!= HEALTH_OK` wait burned the full 120s per node. The opt-in gate
-                            # below still evaluates whatever status remains, either way.
-                            ceph_waited = 0
-                            if _ceph_recovery_pending(ceph_after):
-                                _log(f"Ceph is {status} and still settling — waiting up to 120s for recovery to finish before next node…")
-                                while ceph_waited < 120 and _ceph_recovery_pending(ceph_after):
-                                    time.sleep(10); ceph_waited += 10
-                                    try:
-                                        ceph_after = mgr.get_ceph_health_summary() or {}
-                                        status = ceph_after.get('status', 'unknown')
-                                    except Exception:
-                                        break
-                                _log(f"Ceph {'still recovering' if _ceph_recovery_pending(ceph_after) else 'settled'} ({status}) after {ceph_waited}s")
-                            else:
-                                _log(f"Ceph is {status} but settled (no recovery in progress) — continuing without the HEALTH_OK wait")
-                            if status != 'HEALTH_OK':
-                                # NS 2026-07-17 (#403 part 2, proxforge): opt-in gate — don't pull
-                                # the next node while a deployed Ceph is still at risk.
-                                gate_reason = _ceph_gate_unsafe(ceph_after, ceph_health_gate) if ceph_health_gate != 'off' else None
-                                if gate_reason:
-                                    _log(f"⛔ Ceph is {status} ({gate_reason}) — HOLDING the rolling update before the next node "
-                                         f"(ceph_health_gate={ceph_health_gate}). Fix Ceph, then Continue or Cancel.")
-                                    mgr._rolling_update['status'] = 'paused'
-                                    mgr._rolling_update['paused_reason'] = 'ceph_unhealthy'
-                                    mgr._rolling_update['paused_details'] = {
-                                        'node': node_name,
-                                        'ceph_status': status,
-                                        'pgs': ceph_after.get('pgs', ''),
-                                        'reason': gate_reason,
-                                        'message': (f"Ceph is {status} ({gate_reason}) after updating {node_name}. Pulling the "
-                                                    f"next node now could drop data below min_size and take it offline. Restore "
-                                                    f"Ceph health, then Continue — or Cancel.")
-                                    }
-                                    while mgr._rolling_update.get('status') == 'paused':
-                                        time.sleep(2)
-                                    if mgr._rolling_update.get('status') == 'cancelled':
-                                        break
-                                    elif mgr._rolling_update.get('status') == 'running':
-                                        mgr._rolling_update['paused_reason'] = None
-                                        mgr._rolling_update['paused_details'] = None
-                                        try:
-                                            _c = mgr.get_ceph_health_summary() or {}
-                                            _log(f"▶ Resumed after Ceph-health hold — Ceph now {_c.get('status', 'unknown')} · "
-                                                 f"{_c.get('osd_up', 0)}/{_c.get('osd_in', 0)} OSDs up")
-                                        except Exception:
-                                            _log("▶ Resumed after Ceph-health hold")
-                                elif ceph_health_gate != 'off':
-                                    _log(f"⚠ Ceph still {status} after {ceph_waited}s but data redundancy looks intact — "
-                                         f"continuing (ceph_health_gate={ceph_health_gate})")
-                                else:
-                                    _log(f"⚠ Ceph still {status} after {ceph_waited}s — continuing, but verify cluster health after completion")
-
-                    mgr._rolling_update['completed_nodes'].append(node_name)
-                    _log(f"✓ {node_name} updated successfully")
-                    logging.info(f"[RollingUpdate] Node {node_name} updated successfully")
-                    
-                except Exception as e:
-                    logging.error(f"[RollingUpdate] Error updating {node_name}: {e}")
-                    mgr._rolling_update['failed_nodes'].append({'node': node_name, 'error': safe_error(e, 'Node update failed')})
-                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ ERROR on {node_name}: {e}")
-                    # always try to exit maintenance + clear ceph flags on failure (#141)
-                    try:
-                        exited = mgr.exit_maintenance_mode(node_name)
-                        if exited:
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Maintenance mode disabled for {node_name} after failure")
-                        else:
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠ Could not disable maintenance for {node_name} - check manually")
-                    except Exception as maint_err:
-                        logging.error(f"[RollingUpdate] Failed to exit maintenance on {node_name}: {maint_err}")
-                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠ Failed to exit maintenance on {node_name}: {maint_err}")
-
-                    # NS Mar 2026 - #141: STOP the rolling update on node failure.
-                    # continuing to the next node is dangerous for HCI (Ceph, etc.)
-                    # because we'd pull a second node out while the first may still be down
-                    mgr._rolling_update['status'] = 'paused'
-                    mgr._rolling_update['current_step'] = 'paused_failure'
-                    mgr._rolling_update['paused_reason'] = 'node_failure'
-                    mgr._rolling_update['paused_details'] = {
-                        'node': node_name,
-                        'error': safe_error(e, 'Node update failed'),
-                        'message': f"Update failed on {node_name}. Verify the node is healthy before continuing. For HCI clusters, proceeding with a degraded node can cause data loss."
-                    }
-                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⏸ PAUSED — node failure is unsafe to continue. Check {node_name} manually, then Continue or Cancel.")
-                    logging.warning(f"[RollingUpdate] Paused after failure on {node_name} - waiting for user")
-                    while mgr._rolling_update.get('status') == 'paused':
-                        time.sleep(2)
-                    if mgr._rolling_update.get('status') == 'cancelled':
-                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Rolling update cancelled by user after failure on {node_name}")
-                        break
-                    elif mgr._rolling_update.get('status') == 'running':
-                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ▶ Resumed by user after failure on {node_name}")
-                        mgr._rolling_update['paused_reason'] = None
-                        mgr._rolling_update['paused_details'] = None
-            
-            # NS May 2026 — final sweep: any node still flagged as in maintenance
-            # gets one more attempt with extra settle time. Catches the slow-reboot
-            # case where ha-manager wasn't ready when we tried to disable.
             try:
-                with mgr.maintenance_lock:
-                    stuck = list(mgr.nodes_in_maintenance.keys())
-            except Exception:
-                stuck = []
-            if stuck:
-                mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Cleanup: {len(stuck)} node(s) still in maintenance, retrying after 15s settle...")
-                time.sleep(15)
-                for nn in stuck:
-                    if mgr.exit_maintenance_mode(nn):
-                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ {nn} maintenance cleared on retry")
+                if run_node(idx, node_name, from_phase, resuming and resume.get('recheck', True)) == 'stop':
+                    break
+            except Exception as e:
+                logging.error(f"[RollingUpdate] Error updating {node_name}: {e}")
+                _set(add={'failed_nodes': {'node': node_name, 'error': safe_error(e, 'Node update failed')}},
+                     node=(node_name, {'result': 'failed'}), log=f"✗ ERROR on {node_name}: {e}")
+                # always try to exit maintenance + clear ceph flags on failure (#141)
+                try:
+                    exited = mgr.exit_maintenance_mode(node_name)
+                    if exited:
+                        _set(node=(node_name, {'in_maintenance': False}),
+                             log=f"Maintenance mode disabled for {node_name} after failure")
                     else:
-                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ {nn} STILL stuck — run `ha-manager crm-command node-maintenance disable {nn}` manually")
-                        mgr._rolling_update['failed_nodes'].append({'node': nn, 'error': 'Stuck in maintenance after rolling update'})
+                        _log(f"⚠ Could not disable maintenance for {node_name} - check manually")
+                except Exception as maint_err:
+                    logging.error(f"[RollingUpdate] Failed to exit maintenance on {node_name}: {maint_err}")
+                    _log(f"⚠ Failed to exit maintenance on {node_name}: {maint_err}")
+                
+                # NS Mar 2026 - #141: STOP the rolling update on node failure.
+                # continuing to the next node is dangerous for HCI (Ceph, etc.)
+                # because we'd pull a second node out while the first may still be down
+                logging.warning(f"[RollingUpdate] Paused after failure on {node_name} - waiting for user")
+                status = _hold('node_failure', 'paused_failure', {
+                    'node': node_name,
+                    'error': safe_error(e, 'Node update failed'),
+                    'message': f"Update failed on {node_name}. Verify the node is healthy before continuing. For HCI clusters, proceeding with a degraded node can cause data loss."
+                }, {'index': idx + 1, 'phase': rolling_runs.PHASES[0]},
+                    f"⏸ PAUSED - node failure is unsafe to continue. Check {node_name} manually, then Continue or Cancel.")
+                if status == 'cancelled':
+                    _log(f"Rolling update cancelled by user after failure on {node_name}")
+                    break
+                elif status == 'running':
+                    _log(f"▶ Resumed by user after failure on {node_name}")
+                
+        # NS May 2026 - final sweep: every node this run put into maintenance and that is still
+        # in it gets one more attempt with extra settle time. Catches the slow-reboot case
+        # where ha-manager wasn't ready when we tried to disable. And the negative affinity
+        # rules come back on (#954), every node is out of maintenance by now.
+        cancelled = _status() == 'cancelled'
+        if not cancelled:
+            _set(current_step=rolling_runs.CLEANUP)
+        undone = rolling_wind_down(mgr, who, settle=15, sleep=time.sleep)
 
-            _rules_back_on()   # #954, every node is out of maintenance by now
+        # Final summary
+        done = rolling_runs.current(mgr) or {}
+        completed = len(done.get('completed_nodes') or [])
+        skipped = len(done.get('skipped_nodes') or [])
+        failed = len(done.get('failed_nodes') or [])
+        summary = f"Summary: {completed} updated, {skipped} skipped (up-to-date), {failed} failed"
+        if cancelled:
+            report = undone + rolling_guests_left_moved(mgr)
+            _set(cancel_report=report, rebooting_nodes=[],
+                 log=["=== Rolling update cancelled ===", summary] + _rolling_report_lines(report))
+        else:
+            _set(status='completed', completed_at=time.strftime('%Y-%m-%d %H:%M:%S'),
+                 log=["=== Rolling update completed ===", summary])
+        logging.info(f"[RollingUpdate] Rolling update {'cancelled' if cancelled else 'completed'}: "
+                     f"{completed} updated, {skipped} skipped, {failed} failed")
+        # #716 - un-mute, and say whether anyone needs to look
+        notify_lifecycle('rolling_update.finished',
+                         f"Rolling update {'cancelled' if cancelled else 'finished'} on {mgr.config.name}",
+                         f"{completed} updated, {skipped} skipped (up-to-date), {failed} failed",
+                         cluster_id=cluster_id,
+                         severity='warning' if failed or cancelled else 'info',
+                         channel_ids=notify_channels)
 
-            # Final summary
-            completed = len(mgr._rolling_update['completed_nodes'])
-            skipped = len(mgr._rolling_update['skipped_nodes'])
-            failed = len(mgr._rolling_update['failed_nodes'])
+    except Exception as e:
+        logging.error(f"[RollingUpdate] Rolling update failed with exception: {e}")
+        rolling_rules_back_on(mgr, who)   # #954, before the status says the run is over
+        _set(status='failed', completed_at=time.strftime('%Y-%m-%d %H:%M:%S'), error=str(e),
+             log=f"Rolling update failed: {e}")
+        # #716 - a run that died is exactly when the on-call wants to be un-muted
+        notify_lifecycle('rolling_update.finished',
+                         f"Rolling update FAILED on {mgr.config.name}",
+                         f"The run stopped with an error: {e}",
+                         cluster_id=cluster_id, severity='critical',
+                         channel_ids=notify_channels)
 
-            mgr._rolling_update['status'] = 'completed'
-            mgr._rolling_update['completed_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
-            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] === Rolling update completed ===")
-            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Summary: {completed} updated, {skipped} skipped (up-to-date), {failed} failed")
-            logging.info(f"[RollingUpdate] Rolling update completed: {completed} updated, {skipped} skipped, {failed} failed")
-            # #716 - un-mute, and say whether anyone needs to look
-            notify_lifecycle('rolling_update.finished',
-                             f"Rolling update finished on {mgr.config.name}",
-                             f"{completed} updated, {skipped} skipped (up-to-date), {failed} failed",
-                             cluster_id=cluster_id,
-                             severity='warning' if failed else 'info',
-                             channel_ids=notify_channels)
+                    
+def _rolling_report_lines(report):
+    """The log lines of what a cancel left undone."""
+    lines = []
+    for item in report:
+        if item.get('kind') == 'maintenance':
+            lines.append(f"Not undone: {item.get('node')} is still in maintenance")
+        elif item.get('kind') == 'ha_rules':
+            lines.append(f"Not undone: negative affinity rules still off: {', '.join(item.get('rules') or [])}")
+        elif item.get('kind') == 'guests_stay':
+            lines.append(f"Not undone: {item.get('count')} guest(s) moved off {item.get('node')} stay on the "
+                         f"nodes they were moved to")
+        elif item.get('kind') == 'error':
+            lines.append(f"Cleanup stopped: {item.get('error')} - check the nodes and the HA rules by hand")
+    return lines
 
-        except Exception as e:
-            logging.error(f"[RollingUpdate] Rolling update failed with exception: {e}")
-            _rules_back_on()   # #954, before the status says the run is over
-            mgr._rolling_update['status'] = 'failed'
-            mgr._rolling_update['completed_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
-            mgr._rolling_update['error'] = str(e)
-            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Rolling update failed: {e}")
-            # #716 - a run that died is exactly when the on-call wants to be un-muted
-            notify_lifecycle('rolling_update.finished',
-                             f"Rolling update FAILED on {mgr.config.name}",
-                             f"The run stopped with an error: {e}",
-                             cluster_id=cluster_id, severity='critical',
-                             channel_ids=notify_channels)
-    
+
+def _launch_rolling_update(mgr, cluster_id, who, resume=None):
+    """The worker of the run on mgr, in a thread of its own."""
     import threading
+    run_id = (rolling_runs.current(mgr) or {}).get('run_id')
+                    
+    def work():
+        try:
+            run_rolling_update(mgr, cluster_id, who, resume)
+        finally:
+            rolling_runs.detach(cluster_id, run_id)
+                    
     # a user job: what goes out between the confirms asks at its exit (#625)
-    update_thread = threading.Thread(target=ha.as_job(run_rolling_update, f'rolling update of {cluster_id}'),
-                                     daemon=True)
-    update_thread.start()
-    
-    return jsonify({
-        'success': True,
-        'message': 'Rolling update started',
-        'nodes': nodes_to_update,
-        'include_reboot': include_reboot,
-        'skip_up_to_date': skip_up_to_date,
-        'evacuation_timeout': evacuation_timeout,
-        'update_timeout': update_timeout,
-        'reboot_timeout': reboot_timeout
-    })
+    worker = threading.Thread(target=ha.as_job(work, f'rolling update of {cluster_id}'), daemon=True)
+    rolling_runs.attach(mgr, cluster_id, worker)
+    worker.start()
+    return worker
 
 
 @bp.route('/api/clusters/<cluster_id>/updates/rolling', methods=['DELETE'])
 @require_auth(perms=['node.update'])
 def cancel_rolling_update(cluster_id):
-    """Cancel a running rolling update"""
-    # NS Jul 2026 (CodeAnt re-scan auth-bypass/IDOR) — cluster-scoped route was missing the tenant gate
+    """Cancel a running or paused rolling update
+
+    MK Oct 2026 - with its worker in this process the worker stops at its next look and winds
+    the run down itself. A run no worker follows here (interrupted by a restart, or paused
+    before one) is wound down right here: the nodes it put into maintenance come out, the
+    negative affinity rules go back on, and the answer says what could not be undone."""
+    # NS Jul 2026 (CodeAnt re-scan auth-bypass/IDOR) - cluster-scoped route was missing the tenant gate
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
@@ -5271,29 +5833,55 @@ def cancel_rolling_update(cluster_id):
         return jsonify({'error': 'Cluster not found'}), 404
     
     manager = cluster_managers[cluster_id]
-    
-    if not hasattr(manager, '_rolling_update') or not manager._rolling_update:
+    opened = rolling_runs.open_run(manager, cluster_id)
+    if opened is None:
         return jsonify({'error': 'No rolling update in progress'}), 400
-    
-    manager._rolling_update['status'] = 'cancelled'
-    manager._rolling_update['completed_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
-    manager._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Rolling update cancelled by user")
-    
-    # Try to exit maintenance mode on current node
-    current_node = manager._rolling_update.get('current_node')
-    if current_node:
+    usr = request.session.get('user', 'system')
+    with rolling_runs.claim(cluster_id) as got:
+        if not got:
+            return jsonify({'error': 'This rolling update is being continued or cancelled right now'}), 409
+        state = rolling_runs.adopt(manager, opened)
+        if state.get('status') not in rolling_runs.ACTIVE:
+            return jsonify({'error': 'No rolling update in progress'}), 400
+        name = getattr(manager.config, 'name', cluster_id)
+        log_audit(usr, 'node.rolling_update_cancelled',
+                  f"Rolling update cancelled at {state.get('current_node') or 'its start'} "
+                  f"({state.get('status')}{', ' + state['paused_reason'] if state.get('paused_reason') else ''})",
+                  cluster=name)
+        if rolling_runs.worker_here(cluster_id, manager):
+            rolling_runs.change(manager, status='cancelled', cancelled_by=usr,
+                                log=f"Rolling update cancelled by {usr}")
+            return jsonify({'success': True, 'message': 'Rolling update cancelled', 'cleanup': 'running'})
+        # nobody else winds this one down: the paused state holds off a new start meanwhile
+        rolling_runs.change(manager, cancelled_by=usr, current_step='cancelling',
+                            log=f"Rolling update cancelled by {usr} - taking the run down")
         try:
-            manager.exit_maintenance_mode(current_node)
-        except:
-            pass
-    
-    return jsonify({'success': True, 'message': 'Rolling update cancelled'})
+            undone = rolling_wind_down(manager, usr, settle=0) + rolling_guests_left_moved(manager)
+        except Exception as e:
+            logging.error(f"[RollingUpdate] winding down the cancelled run of {cluster_id}: {e}")
+            undone = [{'kind': 'error', 'error': safe_error(e, 'Cleanup failed')}]
+        rolling_runs.change(manager, status='cancelled', cancel_report=undone, rebooting_nodes=[],
+                            log=['=== Rolling update cancelled ==='] + _rolling_report_lines(undone))
+    try:
+        from pegaprox.utils.webhooks import notify_lifecycle
+        notify_lifecycle('rolling_update.finished', f"Rolling update cancelled on {name}",
+                         f"Cancelled by {usr} while paused", cluster_id=cluster_id, severity='warning',
+                         channel_ids=state.get('notify_channels') or [])
+    except Exception:
+        pass
+    return jsonify({'success': True, 'message': 'Rolling update cancelled', 'not_undone': undone})
 
 
 @bp.route('/api/clusters/<cluster_id>/updates/rolling/resume', methods=['POST'])
 @require_auth(perms=['node.update'])
 def resume_rolling_update(cluster_id):
-    # NS Jul 2026 (CodeAnt re-scan auth-bypass/IDOR) — cluster-scoped route was missing the tenant gate
+    """Continue a paused rolling update
+
+    MK Oct 2026 - one that no worker waits for here (interrupted by a restart or a switch to
+    another instance, or paused before one) gets a worker that looks at its node again and
+    goes on from the phase it was in. A run paused for its quorum looks at it again on a
+    Continue; {"accept_quorum_risk": true} takes that one node down all the same."""
+    # NS Jul 2026 (CodeAnt re-scan auth-bypass/IDOR) - cluster-scoped route was missing the tenant gate
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
@@ -5302,22 +5890,74 @@ def resume_rolling_update(cluster_id):
         return _cerr
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'The body must be a JSON object'}), 400
+    accept_risk = data.get('accept_quorum_risk', False)
+    if not isinstance(accept_risk, bool):
+        return jsonify({'error': 'accept_quorum_risk must be true or false'}), 400
     manager = cluster_managers[cluster_id]
-    if not hasattr(manager, '_rolling_update') or not manager._rolling_update:
+    opened = rolling_runs.open_run(manager, cluster_id)
+    if opened is None:
         return jsonify({'error': 'No rolling update in progress'}), 400
-    if manager._rolling_update.get('status') != 'paused':
-        return jsonify({'error': f"Not paused (status: {manager._rolling_update.get('status')})"}), 400
-    paused_reason = manager._rolling_update.get('paused_reason', 'unknown')
-    manager._rolling_update['status'] = 'running'
-    manager._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ▶ Resumed (was: {paused_reason})")
+    if opened.get('status') != 'paused':
+        return jsonify({'error': f"Not paused (status: {opened.get('status')})"}), 400
+    if opened.get('include_reboot'):
+        # going on reboots nodes: the permission the start asked for (see start_rolling_update)
+        from pegaprox.utils.rbac import has_permission as _hasp
+        from pegaprox.utils.auth import build_authz_user as _bau
+        if not _hasp(_bau(request.session.get('user', ''), request.session), 'node.reboot'):
+            return jsonify({'error': 'This rolling update reboots nodes: going on needs the node.reboot permission'}), 403
+    usr = request.session.get('user', 'system')
+    with rolling_runs.claim(cluster_id) as got:
+        if not got:
+            return jsonify({'error': 'This rolling update is being continued or cancelled right now'}), 409
+        state = rolling_runs.adopt(manager, opened)
+        if state.get('status') != 'paused':
+            return jsonify({'error': f"Not paused (status: {state.get('status')})"}), 400
+        if state.get('current_step') == 'cancelling':
+            return jsonify({'error': 'This rolling update is being cancelled'}), 409
+        paused_reason = state.get('paused_reason') or 'unknown'
+        name = getattr(manager.config, 'name', cluster_id)
+        risk, said = {}, paused_reason
+        if accept_risk:
+            if paused_reason != rolling_runs.QUORUM:
+                return jsonify({'error': 'Only a run paused for its quorum can go on anyway'}), 400
+            risk_node = (state.get('paused_details') or {}).get('node') or state.get('current_node') or ''
+            risk = {'add': {'quorum_risk_accepted': risk_node}}
+            said = f"{paused_reason}, the quorum risk accepted for {risk_node}"
+        if rolling_runs.worker_here(cluster_id, manager):
+            log_audit(usr, 'node.rolling_update_resumed', f"Rolling update continued (was paused: {said})",
+                      cluster=name)
+            rolling_runs.change(manager, status='running', log=f"▶ Resumed (was: {said})", **risk)
+            return jsonify({'success': True, 'message': 'Resumed', 'was_paused_for': paused_reason})
+        nodes = list(state.get('nodes') or [])
+        resume = dict(state.get('resume_at') or {})
+        if 'index' not in resume:
+            resume = {'index': int(state.get('current_index') or 0), 'phase': rolling_runs.resume_phase(state)}
+        resume['recheck'] = True
+        at = int(resume['index'])
+        node = nodes[at] if 0 <= at < len(nodes) else ''
+        log_audit(usr, 'node.rolling_update_resumed',
+                  f"Rolling update continued at {node or 'its end'} (was paused: {said})", cluster=name)
+        rolling_runs.change(manager, status='running', paused_reason=None, paused_details=None, resume_at=None,
+                            current_index=at, current_node=node, current_step=resume['phase'],
+                            log=f"▶ Continued by {usr} (was: {said})"
+                                + (f" - {node} is looked at again before the run goes on" if node else ''),
+                            **risk)
+        _launch_rolling_update(manager, cluster_id, usr, resume)
     return jsonify({'success': True, 'message': 'Resumed', 'was_paused_for': paused_reason})
 
 
 @bp.route('/api/clusters/<cluster_id>/updates/rolling/clear', methods=['POST'])
 @require_auth(perms=['node.update'])
 def clear_rolling_update_status(cluster_id):
-    """Clear completed/cancelled rolling update status (dismiss notification)"""
-    # NS Jul 2026 (CodeAnt re-scan auth-bypass/IDOR) — cluster-scoped route was missing the tenant gate
+    """Clear completed/cancelled rolling update status (dismiss notification)
+
+    The run stays in the history."""
+    # NS Jul 2026 (CodeAnt re-scan auth-bypass/IDOR) - cluster-scoped route was missing the tenant gate
     ok, err = check_cluster_access(cluster_id)
     if not ok:
         return err
@@ -5328,17 +5968,35 @@ def clear_rolling_update_status(cluster_id):
         return jsonify({'error': 'Cluster not found'}), 404
     
     manager = cluster_managers[cluster_id]
-    
-    if hasattr(manager, '_rolling_update') and manager._rolling_update:
-        status = manager._rolling_update.get('status', '')
+    state = rolling_runs.current(manager)
+    if state:
         # Only clear if not currently running
-        if status in ['completed', 'cancelled', 'failed']:
-            manager._rolling_update = None
+        if state.get('status') in rolling_runs.OVER and rolling_runs.dismiss(manager):
             return jsonify({'success': True, 'message': 'Status cleared'})
-        else:
-            return jsonify({'error': 'Cannot clear running update'}), 400
+        return jsonify({'error': 'Cannot clear running update'}), 400
     
     return jsonify({'success': True, 'message': 'Nothing to clear'})
+
+
+@bp.route('/api/clusters/<cluster_id>/updates/rolling/history', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_rolling_update_history(cluster_id):
+    """The last rolling updates of a cluster, newest first, with how each ended
+
+    MK Oct 2026 - their logs name guests and the run is the whole cluster's: a caller confined
+    to part of it gets nothing, as for the run itself."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    try:
+        return jsonify({'runs': rolling_runs.history(cluster_id)})
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'Failed to read the rolling update history')}), 500
 
 
 @bp.route('/api/clusters/<cluster_id>/updates/rolling/plan', methods=['GET'])

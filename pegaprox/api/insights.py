@@ -19,7 +19,8 @@ from flask import Blueprint, jsonify, request
 
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth
-from pegaprox.api.helpers import check_cluster_access, safe_error, load_metrics_window, scope_vm_rows
+from pegaprox.api.helpers import (check_cluster_access, safe_error, load_metrics_window, scope_vm_rows,
+                                  history_report, history_version, run_off_hub)
 from pegaprox.core.db import get_db
 
 bp = Blueprint('insights', __name__)
@@ -77,6 +78,43 @@ def _linear_regression(xs, ys):
     return slope, intercept, r2
 
 
+def _sizing_stats(history):
+    """{vmid: what right-sizing reads of a guest} over the snapshots: plain arithmetic, it
+    runs off the hub. The averages and the p95 are rounded as the page shows them."""
+    by_vm = {}  # vmid -> {cpu: [], mem: [], running_count, latest_meta}
+    for _ts, cd in history:
+        vms = cd.get('vms') or {}
+        for vmid, m in vms.items():
+            entry = by_vm.setdefault(vmid, {'cpu': [], 'mem': [], 'running': 0,
+                                             'meta': {}, 'type': m.get('t', 'qemu')})
+            if m.get('r'):
+                entry['running'] += 1
+            if m.get('cpu') is not None:
+                entry['cpu'].append(m['cpu'])
+            if m.get('mem') is not None:
+                entry['mem'].append(m['mem'])
+            entry['meta'] = m  # last seen wins (current allocation)
+    out = {}
+    for vmid, e in by_vm.items():
+        cpus = e['cpu']; mems = e['mem']
+        meta = e['meta'] or {}
+        s = out[vmid] = {'type': e['type'], 'running': e['running'], 'samples': len(cpus)}
+        try:
+            s.update({
+                'cpu_avg': round(sum(cpus) / len(cpus), 1) if cpus else 0,
+                'cpu_p95': round(_percentile(cpus, 95) or 0, 1),
+                'has_mem': bool(mems),
+                'mem_avg': round(sum(mems) / max(len(mems), 1), 1) if mems else 0,
+                'mem_max': round(max(mems) if mems else 0, 1),
+                'maxcpu': int(meta.get('maxcpu', 0) or 0),
+                'maxmem': int(meta.get('maxmem', 0) or 0),
+            })
+        except (TypeError, ValueError):
+            # a value no number reads from: that guest has no figures, the others keep theirs
+            s['unreadable'] = True
+    return out
+
+
 @bp.route('/api/clusters/<cluster_id>/insights/right-sizing', methods=['GET'])
 @require_auth(perms=['cluster.view'])
 def right_sizing(cluster_id):
@@ -97,21 +135,12 @@ def right_sizing(cluster_id):
 
     history = _load_history(cluster_id, days=days)
     sample_count = len(history)
-
-    # Aggregate per-vmid
-    by_vm = {}  # vmid -> {cpu: [], mem: [], running_count, latest_meta}
-    for _ts, cd in history:
-        vms = cd.get('vms') or {}
-        for vmid, m in vms.items():
-            entry = by_vm.setdefault(vmid, {'cpu': [], 'mem': [], 'running': 0,
-                                             'meta': {}, 'type': m.get('t', 'qemu')})
-            if m.get('r'):
-                entry['running'] += 1
-            if m.get('cpu') is not None:
-                entry['cpu'].append(m['cpu'])
-            if m.get('mem') is not None:
-                entry['mem'].append(m['mem'])
-            entry['meta'] = m  # last seen wins (current allocation)
+    if history:
+        # NS Oct 2026 - the history part off the hub and kept (helpers.history_report)
+        by_vm, stamp = history_report(('sizing', cluster_id, days), history_version(history),
+                                      lambda: run_off_hub(_sizing_stats, history), rows=len)
+    else:
+        by_vm, stamp = {}, {}
 
     # Resolve names from current resources
     mgr = cluster_managers[cluster_id]
@@ -142,17 +171,12 @@ def right_sizing(cluster_id):
             _vmid_i = None
         if _vmid_i is None or not user_can_access_vm(_authz_u, cluster_id, _vmid_i, 'vm.view'):
             continue
-        cpus = e['cpu']; mems = e['mem']
-        if e['running'] < min_samples or len(cpus) < min_samples:
+        if e['running'] < min_samples or e['samples'] < min_samples or e.get('unreadable'):
             counts['no_data'] += 1
             continue
-        cpu_avg = round(sum(cpus) / len(cpus), 1)
-        cpu_p95 = round(_percentile(cpus, 95) or 0, 1)
-        mem_avg = round(sum(mems) / max(len(mems), 1), 1) if mems else 0
-        mem_max = round(max(mems) if mems else 0, 1)
-        meta = e['meta'] or {}
-        maxcpu = int(meta.get('maxcpu', 0) or 0)
-        maxmem = int(meta.get('maxmem', 0) or 0)
+        cpu_avg, cpu_p95 = e['cpu_avg'], e['cpu_p95']
+        mems, mem_avg, mem_max = e['has_mem'], e['mem_avg'], e['mem_max']
+        maxcpu, maxmem = e['maxcpu'], e['maxmem']
 
         flags = []
         # CPU heuristics
@@ -212,7 +236,7 @@ def right_sizing(cluster_id):
                 'cpu_avg': cpu_avg, 'cpu_p95': cpu_p95,
                 'mem_avg': mem_avg, 'mem_max': mem_max,
                 'maxcpu': maxcpu, 'maxmem_gb': round(maxmem / (1024**3), 1) if maxmem else 0,
-                'samples': len(cpus),
+                'samples': e['samples'],
                 'flags': flags,
             })
         else:
@@ -233,6 +257,7 @@ def right_sizing(cluster_id):
         'summary': counts,
         'total_vms': len(by_vm),
         'recommendations': recommendations,
+        **stamp,
     })
 
 

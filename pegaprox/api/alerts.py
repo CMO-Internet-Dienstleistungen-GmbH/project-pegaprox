@@ -283,10 +283,12 @@ def create_cluster_alert(cluster_id):
     if _cerr:
         return _cerr
     
-    data = request.get_json()
+    data = request.get_json(silent=True)
     if not data:
         return jsonify({'error': 'No data provided'}), 400
-    
+    if not isinstance(data, dict):
+        return jsonify({'error': 'The request body must be a JSON object'}), 400
+
     alerts = load_cluster_alerts()
     if cluster_id not in alerts:
         alerts[cluster_id] = []
@@ -337,10 +339,12 @@ def update_cluster_alert(cluster_id, alert_id):
     if _cerr:
         return _cerr
     
-    data = request.get_json()
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'The request body must be a JSON object'}), 400
     alerts = load_cluster_alerts()
     cluster_alerts = alerts.get(cluster_id, [])
-    
+
     for alert in cluster_alerts:
         if alert['id'] == alert_id:
             before = {k: alert.get(k) for k in alert_events.MATCH_FIELDS}
@@ -444,9 +448,11 @@ def get_active_alerts(cluster_id):
         incidents = [dict(zip(_q, r)) for r in rows]
         _ok = _alert_scoper(cluster_id)
         if _ok is not None:
-            # MK Oct 2026 - a ZFS pool is storage of a node, which a pool or guest grant does not reach
-            incidents = [i for i in incidents if i.get('metric') != 'zfs_health'
-                         and (i.get('target_type') != 'vm' or _ok(i.get('target_id')))]
+            # MK Oct 2026 - its own guests' incidents and the cluster's (Ceph health). Nothing
+            # about a node: its pools, OSDs, clock and QDevice, a node threshold, a task without
+            # a guest - a pool or guest grant reaches none of them, and the rows name the nodes
+            incidents = [i for i in incidents if i.get('target_type') == 'cluster'
+                         or (i.get('target_type') == 'vm' and _ok(i.get('target_id')))]
         mutes = alert_events.active_mutes(cluster_id)
         out = []
         for i in incidents:
@@ -520,9 +526,13 @@ def list_alert_mutes(cluster_id):
                     if a.get('target_type') == 'vm'}
 
         def _visible(m):
-            if str(m.get('object_key') or '').startswith('zfs:'):
+            key = str(m.get('object_key') or '')
+            # a replication job of PegaProx's own (xcrepl:<vmid>:<job>) is its guest's
+            vmid = alert_events.object_vmid(key)
+            # an object that is no guest (a node, a node task, a pool, an OSD, the clock or
+            # the QDevice of a node) names the cluster's nodes: not for a confined caller
+            if key and vmid is None:
                 return False
-            vmid = alert_events.object_vmid(m.get('object_key'))
             if vmid is not None and not _ok(vmid):
                 return False
             if m.get('rule_id') in vm_rules and not _ok(vm_rules[m['rule_id']]):

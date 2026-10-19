@@ -51,14 +51,17 @@ def _xapi_refusal(cluster_id, user, perm):
 from pegaprox.utils.realtime import broadcast_sse, broadcast_action, push_immediate_update, hold_websocket
 from pegaprox.core.config import save_config
 from pegaprox.api.helpers import get_connected_manager, check_cluster_access, register_task_user, safe_error, parse_pve_error, scope_vm_rows, require_unconfined, caller_is_scoped
-from pegaprox.api.helpers import xapi_permission_missing
+from pegaprox.api.helpers import node_shell_address
+from pegaprox.api.helpers import xapi_permission_missing, upstream_failure, tenant_quota_gate, guest_size, quota_hold_alive
 from pegaprox.api.helpers import evacuation_options, evacuation_options_said
 from pegaprox.api.helpers import (sees_whole_maintenance, maintenance_without_guests,
                                   node_maintenance_for_caller)
 from pegaprox.api.ha import standby_console_refusal, STANDBY_CONSOLE_ERROR
 from pegaprox.core import ha, ha_transport
+from pegaprox.core import transfer_net, preflight
+from pegaprox.core.transfer_net import transfer_ssh_address
 from pegaprox.background import guest_index
-from pegaprox.utils.ssh import get_paramiko, ssh_password_for, ssh_blocked_for
+from pegaprox.utils.ssh import get_paramiko, ssh_password_for, ssh_password_to, ssh_blocked_for
 from pegaprox.utils.sanitization import sanitize_int, validate_snapshot_name
 from urllib.parse import urlencode, quote as url_quote
 import signal
@@ -147,6 +150,11 @@ def get_datacenter_status(cluster_id):
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
+
+    # MK Oct 2026 - an ESXi connection has no datacenter status; it ran into the Proxmox
+    # branch below and answered 500 on every overview poll
+    if getattr(manager, 'cluster_type', 'proxmox') not in ('proxmox', 'xcpng'):
+        return jsonify({'error': 'This connection has no datacenter status', 'code': 'UNSUPPORTED'}), 400
 
     # MK: XCP-ng clusters build status from their own cached data
     if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
@@ -629,7 +637,7 @@ def set_datacenter_options(cluster_id):
 
         if response.status_code == 200:
             return jsonify({'success': True, 'message': 'Options updated'})
-        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
+        return upstream_failure(response.status_code, parse_pve_error(response.text))
     except requests.exceptions.Timeout:
         # Map to 504 so the frontend knows it's a slow-PVE thing, not a code bug.
         # Settings *may* have applied — pveproxy on busy clusters sometimes
@@ -1173,7 +1181,7 @@ def delete_datastore_content(cluster_id, storage_name, volid):
             return jsonify({'success': True, 'message': f'Deleted {volid}'})
         else:
             error_msg = response.json().get('errors', response.text) if response.text else 'Delete failed'
-            return jsonify({'error': error_msg}), response.status_code
+            return upstream_failure(response.status_code, error_msg)
             
     except Exception as e:
         logging.error(f"Error deleting content: {e}")
@@ -1339,7 +1347,7 @@ def upload_to_datastore(cluster_id, storage_name):
             except Exception:
                 error_msg = response.text[:500] if response.text else 'Upload failed'
             logging.error(f"Upload to {storage_name} failed: HTTP {response.status_code} - {error_msg}")
-            return jsonify({'error': error_msg}), response.status_code
+            return upstream_failure(response.status_code, error_msg)
 
     except Exception as e:
         logging.error(f"Error uploading to {storage_name}: {e}")
@@ -1385,6 +1393,8 @@ def download_iso_from_url(cluster_id, storage_name):
         # metadata-by-hostname. Delegate to the central guard, which fails CLOSED
         # (require_resolution) and blocks private/loopback/link-local/metadata. The URL is
         # fetched by the Proxmox node, so this SSRF would fire from the PVE management LAN.
+        # MK Oct 2026 - for CGNAT that only holds since url_security checks 100.64/10 itself,
+        # the stdlib does not call it private. It is refused like RFC1918 now.
         from pegaprox.utils.url_security import resolve_and_pin_url, SsrfError
         try:
             # GHSA-hmcf-9q7f-vx35 — the download is delegated to the PVE node, which re-resolves the
@@ -1538,7 +1548,7 @@ def download_iso_from_url(cluster_id, storage_name):
             except:
                 error_msg = response.text or 'Download failed'
             
-            return jsonify({'error': f'Proxmox API error: {error_msg}'}), response.status_code
+            return upstream_failure(response.status_code, f'Proxmox API error: {error_msg}')
             
     except Exception as e:
         logging.error(f"Error starting download: {e}")
@@ -1696,7 +1706,7 @@ def create_vm_backup(cluster_id, node, vm_type, vmid):
             log_audit(user, 'backup.created', f"Started backup for {vm_type}/{vmid}", cluster=manager.config.name)
             return jsonify({'success': True, 'task': task})
         
-        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
+        return upstream_failure(response.status_code, parse_pve_error(response.text))
         
     except Exception as e:
         logging.error(f"[BACKUP] Error creating backup: {e}")
@@ -1746,16 +1756,28 @@ def restore_vm_backup(cluster_id, node, vm_type, vmid):
             return jsonify({'error': 'Permission denied for source backup'}), 403
         # another VMID makes this a new guest, which keeps to what the PBS twin asks of one
         # (restore_backup, mode 'new'): the tenant's VMID range, and for a confined caller a
-        # node one of their guests lives on (#1081)
-        if str(target_vmid) != str(vmid):
+        # node one of their guests lives on (#1081). MK Oct 2026 - so does the same VMID when
+        # that guest is gone: the restore makes it anew, on the node in the URL
+        from pegaprox.api.pbs import _authz_restore_node, guest_is_there
+        if str(target_vmid) != str(vmid) or not guest_is_there(cluster_id, vmid):
             from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID
-            from pegaprox.api.pbs import _authz_restore_node
             _rok, _rmsg = check_tenant_vmid(_authz_user.get('tenant_id') or DEFAULT_TENANT_ID, target_vmid)
             if not _rok:
                 return jsonify({'error': _rmsg}), 403
             _nerr = _authz_restore_node(cluster_id, node, _authz_user)
             if _nerr:
                 return _nerr
+
+    # MK Oct 2026 - into a new VMID this is a new guest, over the guest it came from it grows
+    # that one by what the backup has more of: the tenant quota counts both, as on create
+    from pegaprox.core.batch_restore import restore_adds
+    _qerr, _qwarn = tenant_quota_gate(
+        _authz_user, f'restore of {volid}',
+        lambda: restore_adds(manager, node, volid, vmid, target_vmid, str(target_vmid) == str(vmid)),
+        cluster=manager.config.name,
+        hold={'cluster_id': cluster_id, 'vmid': target_vmid, 'grow': str(target_vmid) == str(vmid)})
+    if _qerr:
+        return _qerr
 
     try:
         host, port = manager.host, manager.api_port
@@ -1770,9 +1792,14 @@ def restore_vm_backup(cluster_id, node, vm_type, vmid):
         
         restore_params = {
             'vmid': target_vmid,
-            'archive': volid,
-            'force': 1 if target_vmid == vmid else 0  # force overwrite if same vmid
+            'force': 1 if str(target_vmid) == str(vmid) else 0  # force overwrite if same vmid
         }
+        # MK Oct 2026 - pct has no archive parameter, a container restore is a create from
+        # the backup as ostemplate with restore set (same as core/batch_restore.start_restore)
+        if vm_type == 'qemu':
+            restore_params['archive'] = volid
+        else:
+            restore_params.update(ostemplate=volid, restore=1)
         
         if target_storage:
             restore_params['storage'] = target_storage
@@ -1787,16 +1814,341 @@ def restore_vm_backup(cluster_id, node, vm_type, vmid):
         
         if response.status_code == 200:
             task = response.json().get('data', '')
+            # the restored config replaces what the search index read under that id
+            guest_index.drop(cluster_id, vm_type, target_vmid)
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'backup.restored', f"Restored {volid} to VMID {target_vmid}", cluster=manager.config.name)
-            return jsonify({'success': True, 'task': task, 'vmid': target_vmid})
+            return jsonify({'success': True, 'task': task, 'vmid': target_vmid,
+                            **({'quota_warning': _qwarn} if _qwarn else {})})
         
         # NS: proxmox sometimes returns weird error messages, should probably parse them better
-        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
+        return upstream_failure(response.status_code, parse_pve_error(response.text))
         
     except Exception as e:
         logging.error(f"[BACKUP] Error restoring backup: {e}")
         return jsonify({'error': safe_error(e, 'Failed to restore backup')}), 500
+
+
+# The guest agent's file-write takes its content as at most 60 KiB of base64 (PVE's
+# Agent.pm) and opens the file 'wb' on every call: one call is the whole file, 45 KiB
+# of it (#1139)
+_AGENT_WRITE_MAX_B64 = 60 * 1024
+_AGENT_WRITE_MAX_BYTES = _AGENT_WRITE_MAX_B64 // 4 * 3
+# a container takes the file on stdin over SSH; meant for config files, not bulk data
+_CT_FILE_RESTORE_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _vzdump_refusal(volid):
+    """400 for a vzdump archive (VMA or tar), else None. PVE's file-restore API opens
+    Proxmox Backup Server snapshots only, so it is not asked about anything else."""
+    name = volid.rsplit('/', 1)[-1].rsplit(':', 1)[-1]
+    if re.search(r'\.vma(\.(zst|gz|lzo))?$', name):
+        return jsonify({'error': (
+            f"File-level restore is not available for vzdump VMA backups ({name}). "
+            "PVE's file-browse API only supports Proxmox Backup Server (PBS) backups. "
+            "To restore individual files: use PBS storage for your backups, or restore "
+            "the full VM and copy files from inside the running guest.")}), 400
+    if re.search(r'\.tar(\.(zst|gz|lzo))?$', name):
+        return jsonify({'error': (
+            f"File-level restore is not available for vzdump tar backups ({name}). "
+            "PVE's file-browse API only supports Proxmox Backup Server (PBS) backups. "
+            "To restore individual files from an LXC backup, use PBS storage.")}), 400
+    return None
+
+
+def _backup_source_refusal(user, cluster_id, volid):
+    """403 unless the caller may back up the guest the backup was taken of, as
+    restore_vm_backup asks. An admin passes; for anyone else the volid has to name its
+    guest plainly, storage:backup/(vm|ct)/<vmid>/<time> and nothing more (#1139)."""
+    from pegaprox.utils.rbac import acts_as_admin
+    if acts_as_admin(user):
+        return None
+    m = re.fullmatch(r'[^:]*:backup/(vm|ct)/(\d+)/[^/]+', volid)
+    if m and user_can_access_vm(user, cluster_id, int(m.group(2)), 'vm.backup',
+                                'lxc' if m.group(1) == 'ct' else 'qemu'):
+        return None
+    return jsonify({'error': 'Permission denied for source backup'}), 403
+
+
+def _file_restore_storage(volid, node):
+    """(storage, None) for a volid and node the file-restore API may be asked about,
+    else (None, the refusal)."""
+    if ':' not in volid:
+        return None, (jsonify({'error': 'Invalid volid format (expected storage:path)'}), 400)
+    storage = volid.split(':', 1)[0]
+    if not _PVE_NODE_RE.fullmatch(node or ''):
+        return None, (jsonify({'error': 'Invalid node name'}), 400)
+    if not _STORAGE_ID_RE.fullmatch(storage):
+        return None, (jsonify({'error': 'Invalid storage id'}), 400)
+    return storage, None
+
+
+def _b64_path(value):
+    """The path a base64 filepath of PVE's file-restore API names, without the slashes
+    around it, or b'' for anything that is not one."""
+    import base64
+    import binascii
+    try:
+        return base64.b64decode(value, validate=True).strip(b'/')
+    except (binascii.Error, ValueError, TypeError):
+        return b''
+
+
+def _backup_file_entry(session, base, volid, filepath):
+    """(entry, None) for the regular file `filepath` names in the backup, as the listing
+    of its directory shows it, size included, else (None, the refusal).
+
+    The download is a stream PVE answers 200 for before the extraction has run: one that
+    failed sends nothing or a part, and written into the guest that empties its own copy.
+    The listing says what the entry is and how big; the download has to match it (#1139)."""
+    import base64
+    path = _b64_path(filepath)
+    if not path:
+        return None, (jsonify({'error': 'filepath does not name a file of the backup'}), 400)
+    parent = path.rsplit(b'/', 1)[0] if b'/' in path else b''
+    resp = session.get(f'{base}/list', timeout=30, params={
+        'volume': volid, 'filepath': base64.b64encode(parent).decode('ascii') if parent else '/'})
+    if resp.status_code != 200:
+        return None, upstream_failure(resp.status_code, parse_pve_error(resp.text))
+    entry = next((e for e in (resp.json().get('data') or [])
+                  if isinstance(e, dict) and _b64_path(e.get('filepath')) == path), None)
+    name = path.rsplit(b'/', 1)[-1].decode('utf-8', 'replace')
+    if entry is None:
+        return None, (jsonify({'error': f'{name} is not in this backup'}), 404)
+    if entry.get('type') != 'f':
+        return None, (jsonify({'error': f'{name} is not a regular file. Only a single file can be '
+                                        'restored into the guest'}), 400)
+    size = entry.get('size')
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        return None, (jsonify({'error': f'Proxmox VE did not say how big {name} is, so a cut off '
+                                        'download could not be told apart. Nothing was written'}), 502)
+    return entry, None
+
+
+@bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/backups/files', methods=['GET'])
+@require_auth(perms=['backup.view'])
+def browse_backup_files(cluster_id, node, vm_type, vmid):
+    """Browse the files inside a Proxmox Backup Server backup (PVE's file-restore API, PVE 7.2+).
+
+    Returns the directory listing at ?path= (the base64 filepath of an entry of an earlier
+    listing, the root when left out) of the backup ?volid=. vzdump archives (VMA, tar) are
+    refused: PVE cannot open them file by file.
+
+    Needs backup.view, vm.view on this guest, and for anyone but an admin vm.backup on
+    the guest the backup was taken of.
+    """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    denied = _require_vm_access(cluster_id, vmid, 'vm.view', vm_type)
+    if denied:
+        return denied
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+
+    volid = request.args.get('volid', '')
+    path = request.args.get('path', '/')
+
+    if not volid:
+        return jsonify({'error': 'volid is required'}), 400
+    refusal = _vzdump_refusal(volid)
+    if refusal:
+        return refusal
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    refusal = _backup_source_refusal(user, cluster_id, volid)
+    if refusal:
+        return refusal
+    storage, refusal = _file_restore_storage(volid, node)
+    if refusal:
+        return refusal
+
+    try:
+        host, port = manager.host, manager.api_port
+        session = manager._create_session()
+
+        url = f"https://{host}:{port}/api2/json/nodes/{node}/storage/{storage}/file-restore/list"
+        # filepath is base64 in PVE's schema: '/' for the root, else the filepath of an
+        # entry PVE listed before, handed back as it came
+        import base64 as _b64
+        if not path or path == '/':
+            api_filepath = _b64.b64encode(b'/').decode('ascii')
+        else:
+            api_filepath = path
+        params = {'volume': volid, 'filepath': api_filepath}
+        logging.debug(f"[FILE-RESTORE-BROWSE] {url} params={params}")
+        resp = session.get(url, params=params, timeout=30)
+
+        if resp.status_code == 200:
+            return jsonify(resp.json().get('data', []))
+        # a 401/403 of PVE is about the stored credentials, not this session (#1142)
+        return upstream_failure(resp.status_code, parse_pve_error(resp.text))
+
+    except Exception as e:
+        logging.error(f"[FILE-RESTORE] Error browsing backup files: {e}")
+        return jsonify({'error': safe_error(e, 'Failed to browse backup files')}), 500
+
+
+@bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/backups/file-restore', methods=['POST'])
+@require_auth(perms=['backup.restore'])
+def restore_backup_file(cluster_id, node, vm_type, vmid):
+    """Restore one file from a Proxmox Backup Server backup into this running guest.
+
+    The file comes out of the backup through PVE's file-restore API: a regular file as the
+    listing of its directory shows it, and only all of its bytes. Then:
+
+    QEMU: the guest agent writes it (POST .../agent/file-write) in one call. The agent
+          takes 45 KB at most (60 KiB of base64); a larger file is refused with 413
+          before the guest is asked. The VM must run with the guest agent enabled.
+    LXC:  `pct exec <vmid> -- sh -c 'cat > <dest>'` on the guest's node takes it on stdin,
+          over SSH with the cluster's SSH settings, at the node's own address (through
+          sudo -n for a login that is not root). Up to 50 MB. The container must be running.
+
+    Needs backup.restore, vm.backup and vm.console on this guest (writing a file as root
+    in the guest is as good as its console), and for anyone but an admin vm.backup on the
+    guest the backup was taken of.
+
+    Body JSON: { volid, filepath (as the files listing names it), dest_path (absolute) }
+    """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    if vm_type not in ('qemu', 'lxc'):
+        return jsonify({'error': f'File restore is not supported for vm_type: {vm_type}'}), 400
+
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    if not user_can_access_vm(user, cluster_id, vmid, 'vm.backup', vm_type):
+        return jsonify({'error': 'Permission denied: vm.backup'}), 403
+    # (#1139) a file written as root in the guest is a console's worth of access
+    if not user_can_access_vm(user, cluster_id, vmid, 'vm.console', vm_type):
+        return jsonify({'error': 'Permission denied: vm.console'}), 403
+
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+
+    data = request.get_json(silent=True) or {}
+    volid = data.get('volid', '')
+    filepath = data.get('filepath', '')
+    dest_path = data.get('dest_path', '')
+
+    if not all(isinstance(v, str) and v for v in (volid, filepath, dest_path)):
+        return jsonify({'error': 'volid, filepath, and dest_path are required'}), 400
+
+    # dest_path must be absolute to prevent accidental relative-path writes
+    if not dest_path.startswith('/'):
+        return jsonify({'error': 'dest_path must be an absolute path'}), 400
+    # no path holds a NUL, and the guest agent's C side would cut it there
+    if '\x00' in dest_path or len(dest_path.encode('utf-8', 'replace')) > 4096:
+        return jsonify({'error': 'dest_path is not a path the guest can take'}), 400
+
+    refusal = _vzdump_refusal(volid)
+    if refusal:
+        return refusal
+    refusal = _backup_source_refusal(user, cluster_id, volid)
+    if refusal:
+        return refusal
+    storage, refusal = _file_restore_storage(volid, node)
+    if refusal:
+        return refusal
+
+    node_ip = None
+    if vm_type == 'lxc':
+        # the stored SSH login goes to a member of this cluster or nowhere (#1143)
+        blocked = ssh_blocked_for(manager)
+        if blocked:
+            return jsonify({'code': blocked,
+                            'error': 'Restoring a file into a container goes over SSH, which is '
+                                     'not available for this cluster'}), 409
+        node_ip = node_shell_address(manager, node)
+        if not node_ip:
+            return jsonify({'error': f'Could not find the address of node {node}'}), 400
+
+    limit = _AGENT_WRITE_MAX_BYTES if vm_type == 'qemu' else _CT_FILE_RESTORE_MAX_BYTES
+
+    try:
+        host, port = manager.host, manager.api_port
+        session = manager._create_session()
+
+        base = f"https://{host}:{port}/api2/json/nodes/{node}/storage/{storage}/file-restore"
+        entry, refusal = _backup_file_entry(session, base, volid, filepath)
+        if refusal:
+            return refusal
+        size = entry['size']
+        if size > limit:
+            if vm_type == 'qemu':
+                msg = ('VMs take files of up to 45 KB through the guest agent. Restore the '
+                       'whole VM for a larger file.')
+            else:
+                msg = f'File exceeds the {limit // (1024 * 1024)} MB limit for direct restore'
+            return jsonify({'error': msg, 'limit_bytes': limit}), 413
+
+        with session.get(f'{base}/download', params={'volume': volid, 'filepath': filepath},
+                         stream=True, timeout=60) as dl_resp:
+            if dl_resp.status_code != 200:
+                return upstream_failure(dl_resp.status_code,
+                                        f'Could not download file from backup: {parse_pve_error(dl_resp.text)}')
+            buf = bytearray()
+            for chunk in dl_resp.iter_content(chunk_size=65536):
+                buf += chunk
+                if len(buf) > size:
+                    break
+        # all of it or nothing: a short file would replace the guest's whole copy
+        if len(buf) != size:
+            return jsonify({'error': f"The download of {entry.get('text') or 'the file'} brought "
+                                     f"{len(buf)} bytes, the backup lists {size}. Nothing was "
+                                     'written into the guest', 'code': 'SHORT_DOWNLOAD'}), 502
+        file_content = bytes(buf)
+
+        audit_user = getattr(request, 'session', {}).get('user', 'system')
+
+        if vm_type == 'qemu':
+            import base64
+            # encode=0: the content is base64 already, with 1 PVE encodes it once more
+            b64 = base64.b64encode(file_content).decode('ascii')
+            agent_url = f"https://{host}:{port}/api2/json/nodes/{node}/qemu/{vmid}/agent/file-write"
+            agent_resp = session.post(agent_url, data={'file': dest_path, 'content': b64, 'encode': 0},
+                                      timeout=60)
+            if agent_resp.status_code != 200:
+                return upstream_failure(agent_resp.status_code,
+                                        f'Guest agent file-write failed: {parse_pve_error(agent_resp.text)}')
+        else:
+            ssh_failure = {}
+            ssh = manager._ssh_connect(node_ip, retries=2, retry_delay=1.0, failure=ssh_failure)
+            if not ssh:
+                why = ssh_failure.get('kind') or 'error'
+                return jsonify({'error': f'SSH to node {node} failed ({why})', 'code': 'SSH_FAILED'}), 502
+            try:
+                inner_cmd = 'cat > ' + shlex.quote(dest_path)
+                cmd = f'pct exec {vmid} -- sh -c {shlex.quote(inner_cmd)}'
+                # pct wants root: the login _ssh_connect made, when it is not root, asks
+                # sudo, never with a prompt
+                cfg = manager.config
+                if (cfg.ssh_user or (cfg.user or 'root').split('@')[0]) != 'root':
+                    cmd = 'sudo -n ' + cmd
+                stdin_ch, stdout_ch, stderr_ch = ssh.exec_command(cmd, timeout=60)
+                try:
+                    stdin_ch.write(file_content)
+                    stdin_ch.flush()
+                except (OSError, EOFError):
+                    pass  # the remote is gone already, its exit status says why
+                stdin_ch.channel.shutdown_write()
+                err_out = _read_capped(stderr_ch).strip()
+                exit_status = stdout_ch.channel.recv_exit_status()
+            finally:
+                ssh.close()
+            if exit_status != 0:
+                return jsonify({'error': f'pct exec failed (exit {exit_status}): {err_out[:200]}'}), 500
+
+        restored = _b64_path(filepath).decode('utf-8', 'replace')
+        log_audit(audit_user, 'backup.file_restored',
+                  f"Restored '/{_sl(restored)}' from {_sl(volid)} to {vm_type}/{vmid}:{_sl(dest_path)}",
+                  cluster=manager.config.name)
+        return jsonify({'success': True})
+
+    except Exception as e:
+        logging.error(f"[FILE-RESTORE] Error restoring file: {e}")
+        return jsonify({'error': safe_error(e, 'Failed to restore file')}), 500
 
 
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/backups/<path:volid>', methods=['DELETE'])
@@ -1853,7 +2205,7 @@ def delete_vm_backup(cluster_id, node, vm_type, vmid, volid):
             log_audit(user, 'backup.deleted', f"Deleted backup {volid}", cluster=manager.config.name)
             return jsonify({'success': True})
         
-        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
+        return upstream_failure(response.status_code, parse_pve_error(response.text))
         
     except Exception as e:
         logging.error(f"[BACKUP] Error deleting backup: {e}")
@@ -1961,7 +2313,7 @@ def set_firewall_options(cluster_id):
             usr = getattr(request, 'session', {}).get('user', 'system')
             log_audit(usr, 'firewall.options_changed', f"Firewall options updated", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'Firewall options updated'})
-        return jsonify({'error': r.text}), r.status_code
+        return upstream_failure(r.status_code, r.text)
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to set firewall options')}), 500
 
@@ -2012,7 +2364,7 @@ def create_firewall_rule(cluster_id):
             usr = getattr(request, 'session', {}).get('user', 'system')
             log_audit(usr, 'firewall.rule_created', f"Firewall rule created", cluster=manager.config.name)
             return jsonify({'success': True, 'message': 'Firewall rule created'})
-        return jsonify({'error': r.text}), r.status_code
+        return upstream_failure(r.status_code, r.text)
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to create firewall rule')}), 500
 
@@ -2039,7 +2391,7 @@ def update_firewall_rule(cluster_id, pos):
         
         if r.status_code == 200:
             return jsonify({'success': True, 'message': 'Firewall rule updated'})
-        return jsonify({'error': r.text}), r.status_code
+        return upstream_failure(r.status_code, r.text)
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to update firewall rule')}), 500
 
@@ -2065,7 +2417,7 @@ def delete_firewall_rule(cluster_id, pos):
         
         if response.status_code == 200:
             return jsonify({'success': True, 'message': 'Firewall rule deleted'})
-        return jsonify({'error': parse_pve_error(response.text)}), response.status_code
+        return upstream_failure(response.status_code, parse_pve_error(response.text))
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to delete firewall rule')}), 500
 
@@ -2184,7 +2536,7 @@ def set_vm_firewall_options(cluster_id, node, vmtype, vmid):
             usr = getattr(request, 'session', {}).get('user', 'system')
             log_audit(usr, 'vm.firewall.options', f"VM {vmid} firewall options updated", cluster=manager.config.name)
             return jsonify({'success': True})
-        return jsonify({'error': r.text}), r.status_code
+        return upstream_failure(r.status_code, r.text)
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to set VM firewall options')}), 500
 
@@ -2235,7 +2587,7 @@ def create_vm_firewall_rule(cluster_id, node, vmtype, vmid):
         except:
             pve_err = r.text
         logging.warning(f"VM FW rule create failed: {r.status_code} data={data} pve_response={r.text[:300]}")
-        return jsonify({'error': pve_err, 'status': r.status_code}), r.status_code
+        return upstream_failure(r.status_code, pve_err, status=r.status_code)
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to create VM firewall rule')}), 500
 
@@ -2255,7 +2607,7 @@ def update_vm_firewall_rule(cluster_id, node, vmtype, vmid, pos):
         r = manager._create_session().put(_vm_fw_url(manager, node, vmtype, vmid, f'/rules/{pos}'), data=data, timeout=10)
         if r.status_code == 200:
             return jsonify({'success': True})
-        return jsonify({'error': r.text}), r.status_code
+        return upstream_failure(r.status_code, r.text)
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to update VM firewall rule')}), 500
 
@@ -2276,7 +2628,7 @@ def delete_vm_firewall_rule(cluster_id, node, vmtype, vmid, pos):
             usr = getattr(request, 'session', {}).get('user', 'system')
             log_audit(usr, 'vm.firewall.rule_deleted', f"VM {vmid} firewall rule {pos} deleted", cluster=manager.config.name)
             return jsonify({'success': True})
-        return jsonify({'error': r.text}), r.status_code
+        return upstream_failure(r.status_code, r.text)
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to delete VM firewall rule')}), 500
 
@@ -2315,7 +2667,7 @@ def create_vm_firewall_alias(cluster_id, node, vmtype, vmid):
         r = manager._create_session().post(_vm_fw_url(manager, node, vmtype, vmid, '/aliases'), data=data, timeout=10)
         if r.status_code == 200:
             return jsonify({'success': True})
-        return jsonify({'error': r.text}), r.status_code
+        return upstream_failure(r.status_code, r.text)
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to create VM firewall alias')}), 500
 
@@ -2335,7 +2687,7 @@ def update_vm_firewall_alias(cluster_id, node, vmtype, vmid, name):
         r = manager._create_session().put(_vm_fw_url(manager, node, vmtype, vmid, f'/aliases/{name}'), data=data, timeout=10)
         if r.status_code == 200:
             return jsonify({'success': True})
-        return jsonify({'error': r.text}), r.status_code
+        return upstream_failure(r.status_code, r.text)
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to update VM firewall alias')}), 500
 
@@ -2354,7 +2706,7 @@ def delete_vm_firewall_alias(cluster_id, node, vmtype, vmid, name):
         r = manager._create_session().delete(_vm_fw_url(manager, node, vmtype, vmid, f'/aliases/{name}'), timeout=10)
         if r.status_code == 200:
             return jsonify({'success': True})
-        return jsonify({'error': r.text}), r.status_code
+        return upstream_failure(r.status_code, r.text)
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to delete VM firewall alias')}), 500
 
@@ -2393,7 +2745,7 @@ def create_vm_firewall_ipset(cluster_id, node, vmtype, vmid):
         r = manager._create_session().post(_vm_fw_url(manager, node, vmtype, vmid, '/ipset'), data=data, timeout=10)
         if r.status_code == 200:
             return jsonify({'success': True})
-        return jsonify({'error': r.text}), r.status_code
+        return upstream_failure(r.status_code, r.text)
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to create VM firewall IP set')}), 500
 
@@ -2432,7 +2784,7 @@ def add_vm_firewall_ipset_entry(cluster_id, node, vmtype, vmid, name):
         r = manager._create_session().post(_vm_fw_url(manager, node, vmtype, vmid, f'/ipset/{name}'), data=data, timeout=10)
         if r.status_code == 200:
             return jsonify({'success': True})
-        return jsonify({'error': r.text}), r.status_code
+        return upstream_failure(r.status_code, r.text)
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to add IP set entry')}), 500
 
@@ -2451,7 +2803,7 @@ def delete_vm_firewall_ipset_entry(cluster_id, node, vmtype, vmid, name, cidr):
         r = manager._create_session().delete(_vm_fw_url(manager, node, vmtype, vmid, f'/ipset/{name}/{cidr}'), timeout=10)
         if r.status_code == 200:
             return jsonify({'success': True})
-        return jsonify({'error': r.text}), r.status_code
+        return upstream_failure(r.status_code, r.text)
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to delete IP set entry')}), 500
 
@@ -2470,7 +2822,7 @@ def delete_vm_firewall_ipset(cluster_id, node, vmtype, vmid, name):
         r = manager._create_session().delete(_vm_fw_url(manager, node, vmtype, vmid, f'/ipset/{name}'), timeout=10)
         if r.status_code == 200:
             return jsonify({'success': True})
-        return jsonify({'error': r.text}), r.status_code
+        return upstream_failure(r.status_code, r.text)
     except Exception as e:
         return jsonify({'error': safe_error(e, 'Failed to delete VM firewall IP set')}), 500
 
@@ -2689,12 +3041,15 @@ def _dir_mapping_nodes_refusal(manager, pairs):
 
 def _pve_dir_mapping_refusal(resp, what):
     msg = parse_pve_error(resp.text, f'Proxmox refused to {what} the directory mapping')
+    # a 403 of Proxmox is about the account PegaProx signs in with, not the caller (#1142)
+    if resp.status_code in (401, 403):
+        return upstream_failure(resp.status_code, msg)
     low = msg.lower()
     if 'already defined' in low or 'modified configuration' in low or 'digest' in low:
         return jsonify({'error': msg}), 409
     # the node that answered checks its own path, and dies (500) on one it does not have
-    if resp.status_code in (400, 403) or 'does not exist' in low or 'not a directory' in low:
-        return jsonify({'error': msg}), 403 if resp.status_code == 403 else 400
+    if resp.status_code == 400 or 'does not exist' in low or 'not a directory' in low:
+        return jsonify({'error': msg}), 400
     return jsonify({'error': msg}), 502
 
 
@@ -3120,7 +3475,9 @@ def test_node_connection(cluster_id):
         })
         
     except paramiko.AuthenticationException:
-        return jsonify({'success': False, 'error': 'Authentication failed. Check username/password.'}), 401
+        # the node refused the login typed here, the caller's session is fine (#1142)
+        return jsonify({'success': False, 'error': 'Authentication failed. Check username/password.',
+                        'code': 'UPSTREAM_AUTH'}), 502
     except paramiko.SSHException as e:
         return jsonify({'success': False, 'error': safe_error(e, 'SSH error')}), 500
     except socket.timeout:
@@ -3366,7 +3723,7 @@ def join_node_to_cluster(cluster_id):
         })
         
     except paramiko.AuthenticationException:
-        return jsonify({'success': False, 'error': 'SSH authentication failed'}), 401
+        return jsonify({'success': False, 'error': 'SSH authentication failed', 'code': 'UPSTREAM_AUTH'}), 502
     except Exception as e:
         logging.error(f"Error joining node to cluster: {e}")
         return jsonify({'success': False, 'error': safe_error(e, 'Failed to join node to cluster')}), 500
@@ -3515,7 +3872,6 @@ def remove_node_from_cluster(cluster_id, node_name):
         if not ssh_user:
             api_user = cluster_config.user
             ssh_user = (api_user or 'root').split('@')[0]  # PR #62 (ry-ops): null-safe
-        ssh_password = ssh_password_for(cluster_config)
         ssh_key_content = getattr(cluster_config, 'ssh_key', '') or ''
         
         # Find an online node to execute the removal from
@@ -3541,8 +3897,12 @@ def remove_node_from_cluster(cluster_id, node_name):
         # would return wrong/stale data, potentially wiping another node's config!
         removed_node_ip = mgr._get_node_ip(node_name) if hasattr(mgr, '_get_node_ip') else None
         logging.info(f"[RemoveNode] Pre-resolved IP for {node_name}: {removed_node_ip}")
+        # its password too, while it is still a member (#1136)
+        removed_node_password = ssh_password_to(mgr, removed_node_ip) if removed_node_ip else ''
         
-        # Connect to an online node via SSH (its commands ask the transport guard, #625)
+        # Connect to an online node via SSH (its commands ask the transport guard, #625).
+        # Each of the two nodes gets its own password where it has one (#1136)
+        ssh_password = ssh_password_to(mgr, online_node_ip)
         ssh = secure_ssh_client(paramiko)
         
         # Try SSH key first, then password
@@ -3605,6 +3965,7 @@ def remove_node_from_cluster(cluster_id, node_name):
                 
                 # Try to connect to the removed node
                 cleanup_connected = False
+                ssh_password = removed_node_password
                 if ssh_key_content:
                     try:
                         import io
@@ -3707,6 +4068,17 @@ def remove_node_from_cluster(cluster_id, node_name):
         # Clean up maintenance task
         if node_name in mgr.nodes_in_maintenance:
             del mgr.nodes_in_maintenance[node_name]
+
+        # MK Oct 2026 (#1136) - the stored login of the node goes with it
+        try:
+            from pegaprox.core import node_creds
+            if node_creds.forget(cluster_id, node_name):
+                log_audit(getattr(request, 'session', {}).get('user', 'system'),
+                          'cluster.node_credential_removed',
+                          f"Dropped the stored login of node {node_name}: removed from the cluster",
+                          cluster=mgr.config.name)
+        except Exception as e:
+            logging.warning(f"[RemoveNode] could not drop the stored login of {node_name}: {e}")
         
         # MK: Clean up excluded_nodes - remove the deleted node
         excluded = getattr(mgr.config, 'excluded_nodes', []) or []
@@ -3770,7 +4142,8 @@ def remove_node_from_cluster(cluster_id, node_name):
         })
         
     except paramiko.AuthenticationException:
-        return jsonify({'success': False, 'error': 'SSH authentication failed. Check cluster credentials.'}), 401
+        return jsonify({'success': False, 'error': 'SSH authentication failed. Check cluster credentials.',
+                        'code': 'UPSTREAM_AUTH'}), 502
     except Exception as e:
         logging.error(f"Error removing node from cluster: {e}")
         return jsonify({'success': False, 'error': safe_error(e, 'Failed to remove node from cluster')}), 500
@@ -4321,6 +4694,164 @@ def get_next_vmid_api(cluster_id):
     return jsonify({'vmid': result['vmid']})
 
 
+_RESIZE_RE = re.compile(r'(\+)?(\d+(?:\.\d+)?)([KMGT]?)', re.I)
+# a replication job makes its replica at its first run, on its schedule (a weekly one too)
+_REPLICA_HOLD_TTL = 8 * 86400
+
+
+def _int_or(v, default):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return default
+
+
+def _node_cores(manager, node):
+    """CPU threads of a node from the status the manager keeps, None when it has none"""
+    try:
+        st = (manager.get_node_status() or {}).get(node) or {}
+        n = (st.get('cpuinfo') or {}).get('cpus') or st.get('maxcpu')
+        return int(n) if n and int(n) > 0 else None
+    except Exception:
+        return None
+
+
+def _imported_size_gb(manager, node, value):
+    """GB of the image a new disk is filled from (import-from=STORAGE:VOLUME), as its
+    storage lists it; None when it cannot be told (a path, no answer)"""
+    from urllib.parse import quote
+    from pegaprox.utils.rbac import property_string, GIB
+    _, opts = property_string(value, 'file')
+    src = opts.get('import-from') or ''
+    if ':' not in src or src.startswith('/'):
+        return None
+    try:
+        r = manager._api_get(f"https://{manager.host}:{manager.api_port}/api2/json/nodes/{node}/storage/"
+                             f"{quote(src.split(':', 1)[0], safe='')}/content/{quote(src, safe='')}", timeout=15)
+        data = r.json().get('data') if r.status_code == 200 else None
+        size = float(data.get('size') or 0) if isinstance(data, dict) else 0.0
+    except Exception:
+        return None
+    return size / GIB if size > 0 else None
+
+
+def _config_growth(manager, node, vm_type, vmid, updates):
+    """What a config change adds to a guest: more cores, more memory, new volumes
+    ('storage:32' allocates 32 GB). None when it touches none of them, so the guest's
+    config is read only when there is something to compare.
+
+    MK Oct 2026 - in every spelling Proxmox VE takes: a drive or mount point with its
+    file=/volume= key written out, memory as 'current=N', a disk filled from an image
+    (import-from: the image's size, more than any quota when that is unknown), and a
+    container whose core limit is deleted, which then runs on every core of its node. The
+    current values are the guest's own config (its raw keys), not the defaults."""
+    from pegaprox.utils.rbac import drive_new_gb, memory_mb, raw_guest_config, QUOTA_UNKNOWN
+    new_gb = 0.0
+    for k, v in updates.items():
+        gb = drive_new_gb(k, v)
+        if gb >= QUOTA_UNKNOWN:
+            gb = _imported_size_gb(manager, node, v) or QUOTA_UNKNOWN
+        new_gb += gb
+    deleted = {p.strip() for p in str(updates.get('delete') or '').split(',') if p.strip()}
+    cpu = {'cores', 'sockets'} & (set(updates) | deleted)
+    mem = 'memory' in updates or 'memory' in deleted
+    if not (cpu or mem or new_gb):
+        return None
+    got = manager.get_vm_config(node, vmid, vm_type) or {}
+    if not isinstance(got, dict) or got.get('success') is False:
+        # without the guest's config only the new volumes are known
+        return {'disk_gb': new_gb} if new_gb else None
+    cur = raw_guest_config(got)
+    adds = {'disk_gb': new_gb}
+    if cpu and vm_type == 'qemu':
+        cores, sockets = _int_or(cur.get('cores'), 1), _int_or(cur.get('sockets'), 1)
+        new_cores = 1 if 'cores' in deleted else _int_or(updates.get('cores', cores), cores)
+        new_sockets = 1 if 'sockets' in deleted else _int_or(updates.get('sockets', sockets), sockets)
+        adds['cores'] = new_cores * new_sockets - cores * sockets
+    elif cpu:
+        # a container without cores is not limited: all of its node's
+        unlimited = _node_cores(manager, node) or QUOTA_UNKNOWN
+        cores = _int_or(cur.get('cores'), 0) or unlimited
+        if 'cores' in deleted:
+            new = unlimited
+        else:
+            new = _int_or(updates.get('cores'), cores) if 'cores' in updates else cores
+        adds['cores'] = new - cores
+    if mem:
+        old = memory_mb(cur.get('memory'), 512)
+        new = 512 if 'memory' in deleted else memory_mb(updates.get('memory'), old)
+        adds['memory_gb'] = (new - old) / 1024.0
+    return adds
+
+
+def _rollback_growth(manager, node, vm_type, vmid, snapname):
+    """What a rollback adds: the snapshot's config (Proxmox VE keeps it with the snapshot)
+    against the guest's config now. None when either cannot be read."""
+    from urllib.parse import quote
+    from pegaprox.utils.rbac import config_footprint
+    if vm_type not in ('qemu', 'lxc'):
+        return None
+    r = manager._api_get(f"https://{manager.host}:{manager.api_port}/api2/json/nodes/{node}/{vm_type}/"
+                         f"{vmid}/snapshot/{quote(str(snapname), safe='')}/config", timeout=15)
+    snap = r.json().get('data') if r.status_code == 200 else None
+    got = manager.get_vm_config(node, vmid, vm_type) or {}
+    if not isinstance(snap, dict) or not isinstance(got, dict) or got.get('success') is False:
+        return None
+    node_cores = _node_cores(manager, node) if vm_type == 'lxc' else None
+    then = config_footprint(snap, vm_type, node_cores)
+    now = config_footprint(got, vm_type, node_cores)
+    return {k: then[k] - now[k] for k in ('cores', 'memory_gb', 'disk_gb')}
+
+
+def _xcp_config_growth(manager, node, vm_type, vmid, updates):
+    """The same for XCP-ng, whose config change takes vcpus and memory (read as
+    xcpng.update_vm_config reads them), against the guest's XAPI record"""
+    from pegaprox.core.xcpng import xapi_memory_bytes
+    if 'vcpus' not in updates and 'memory' not in updates:
+        return None
+    got = manager.get_vm_config(node, vmid, vm_type) or {}
+    cur = (got.get('config') or {}) if isinstance(got, dict) else {}
+    adds = {}
+    if 'vcpus' in updates:
+        new = _int_or(updates.get('vcpus'), None)
+        if new is not None:
+            adds['cores'] = max(1, new) - _int_or(cur.get('vcpus'), 0)
+    if 'memory' in updates:
+        new = xapi_memory_bytes(updates.get('memory'))
+        if new is not None:
+            adds['memory_gb'] = (new - _int_or(cur.get('memory'), 0)) / 1024.0 ** 3
+    return adds or None
+
+
+def _resize_growth(manager, node, vm_type, vmid, disk, size):
+    """GB a disk resize adds: '+10G' adds ten, '50G' what lies above the disk's size now.
+    On XCP-ng as XAPI reads it (xcpng.xapi_resize_bytes): no unit below 4096 is GB, a '+'
+    changes nothing, and the size is always the new total."""
+    from pegaprox.utils.rbac import size_to_gb, QUOTA_SIZE_RE, raw_guest_config, GIB
+    if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
+        from pegaprox.core.xcpng import xapi_resize_bytes
+        want = xapi_resize_bytes(size)
+        if want is None:
+            return None             # XAPI refuses it too
+        got = manager.get_vm_config(node, vmid, vm_type) or {}
+        disks = ((got.get('config') or {}).get('disks') or []) if isinstance(got, dict) else []
+        have = next((d for d in disks if isinstance(d, dict)
+                     and str(disk) in (str(d.get('id', '')), str(d.get('uuid', '')))), None)
+        # a disk whose size is not known grows by all of it at most
+        return {'disk_gb': (want - float((have or {}).get('size') or 0)) / GIB}
+    m = _RESIZE_RE.fullmatch(str(size).strip())
+    if not m:
+        return None                 # Proxmox refuses what it cannot read
+    gb = size_to_gb(m.group(2), m.group(3))
+    if m.group(1):
+        return {'disk_gb': gb}
+    got = manager.get_vm_config(node, vmid, vm_type) or {}
+    have = QUOTA_SIZE_RE.search(str(raw_guest_config(got).get(disk) or ''))
+    if not have:
+        return None                 # no size to grow from in the config: open, as the quota is
+    return {'disk_gb': gb - size_to_gb(have.group(1), have.group(2))}
+
+
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/clone', methods=['POST'])
 @require_auth(perms=['vm.clone'])
 def clone_vm_api(cluster_id, node, vm_type, vmid):
@@ -4358,14 +4889,24 @@ def clone_vm_api(cluster_id, node, vm_type, vmid):
         if _nerr:
             return _nerr
 
+    # MK Oct 2026 - a clone is a new guest the size of its source: the tenant quota counts it,
+    # and holds it until the new guest shows on the cluster
+    _qerr, _qwarn = tenant_quota_gate(user, f'clone of {vm_type} {vmid}',
+                                      lambda: dict(guest_size(manager, node, vm_type, vmid), vms=1),
+                                      cluster=manager.config.name,
+                                      hold={'cluster_id': cluster_id, 'vmid': newid})
+    if _qerr:
+        return _qerr
+
     if not newid:
         # Get next available VMID
         next_result = manager.get_next_vmid()
         if next_result['success']:
             newid = next_result['vmid']
+            quota_hold_alive(vmids=[newid])
         else:
             return jsonify({'error': 'Could not get next VMID'}), 500
-    
+
     result = manager.clone_vm(
         node=node,
         vmid=vmid,
@@ -4412,7 +4953,8 @@ def clone_vm_api(cluster_id, node, vm_type, vmid):
         return jsonify({
             'message': f'Clone gestartet: {vmid} -> {newid}',
             'newid': newid,
-            'data': result.get('data')
+            'data': result.get('data'),
+            **({'quota_warning': _qwarn} if _qwarn else {}),
         })
     else:
         return jsonify({'error': result['error']}), 500
@@ -4674,7 +5216,7 @@ def _screenshot_via_rfb(mgr, node, vm_type, vmid, max_width=480, timeout=10):
                 cluster_id=getattr(mgr, 'id', ''), pve_host=host,
                 ssh_user=_ssh_user, ssh_port=_ssh_port,
                 ssh_key_content=getattr(mgr.config, 'ssh_key', '') or '',
-                ssh_password=ssh_password_for(mgr.config),
+                ssh_password=ssh_password_to(mgr, host),
                 target_host='127.0.0.1', target_port=_api_port,
             )
             target_host, target_port = '127.0.0.1', tunnel_endpoint.local_port
@@ -4904,7 +5446,7 @@ def vnc_poll(cluster_id, node, vm_type, vmid):
                     cluster_id=cluster_id, pve_host=host,
                     ssh_user=_ssh_user, ssh_port=_ssh_port,
                     ssh_key_content=getattr(mgr.config, 'ssh_key', '') or '',
-                    ssh_password=ssh_password_for(mgr.config),
+                    ssh_password=ssh_password_to(mgr, host),
                     target_host='127.0.0.1', target_port=port,
                 )
                 target_host = '127.0.0.1'
@@ -5492,7 +6034,7 @@ def get_vm_guest_file_read_api(cluster_id, node, vm_type, vmid):
                 'truncated': bool(data.get('truncated', False)),
                 'bytes_read': data.get('bytes-read') or data.get('content-size'),
             })
-        return jsonify({'error': resp.text or f'HTTP {resp.status_code}'}), resp.status_code
+        return upstream_failure(resp.status_code, resp.text or f'HTTP {resp.status_code}')
     except Exception as e:
         return jsonify({'error': safe_error(e)}), 500
 
@@ -5523,6 +6065,36 @@ def get_vm_rrd_api(cluster_id, node, vm_type, vmid, timeframe):
         return jsonify(result['data'])
     else:
         return jsonify({'error': result['error']}), 500
+
+
+# MK Oct 2026 - the guest twin of nodes/<node>/metrics-history: CPU and memory of a picked
+# range from the snapshots PegaProx stores every 5 minutes, where the RRD presets have only
+# a few points in it. Keyed by vmid in the snapshots, so a guest that moved keeps its line.
+@bp.route('/api/clusters/<cluster_id>/vms/<int:vmid>/metrics-history', methods=['GET'])
+@require_auth(perms=['vm.view'])
+def get_vm_metrics_history_api(cluster_id, vmid):
+    """CPU and memory of a guest over a picked time range, from PegaProx's stored metrics
+
+    Query params:
+    - from, to: unix seconds, a year apart at most; cut to what is stored
+    """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    denied = _require_vm_access(cluster_id, vmid, 'vm.view')
+    if denied: return denied
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    from pegaprox.background.metrics import history_range, load_metrics_range, history_series
+    start, end, why = history_range(request.args)
+    if why:
+        return jsonify({'error': why}), 400
+    key = str(vmid)
+
+    def _guest(clusters):
+        return ((clusters.get(cluster_id) or {}).get('vms') or {}).get(key)
+    out = history_series(load_metrics_range(start, end, _guest), {'cpu': 'cpu', 'memory': 'mem'})
+    out.update({'vmid': vmid, 'from': int(start), 'to': int(end)})
+    return jsonify(out)
 
 
 # MK Oct 2026 - rng0 is a property string PVE parses as pve-qm-rng: the source is one of
@@ -5616,6 +6188,16 @@ def update_vm_config_api(cluster_id, node, vm_type, vmid):
             if root_key:
                 return _confined_root_refusal(f'setting {root_key}')
 
+    # MK Oct 2026 - more cores, memory or a new volume grow the tenant like a create does
+    _grow = (_xcp_config_growth if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng'
+             else _config_growth)
+    _qerr, _qwarn = tenant_quota_gate(
+        user, f'config change of {vm_type} {vmid}',
+        lambda: _grow(manager, node, vm_type, vmid, config_updates),
+        cluster=manager.config.name, hold={'cluster_id': cluster_id, 'vmid': vmid, 'grow': True})
+    if _qerr:
+        return _qerr
+
     result = manager.update_vm_config(node, vmid, vm_type, config_updates)
 
     if result['success']:
@@ -5636,7 +6218,7 @@ def update_vm_config_api(cluster_id, node, vm_type, vmid):
         user = getattr(request, 'session', {}).get('user', 'system')
         changes = ', '.join([f"{k}={v}" for k, v in config_updates.items()][:5])
         log_audit(user, 'vm.config_changed', f"{vm_type.upper()} {vmid} config updated: {changes}", cluster=manager.config.name)
-        return jsonify({'message': result['message']})
+        return jsonify({'message': result['message'], **({'quota_warning': _qwarn} if _qwarn else {})})
     else:
         return jsonify({'error': result['error']}), 500
 
@@ -6861,13 +7443,22 @@ def resize_vm_disk_api(cluster_id, node, vm_type, vmid):
     if not disk or not size:
         return jsonify({'error': 'disk and size required'}), 400
     
+    # MK Oct 2026 - a bigger disk is more of the tenant's disk quota
+    _qerr, _qwarn = tenant_quota_gate(
+        build_authz_user(request.session.get('user', ''), request.session),
+        f'disk resize of {vm_type} {vmid}',
+        lambda: _resize_growth(manager, node, vm_type, vmid, disk, size), cluster=manager.config.name,
+        hold={'cluster_id': cluster_id, 'vmid': vmid, 'grow': True})
+    if _qerr:
+        return _qerr
+
     result = manager.resize_vm_disk(node, vmid, vm_type, disk, size)
     
     if result['success']:
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
         log_audit(user, 'vm.disk_resized', f"{vm_type.upper()} {vmid} disk {disk} resized to {size}", cluster=manager.config.name)
-        return jsonify({'message': result['message']})
+        return jsonify({'message': result['message'], **({'quota_warning': _qwarn} if _qwarn else {})})
     else:
         return jsonify({'error': result['error']}), 500
 
@@ -6968,6 +7559,23 @@ def add_disk_api(cluster_id, node, vm_type, vmid):
         if why:
             return jsonify({'error': why}), 400
 
+    # a new disk is new disk quota (MK Oct 2026); manager.add_disk takes 32 GB when none is
+    # given. The size is read the way the manager reads it, XCP-ng's included, so the quota
+    # counts what is created
+    if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
+        from pegaprox.core.xcpng import xapi_add_disk_gb
+        _new_gb = xapi_add_disk_gb(disk_config.get('size', 32))
+        if _new_gb is None or _new_gb < 1:
+            return jsonify({'error': 'Disk size is a number of GB'}), 400
+    else:
+        _new_gb = float(str(disk_config.get('size', '32')).replace('G', '').replace('g', '') or 0)
+    _qerr, _qwarn = tenant_quota_gate(
+        build_authz_user(request.session.get('user', ''), request.session),
+        f'new disk on {vm_type} {vmid}', {'disk_gb': _new_gb},
+        cluster=manager.config.name, hold={'cluster_id': cluster_id, 'vmid': vmid, 'grow': True})
+    if _qerr:
+        return _qerr
+
     result = manager.add_disk(node, vmid, vm_type, disk_config)
     
     if result['success']:
@@ -6987,7 +7595,7 @@ def add_disk_api(cluster_id, node, vm_type, vmid):
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
         log_audit(user, 'vm.disk_added', f"{vm_type.upper()} {vmid} - disk added: {disk_config.get('size', 'unknown')}GB on {disk_config.get('storage', 'default')}", cluster=manager.config.name)
-        return jsonify({'message': result['message']})
+        return jsonify({'message': result['message'], **({'quota_warning': _qwarn} if _qwarn else {})})
     else:
         return jsonify({'error': result['error']}), 500
 
@@ -7347,13 +7955,26 @@ def rollback_snapshot_api(cluster_id, node, vm_type, vmid, snapname):
     if denied: return denied
 
     mgr = cluster_managers[cluster_id]
+
+    # MK Oct 2026 - a rollback brings the snapshot's config back: cores, memory and disks
+    # taken from the guest since come back with it, past the tenant quota as on a resize
+    _qwarn = None
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'xcpng':
+        _qerr, _qwarn = tenant_quota_gate(
+            user, f"rollback of {vm_type} {vmid} to '{snapname}'",
+            lambda: _rollback_growth(mgr, node, vm_type, vmid, snapname),
+            cluster=mgr.config.name, hold={'cluster_id': cluster_id, 'vmid': vmid, 'grow': True})
+        if _qerr:
+            return _qerr
+
     result = mgr.rollback_snapshot(node, vmid, vm_type, snapname)
-    
+
     if result['success']:
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
         log_audit(user, 'snapshot.restored', f"{vm_type.upper()} {vmid} - rolled back to snapshot '{snapname}'", cluster=mgr.config.name)
-        return jsonify({'message': f'Rollback zu {snapname} gestartet', 'task': result.get('task')})
+        return jsonify({'message': f'Rollback zu {snapname} gestartet', 'task': result.get('task'),
+                        **({'quota_warning': _qwarn} if _qwarn else {})})
     else:
         return jsonify({'error': result['error']}), 500
 
@@ -8527,6 +9148,16 @@ def _untagged_replica_error(job_id, vmid, node, detail):
             f"target, so tag it by hand or the job stays stuck here.")
 
 
+def _running_replica_error(vmid, node):
+    """A replica is kept stopped; one that runs is a guest in use, most likely failed over
+    by a recovery plan whose mark the run did not see (a leader gone before it reached
+    the members, #625). Nothing stops, purges or writes into it."""
+    return (f"Target VM {vmid} on {node} is running. A replica is kept stopped, so this is a "
+            f"guest in use there (failed over by a recovery plan?) - nothing was stopped, "
+            f"removed or written. Fail it back, or stop it if it really is the replica, and run "
+            f"the job again.")
+
+
 # ============================================================================
 # #174 aderumier — incremental cross-cluster replication (RBD)
 # ============================================================================
@@ -8553,6 +9184,30 @@ def _xcincr_node_ip(mgr, node):
     return None
 
 
+def _xcincr_ssh(mgr, node, job_id):
+    """SSH to a node for the byte relay, or None.
+
+    MK Oct 2026 - at its address in the cluster's transfer network when PegaProx reaches
+    it there and the host key it presents is the one pinned for its management address;
+    else, and for the next ten minutes, at the management address as before."""
+    mgmt_ip = _xcincr_node_ip(mgr, node)
+    if not mgmt_ip:
+        return None
+    via = transfer_ssh_address(mgr, node, mgmt_ip)
+    if via:
+        failure = {}
+        client = mgr._ssh_connect(via, retries=1, connect_timeout=10, failure=failure,
+                                  pinned_as=mgmt_ip)
+        if client:
+            logging.info(f"[XCINCR] Job {job_id}: {node} relays over its transfer address {via}")
+            return client
+        transfer_net.ssh_unusable(mgr, node, via)
+        logging.warning(f"[XCINCR] Job {job_id}: transfer address {via} of {node} not used "
+                        f"({failure.get('kind') or 'error'}: {failure.get('detail') or 'no connection'}) - "
+                        f"relaying over its management address {mgmt_ip}")
+    return mgr._ssh_connect(mgmt_ip)
+
+
 def _xcincr_rbd_pool(ssh, storage):
     """Ceph pool backing an rbd storage (from `pvesm config`); falls back to the
     storage name."""
@@ -8573,20 +9228,26 @@ def _xcincr_zfs_pool(ssh, storage):
     return p or storage
 
 
-def _xcincr_vm_node(mgr, vmid):
-    """(node or None, readable): where the guest with this VMID lives. NS Oct 2026 - a list
-    that could not be read is not an empty one (#1051): read as "nobody there" it sent a
-    seed onto the VMID, and a seed replaces whatever disk carries that name."""
+def _xcincr_vm_entry(mgr, vmid):
+    """(its cluster/resources entry or None, readable) of the guest with this VMID."""
     try:
         r = mgr._api_get(f"https://{mgr.host}:{mgr.api_port}/api2/json/cluster/resources", params={'type': 'vm'})
         if r.status_code != 200:
             return None, False
         for x in r.json().get('data', []):
             if int(x.get('vmid', 0)) == int(vmid):
-                return x.get('node') or None, True
+                return x, True
         return None, True
     except Exception:
         return None, False
+
+
+def _xcincr_vm_node(mgr, vmid):
+    """(node or None, readable): where the guest with this VMID lives. NS Oct 2026 - a list
+    that could not be read is not an empty one (#1051): read as "nobody there" it sent a
+    seed onto the VMID, and a seed replaces whatever disk carries that name."""
+    entry, readable = _xcincr_vm_entry(mgr, vmid)
+    return ((entry or {}).get('node') or None), readable
 
 
 def _xcincr_vm_exists(mgr, vmid):
@@ -8597,13 +9258,17 @@ def _xcincr_vm_exists(mgr, vmid):
 
 def _xcincr_replica_node(target_mgr, tgt_vmid, vm_type, job_id):
     """(node, None) of the guest at the target VMID when it is THIS job's replica, (None,
-    None) when there is none, (None, error) when it is somebody else's or cannot be told."""
-    node, readable = _xcincr_vm_node(target_mgr, tgt_vmid)
+    None) when there is none, (None, error) when it is somebody else's, runs, or cannot be
+    told. The gate of both the delta and the removal before a reseed."""
+    entry, readable = _xcincr_vm_entry(target_mgr, tgt_vmid)
     if not readable:
         return None, (f"Cannot read the guests of the target cluster to check VMID {tgt_vmid} - "
                       f"refusing to write to it this run")
+    node = (entry or {}).get('node') or None
     if not node:
         return None, None
+    if entry.get('status') == 'running':
+        return None, _running_replica_error(tgt_vmid, node)
     if not _is_replica_of_job(target_mgr, node, tgt_vmid, vm_type, job_id):
         return None, (f"Target VM {tgt_vmid} on {node} is not tagged as this job's replica "
                       f"({_job_tag(job_id)} missing) - refusing to overwrite. Pick a free target VMID "
@@ -8803,8 +9468,8 @@ def _execute_replication_incremental(job):
                                 f'Node {_missing!r} is not listed as a member of its cluster - '
                                 f'refusing to SSH to it')
             return True
-        src_ssh = source_mgr._ssh_connect(_src_ip)
-        tgt_ssh = target_mgr._ssh_connect(_tgt_ip)
+        src_ssh = _xcincr_ssh(source_mgr, source_node, job_id)
+        tgt_ssh = _xcincr_ssh(target_mgr, target_node, job_id)
         if not src_ssh or not tgt_ssh:
             _update_repl_status(db, job_id, 'error', 'SSH to source/target node failed (incremental needs SSH creds on both clusters)')
             return True
@@ -8935,6 +9600,14 @@ def _execute_replication(job):
     isn't eligible (non-rbd disks etc.), in which case we fall through to this
     full clone+migrate flow.
     """
+    # MK Oct 2026 - never while a recovery plan has the guest failed over: the replica on
+    # the target is the running guest then, and this would replace it with the old source
+    from pegaprox.background.site_recovery import replication_held_by
+    _held = replication_held_by(job, get_db())
+    if _held:
+        logging.warning(f"[XCREPL] Job {job.get('id')}: VM {job.get('vmid')} is failed over by recovery "
+                        f"plan '{_sl(_held)}' - not replicated until it is failed back")
+        return
     if (job.get('mode') or 'full') == 'incremental':
         try:
             if _execute_replication_incremental(job):
@@ -9135,22 +9808,29 @@ def _execute_replication(job):
             return
 
         try:
-            fp = target_mgr.get_cluster_fingerprint()
+            # the target node's transfer address when the target cluster has one (MK Oct 2026)
+            xfer = transfer_net.migration_route(target_mgr, target_node or None)
+            if xfer and xfer['host']:
+                fp = {'success': True, 'host': xfer['host'], 'fingerprint': xfer['fingerprint']}
+            else:
+                fp = target_mgr.get_cluster_fingerprint()
             if not fp.get('success'):
                 target_mgr.delete_api_token(token_name)
                 _cleanup_clone_and_snap(source_mgr, source_node, clone_vmid, vmid, vm_type, snap_name)
                 _update_repl_status(db, job_id, 'error', f'Fingerprint failed: {fp.get("error")}')
                 return
+            transfer_net.report_fallback(xfer, getattr(source_mgr, 'logger', None))
+            logging.info(f"[XCREPL] Job {job_id}: target endpoint host {fp['host']}"
+                         + (f" (transfer network {xfer['network']})" if xfer and xfer['host'] else ''))
 
-            endpoint = (
-                f"apitoken=PVEAPIToken={token['token_id']}={token['token_value']},"
-                f"host={fp['host']},fingerprint={fp['fingerprint']}"
-            )
+            endpoint = transfer_net.endpoint(token, fp['host'], fp['fingerprint'])
 
             # NS Apr 2026: #321 - second+ replication run fails because VM exists on target.
             # A replication job's whole point is to REPLACE the old copy, so remove it here
             # before remote_migrate tries to create-from-empty (which errors on existing VMID).
             existing_target_node = None
+            existing_running = False
+            listed = False
             try:
                 tgt_res = target_mgr._api_get(
                     f"https://{target_mgr.host}:{target_mgr.api_port}/api2/json/cluster/resources",
@@ -9160,9 +9840,30 @@ def _execute_replication(job):
                     for r in tgt_res.json().get('data', []):
                         if int(r.get('vmid', 0)) == tgt_vmid:
                             existing_target_node = r.get('node')
+                            existing_running = r.get('status') == 'running'
                             break
+                    listed = True
             except Exception as e:
                 logging.warning(f"[XCREPL] Job {job_id}: target existence check failed: {e}")
+
+            if not listed:
+                # unread is not empty (#1051): a replica that runs cannot be told from none
+                target_mgr.delete_api_token(token_name)
+                _cleanup_clone_and_snap(source_mgr, source_node, clone_vmid, vmid, vm_type, snap_name)
+                err_msg = (f"Cannot read the guests of the target cluster to check VMID {tgt_vmid} - "
+                           f"nothing was written this run")
+                _update_repl_status(db, job_id, 'error', err_msg)
+                logging.error(f"[XCREPL] Job {job_id}: ABORT - {err_msg}")
+                return
+
+            if existing_target_node and existing_running:
+                # never stopped and purged, tagged or not (#625)
+                target_mgr.delete_api_token(token_name)
+                _cleanup_clone_and_snap(source_mgr, source_node, clone_vmid, vmid, vm_type, snap_name)
+                err_msg = _running_replica_error(tgt_vmid, existing_target_node)
+                _update_repl_status(db, job_id, 'error', err_msg)
+                logging.error(f"[XCREPL] Job {job_id}: ABORT - {err_msg}")
+                return
 
             if existing_target_node:
                 # MK May 2026 (#413 @blackshocks) — refuse to delete unless the existing
@@ -9287,12 +9988,19 @@ def _execute_replication(job):
 def _update_repl_status(db, job_id, status, error=''):
     """Update job status in DB after a replication run."""
     try:
+        stamp = datetime.now().isoformat()
+        # MK Oct 2026 - last_ok_at is the last run that went through, what the RPO alert counts from
         db.execute(
-            'UPDATE cross_cluster_replications SET last_run = ?, last_status = ?, last_error = ?, updated_at = ? WHERE id = ?',
-            (datetime.now().isoformat(), status, error or '', datetime.now().isoformat(), job_id)
+            'UPDATE cross_cluster_replications SET last_run = ?, last_status = ?, last_error = ?, updated_at = ?, '
+            'last_ok_at = CASE WHEN ? = \'ok\' THEN ? ELSE last_ok_at END WHERE id = ?',
+            (stamp, status, error or '', stamp, status, stamp, job_id)
         )
     except Exception as e:
         logging.warning(f"[XCREPL] Could not update status for {job_id}: {e}")
+    if status == 'ok':
+        # the replica is there now and counted as it is (MK Oct 2026)
+        from pegaprox.utils.rbac import quota_release_key
+        quota_release_key(('xcrepl', job_id))
     # MK May 2026 (audit completeness) — emit terminal audit event so the bundle's
     # audit_log captures the outcome of every xcrepl run, not just `replication.triggered`.
     # Mirrors the gap that surfaced via #438 on the v2p side: started-only audit forces
@@ -9591,6 +10299,20 @@ def create_cross_cluster_replication():
         _rok, _rmsg = check_tenant_vmid(_xu.get('tenant_id') or DEFAULT_TENANT_ID, _land)
         if not _rok:
             return jsonify({'error': _rmsg}), 403
+    # the replica is a guest of its own on the target, for the tenant quota as well (MK Oct 2026).
+    # The job makes it at its first run, maybe days from now: the hold stays until that run
+    # went through or the job is deleted (_update_repl_status, delete_cross_cluster_replication)
+    from pegaprox.utils.rbac import landing_adds, quota_tenant
+    _qerr, _qwarn = tenant_quota_gate(
+        _xu, f'replication of {vmid} to {target_cluster}',
+        lambda: landing_adds(quota_tenant(_xu), target_cluster,
+                             guest_size(cluster_managers[source_cluster], data.get('source_node') or '',
+                                        data.get('vm_type', 'qemu'), int(vmid))),
+        cluster=cluster_managers[target_cluster].config.name,
+        hold={'cluster_id': target_cluster, 'vmid': target_vmid or (None if source_cluster == target_cluster else vmid),
+              'key': ('xcrepl', job_id), 'ttl': _REPLICA_HOLD_TTL})
+    if _qerr:
+        return _qerr
     delete_target = 1 if data.get('delete_target') else 0
     # #174 aderumier — opt-in incremental mode. Validated here; the engine still
     # falls back to 'full' at run time if the VM's disks aren't rbd/zfspool on
@@ -9628,7 +10350,7 @@ def create_cross_cluster_replication():
               f"Cross-cluster replication {job_id}: VM {vmid} from {source_cluster} to {target_cluster} "
               f"(target VMID {target_vmid or 'auto'}{', delete-target ON' if delete_target else ''})")
 
-    return jsonify({'success': True, 'id': job_id})
+    return jsonify({'success': True, 'id': job_id, **({'quota_warning': _qwarn} if _qwarn else {})})
 
 
 def _delete_replica_target(job):
@@ -9780,6 +10502,9 @@ def delete_cross_cluster_replication(job_id):
             target_detail = f' (replica: {detail})'
 
     db.execute('DELETE FROM cross_cluster_replications WHERE id = ?', (job_id,))
+    # a job that never ran leaves no replica to hold the tenant quota for
+    from pegaprox.utils.rbac import quota_release_key
+    quota_release_key(('xcrepl', job_id))
 
     usr = getattr(request, 'session', {}).get('user', 'system')
     log_audit(usr, 'replication.deleted', f"Cross-cluster replication {job_id} deleted{target_detail}")
@@ -9817,6 +10542,12 @@ def run_cross_cluster_replication(job_id):
     # NS Oct 2026 - a run writes the replica on the target, as create would have (#1068)
     if caller_is_scoped(_xu, _job.get('target_cluster') or ''):
         return jsonify({'error': 'Access denied to the target cluster'}), 403
+    # MK Oct 2026 - its guest is failed over: the replica is the running guest now
+    from pegaprox.background.site_recovery import replication_held_by
+    if replication_held_by(_job, db):
+        return jsonify({'error': 'This guest is failed over by a site recovery plan. Its replica on the '
+                                 'target is the running guest now: fail it back before replicating it again.',
+                        'code': 'SR_FAILED_OVER'}), 409
 
     # MK May 2026 (#455) — block duplicate triggers while a previous run is still
     # in-flight. The scheduler uses the same _claim_job() guard.
@@ -10478,7 +11209,7 @@ def start_vnc_websocket_server(port=5001, ssl_cert=None, ssl_key=None, host='0.0
                     _ssh_user = getattr(manager.config, 'ssh_user', None) or (manager.config.user or 'root').split('@')[0]
                     _ssh_port = getattr(manager.config, 'ssh_port', 22) or 22
                     _ssh_key = getattr(manager.config, 'ssh_key', '') or ''
-                    _ssh_pass = ssh_password_for(manager.config)
+                    _ssh_pass = ssh_password_to(manager, host)
                     # MK Apr 2026 — _vt.acquire() is sync. On the *first* call for a
                     # cluster it builds the SSH transport (~1-2s on a fast LAN, more
                     # over WAN). If we ran it directly on the event loop, that 1-2s
@@ -11266,7 +11997,9 @@ def get_termproxy_ticket_api(cluster_id, node, vm_type, vmid):
     pve_pwd = getattr(mgr.config, 'pass_', None) or getattr(mgr.config, 'password', None)
     pve_usr = getattr(mgr.config, 'user', None) or 'root@pam'
     # #955 - a token id with its secret is no password either; PVE would only answer 401
-    if not pve_pwd or '!' in pve_usr:
+    # (the capability list asks the same question, core/pve_access.password_login)
+    from pegaprox.core.pve_access import password_login
+    if password_login(mgr.config):
         return jsonify({'error': 'Cluster has no stored password — termproxy needs user/pass auth (API tokens cannot mint termproxy tickets).'}), 400
 
     import ssl as _ssl
@@ -11407,7 +12140,7 @@ async def ssh_handler(websocket):
     """SSH WebSocket handler with user credential prompt and SSH key support
     
     MK: Supports both password and SSH key authentication
-    Frontend can pre-fetch the IP and pass it as query parameter
+    The node's address comes from the main app, the page's ?ip= is not read (#1143)
     """
     path = websocket.request.path if hasattr(websocket, 'request') else websocket.path
     print(f"SSH WebSocket connection: {path}")
@@ -11417,12 +12150,6 @@ async def ssh_handler(websocket):
     query = parse_qs(parsed.query)
     ws_token = query.get('token', [None])[0]
     session_id = query.get('session', [None])[0]  # LW: backwards compat
-    prefetched_ip = query.get('ip', [None])[0]  # IP pre-fetched by frontend
-    if prefetched_ip:
-        prefetched_ip = unquote(prefetched_ip)
-        # NS Jul 2026 (CodeAnt CWE-117) — prefetched_ip is unquoted user input; strip CR/LF so
-        # it can't forge log lines (self-contained: this runs in the standalone WS subprocess).
-        print("Frontend provided IP: " + str(prefetched_ip).replace(chr(10), ' ').replace(chr(13), ' '))
 
     # NS May 2026 — accept both shell and termproxy paths.
     # termproxy: /api/clusters/<cid>/vms/<node>/<vm_type>/<vmid>/termwebsocket
@@ -11464,9 +12191,11 @@ async def ssh_handler(websocket):
         if ws_token:
             # NS Aug 2026 (Aikido pentest) — shell=node makes /validate enforce the node.shell
             # permission for this node SSH shell (the VM termproxy path deliberately omits it).
+            # MK Oct 2026 (#1143) - the token quoted too: ?token=x%26shell%3D1 came out as a
+            # shell=1 ahead of ours, and /validate reads the first one, node.shell skipped.
             validate_url = (
                 f"{PEGAPROX_URL}/api/ws/token/validate"
-                f"?token={ws_token}&cluster_id={quote_plus(cluster_id)}&node={quote_plus(node)}&shell=node"
+                f"?token={quote_plus(ws_token)}&cluster_id={quote_plus(cluster_id)}&node={quote_plus(node)}&shell=node"
             )
             print(f"Validating WS token (cluster={cluster_id}, node={node})...")
         else:
@@ -11478,7 +12207,9 @@ async def ssh_handler(websocket):
         # nosec B501 — localhost-to-PegaProx (PEGAPROX_URL = 127.0.0.1:port) with our
         # own self-signed cert. Same-host trust boundary; attacker with local
         # cert-read access already has more direct attack paths. MK 2026-06-04.
-        r = requests.get(validate_url, cookies=cookies, headers=headers, timeout=8, verify=False)
+        # MK Oct 2026 (#1143) - the token check also looks up the node's address now, which
+        # can probe the node: more time than a bare check needs.
+        r = requests.get(validate_url, cookies=cookies, headers=headers, timeout=30, verify=False)
 
         if await _refused_as_standby(websocket, r):
             return
@@ -11507,8 +12238,7 @@ async def ssh_handler(websocket):
                 ctx = payload.get('cluster_context') or {}
                 cluster_host = ctx.get('host')
                 node_ips = ctx.get('node_ips') or {}
-                node_ip = node_ips.get(node) or node_ips.get(node.lower())
-                print(f"validate→ host={cluster_host} node_ips={node_ips} resolved_node_ip={node_ip}")
+                print(f"validate→ host={cluster_host} node_ips={node_ips}")
             except Exception as e:
                 print(f"Could not parse validate payload: {e}")
 
@@ -11525,7 +12255,6 @@ async def ssh_handler(websocket):
                     creds = rc.json()
                     cluster_host = creds.get('host')
                     node_ips = creds.get('node_ips', {})
-                    node_ip = node_ips.get(node) or node_ips.get(node.lower())
             except Exception as e:
                 print(f"Could not get node IP from API: {e}")
 
@@ -11542,50 +12271,27 @@ async def ssh_handler(websocket):
         await websocket.close(1011, "Auth error")
         return
 
-    # cluster_host fallback for node_ip (single-node setups where only the host
-    # was registered).
-    if not node_ip and cluster_host:
-        node_ip = cluster_host
-        print(f"Using cluster host as fallback: {cluster_host}")
-
-    # MK May 2026 (CodeAnt CWE-918) - build the SSH allow-list. prefetched_ip from
-    # URL and user-supplied creds.host below must both be in this set; otherwise
-    # an authenticated user could turn PegaProx into an SSH jump host for any
-    # internal IP. Set comes from server-side resolution only.
-    allowed_hosts = set()
-    if cluster_host:
-        allowed_hosts.add(cluster_host)
-    allowed_hosts.update(v for v in (node_ips or {}).values() if v)
-
-    if prefetched_ip:
-        if prefetched_ip in allowed_hosts:
-            node_ip = prefetched_ip
-            print(f"Using prefetched IP (allow-list match): {node_ip}")
-        else:
-            print(f"REJECT prefetched ?ip={prefetched_ip!r} not in {sorted(allowed_hosts)}")
-            await websocket.send(json.dumps({
-                'status': 'error',
-                'message': f"Prefetched IP {prefetched_ip!r} is not a known node of cluster {cluster_id}."
-            }))
-            await websocket.close(1008, "prefetched ip not allowed")
-            return
-
-    # If we still don't have an IP, allow manual entry (but allow-list still applies)
-    allow_manual_ip = False
+    # MK Oct 2026 (#1143) - the shell logs in on the node it was opened for, at the address
+    # the main app resolved under that node's name. The connection host used to stand in
+    # when there was none, and the validate answer never named the node, so every shell on
+    # this port that the page's ?ip= did not move landed on that host under this node's
+    # name. No stand-in now, and neither ?ip= nor the dialog's host field moves the shell:
+    # the target is only ever an address the server resolved, which the CWE-918 allow-list
+    # they were checked against stood for. _fallback_0 and _default are keys of the
+    # context, no node names.
+    node_ip = None if node.startswith('_') else (node_ips.get(node) or node_ips.get(node.lower()))
     if not node_ip:
-        print(f"No IP found - allowing manual entry")
-        node_ip = ""  # Empty - user must provide
-        allow_manual_ip = True
-
-    print(f"Final node IP for {node}: {node_ip or '(manual entry required)'}")
-    print(f"Allow-list for host override: {sorted(allowed_hosts) or '(empty - no manual override permitted)'}")
+        print(f"No address for node {node} (connection host {cluster_host}) - no shell")
+        await websocket.send(json.dumps({'status': 'error', 'message': f'Could not find the address of node {node}'}))
+        await websocket.close(1008, "node address unknown")
+        return
+    print(f"Final node IP for {node}: {node_ip}")
 
     # Send need_credentials status - frontend will show login dialog
     await websocket.send(json.dumps({
         'status': 'need_credentials',
         'node': node,
         'ip': node_ip,
-        'allowManualIp': allow_manual_ip
     }))
 
     # Wait for credentials from user
@@ -11596,25 +12302,11 @@ async def ssh_handler(websocket):
         ssh_pass = creds.get('password', '')
         ssh_key = creds.get('privateKey', '')
 
-        # MK May 2026 (CodeAnt CWE-918) - host override is gated by allow_hosts.
-        # Empty set rejects all overrides (no-resolved-cluster case).
-        user_ip = creds.get('host', '').strip()
-        if user_ip:
-            if user_ip not in allowed_hosts:
-                print(f"REJECT user host override: {user_ip!r} not in {sorted(allowed_hosts)}")
-                await websocket.send(json.dumps({
-                    'status': 'error',
-                    'message': f"Host {user_ip!r} is not a known node of cluster {cluster_id}. Manual override blocked."
-                }))
-                await websocket.close(1008, "host not allowed")
-                return
-            node_ip = user_ip
-            print(f"Using user-provided IP (allow-list match): {node_ip}")
+        # #1143 - the dialog's host is shown to the user, the target stays the node's own
+        user_ip = str(creds.get('host') or '').strip()
+        if user_ip and user_ip != node_ip:
+            print(f"Ignoring host {user_ip!r} from the page, the shell of {node} opens on {node_ip}")
 
-        if not node_ip:
-            await websocket.send('{"status":"error","message":"Host/IP address required"}')
-            return
-        
         if not ssh_pass and not ssh_key:
             await websocket.send('{"status":"error","message":"Password or SSH key required"}')
             return
@@ -11824,7 +12516,7 @@ async def termproxy_handler(client_ws, query, m_term, ws_token, session_id):
         if ws_token:
             validate_url = (
                 f"{PEGAPROX_URL}/api/ws/token/validate"
-                f"?token={ws_token}&cluster_id={quote_plus(cluster_id)}&node={quote_plus(node)}"
+                f"?token={quote_plus(ws_token)}&cluster_id={quote_plus(cluster_id)}&node={quote_plus(node)}"
             )
         else:
             validate_url = f"{PEGAPROX_URL}/api/auth/validate"
@@ -12237,20 +12929,34 @@ def node_shell_websocket_proxy(ws, cluster_id, node):
         return
 
     # NS Feb 2026: Authentication + authorization (was missing entirely - critical security fix)
+    # MK Oct 2026 (#1143) - the WS token first, the session as fallback, as both VNC sockets
+    # do. The page only sends ?token=, so behind a reverse proxy (the one way to this route)
+    # every shell ended in "Authentication required".
+    from pegaprox.utils.realtime import validate_ws_token
+    ws_token = request.args.get('token')
     session_id = request.args.get('session')
-    if not session_id:
-        logging.error("SHELL WS: No session provided")
+    if ws_token:
+        session = validate_ws_token(ws_token)
+        if not session:
+            logging.error("SHELL WS: Invalid or expired token")
+            try:
+                ws.send('{"status":"error","message":"Invalid or expired token"}')
+            except:
+                pass
+            return
+    elif session_id:
+        session = validate_session(session_id)
+        if not session:
+            logging.error("SHELL WS: Invalid session")
+            try:
+                ws.send('{"status":"error","message":"Invalid session"}')
+            except:
+                pass
+            return
+    else:
+        logging.error("SHELL WS: No token or session provided")
         try:
             ws.send('{"status":"error","message":"Authentication required"}')
-        except:
-            pass
-        return
-
-    session = validate_session(session_id)
-    if not session:
-        logging.error("SHELL WS: Invalid session")
-        try:
-            ws.send('{"status":"error","message":"Invalid session"}')
         except:
             pass
         return
@@ -12299,8 +13005,8 @@ def node_shell_websocket_proxy(ws, cluster_id, node):
 
     logging.info(f"SHELL WS: User {session['user']} authenticated for shell on {cluster_id}/{node}")
     # #988 - counted against the account until the request ends, the credential wait included,
-    # and hung up with its session (#1038)
-    hold_websocket(session['user'], ws, sid=session_id)
+    # and hung up with its session (#1038), the one the token was minted under
+    hold_websocket(session['user'], ws, sid=session.get('sid') if ws_token else session_id)
 
     logging.info(f"")
     logging.info(f"========================================")
@@ -12327,7 +13033,6 @@ def node_shell_websocket_proxy(ws, cluster_id, node):
         return
     
     manager = cluster_managers[cluster_id]
-    cluster_host = manager.config.host
     
     # Get node IP address from cluster status
     logging.info(f"Step 1: Getting IP for node {node}...")
@@ -12341,27 +13046,23 @@ def node_shell_websocket_proxy(ws, cluster_id, node):
             pass
         return
     
-    node_ip = None
-    try:
-        cluster_url = f"https://{cluster_host}:{cluster_port}/api2/json/cluster/status"
-        cluster_response = manager._create_session().get(cluster_url, timeout=5)
-        if cluster_response.status_code == 200:
-            cluster_data = cluster_response.json().get('data', [])
-            for item in cluster_data:
-                if item.get('type') == 'node' and item.get('name') == node:
-                    node_ip = item.get('ip')
-                    logging.info(f"  Found node IP: {node_ip}")
-                    break
-    except Exception as e:
-        logging.error(f"  Error getting cluster status: {e}")
-    
+    # MK Oct 2026 (#1143) - the cluster/status lookup here read a cluster_port that was never
+    # set, raised, and node_ip fell back to the connection host: every shell logged in on
+    # that node while the terminal named the clicked one. The node's own address now, from
+    # the manager, and no shell without it. ?ip= and the dialog's host field pick nothing.
+    node_ip = node_shell_address(manager, node)
     if not node_ip:
-        node_ip = cluster_host
-        logging.info(f"  Using cluster host: {node_ip}")
+        logging.error(f"  No address for node {_sl(node)}, no shell")
+        try:
+            ws.send(json.dumps({'status': 'error', 'message': f'Could not find the address of node {node}'}))
+        except Exception:
+            pass
+        return
+    logging.info(f"  Found node IP: {node_ip}")
     
     # Request credentials from client
     try:
-        ws.send(f'{{"status":"need_credentials","node":"{node}","ip":"{node_ip}"}}')
+        ws.send(json.dumps({'status': 'need_credentials', 'node': node, 'ip': node_ip}))
     except Exception as e:
         logging.error(f"Failed to send need_credentials: {e}")
         return
@@ -12591,6 +13292,88 @@ def migrate_vm_api(cluster_id, node, vm_type, vmid):
         return jsonify({'error': 'Migration failed'}), 500
 
 
+# MK Oct 2026 - what the migrate dialog warns about for a guest with snapshots. Proxmox does
+# not move a local disk that is part of a snapshot while the VM runs (unless replication has
+# it on the target already), and offline it only takes the snapshots along where the storage
+# keeps them in the volume: ZFS, btrfs or a qcow2 file. Read only, one call per dialog.
+# The volume rules live in core/preflight.py, which checks a whole set of guests that way.
+_guest_volumes, _snapshot_family = preflight.guest_volumes, preflight.snapshot_family
+_MIG_SNAPSHOTS_LISTED = 50
+
+
+@bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>/migrate-check', methods=['GET'])
+@require_auth(perms=['vm.migrate'])
+def migrate_check_api(cluster_id, node, vm_type, vmid):
+    """The snapshots of a guest and its local volumes, for the warnings of the migrate dialog"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    if vm_type not in ('qemu', 'lxc'):
+        return jsonify({'error': 'vm_type is qemu or lxc'}), 400
+    from pegaprox.utils.sanitization import validate_hostname
+    if not validate_hostname(node):
+        return jsonify({'error': 'Invalid node name'}), 400
+    denied = _require_vm_access(cluster_id, vmid, 'vm.migrate', vm_type)
+    if denied:
+        return denied
+
+    mgr = cluster_managers[cluster_id]
+    out = {'supported': True, 'snapshot_count': 0, 'snapshots': [], 'volumes': [], 'replicated_to': []}
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify(dict(out, supported=False))
+    if not mgr.is_connected:
+        return jsonify({'error': 'Cluster not connected', 'offline': True}), 503
+
+    base = f"https://{mgr.host}:{mgr.api_port}/api2/json"
+
+    def _read(path):
+        try:
+            r = mgr._api_get(base + path)
+        except Exception:
+            return None
+        if r is None or r.status_code != 200:
+            return None
+        try:
+            return r.json().get('data')
+        except Exception:
+            return None
+
+    snaps = _read(f'/nodes/{node}/{vm_type}/{vmid}/snapshot')
+    if not isinstance(snaps, list):
+        return jsonify({'error': 'Could not read the snapshots of the guest'}), 502
+    snaps = [s for s in snaps if isinstance(s, dict) and s.get('name') and s.get('name') != 'current']
+    if not snaps:
+        return jsonify(out)
+    snaps.sort(key=lambda s: s.get('snaptime') or 0)
+    out['snapshot_count'] = len(snaps)
+    out['snapshots'] = [{'name': str(s['name']), 'vmstate': bool(s.get('vmstate'))}
+                        for s in snaps[-_MIG_SNAPSHOTS_LISTED:]]
+
+    cfg = _read(f'/nodes/{node}/{vm_type}/{vmid}/config')
+    if not isinstance(cfg, dict):
+        return jsonify({'error': 'Could not read the configuration of the guest'}), 502
+    from pegaprox.api.clusters import cluster_storage_resources
+    stores = {s.get('storage'): s for s in (cluster_storage_resources(cluster_id, mgr) or [])
+              if isinstance(s, dict) and s.get('node') == node}
+    for vol in _guest_volumes(cfg, vm_type):
+        st = stores.get(vol['storage'])
+        # a storage this node does not list cannot be told apart, so it is not warned about
+        if st is None or vol['flagged_shared'] or st.get('shared'):
+            continue
+        stype = str(st.get('plugintype') or '')
+        out['volumes'].append({'key': vol['key'], 'storage': vol['storage'], 'type': stype,
+                               'format': vol['format'],
+                               'family': _snapshot_family(stype, vol['format'], vm_type)})
+    if any(v['family'] == 'zfs' for v in out['volumes']):
+        jobs = _read('/cluster/replication')
+        out['replicated_to'] = sorted({str(j.get('target')) for j in (jobs or [])
+                                       if isinstance(j, dict) and str(j.get('guest')) == str(vmid)
+                                       and j.get('target') and not j.get('disable')})
+    return jsonify(out)
+
+
 @bp.route('/api/clusters/<cluster_id>/vms/<node>/<vm_type>/<int:vmid>', methods=['DELETE'])
 @require_auth(perms=['vm.delete'])
 def delete_vm_api(cluster_id, node, vm_type, vmid):
@@ -12656,6 +13439,91 @@ def delete_vm_api(cluster_id, node, vm_type, vmid):
         return jsonify({'error': result.get('error', 'Delete failed')}), 500
 
 
+def _scoped_guests(cluster_id, mgr, wanted, user):
+    """(the cluster's guests by VMID, an error answer for a VMID elsewhere or out of reach)"""
+    guests = {}
+    rows = mgr.get_vm_resources(max_age=2)
+    for row in (rows if isinstance(rows, list) else []):
+        if isinstance(row, dict) and row.get('type') in ('qemu', 'lxc'):
+            try:
+                guests[int(row.get('vmid'))] = row
+            except (TypeError, ValueError):
+                continue
+    # one answer for a guest elsewhere and one out of reach: which is which stays unsaid
+    refused = [v for v in wanted if v not in guests
+               or not user_can_access_vm(user, cluster_id, v, 'vm.migrate', guests[v].get('type'))]
+    if refused:
+        return guests, (jsonify({'error': f"Not on this cluster or out of reach: "
+                                          f"{', '.join(str(v) for v in refused[:20])}"}), 400)
+    return guests, None
+
+
+@bp.route('/api/clusters/<cluster_id>/migration-preflight', methods=['POST'])
+@require_auth(perms=['vm.migrate'])
+def migration_preflight_api(cluster_id):
+    """What a migration of these guests inside the cluster would run into
+
+    Body: vms (VMIDs, or {vmid} objects as bulk-migrate takes them, at most 1000), target (a
+    node; left out or empty, each guest goes to the node it fits best), online (default
+    true), with_local_disks, and mode and parallel as bulk-migrate takes them, for the
+    order of the steps; override as bulk-migrate takes it.
+
+    Per guest ready, warning or blocked with the reasons (a block says whether it may be
+    overridden) and what an abort leaves behind; the totals, what the target nodes hold
+    afterwards and the steps a run would take. The set is placed as a whole: what one
+    guest takes on a node counts for the guests after it. Reads only, so a standby
+    answers it as well.
+    """
+    from pegaprox.core import bulk_migrate as bulk
+    from pegaprox.utils.sanitization import validate_hostname
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    mgr = cluster_managers[cluster_id]
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'JSON object required'}), 400
+    raw = data.get('vms')
+    if not isinstance(raw, list) or not raw or len(raw) > preflight.GUESTS_MAX:
+        return jsonify({'error': f'vms is a list of 1 to {preflight.GUESTS_MAX} guests'}), 400
+    wanted = _vmid_list([v.get('vmid') if isinstance(v, dict) else v for v in raw])
+    if wanted is None:
+        return jsonify({'error': 'vms holds something that is no VMID'}), 400
+    wanted = list(dict.fromkeys(wanted))
+    target = data.get('target') or None
+    if target is not None and (not isinstance(target, str) or not validate_hostname(target)):
+        return jsonify({'error': 'target is a node name'}), 400
+    online, local = data.get('online', True), data.get('with_local_disks', False)
+    if not isinstance(online, bool) or not isinstance(local, bool):
+        return jsonify({'error': 'online and with_local_disks are true or false'}), 400
+    mode, parallel = data.get('mode'), data.get('parallel', 2)
+    if mode is not None and mode not in bulk.MODES:
+        return jsonify({'error': 'mode is sequential, parallel or all'}), 400
+    if mode == 'parallel' and (isinstance(parallel, bool) or not isinstance(parallel, int)
+                               or not 2 <= parallel <= bulk.PARALLEL_MAX):
+        return jsonify({'error': f'parallel is a number from 2 to {bulk.PARALLEL_MAX}'}), 400
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    if getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng':
+        from pegaprox.utils.rbac import has_permission
+        if not has_permission(user, 'xapi.vm.migrate'):
+            return jsonify({'error': 'Permission denied: xapi.vm.migrate'}), 403
+    _guests, refused = _scoped_guests(cluster_id, mgr, wanted, user)
+    if refused:
+        return refused
+    override, oerr = _override_ids(dict(data, dry_run=True), wanted)
+    if oerr:
+        return jsonify({'error': oerr}), 400
+    try:
+        res = preflight.intra(cluster_id, mgr, wanted, target, online, local, mode, parallel,
+                              busy=bulk.busy_vmids(cluster_id), override=override, **_pf_caller(user, cluster_id))
+    except Exception as e:
+        logging.error(f"[PREFLIGHT] {cluster_id}: {e}", exc_info=True)
+        return jsonify({'error': 'The migration preflight failed - see the PegaProx log'}), 500
+    return jsonify(res)
+
+
 @bp.route('/api/clusters/<cluster_id>/vms/bulk-migrate', methods=['POST'])
 @require_auth(perms=['vm.migrate'])
 def bulk_migrate_api(cluster_id):
@@ -12670,18 +13538,25 @@ def bulk_migrate_api(cluster_id):
       migration starts at once and nobody waits for them)
     - with_local_disks: (VMs) move local disks along
     A guest that is not on the cluster or out of the caller's reach refuses the request
-    (400); one an enforced affinity rule keeps off the target, one already there and one
-    another running run still moves are listed as skipped.
+    (400); one already there, one another running run still moves and one the migration
+    preflight blocks are listed as skipped, with the reason.
 
     Without mode every migration starts at once, and the answer lists what Proxmox said
     to each start.
+
+    Either way the preflight (POST .../migration-preflight) is asked first: what it blocks
+    does not start. override names guests whose blocks may be overridden (too little memory
+    or disk space on the target, an enforced affinity rule for an admin, ...), with
+    confirm_override: true; that goes to the audit log. dry_run: true starts nothing and
+    answers with the preflight and the steps the run would take. A preflight that fails
+    starts nothing either (500).
     """
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
-    
+
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
-    
+
     mgr = cluster_managers[cluster_id]
     data = request.get_json(silent=True)
     if data is None:
@@ -12696,24 +13571,41 @@ def bulk_migrate_api(cluster_id):
         return jsonify({'error': 'Too many VMs in one request (max 1000). Split into smaller batches.'}), 400
     target_node = data.get('target')
     online = data.get('online', True)
-    
+
     if not target_node:
         return jsonify({'error': 'Target node is required'}), 400
-    
+
     if not vms:
         return jsonify({'error': 'No VMs specified'}), 400
-    
+
     # the single-guest route asks this of an XCP-ng pool, the bulk one never did
     if getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng':
         from pegaprox.utils.rbac import has_permission
         if not has_permission(build_authz_user(request.session.get('user', ''), request.session), 'xapi.vm.migrate'):
             return jsonify({'error': 'Permission denied: xapi.vm.migrate'}), 403
 
-    if data.get('mode') is not None:
+    # by type: 1 == True passed "true or false" here and `is True` below read it as false,
+    # so a dry run asked for as 1 migrated the guests
+    if not isinstance(data.get('dry_run', False), bool):
+        return jsonify({'error': 'dry_run is true or false'}), 400
+    if data.get('mode') is not None or data.get('dry_run') is True:
         return _start_bulk_run(cluster_id, mgr, data)
 
+    # a target in another shape (['pve2']) broke the preflight, and Proxmox still read it as a node
+    from pegaprox.utils.sanitization import validate_hostname
+    if not isinstance(target_node, str) or not validate_hostname(target_node):
+        return jsonify({'error': 'Target node is required'}), 400
+    if not isinstance(vms, list) or not all(isinstance(v, dict) and v.get('node') and v.get('type') in ('qemu', 'lxc')
+                                             for v in vms):
+        return jsonify({'error': 'vms is a list of {vmid, node, type}'}), 400
+    wanted = _vmid_list([v.get('vmid') for v in vms])
+    if wanted is None:
+        return jsonify({'error': 'vms holds something that is no VMID'}), 400
+    override, oerr = _override_ids(data, wanted)
+    if oerr:
+        return jsonify({'error': oerr}), 400
+
     user = getattr(request, 'session', {}).get('user', 'system')
-    log_audit(user, 'vm.bulk_migrated', f"Bulk migration of {len(vms)} VMs to {target_node}", cluster=mgr.config.name)
 
     # NS Aug 2026 (audit) — the single-VM migrate gates every vmid via user_can_access_vm, but this
     # bulk twin only had the cluster gate, so a VM-ACL/pool-scoped user could relocate foreign VMs
@@ -12723,36 +13615,40 @@ def bulk_migrate_api(cluster_id):
     _authz_user = build_authz_user(request.session['user'], request.session)
 
     # LW: Feb 2026 - enforced violations skip that VM but don't abort the whole batch
-    from pegaprox.api.history import check_affinity_violation
+    # MK Oct 2026 - the preflight judges the affinity rules now, with everything else it checks,
+    # and skips what a bulk run moves already, as the dry run of the same body says
+    from pegaprox.core import bulk_migrate as bulk
+    reach = [v for v, vm in zip(wanted, vms)
+             if user_can_access_vm(_authz_user, cluster_id, v, 'vm.migrate', vm.get('type', 'qemu'))]
+    verdicts = _bulk_preflight(cluster_id, mgr, reach, target_node, online is not False, False, None, 1,
+                               _authz_user, override, busy=bulk.busy_vmids(cluster_id))
+    if verdicts is None:
+        return jsonify({'error': 'The migration preflight failed - see the PegaProx log'}), 500
+    log_audit(user, 'vm.bulk_migrated', f"Bulk migration of {len(vms)} VMs to {target_node}", cluster=mgr.config.name)
+    _audit_overrides(user, mgr, f"Bulk migration to {target_node}", verdicts)
 
     results = []
-    for vm in vms:
-        if not user_can_access_vm(_authz_user, cluster_id, vm['vmid'], 'vm.migrate', vm.get('type', 'qemu')):
+    for vmid, vm in zip(wanted, vms):
+        if vmid not in reach:
             results.append({
-                'vmid': vm['vmid'], 'success': False, 'task': None,
+                'vmid': vmid, 'success': False, 'task': None,
                 'error': 'Permission denied: vm.migrate'
             })
             continue
 
-        # NS: affinity check per VM
-        aff = check_affinity_violation(cluster_id, vm['vmid'], target_node)
-        if aff.get('violation') and aff.get('enforce'):
-            results.append({
-                'vmid': vm['vmid'], 'success': False, 'task': None,
-                'error': f"Blocked by affinity rule '{aff['rule']}': {aff['message']}"
-            })
+        pv = verdicts.get(vmid)
+        if pv and not preflight.moving(pv):
+            results.append({'vmid': vmid, 'success': False, 'task': None, 'error': preflight.block_note(pv)})
             continue
-        elif aff.get('violation'):
-            logging.warning(f"Affinity warning for VMID {vm['vmid']} -> {target_node}: {aff['message']} (not enforced)")
 
-        result = mgr.migrate_vm_manual(vm['node'], vm['vmid'], vm['type'], target_node, online)
+        result = mgr.migrate_vm_manual(vm['node'], vmid, vm['type'], target_node, online)
 
         # NS: Register PegaProx user for each migration task
         if result.get('task') or result.get('upid'):
             register_task_user(result.get('task') or result.get('upid'), user, cluster_id)
 
         results.append({
-            'vmid': vm['vmid'],
+            'vmid': vmid,
             'success': result.get('success', False),
             'task': result.get('task'),
             'error': result.get('error')
@@ -12775,11 +13671,60 @@ def bulk_migrate_api(cluster_id):
 _BULK_HOW = {'sequential': 'one at a time', 'parallel': '{n} at a time', 'all': 'all at once'}
 
 
+def _override_ids(data, wanted):
+    """The guests whose overridable blocks the caller overrides, (ids, error): a list of their
+    VMIDs in override, and confirm_override: true beside it"""
+    raw = data.get('override')
+    if raw in (None, []):
+        return set(), None
+    ids = _vmid_list(raw) if isinstance(raw, list) and len(raw) <= 1000 else None
+    if ids is None:
+        return set(), 'override is a list of VMIDs'
+    if not set(ids) <= set(wanted):
+        return set(), 'override names a guest this request does not move'
+    if data.get('confirm_override') is not True and data.get('dry_run') is not True:
+        return set(), 'Overriding a block of the migration preflight needs confirm_override: true'
+    return set(ids), None
+
+
+def _pf_caller(user, cluster_id):
+    """What the preflight takes of the caller: confined to some guests or not, and whether
+    they may override an enforced affinity rule. MK Oct 2026 - only whoever may change the
+    rules (history.py: an admin) may: the single migrate and the node's migrate-all refuse
+    such a move to everyone, and bulk-migrate let a VM-ACL user past an admin's rule."""
+    from pegaprox.utils.rbac import acts_as_admin
+    return {'scoped': caller_is_scoped(user, cluster_id), 'affinity_override': acts_as_admin(user)}
+
+
+def _bulk_preflight(cluster_id, mgr, vmids, target, online, local, mode, parallel, user, override,
+                    backups=False, busy=()):
+    """{vmid: preflight row} of a bulk migration that starts now, None when the preflight
+    broke: nothing starts then. Going on "as before the preflight existed" meant no check at
+    all, the affinity check it replaced among them."""
+    try:
+        res = preflight.intra(cluster_id, mgr, vmids, target, online, local, mode, parallel, busy=busy,
+                              override=override, backups=backups, **_pf_caller(user, cluster_id))
+    except Exception as e:
+        logging.error(f"[PREFLIGHT] bulk migration to {target} on {cluster_id}: {e}", exc_info=True)
+        return None
+    return {r['vmid']: r for r in res['guests']}
+
+
+def _audit_overrides(usr, mgr, what, verdicts):
+    done = [r for r in verdicts.values() if r.get('overridden')]
+    if done:
+        log_audit(usr, 'vm.migrate_block_overridden',
+                  f"{what}: blocks of the migration preflight overridden for "
+                  + '; '.join(f"{r['vmid']} ({preflight.block_note(r)})" for r in done[:20])
+                  + (' ...' if len(done) > 20 else ''), cluster=mgr.config.name)
+
+
 def _start_bulk_run(cluster_id, mgr, data):
     from pegaprox.core import bulk_migrate as bulk
     from pegaprox.utils.sanitization import validate_hostname
+    dry_run = data.get('dry_run') is True
     mode = data.get('mode')
-    if mode not in bulk.MODES:
+    if mode not in bulk.MODES and not (dry_run and mode is None):
         return jsonify({'error': 'mode is sequential, parallel or all'}), 400
     parallel = 1
     if mode == 'parallel':
@@ -12807,31 +13752,38 @@ def _start_bulk_run(cluster_id, mgr, data):
     wanted = list(dict.fromkeys(wanted))
 
     user = build_authz_user(request.session.get('user', ''), request.session)
-    guests = {}
-    for g in (mgr.get_vm_resources(max_age=2) or []):
-        if g.get('type') in ('qemu', 'lxc'):
-            try:
-                guests[int(g.get('vmid'))] = g
-            except (TypeError, ValueError):
-                continue
-    # one answer for a guest elsewhere and one out of reach: which is which stays unsaid
-    refused = [v for v in wanted if v not in guests
-               or not user_can_access_vm(user, cluster_id, v, 'vm.migrate', guests[v].get('type'))]
+    guests, refused = _scoped_guests(cluster_id, mgr, wanted, user)
     if refused:
-        return jsonify({'error': f"Not on this cluster or out of reach: "
-                                 f"{', '.join(str(v) for v in refused[:20])}"}), 400
+        return refused
 
-    held = _affinity_held(cluster_id, wanted, target)
+    override, oerr = _override_ids(data, wanted)
+    if oerr:
+        return jsonify({'error': oerr}), 400
     busy = bulk.busy_vmids(cluster_id)
+    # MK Oct 2026 - what the preflight blocks (an enforced affinity rule among it) is skipped
+    # with its reason, unless the caller overrides a block that may be overridden
+    if dry_run:
+        try:
+            res = preflight.intra(cluster_id, mgr, wanted, target, online, local, mode, parallel, busy=busy,
+                                  override=override, **_pf_caller(user, cluster_id))
+        except Exception as e:
+            logging.error(f"[PREFLIGHT] dry run of a bulk migration to {target}: {e}", exc_info=True)
+            return jsonify({'error': 'The migration preflight failed - see the PegaProx log'}), 500
+        return jsonify({'dry_run': True, 'preflight': res, 'steps': res['steps']})
+    verdicts = _bulk_preflight(cluster_id, mgr, wanted, target, online, local, mode, parallel, user, override,
+                               busy=busy)
+    if verdicts is None:
+        return jsonify({'error': 'The migration preflight failed - see the PegaProx log'}), 500
     rows = []
     for vmid in wanted:
         g = guests[vmid]
-        if vmid in held:
-            rows.append(bulk.new_row(g, 'skipped', f"Affinity rule '{held[vmid]}' keeps it off {target}"))
-        elif g.get('node') == target:
+        pv = verdicts.get(vmid)
+        if g.get('node') == target:
             rows.append(bulk.new_row(g, 'skipped', f'Already on {target}'))
         elif vmid in busy:
             rows.append(bulk.new_row(g, 'skipped', 'Another bulk migration moves it already'))
+        elif pv and not preflight.moving(pv):
+            rows.append(bulk.new_row(g, 'skipped', preflight.block_note(pv)))
         else:
             rows.append(bulk.new_row(g))
     if not any(r['state'] == bulk.WAITING for r in rows):
@@ -12851,8 +13803,12 @@ def _start_bulk_run(cluster_id, mgr, data):
               f"Bulk migration {run.id} of {len(moving)} guest(s) to {target}, "
               f"{_BULK_HOW[mode].format(n=parallel)} ({', '.join(moving[:50])}{' ...' if len(moving) > 50 else ''})",
               cluster=mgr.config.name)
+    _audit_overrides(usr, mgr, f"Bulk migration {run.id} to {target}",
+                     {v: r for v, r in verdicts.items() if str(v) in moving})
     bulk.launch(run)
-    return jsonify({'run': run.view(run.rows_copy(), me=usr)}), 202
+    warned = sum(1 for r in verdicts.values() if r['verdict'] == preflight.WARNING)
+    return jsonify({'run': run.view(run.rows_copy(), me=usr),
+                    'preflight': {'checked': bool(verdicts), 'warnings': warned}}), 202
 
 
 def _bulk_view(run, with_rows=True):
@@ -12986,6 +13942,7 @@ def remote_migrate_vm_api(cluster_id, node, vm_type, vmid):
     bwlimit = data.get('bwlimit')
     
     user = build_authz_user(request.session.get('user', ''), request.session)
+    _qwarn = None
     if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
         # NS Oct 2026 (#1088, #1048) - an XCP-ng pool logs into the target with stored
         # credentials, so the target is a registered pool, never a URL from the request
@@ -13005,6 +13962,17 @@ def remote_migrate_vm_api(cluster_id, node, vm_type, vmid):
             return err
         if caller_is_scoped(user, target_cluster):
             return jsonify({'error': 'Access denied to target cluster'}), 403
+        # MK Oct 2026 - the tenant quota, as for every other way a guest lands on a cluster;
+        # migrate_send moves it, so between two pools both counted for the tenant it adds nothing
+        from pegaprox.utils.rbac import landing_adds, quota_tenant
+        _qerr, _qwarn = tenant_quota_gate(
+            user, f'migration of {vm_type} {vmid} to another pool',
+            lambda: landing_adds(quota_tenant(user), target_cluster, guest_size(manager, node, vm_type, vmid),
+                                 source_cluster=cluster_id, source_removed=True),
+            cluster=getattr(target_mgr.config, 'name', target_cluster),
+            hold={'cluster_id': target_cluster, 'vmid': vmid})
+        if _qerr:
+            return _qerr
         result = manager.remote_migrate_vm(
             node, vmid, vm_type, None, target_storage, target_bridge,
             target_vmid, online, delete_source, bwlimit, target_pool=target_mgr)
@@ -13031,9 +13999,161 @@ def remote_migrate_vm_api(cluster_id, node, vm_type, vmid):
         # NS: Push immediate update for live UI
         push_immediate_update(cluster_id, delay=0.5)
         
-        return jsonify({'message': f'Remote migration started for {vm_type}/{vmid}', 'task': result.get('task')})
+        return jsonify({'message': f'Remote migration started for {vm_type}/{vmid}', 'task': result.get('task'),
+                        **({'quota_warning': _qwarn} if _qwarn else {})})
     else:
-        return jsonify({'error': result.get('error', 'Remote migration failed')}), 500
+        return jsonify({'error': result.get('error', 'Remote migration failed')}), \
+            409 if result.get('code') == 'NOT_RUNNING' else 500
+
+
+def _vmid_or_none(value):
+    got = _vmid_list([value]) if value not in (None, '') else None
+    return got[0] if got else None
+
+
+def _cross_preflight_args(data, storage_map, bridge_map):
+    """The flags and maps of a cross-cluster body the preflight takes: (dict, error)"""
+    flags = {}
+    for name, default in (('dry_run', False), ('online', True), ('force_online', False), ('delete_source', True)):
+        flags[name] = data.get(name, default)
+    if not isinstance(flags['dry_run'], bool):
+        return None, 'dry_run is true or false'
+    # MK Oct 2026 - a map in another shape was dropped without a word
+    for value, name in ((storage_map, 'target_storage_map'), (bridge_map, 'target_bridge_map')):
+        if value not in (None, '', {}) and not isinstance(value, dict):
+            return None, f'{name} must be an object of source to target names'
+    smap, err = preflight.map_arg(storage_map if isinstance(storage_map, dict) else None, 'target_storage_map')
+    if err:
+        return None, err
+    bmap, err = preflight.map_arg(bridge_map if isinstance(bridge_map, dict) else None, 'target_bridge_map')
+    if err:
+        return None, err
+    return dict(flags, storage_map=smap, bridge_map=bmap), None
+
+
+def _cross_preflight_for(data, src_id, tgt_id, vmids, vm_type, target_node, storage_map, target_storage,
+                         bridge_map, target_bridge, target_vmid, online, force_online, delete_source, user):
+    """The preflight a cross-cluster migration starts with: (result or None, an answer to
+    return instead of migrating: the dry run, a 400, the 409 of a block or a 500 when the
+    preflight broke)"""
+    args, err = _cross_preflight_args(data, storage_map, bridge_map)
+    if err:
+        return None, (jsonify({'error': err}), 400)
+    override, err = _override_ids(data, vmids)
+    if err:
+        return None, (jsonify({'error': err}), 400)
+    # MK Oct 2026 - a real run leaves the quota to the gate before it, which holds the room
+    # for the guest; weighed here again the guest counted twice and a copy that fit was refused
+    try:
+        pf = preflight.cross(src_id, cluster_managers[src_id], tgt_id, cluster_managers[tgt_id], vmids, target_node,
+                             storage_map=args['storage_map'], target_storage=None if args['storage_map'] else target_storage,
+                             bridge_map=args['bridge_map'],
+                             target_bridge=None if args['bridge_map'] else (target_bridge or 'vmbr0'),
+                             target_vmid=_vmid_or_none(target_vmid), online=bool(online),
+                             force_online=bool(force_online), delete_source=bool(delete_source), may_delete=True,
+                             user=user, vm_type=vm_type, scoped=caller_is_scoped(user, src_id), override=override,
+                             backups=args['dry_run'], quota=args['dry_run'])
+    except Exception as e:
+        # a broken preflight starts nothing: what it would have blocked was let through
+        logging.error(f"[PREFLIGHT] cross-cluster {src_id} -> {tgt_id}: {e}", exc_info=True)
+        return None, (jsonify({'error': 'The migration preflight failed - see the PegaProx log'}), 500)
+    if args['dry_run']:
+        return pf, (jsonify({'dry_run': True, 'preflight': pf, 'steps': pf['steps']}), 200)
+    row = pf['guests'][0]
+    if not preflight.moving(row):
+        return pf, (jsonify({'error': f"The migration preflight blocks it: {preflight.block_note(row)}",
+                             'preflight': pf}), 409)
+    return pf, None
+
+
+@bp.route('/api/cross-cluster-migrate/preflight', methods=['POST'])
+@require_auth(perms=['vm.migrate'])
+def cross_cluster_preflight_api():
+    """What a migration of guests to another cluster would run into
+
+    Body as POST /api/cross-cluster-migrate takes it - source_cluster, target_cluster,
+    target_node, target_storage or target_storage_map, target_bridge or target_bridge_map,
+    target_vmid, online, force_online, delete_source - with vms (a list of up to 100 VMIDs)
+    in place of vmid where several guests go.
+
+    Per guest ready, warning or blocked with the reasons and what an abort leaves behind:
+    the storage and bridge maps against the target node, its memory and CPU with the whole
+    set on it, the VMID there and the tenant's range and quota, the CPU type, snapshots,
+    devices, HA and replication on the source, the newest backup, and whether the transfer
+    network of the target is used. The totals and the steps of the migration. Reads only,
+    so a standby answers it as well.
+    """
+    from pegaprox.utils.sanitization import validate_hostname
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'JSON object required'}), 400
+    src_id, tgt_id = data.get('source_cluster'), data.get('target_cluster')
+    if not isinstance(src_id, str) or not isinstance(tgt_id, str) or not src_id or not tgt_id or src_id == tgt_id:
+        return jsonify({'error': 'source_cluster and target_cluster are two different clusters'}), 400
+    raw = data.get('vms') if data.get('vms') is not None else [data.get('vmid')]
+    if not isinstance(raw, list) or not raw or len(raw) > preflight.CROSS_GUESTS_MAX:
+        return jsonify({'error': f'vms is a list of 1 to {preflight.CROSS_GUESTS_MAX} guests'}), 400
+    wanted = _vmid_list([v.get('vmid') if isinstance(v, dict) else v for v in raw])
+    if wanted is None:
+        return jsonify({'error': 'vms holds something that is no VMID'}), 400
+    wanted = list(dict.fromkeys(wanted))
+    target_node = data.get('target_node')
+    if not isinstance(target_node, str) or not validate_hostname(target_node):
+        return jsonify({'error': 'Target node is required for cross-cluster migration'}), 400
+    vm_type = data.get('vm_type', 'qemu')
+    if vm_type not in ('qemu', 'lxc'):
+        return jsonify({'error': 'vm_type is qemu or lxc'}), 400
+    target_vmid = data.get('target_vmid')
+    if target_vmid not in (None, '') and (_vmid_or_none(target_vmid) is None or len(wanted) > 1):
+        return jsonify({'error': 'target_vmid is one VMID, for a single guest'}), 400
+    for name in ('target_storage', 'target_bridge'):
+        if data.get(name) not in (None, '') and (not isinstance(data[name], str) or not preflight.NAME_RE.match(data[name])):
+            return jsonify({'error': f'{name} is a name'}), 400
+    if src_id not in cluster_managers:
+        return jsonify({'error': 'Source cluster not found'}), 404
+    if tgt_id not in cluster_managers:
+        return jsonify({'error': 'Target cluster not found'}), 404
+    ok, err = check_cluster_access(src_id)
+    if not ok:
+        return err
+    ok, err = check_cluster_access(tgt_id)
+    if not ok:
+        return err
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    src_rows = cluster_managers[src_id].get_vm_resources(max_age=2)
+    kinds = {}
+    for row in (src_rows if isinstance(src_rows, list) else []):
+        if isinstance(row, dict) and row.get('type') in ('qemu', 'lxc'):
+            kinds[str(row.get('vmid'))] = row['type']
+    for vmid in wanted:
+        if not user_can_access_vm(user, src_id, vmid, 'vm.migrate', kinds.get(str(vmid), vm_type)):
+            return jsonify({'error': 'Access denied to this VM (vm.migrate)'}), 403
+    if caller_is_scoped(user, tgt_id):
+        return jsonify({'error': 'Access denied to the target cluster'}), 403
+    args, err = _cross_preflight_args(dict(data, dry_run=False), data.get('target_storage_map'),
+                                      data.get('target_bridge_map'))
+    if err:
+        return jsonify({'error': err}), 400
+    override, err = _override_ids(dict(data, dry_run=True), wanted)
+    if err:
+        return jsonify({'error': err}), 400
+    delete_source = bool(args['delete_source'])
+    may_delete = not delete_source or all(
+        user_can_access_vm(user, src_id, v, 'vm.delete', kinds.get(str(v), vm_type)) for v in wanted)
+    try:
+        res = preflight.cross(src_id, cluster_managers[src_id], tgt_id, cluster_managers[tgt_id], wanted, target_node,
+                              storage_map=args['storage_map'],
+                              target_storage=None if args['storage_map'] else data.get('target_storage'),
+                              bridge_map=args['bridge_map'],
+                              target_bridge=None if args['bridge_map'] else (data.get('target_bridge') or 'vmbr0'),
+                              target_vmid=_vmid_or_none(target_vmid), online=bool(args['online']),
+                              force_online=bool(args['force_online']), delete_source=delete_source,
+                              may_delete=may_delete, user=user, vm_type=vm_type,
+                              scoped=caller_is_scoped(user, src_id), override=override)
+    except Exception as e:
+        logging.error(f"[PREFLIGHT] cross-cluster {src_id} -> {tgt_id}: {e}", exc_info=True)
+        return jsonify({'error': 'The migration preflight failed - see the PegaProx log'}), 500
+    return jsonify(res)
 
 
 @bp.route('/api/cross-cluster-migrate', methods=['POST'])
@@ -13078,7 +14198,10 @@ def cross_cluster_migrate_api():
     delete_source = data.get('delete_source', True)
     bwlimit = data.get('bwlimit', 0)  # 0 = no limit (maximum speed to beat ticket timeout)
     
-    if not target_node:
+    # MK Oct 2026 - checked as the preflight route checks it: a node as a list broke the
+    # preflight and the migration started anyway
+    from pegaprox.utils.sanitization import validate_hostname
+    if not isinstance(target_node, str) or not validate_hostname(target_node):
         return jsonify({'error': 'Target node is required for cross-cluster migration'}), 400
     # NS Oct 2026 (#1048) - the gates and the migration have to mean the same guest. '0100'
     # or ' 100' missed the ACL row of VM 100 and got decided by the role instead.
@@ -13119,6 +14242,14 @@ def cross_cluster_migrate_api():
         _rok, _rmsg = check_tenant_vmid(_xu.get('tenant_id') or DEFAULT_TENANT_ID, target_vmid or vmid)
         if not _rok:
             return jsonify({'error': _rmsg}), 403
+    # one VMID, and the preflight judges the one Proxmox is handed: a list had it look at
+    # the source VMID while target-vmid went out form-encoded
+    if target_vmid in (None, '', 0):
+        target_vmid = None
+    elif _vmid_or_none(target_vmid) is None:
+        return jsonify({'error': 'target_vmid is one VMID'}), 400
+    else:
+        target_vmid = _vmid_or_none(target_vmid)
     # NS Oct 2026 (#1048) - delete_source destroys the source guest: vm.delete, like XHM
     if delete_source:
         err = _require_vm_access(source_cluster_id, vmid, 'vm.delete', vm_type)
@@ -13128,44 +14259,43 @@ def cross_cluster_migrate_api():
 
     source_manager = cluster_managers[source_cluster_id]
     target_manager = cluster_managers[target_cluster_id]
+
+    _dry = str((data or {}).get('dry_run', '')).lower() in ('1', 'true', 'yes')
+    # MK Oct 2026 - the quota before the preflight (a refused preflight answers 409 and lets the
+    # hold go again); a dry run takes no hold, its preflight weighs the quota itself.
+    # The guest lands as a new one on the target; kept at the source too it is
+    # one more for the tenant quota, moved between two of the tenant's clusters it is not
+    from pegaprox.utils.rbac import landing_adds, quota_tenant
+    _qerr, _qwarn = (None, None) if _dry else tenant_quota_gate(
+        _xu, f'cross-cluster migration of {vm_type} {vmid}',
+        lambda: landing_adds(quota_tenant(_xu), target_cluster_id,
+                             guest_size(source_manager, source_node, vm_type, vmid),
+                             source_cluster=source_cluster_id, source_removed=bool(delete_source)),
+        cluster=target_manager.config.name,
+        hold={'cluster_id': target_cluster_id, 'vmid': target_vmid or vmid})
+    if _qerr:
+        return _qerr
+
+    # what the preflight blocks does not start (override as on the bulk
+    # migration), and a dry run answers with it and the steps instead of starting anything
+    pf, refusal = _cross_preflight_for(data, source_cluster_id, target_cluster_id, [vmid], vm_type, target_node,
+                                       storage_map, target_storage, bridge_map, target_bridge, target_vmid,
+                                       online, force_online, delete_source, _xu)
+    if refusal:
+        return refusal
+
     
     # MK: Check VM disk size and warn about potential issues with online migration
     warnings = []
     try:
         vm_info = source_manager.get_vm_config(source_node, vmid, vm_type)
         if vm_info.get('success'):
-            config = vm_info.get('config', {})
-            total_disk_gb = 0
-            for key, value in config.items():
-                if key.startswith(('scsi', 'virtio', 'sata', 'ide', 'efidisk', 'tpmstate')) and 'size' in str(value):
-                    # Extract size from disk config
-                    import re
-                    size_match = re.search(r'size=(\d+)([GMT])', str(value))
-                    if size_match:
-                        size_val = int(size_match.group(1))
-                        size_unit = size_match.group(2)
-                        if size_unit == 'G':
-                            total_disk_gb += size_val
-                        elif size_unit == 'T':
-                            total_disk_gb += size_val * 1024
-                        elif size_unit == 'M':
-                            total_disk_gb += size_val / 1024
-            
-            if total_disk_gb > 100 and online and not force_online:
-                # MK: Proxmox WebSocket tickets have internal timeout (~5 min)
-                # Large disk migrations take longer than this, causing 401 errors
-                # during RAM sync phase. Auto-switch to offline migration.
-                # 
-                # Math: 100GB in 5 min = 333 MB/s = ~2.7 Gbit/s sustained
-                # Most cross-cluster links can't sustain this.
-                required_speed_mbps = (total_disk_gb * 1024) / 300  # MB/s needed for 5 min
-                warnings.append(f"VM has {total_disk_gb:.0f}GB disk. Would need {required_speed_mbps:.0f} MB/s ({required_speed_mbps*8/1000:.1f} Gbit/s) to complete in 5 min. Automatically using offline migration.")
-                logging.warning(f"[CROSS-MIGRATE] Large VM ({total_disk_gb}GB) - forcing offline migration due to Proxmox WebSocket ticket timeout limitation")
-                online = False  # Force offline migration for large disks
-            elif total_disk_gb > 100 and online and force_online:
-                required_speed_mbps = (total_disk_gb * 1024) / 300
-                warnings.append(f"VM has {total_disk_gb:.0f}GB disk with forced online migration. Need {required_speed_mbps:.0f} MB/s sustained to avoid timeout. Migration may fail with '401 Unauthorized'.")
-                logging.warning(f"[CROSS-MIGRATE] Large VM ({total_disk_gb}GB) - online migration forced by user, may fail")
+            online, total_disk_gb, note = preflight.cross_online(vm_info.get('config', {}), online, force_online)
+            if note:
+                warnings.append(note)
+                logging.warning(f"[CROSS-MIGRATE] Large VM ({total_disk_gb}GB) - "
+                                + ("online migration forced by user, may fail" if online else
+                                   "forcing offline migration due to Proxmox WebSocket ticket timeout limitation"))
     except Exception as e:
         logging.debug(f"Could not check VM size: {e}")
     
@@ -13185,18 +14315,22 @@ def cross_cluster_migrate_api():
         logging.info(f"Created token on target cluster: {target_token['token_id']}")
         
         # Step 2: Get target cluster fingerprint
-        fp_result = target_manager.get_cluster_fingerprint()
+        # MK Oct 2026 - a target with a transfer network is dialled at the target node's
+        # address there, pinned to the certificate that node reports for itself
+        xfer = transfer_net.migration_route(target_manager, target_node)
+        if xfer and xfer['host']:
+            fp_result = {'success': True, 'host': xfer['host'], 'fingerprint': xfer['fingerprint']}
+        else:
+            fp_result = target_manager.get_cluster_fingerprint()
         if not fp_result.get('success'):
             raise Exception(f'Could not get target fingerprint: {fp_result.get("error")}')
-        
+        transfer_net.report_fallback(xfer, getattr(source_manager, 'logger', None),
+                                     request.session.get('user', 'system'))
+
         # Step 3: Build target endpoint string
         # MK: Format must be exact - Proxmox is picky about this
         # Format: apitoken=PVEAPIToken=<user>!<tokenname>=<secret>,host=<host>,fingerprint=<fp>
-        target_endpoint = (
-            f"apitoken=PVEAPIToken={target_token['token_id']}={target_token['token_value']},"
-            f"host={fp_result['host']},"
-            f"fingerprint={fp_result['fingerprint']}"
-        )
+        target_endpoint = transfer_net.endpoint(target_token, fp_result['host'], fp_result['fingerprint'])
         
         # MK Aug 2026 (#733) — log the host + fingerprint we hand to PVE. remote_migrate on a
         # target added without SSL trust rejects with a bare {"data":null}/500 and swallows the
@@ -13326,9 +14460,22 @@ def cross_cluster_migrate_api():
                 'online': online,
                 'info': 'Temporary API token will be automatically cleaned up after migration completes.'
             }
+            if xfer:
+                response['transfer_network'] = transfer_net.describe(xfer)
+                if not xfer['host']:
+                    warnings.append(xfer['note'])
             if warnings:
                 response['warnings'] = warnings
+            if _qwarn:
+                response['quota_warning'] = _qwarn
             
+            if pf:
+                response['preflight'] = {'verdict': pf['guests'][0]['verdict'], 'reasons': pf['guests'][0]['reasons']}
+                if pf['guests'][0].get('overridden'):
+                    _audit_overrides(user, source_manager, f"Cross-cluster migration of {vm_type}/{vmid} to "
+                                                           f"{target_cluster_id}/{target_node}",
+                                     {vmid: pf['guests'][0]})
+
             return jsonify(response)
         else:
             # Migration failed - cleanup token immediately
@@ -13466,18 +14613,27 @@ def create_vm_api(cluster_id, node):
     vm_config = request.json or {}
 
     # NS #502 — tenant quota pre-flight (fail-open: a quota bug must never block a create)
+    # MK Oct 2026 - under the tenant's lock, with a hold on the new guest until it shows, so
+    # two creates at the same moment do not both fit into one slot
+    _held = None
     try:
         from pegaprox.utils.rbac import check_tenant_quota, DEFAULT_TENANT_ID
+        from pegaprox.utils import rbac as _rbac
         _qu = load_users().get(request.session.get('user', ''), {})
         _tid = _qu.get('tenant_id') or DEFAULT_TENANT_ID
         _qcores = int(vm_config.get('cores') or 1) * int(vm_config.get('sockets') or 1)
         _qmem = float(vm_config.get('memory') or 0) / 1024.0  # MB → GB
         _qdisk = float(vm_config.get('disk_size') or 0)       # already GB
-        _qchk = check_tenant_quota(_tid, add_cores=_qcores, add_mem_gb=_qmem, add_vms=1,
-                                   add_disk_gb=_qdisk)
-        if not _qchk['ok'] and _qchk.get('enforce') == 'block':
-            return jsonify({'error': f"Tenant quota exceeded ({', '.join(_qchk['violations'])}) — "
-                            f"usage {_qchk['usage']} vs quota {_qchk['quota']}", 'quota': _qchk}), 403
+        with _rbac.quota_tenant_lock(_tid):
+            _qchk = check_tenant_quota(_tid, add_cores=_qcores, add_mem_gb=_qmem, add_vms=1,
+                                       add_disk_gb=_qdisk)
+            if not _qchk['ok'] and _qchk.get('enforce') == 'block':
+                return jsonify({'error': f"Tenant quota exceeded ({', '.join(_qchk['violations'])}) - "
+                                f"usage {_qchk['usage']} vs quota {_qchk['quota']}", 'quota': _qchk}), 403
+            if _qchk.get('quota'):
+                _held = _rbac.quota_hold(_tid, cluster_id, {'vms': 1, 'cores': _qcores, 'memory_gb': _qmem,
+                                                            'disk_gb': _qdisk},
+                                         vmids=[vm_config['vmid']] if vm_config.get('vmid') else ())
     except Exception as _qe:
         logging.debug(f"[quota] qemu pre-flight skipped: {_qe}")
 
@@ -13492,7 +14648,9 @@ def create_vm_api(cluster_id, node):
     except Exception as _re:
         logging.debug(f"[vmid-range] qemu pre-flight skipped: {_re}")
         _rok, _rmsg = True, ''
+    from pegaprox.utils.rbac import quota_release, quota_hold_update
     if not _rok:
+        quota_release(_held)
         return jsonify({'error': _rmsg}), 403
 
     result = manager.create_vm(node, vm_config)
@@ -13501,6 +14659,10 @@ def create_vm_api(cluster_id, node):
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'unknown')
         vmid = vm_config.get('vmid') or result.get('vmid') or result.get('data', {}).get('vmid', 'unknown')
+        if str(vmid).isdigit():
+            quota_hold_update(_held, vmids=[vmid])
+        else:
+            quota_release(_held)        # one it cannot tell apart would count twice for hours
         vm_name = vm_config.get('name', f'vm-{vmid}')
         log_audit(user, 'vm.create', f"Created VM {vmid} ({vm_name}) on {node}", cluster=manager.config.name)
 
@@ -13512,6 +14674,7 @@ def create_vm_api(cluster_id, node):
 
         return jsonify(result)
     else:
+        quota_release(_held)
         return jsonify(result), 400
 
 
@@ -13532,19 +14695,27 @@ def create_container_api(cluster_id, node):
     ct_config = request.json or {}
 
     # NS #502 — tenant quota pre-flight (fail-open)
+    # MK Oct 2026 - under the tenant's lock with a hold, as the VM twin above
+    _held = None
     try:
         from pegaprox.utils.rbac import check_tenant_quota, DEFAULT_TENANT_ID
+        from pegaprox.utils import rbac as _rbac
         _qu = load_users().get(request.session.get('user', ''), {})
         _tid = _qu.get('tenant_id') or DEFAULT_TENANT_ID
         _qcores = int(ct_config.get('cores') or 1)
         _qmem = float(ct_config.get('memory') or 0) / 1024.0  # MB → GB
         # CT root disk is 'disk_size' like the VM path; 'rootfs'/'disk' are the PVE-side spellings
         _qdisk = float(ct_config.get('disk_size') or ct_config.get('disk') or 0)
-        _qchk = check_tenant_quota(_tid, add_cores=_qcores, add_mem_gb=_qmem, add_vms=1,
-                                   add_disk_gb=_qdisk)
-        if not _qchk['ok'] and _qchk.get('enforce') == 'block':
-            return jsonify({'error': f"Tenant quota exceeded ({', '.join(_qchk['violations'])}) — "
-                            f"usage {_qchk['usage']} vs quota {_qchk['quota']}", 'quota': _qchk}), 403
+        with _rbac.quota_tenant_lock(_tid):
+            _qchk = check_tenant_quota(_tid, add_cores=_qcores, add_mem_gb=_qmem, add_vms=1,
+                                       add_disk_gb=_qdisk)
+            if not _qchk['ok'] and _qchk.get('enforce') == 'block':
+                return jsonify({'error': f"Tenant quota exceeded ({', '.join(_qchk['violations'])}) - "
+                                f"usage {_qchk['usage']} vs quota {_qchk['quota']}", 'quota': _qchk}), 403
+            if _qchk.get('quota'):
+                _held = _rbac.quota_hold(_tid, cluster_id, {'vms': 1, 'cores': _qcores, 'memory_gb': _qmem,
+                                                            'disk_gb': _qdisk},
+                                         vmids=[ct_config['vmid']] if ct_config.get('vmid') else ())
     except Exception as _qe:
         logging.debug(f"[quota] lxc pre-flight skipped: {_qe}")
 
@@ -13556,15 +14727,21 @@ def create_container_api(cluster_id, node):
     except Exception as _re:
         logging.debug(f"[vmid-range] lxc pre-flight skipped: {_re}")
         _rok, _rmsg = True, ''
+    from pegaprox.utils.rbac import quota_release, quota_hold_update
     if not _rok:
+        quota_release(_held)
         return jsonify({'error': _rmsg}), 403
 
     result = manager.create_container(node, ct_config)
-    
+
     if result.get('success'):
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'unknown')
         vmid = ct_config.get('vmid') or result.get('data', {}).get('vmid', 'unknown')
+        if str(vmid).isdigit():
+            quota_hold_update(_held, vmids=[vmid])
+        else:
+            quota_release(_held)        # one it cannot tell apart would count twice for hours
         ct_name = ct_config.get('hostname', f'ct-{vmid}')
         log_audit(user, 'container.create', f"Created CT {vmid} ({ct_name}) on {node}", cluster=manager.config.name)
         
@@ -13573,8 +14750,9 @@ def create_container_api(cluster_id, node):
         
         # NS: Push immediate update for live UI
         push_immediate_update(cluster_id, delay=0.5)
-        
+
         return jsonify(result)
     else:
+        quota_release(_held)
         return jsonify(result), 400
 

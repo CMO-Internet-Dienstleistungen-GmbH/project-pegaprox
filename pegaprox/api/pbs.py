@@ -2,6 +2,7 @@
 """PBS (proxmox backup server) routes - split from monolith dec 2025, NS"""
 
 import logging
+import re
 import uuid
 from flask import Blueprint, jsonify, request
 
@@ -14,6 +15,8 @@ from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
 from pegaprox.utils.sanitization import bounded_list
 from pegaprox.api.helpers import safe_error, check_pbs_access, check_cluster_access, scope_vm_rows, require_unconfined, bounded_limit, acts_as_admin, caller_acts_as_admin
+from pegaprox.api.helpers import upstream_failure, tenant_quota_gate, caller_is_scoped
+from pegaprox.utils.sanitization import valid_pbs_upid
 from pegaprox.core.pbs import PBSManager, load_pbs_servers, save_pbs_server, pbs_config_from_row, pbs_target_refusal
 
 bp = Blueprint('pbs', __name__)
@@ -568,6 +571,19 @@ def clear_pbs_update_status(pbs_id):
     return jsonify({'cleared': ok})
 
 
+def _gc_jobs_by_store(mgr):
+    # MK Oct 2026 - when GC last ran is only in /admin/gc, one entry per datastore. A PBS
+    # without that list, or a token that may not read it, just shows no GC times
+    try:
+        resp = mgr.get_gc_jobs()
+    except Exception:
+        return {}
+    rows = resp.get('data') if isinstance(resp, dict) else None
+    if not isinstance(rows, list):
+        return {}
+    return {r['store']: r for r in rows if isinstance(r, dict) and isinstance(r.get('store'), str)}
+
+
 @bp.route('/api/pbs/<pbs_id>/datastores', methods=['GET'])
 @require_auth(perms=['pbs.datastore.view'])
 def get_pbs_datastores(pbs_id):
@@ -589,12 +605,15 @@ def get_pbs_datastores(pbs_id):
     
     datastores = config_resp.get('data', [])
     usage_list = {u.get('store'): u for u in usage_resp.get('data', [])}
+    gc_jobs = _gc_jobs_by_store(mgr)
     
     # Merge config with usage
     result = []
     for ds in datastores:
         name = ds.get('name', '')
         info = {**ds, **(usage_list.get(name, {}))}
+        if name in gc_jobs:
+            info['gc-job'] = gc_jobs[name]
         
         # Try to get detailed status (GC info, counts)
         try:
@@ -674,7 +693,7 @@ def get_pbs_snapshots(pbs_id, store):
     result = mgr.get_snapshots(store, ns=ns, backup_type=backup_type, backup_id=backup_id)
     # #143: don't mask errors as empty arrays
     if 'error' in result:
-        return jsonify({'error': result['error']}), result.get('status_code', 502)
+        return upstream_failure(result.get('status_code'), result['error'], system='The PBS server', default=502)
     snaps = result.get('data', []) or []
     # NS — enrich with vm_name from linked clusters
     owners = _BackupOwners(mgr)
@@ -704,7 +723,7 @@ def get_pbs_groups(pbs_id, store):
     ns = request.args.get('ns', None)
     result = mgr.get_groups(store, ns=ns)
     if 'error' in result:
-        return jsonify({'error': result['error']}), result.get('status_code', 502)
+        return upstream_failure(result.get('status_code'), result['error'], system='The PBS server', default=502)
     groups = result.get('data', []) or []
     # NS — enrich with vm_name
     owners = _BackupOwners(mgr)
@@ -1201,6 +1220,8 @@ def get_pbs_task_detail(pbs_id, upid):
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
+    if not valid_pbs_upid(upid):
+        return jsonify({'error': 'Invalid task id'}), 400
     # sec (audit) — the log names the archives and the guest it backed up
     _bt, _bid = _pbs_upid_guest(upid)
     ok, err = _authz_pbs_backup(mgr, _bt, _bid, 'vm.view', store=_pbs_task_store(upid), ns='')
@@ -1217,7 +1238,12 @@ def get_pbs_task_detail(pbs_id, upid):
 @bp.route('/api/pbs/<pbs_id>/jobs', methods=['GET'])
 @require_auth(perms=['pbs.jobs.view'])
 def get_pbs_jobs(pbs_id):
-    """List all PBS jobs (sync, verify, prune)"""
+    """List PBS sync, verify and prune jobs with schedule and last-run status.
+
+    Returns 404 if the PBS manager is missing. Otherwise, successful job lists
+    remain available; errors maps each failed kind to PBS_FORBIDDEN,
+    PBS_UNREACHABLE or PBS_UPSTREAM (including malformed responses).
+    """
     # NS Jul 2026 (CodeAnt IDOR) — enforce the per-PBS linked-clusters tenant gate
     ok, err = check_pbs_access(pbs_id)
     if not ok:
@@ -1226,15 +1252,25 @@ def get_pbs_jobs(pbs_id):
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
     
-    sync = mgr.get_sync_jobs()
-    verify = mgr.get_verify_jobs()
-    prune = mgr.get_prune_jobs()
-    
-    return jsonify({
-        'sync': sync.get('data', []),
-        'verify': verify.get('data', []),
-        'prune': prune.get('data', []),
-    })
+    jobs = {}
+    errors = {}
+    for kind, get_jobs in (('sync', mgr.get_sync_jobs),
+                           ('verify', mgr.get_verify_jobs),
+                           ('prune', mgr.get_prune_jobs)):
+        result = get_jobs()
+        failure = pbs_upstream_error(result)
+        if failure:
+            errors[kind] = failure[1]['code']
+            jobs[kind] = []
+        elif not isinstance(result, dict) or not isinstance(result.get('data'), list):
+            errors[kind] = 'PBS_UPSTREAM'
+            jobs[kind] = []
+        else:
+            jobs[kind] = result['data']
+
+    if errors:
+        jobs['errors'] = errors
+    return jsonify(jobs)
 
 
 @bp.route('/api/pbs/<pbs_id>/jobs/<job_type>/<job_id>/run', methods=['POST'])
@@ -1630,7 +1666,7 @@ def download_pbs_file(pbs_id, store):
         resp = mgr.download_file_from_snapshot(store, bt, bid, int(btime), filepath)
         if resp is None or resp.status_code != 200:
             status = resp.status_code if resp else 502
-            return jsonify({'error': f'Download failed: HTTP {status}'}), status
+            return upstream_failure(status, f'Download failed: HTTP {status}', system='The PBS server')
         # Extract filename from filepath + sanitize for Content-Disposition header injection
         import re as _re
         filename = filepath.rstrip('/').split('/')[-1] or 'download'
@@ -1671,7 +1707,7 @@ def get_pbs_datastore_config(pbs_id, store):
     mgr = pbs_managers[pbs_id]
     result = mgr.get_datastore_config(store)
     if 'error' in result:
-        return jsonify(result), result.get('status_code', 500)
+        return upstream_failure(result.get('status_code'), result['error'], system='The PBS server')
     return jsonify(result.get('data', result))
 
 
@@ -1967,6 +2003,8 @@ def stop_pbs_task(pbs_id, upid):
     if pbs_id not in pbs_managers:
         return jsonify({'error': 'PBS server not found'}), 404
     mgr = pbs_managers[pbs_id]
+    if not valid_pbs_upid(upid):
+        return jsonify({'error': 'Invalid task id'}), 400
     result = mgr.stop_task(upid)
     if 'error' in result:
         return jsonify(result), 400
@@ -2193,7 +2231,7 @@ def get_pbs_disk_smart(pbs_id, disk):
         return jsonify({'error': 'PBS server not found'}), 404
     result = pbs_managers[pbs_id].get_disk_smart(disk)
     if 'error' in result:
-        return jsonify(result), result.get('status_code', 500)
+        return upstream_failure(result.get('status_code'), result['error'], system='The PBS server')
     return jsonify(result.get('data', result))
 
 
@@ -2717,11 +2755,22 @@ def start_backup_verification(cluster_id):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
 
-    data = request.json or {}
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'The request body must be a JSON object'}), 400
     required = ['node', 'vmid', 'backup_volid']
     for f in required:
         if f not in data:
             return jsonify({'error': f'Missing: {f}'}), 400
+    # MK Oct 2026 - where the test guest's NICs go is the cluster's setting (isolation, test
+    # bridge), not the caller's: a bridge named here put the restored copy, with the
+    # original's IP, on whatever network that was
+    _bad = _verify_body_refusal(data)
+    if _bad:
+        return jsonify({'error': _bad}), 400
+    data.pop('network_bridge', None)
+    data.pop('plan', None)
+    data['source'] = 'manual'
 
     # NS Aug 2026 (sec-report, BOLA) — verification restores + boots the backup, so it needs
     # the same per-VM ACL as a direct VM op; cluster reach alone let a vm.backup holder restore
@@ -2745,12 +2794,42 @@ def start_backup_verification(cluster_id):
     # foreign archive in an odd format and the bind is skipped.
     if _volid and (not _m or int(_m.group(1)) != _vmid):
         return jsonify({'error': 'Access denied: backup_volid does not belong to the given VM'}), 403
+    # MK Oct 2026 - the number, not the text: "100" and " 100" each passed the one-at-a-time
+    # check of the guest, and each started a copy of it
+    data['vmid'] = _vmid
+    # a confined caller places the copy as a new guest of theirs: on a node one of their
+    # guests lives on, and on the storage the restore tests are set to, not one they name
+    _au = build_authz_user(request.session.get('user', ''), request.session)
+    from pegaprox.api.helpers import caller_is_scoped
+    if caller_is_scoped(_au, cluster_id):
+        _nerr = _authz_restore_node(cluster_id, data['node'], _au)
+        if _nerr:
+            return _nerr
+        data.pop('storage', None)
 
     data['cluster_id'] = cluster_id
     pve_mgr = cluster_managers[cluster_id]
 
     if not pve_mgr.is_connected:
         return jsonify({'error': 'Cluster not connected'}), 503
+
+    # MK Oct 2026 - a test guest kept for inspection is a restore in test mode: the same
+    # checks, and the tenant quota counts it (backup-restore mode 'test')
+    _qwarn = None
+    if data.get('auto_cleanup') is False:
+        _u = build_authz_user(request.session.get('user', ''), request.session)
+        _refused = _restore_refusal(cluster_id, _u, _volid, data['node'], _vmid, 'test')
+        if _refused:
+            return _refused
+        from pegaprox.core.batch_restore import restore_adds
+        _src = next((r.search(_volid) for r in _SOURCE_RES if r.search(_volid)), None)
+        _qerr, _qwarn = tenant_quota_gate(
+            _u, f'restore test of {_volid}',
+            lambda: restore_adds(pve_mgr, data['node'], _volid, int(_src.group(1)) if _src else 0, _vmid, False),
+            cluster=getattr(getattr(pve_mgr, 'config', None), 'name', cluster_id),
+            hold={'cluster_id': cluster_id, 'vmid': _vmid, 'grow': False})
+        if _qerr:
+            return _qerr
 
     try:
         task_id = start_verification(pve_mgr, data)
@@ -2761,7 +2840,32 @@ def start_backup_verification(cluster_id):
     log_audit(user, 'backup.verify_started',
               f"Backup verification started for VM {data.get('vmid')} on {data.get('node')}")
 
-    return jsonify({'success': True, 'task_id': task_id})
+    return jsonify({'success': True, 'task_id': task_id, **({'quota_warning': _qwarn} if _qwarn else {})})
+
+
+_VERIFY_NODE_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9.-]{0,62}')
+
+
+def _verify_body_refusal(data):
+    """Why the body of a verification start is refused, None when it is fine."""
+    if not isinstance(data.get('node'), str) or not _VERIFY_NODE_RE.fullmatch(data['node']):
+        return 'node is the name of a node of the cluster'
+    if not isinstance(data.get('backup_volid'), str) or not data['backup_volid'] or len(data['backup_volid']) > 512:
+        return 'backup_volid is the volume ID of a backup'
+    if data.get('storage') not in (None, '') and not (isinstance(data['storage'], str)
+                                                      and _STORAGE_ID_RE.fullmatch(data['storage'])):
+        return 'storage is the ID of a storage'
+    if 'boot_timeout' in data:
+        bt = data['boot_timeout']
+        if isinstance(bt, bool) or not isinstance(bt, int) or not 30 <= bt <= 1800:
+            return 'boot_timeout is a whole number of seconds from 30 to 1800'
+    for k in ('check_agent', 'auto_cleanup'):
+        if k in data and not isinstance(data[k], bool):
+            return f'{k} is true or false'
+    for k in ('vm_name', 'backup_time', 'vm_type', 'pbs_id'):
+        if data.get(k) is not None and not isinstance(data[k], str):
+            return f'{k} is text'
+    return None
 
 
 def _verification_rows_visible(cluster_id, rows):
@@ -2807,7 +2911,7 @@ def get_backup_verification_status(cluster_id, task_id):
             return jsonify({'error': 'Verification not found'}), 404
         if not _verification_rows_visible(cluster_id, [status]):
             return jsonify({'error': 'Verification not found'}), 404
-        return jsonify(status)
+        return jsonify(_mask_run(status, caller_acts_as_admin()))
 
     # check database
     db = get_db()
@@ -2821,7 +2925,7 @@ def get_backup_verification_status(cluster_id, task_id):
             result['logs'] = result['details'].get('logs', [])
             if not _verification_rows_visible(cluster_id, [result]):
                 return jsonify({'error': 'Verification not found'}), 404
-            return jsonify(result)
+            return jsonify(_mask_run(result, caller_acts_as_admin()))
     except Exception:
         pass
 
@@ -2844,7 +2948,8 @@ def get_backup_verification_history(cluster_id):
     limit = bounded_limit(request.args.get('limit'), 50, 1000)
 
     results = get_verification_history(cluster_id, vmid, limit)
-    return jsonify(_verification_rows_visible(cluster_id, results))
+    admin = caller_acts_as_admin()
+    return jsonify([_mask_run(r, admin) for r in _verification_rows_visible(cluster_id, results)])
 
 
 @bp.route('/api/clusters/<cluster_id>/backup-verify/active', methods=['GET'])
@@ -2863,7 +2968,658 @@ def get_active_verifications(cluster_id):
     # a scoped caller sees only their own guests' runs (see _verification_rows_visible)
     _keys = [k for k, v in cluster_active.items()
              if _verification_rows_visible(cluster_id, [v])]
-    return jsonify({k: cluster_active[k] for k in _keys})
+    admin = caller_acts_as_admin()
+    return jsonify({k: _mask_run(cluster_active[k], admin) for k in _keys})
+
+
+# ============================================================================
+# MK Oct 2026 - restore tests: what they check per cluster, guest and tag, and the
+# recovery report per guest, cluster and tenant (core/recovery.py)
+# ============================================================================
+
+def _recovery_cluster(cluster_id):
+    """(manager, None) of a Proxmox cluster the caller reaches, or (None, error response)."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return None, err
+    mgr = cluster_managers.get(cluster_id)
+    if mgr is None:
+        return None, (jsonify({'error': 'Cluster not found'}), 404)
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return None, (jsonify({'error': 'Restore tests are for Proxmox VE clusters'}), 400)
+    return mgr, None
+
+
+def _caller():
+    from pegaprox.utils.auth import build_authz_user
+    return build_authz_user(request.session.get('user', ''), request.session)
+
+
+def _recovery_admin(cluster_id):
+    """The checks of a write to the restore test settings: an admin whom no tenant lowers,
+    confined nowhere in the cluster. They pick the network a restored copy boots on and the
+    commands it runs. An error response, or None."""
+    if not caller_acts_as_admin():
+        return jsonify({'error': 'Only an administrator sets what restore tests do'}), 403
+    return require_unconfined(cluster_id)
+
+
+def _mask_command(row, admin):
+    if not admin and row.get('command'):
+        row = dict(row, command='', command_set=True)
+    return row
+
+
+# MK Oct 2026 - the check command is masked in the settings for anybody but an admin (it
+# may carry a secret); the checks and the log of a test that ran it are masked the same
+_CHECK_LINE_RES = (re.compile(r'(Check command ).*(: (?:ok|FAILED|skipped) \()'),
+                   re.compile(r'(Check failed: command ).*( - )'))
+
+
+def _mask_checks(checks, admin):
+    if admin or not isinstance(checks, list):
+        return checks
+    return [dict(c, target='') if isinstance(c, dict) and c.get('check') == 'command' and c.get('target') else c
+            for c in checks]
+
+
+def _mask_run(run, admin):
+    """A verification (a status of the registry, or a row with its details as a dict or as
+    the stored text) as a caller who is no admin sees it: no check command in its checks
+    or its log. A copy."""
+    import json as _json
+    if admin or not isinstance(run, dict):
+        return run
+    out = dict(run)
+    details, packed = out.get('details'), isinstance(out.get('details'), str)
+    if packed:
+        try:
+            details = _json.loads(details or '{}')
+        except (TypeError, ValueError):
+            details = {}
+    parts = [out] + ([dict(details)] if isinstance(details, dict) else [])
+    commands = {str(c['target']) for p in parts for c in (p.get('checks') or [])
+                if isinstance(c, dict) and c.get('check') == 'command' and c.get('target')}
+    for p in parts:
+        if 'checks' in p:
+            p['checks'] = _mask_checks(p['checks'], False)
+        if isinstance(p.get('logs'), list):
+            lines = []
+            for line in p['logs']:
+                line = str(line)
+                for cmd in commands:
+                    line = line.replace(cmd, '***')
+                for rx in _CHECK_LINE_RES:
+                    line = rx.sub(r'\1***\2', line)
+                lines.append(line)
+            p['logs'] = lines
+    if len(parts) > 1:
+        out['details'] = _json.dumps(parts[1]) if packed else parts[1]
+    return out
+
+
+@bp.route('/api/clusters/<cluster_id>/recovery-settings', methods=['GET'])
+@require_auth(perms=['backup.view'])
+def get_recovery_settings(cluster_id):
+    """The restore test settings of a cluster: its defaults and the guest and tag rules."""
+    from pegaprox.core import recovery
+    from pegaprox.api.helpers import caller_is_scoped
+    from pegaprox.utils.rbac import user_can_access_vm
+    mgr, err = _recovery_cluster(cluster_id)
+    if err:
+        return err
+    try:
+        rules = recovery.load_rules(cluster_id)
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The restore test settings could not be read')}), 500
+    user = _caller()
+    scoped = caller_is_scoped(user, cluster_id)
+    admin = caller_acts_as_admin()
+    settings = recovery.cluster_settings(rules)
+    guests = [_mask_command(recovery.rule_view(r), admin) for _v, r in sorted(rules['guest'].items())]
+    tags = [_mask_command(recovery.rule_view(r), admin) for _t, r in sorted(rules['tag'].items())]
+    if scoped:
+        # a confined caller: the RTO it is held to, the rules of its own guests, nothing of
+        # the network, the storage or another guest
+        settings = {'rto_minutes': settings['rto_minutes']}
+        guests = [g for g in guests if user_can_access_vm(user, cluster_id, int(g['scope_key']), 'vm.view')]
+        tags = []
+    else:
+        settings = _mask_command(settings, admin)
+    return jsonify({'cluster': settings, 'guests': guests, 'tags': tags,
+                    'can_edit': bool(admin and not scoped), 'limits': {
+                        'rto_max': recovery.RTO_MAX, 'ports_max': recovery.PORTS_MAX,
+                        'command_max': recovery.COMMAND_MAX, 'boot_min': recovery.BOOT_MIN,
+                        'boot_max': recovery.BOOT_MAX}})
+
+
+@bp.route('/api/clusters/<cluster_id>/recovery-settings', methods=['PUT'])
+@require_auth(roles=[ROLE_ADMIN])
+def put_recovery_settings(cluster_id):
+    """The cluster's defaults: rto_minutes, agent, ports, command, isolation ('link_down',
+    or 'bridge' with test_bridge), test_storage, boot_timeout. A field sent as null goes back
+    to the built-in default."""
+    from pegaprox.core import recovery
+    mgr, err = _recovery_cluster(cluster_id)
+    if err:
+        return err
+    refused = _recovery_admin(cluster_id)
+    if refused:
+        return refused
+    fields, bad = recovery.clean_rule(request.get_json(silent=True), 'cluster')
+    if bad:
+        return jsonify({'error': bad}), 400
+    try:
+        recovery.save_rule(cluster_id, 'cluster', '', fields, request.session.get('user', ''))
+        settings = recovery.cluster_settings(recovery.load_rules(cluster_id))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The restore test settings could not be saved')}), 500
+    log_audit(request.session.get('user', 'system'), 'backup.recovery_settings',
+              f"Restore test defaults set: {', '.join(sorted(fields)) or 'nothing'} "
+              f"(isolation {settings['isolation']}, RTO {settings['rto_minutes'] or 'none'})",
+              cluster=getattr(getattr(mgr, 'config', None), 'name', cluster_id))
+    return jsonify({'success': True, 'cluster': settings})
+
+
+@bp.route('/api/clusters/<cluster_id>/recovery-settings/rules', methods=['PUT'])
+@require_auth(roles=[ROLE_ADMIN])
+def put_recovery_rule(cluster_id):
+    """A rule for one guest or one tag. Body: {scope: 'guest'|'tag', key: VMID or tag,
+    rto_minutes, agent, ports, command}; a field sent as null is taken from the tag or the
+    cluster again, and a rule left with nothing in it is removed."""
+    from pegaprox.core import recovery
+    mgr, err = _recovery_cluster(cluster_id)
+    if err:
+        return err
+    refused = _recovery_admin(cluster_id)
+    if refused:
+        return refused
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({'error': 'The request body must be a JSON object'}), 400
+    scope = body.get('scope')
+    if scope not in ('guest', 'tag'):
+        return jsonify({'error': "scope is 'guest' or 'tag'"}), 400
+    key = recovery.scope_key(scope, body.get('key'))
+    if key is None:
+        return jsonify({'error': 'key is a VMID' if scope == 'guest' else 'key is a tag name'}), 400
+    fields, bad = recovery.clean_rule(body, scope)
+    if bad:
+        return jsonify({'error': bad}), 400
+    try:
+        row = recovery.save_rule(cluster_id, scope, key, fields, request.session.get('user', ''))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The rule could not be saved')}), 500
+    log_audit(request.session.get('user', 'system'), 'backup.recovery_rule',
+              f"Restore test rule for {scope} {key} " + ('removed' if row is None else
+                                                          f"set: {', '.join(sorted(fields)) or 'nothing'}"),
+              cluster=getattr(getattr(mgr, 'config', None), 'name', cluster_id))
+    return jsonify({'success': True, 'rule': recovery.rule_view(row) if row else None})
+
+
+@bp.route('/api/clusters/<cluster_id>/recovery-settings/rules/<scope>/<key>', methods=['DELETE'])
+@require_auth(roles=[ROLE_ADMIN])
+def delete_recovery_rule(cluster_id, scope, key):
+    from pegaprox.core import recovery
+    mgr, err = _recovery_cluster(cluster_id)
+    if err:
+        return err
+    refused = _recovery_admin(cluster_id)
+    if refused:
+        return refused
+    if scope not in ('guest', 'tag'):
+        return jsonify({'error': "scope is 'guest' or 'tag'"}), 400
+    skey = recovery.scope_key(scope, key)
+    if skey is None:
+        return jsonify({'error': 'key is a VMID' if scope == 'guest' else 'key is a tag name'}), 400
+    try:
+        gone = recovery.delete_rule(cluster_id, scope, skey)
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The rule could not be removed')}), 500
+    if not gone:
+        return jsonify({'error': 'No such rule'}), 404
+    log_audit(request.session.get('user', 'system'), 'backup.recovery_rule',
+              f"Restore test rule for {scope} {skey} removed",
+              cluster=getattr(getattr(mgr, 'config', None), 'name', cluster_id))
+    return jsonify({'success': True})
+
+
+def _report_days():
+    raw = request.args.get('days')
+    if raw in (None, ''):
+        return 30, None
+    from pegaprox.core.recovery import _whole
+    n = _whole(raw, 1, 365)
+    if n is None:
+        return None, (jsonify({'error': 'days is a whole number from 1 to 365'}), 400)
+    return n, None
+
+
+def _report_format():
+    fmt = (request.args.get('format') or 'json').lower()
+    if fmt not in ('json', 'csv'):
+        return None, (jsonify({'error': "format is 'json' or 'csv'"}), 400)
+    return fmt, None
+
+
+def _csv_response(rows, name):
+    from flask import Response
+    from pegaprox.core import recovery
+    return Response(recovery.csv_text(rows), mimetype='text/csv',
+                    headers={'Content-Disposition': f'attachment; filename="{name}.csv"'})
+
+
+def _cluster_label(cluster_id, mgr):
+    name = getattr(getattr(mgr, 'config', None), 'name', None)
+    return name if isinstance(name, str) and name else cluster_id
+
+
+@bp.route('/api/clusters/<cluster_id>/recovery-report', methods=['GET'])
+@require_auth(perms=['backup.view'])
+def get_recovery_report(cluster_id):
+    """How recoverable each guest of a cluster looks: the last restore test that passed, the
+    backup it restored, how long restore, boot and checks took against the RTO, the newest
+    backup against the backup SLA, the last failure. ?days= (default 30) is how old a passed
+    test may be before it counts as stale, ?format=csv, ?refresh=1 reads the backups again."""
+    from pegaprox.core import recovery
+    from pegaprox.api.helpers import caller_is_scoped
+    mgr, err = _recovery_cluster(cluster_id)
+    if err:
+        return err
+    days, err = _report_days()
+    if err:
+        return err
+    fmt, err = _report_format()
+    if err:
+        return err
+    if not getattr(mgr, 'is_connected', False):
+        return jsonify({'error': 'cluster offline'}), 503
+    try:
+        rows, meta = recovery.cluster_report(cluster_id, mgr, stale_days=days,
+                                             refresh=request.args.get('refresh') in ('1', 'true'))
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The recovery report could not be made')}), 500
+    rows = scope_vm_rows(cluster_id, rows)
+    label = _cluster_label(cluster_id, mgr)
+    for r in rows:
+        r.pop('last_checks', None)
+        r['cluster_id'], r['cluster_name'] = cluster_id, label
+    if fmt == 'csv':
+        return _csv_response(rows, f'recovery-{cluster_id}')
+    if caller_is_scoped(_caller(), cluster_id):
+        meta['settings'] = {'rto_minutes': meta['settings']['rto_minutes']}
+    else:
+        meta['settings'] = _mask_command(meta['settings'], caller_acts_as_admin())
+    return jsonify(dict(meta, cluster_id=cluster_id, cluster_name=label,
+                        summary=recovery.summary(rows), guests=rows))
+
+
+@bp.route('/api/clusters/<cluster_id>/recovery-report/<int:vmid>', methods=['GET'])
+@require_auth(perms=['backup.view'])
+def get_guest_recovery(cluster_id, vmid):
+    """One guest of the report, with what its tests check and its last tests."""
+    import json as _json
+    import time as _time
+    from pegaprox.core import recovery
+    from pegaprox.core.backup_verify import get_verification_history
+    from pegaprox.utils.rbac import user_can_access_vm
+    mgr, err = _recovery_cluster(cluster_id)
+    if err:
+        return err
+    if not user_can_access_vm(_caller(), cluster_id, vmid, 'vm.view'):
+        return jsonify({'error': 'Guest not found'}), 404
+    if not getattr(mgr, 'is_connected', False):
+        return jsonify({'error': 'cluster offline'}), 503
+    try:
+        guests = recovery.report_guests(mgr.get_vm_resources(max_age=60) or [])
+        r = guests.get(vmid)
+        if r is None:
+            return jsonify({'error': 'Guest not found'}), 404
+        rules = recovery.load_rules(cluster_id)
+        plan = recovery.plan_for(cluster_id, vmid, tags=recovery.guest_tags(r.get('tags')), rules=rules)
+        mark = recovery.load_marks(cluster_id).get(vmid)
+        idx = recovery.guest_backups(cluster_id, mgr)
+        backups = None if idx is None else (idx['guests'].get(vmid) or [])
+        sla = int(getattr(getattr(mgr, 'config', None), 'backup_sla_max_age_hours', 0) or 0)
+        row = recovery.guest_row(vmid, r, mark, backups, plan, sla, _time.time())
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The recovery report could not be made')}), 500
+    admin = caller_acts_as_admin()
+    row['last_checks'] = _mask_checks(row.get('last_checks'), admin)
+    history = []
+    for h in get_verification_history(cluster_id, vmid, 10):
+        try:
+            d = _json.loads(h.get('details') or '{}')
+        except (TypeError, ValueError):
+            d = {}
+        history.append({'id': h.get('id'), 'started_at': h.get('started_at'), 'completed_at': h.get('completed_at'),
+                        'status': h.get('status'), 'backup_time': h.get('backup_time'),
+                        'duration_seconds': h.get('duration_seconds'), 'measured_seconds': d.get('measured_seconds'),
+                        'rto_met': d.get('rto_met'), 'checks': _mask_checks(d.get('checks') or [], admin),
+                        'source': d.get('source') or 'manual', 'cause': d.get('cause') or h.get('error') or ''})
+    plan = {k: plan[k] for k in ('agent', 'ports', 'command', 'rto_seconds', 'source')}
+    plan = _mask_command(plan, admin)
+    row['cluster_id'], row['cluster_name'] = cluster_id, _cluster_label(cluster_id, mgr)
+    return jsonify({'guest': row, 'checks': plan, 'history': history,
+                    'backups': [{'volid': b['volid'], 'ctime': b['ctime'], 'storage': b['storage']}
+                                for b in (backups or [])[:5]]})
+
+
+def _tenant_recovery_clusters(tenant_id):
+    """(clusters, reach, None) of the Proxmox clusters of a tenant the caller reaches, or
+    (None, None, error response). `reach` holds the connected ones as (id, manager, entry)."""
+    import pegaprox.utils.rbac as _rbac
+    _rbac.tenants_db = _rbac.load_tenants()
+    if tenant_id not in (_rbac.tenants_db or {}) and tenant_id != _rbac.DEFAULT_TENANT_ID:
+        return None, None, (jsonify({'error': 'Tenant not found'}), 404)
+    if not caller_acts_as_admin():
+        if tenant_id != (_caller().get('tenant_id') or _rbac.DEFAULT_TENANT_ID):
+            return None, None, (jsonify({'error': 'Access denied to this tenant'}), 403)
+    allowed = _rbac.get_user_clusters({'role': _rbac.ROLE_VIEWER, 'tenant_id': tenant_id})
+    reach, clusters = [], []
+    for cid, mgr in sorted(list(cluster_managers.items()), key=lambda kv: _cluster_label(*kv).lower()):
+        if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+            continue
+        if allowed is not None and cid not in allowed:
+            continue
+        ok, _err = check_cluster_access(cid)
+        if not ok:
+            continue
+        entry = {'cluster_id': cid, 'cluster_name': _cluster_label(cid, mgr), 'state': 'ok', 'summary': None}
+        clusters.append(entry)
+        if not getattr(mgr, 'is_connected', False):
+            entry['state'] = 'offline'
+            continue
+        reach.append((cid, mgr, entry))
+    return clusters, reach, None
+
+
+@bp.route('/api/tenants/<tenant_id>/recovery-report', methods=['GET'])
+@require_auth(perms=['backup.view'])
+def get_tenant_recovery_report(tenant_id):
+    """The recovery report over every Proxmox cluster of a tenant the caller reaches; an
+    admin asks for any tenant, everybody else for their own. ?days=, ?format=csv."""
+    import pegaprox.utils.rbac as _rbac
+    from pegaprox.core import recovery
+    from pegaprox.utils.concurrent import run_concurrent
+    days, err = _report_days()
+    if err:
+        return err
+    fmt, err = _report_format()
+    if err:
+        return err
+    clusters, reach, err = _tenant_recovery_clusters(tenant_id)
+    if err:
+        return err
+    results = run_concurrent([lambda c=cid, m=mgr: recovery.cluster_report(c, m, stale_days=days)
+                              for cid, mgr, _e in reach], timeout=120)
+    rows = []
+    for (cid, mgr, entry), res in zip(reach, results):
+        if not res:
+            entry['state'] = 'unreadable'
+            continue
+        found = scope_vm_rows(cid, res[0])
+        for r in found:
+            r.pop('last_checks', None)
+            r['cluster_id'], r['cluster_name'] = cid, entry['cluster_name']
+        entry['summary'] = recovery.summary(found)
+        entry['backups_state'] = res[1]['backups_state']
+        rows += found
+    if fmt == 'csv':
+        return _csv_response(rows, f'recovery-{tenant_id}')
+    return jsonify({'tenant_id': tenant_id, 'stale_days': days, 'clusters': clusters,
+                    'summary': recovery.summary(rows), 'guests': rows})
+
+
+# ---------------------------------------------------------------------------
+# MK Oct 2026 - recovery assurance: coverage of the guests that matter, the gaps, manual
+# confirmations and the signed evidence (core/assurance.py)
+# ---------------------------------------------------------------------------
+
+def _assured(cluster_id, label, rows, settings):
+    """Report rows of one cluster, assessed and with their confirmation. The caller has
+    scoped `rows` already."""
+    from pegaprox.core import assurance
+    for r in rows:
+        r['cluster_id'], r['cluster_name'] = cluster_id, label
+    assurance.assess(rows, settings)
+    confs = assurance.load_confirmations(cluster_id)
+    for r in rows:
+        r['confirmation'] = confs.get(r['vmid'])
+    return rows
+
+
+def _site_gaps(cluster_id):
+    """Site Recovery plan gaps of a cluster as far as the caller may see them: a confined
+    caller sees none, the plans are not theirs; nor does one without site_recovery.view, or
+    a plan whose target it does not reach (as in the timeline)."""
+    from pegaprox.core import assurance
+    from pegaprox.api.helpers import caller_is_scoped
+    from pegaprox.utils.rbac import has_permission
+    user = _caller()
+    if caller_is_scoped(user, cluster_id) or not has_permission(user, 'site_recovery.view'):
+        return []
+
+    def state_of(cid):
+        m = cluster_managers.get(cid)
+        if m is None:
+            return 'missing'
+        return 'ok' if getattr(m, 'is_connected', False) else 'offline'
+
+    def reaches(cid):
+        # MK Oct 2026 - a plan names its target and the gap says how that cluster is doing;
+        # one of another tenant is not for this caller. A target that is gone names nobody's.
+        if cid not in cluster_managers:
+            return True
+        ok, _err = check_cluster_access(cid)
+        return ok and not caller_is_scoped(user, cid)
+    return assurance.plan_gaps(cluster_id, state_of, reaches)
+
+
+def _evidence_for(cluster_id, rows):
+    """The evidence entry of each assessed row of one cluster, under row['_evidence']."""
+    from pegaprox.core import assurance, recovery
+    marks, runs = recovery.load_marks(cluster_id), assurance.passed_runs(cluster_id)
+    for r in rows:
+        r['_evidence'] = assurance.evidence_guest(r, marks, runs, r.get('confirmation'))
+
+
+def _evidence_response(doc, fmt, name):
+    import json as _json
+    from flask import Response
+    from pegaprox.core import assurance
+    if fmt == 'csv':
+        return Response(assurance.evidence_csv(doc), mimetype='text/csv',
+                        headers={'Content-Disposition': f'attachment; filename="{name}.csv"'})
+    return Response(_json.dumps(doc, ensure_ascii=False, indent=1), mimetype='application/json',
+                    headers={'Content-Disposition': f'attachment; filename="{name}.json"'})
+
+
+@bp.route('/api/clusters/<cluster_id>/recovery-assurance', methods=['GET'])
+@require_auth(perms=['backup.view'])
+def get_recovery_assurance(cluster_id):
+    """How much of the cluster is proven recoverable: the share of critical guests (and of
+    all) with a passed restore test in the period, an agent check and an application check
+    that passed; the gaps behind the rest; manual confirmations beside, never in place of
+    that. ?days= (default 30) is the period, ?refresh=1 reads the backups again."""
+    from pegaprox.core import assurance, recovery
+    from pegaprox.api.helpers import caller_is_scoped
+    mgr, err = _recovery_cluster(cluster_id)
+    if err:
+        return err
+    days, err = _report_days()
+    if err:
+        return err
+    if not getattr(mgr, 'is_connected', False):
+        return jsonify({'error': 'cluster offline'}), 503
+    try:
+        rows, meta = recovery.cluster_report(cluster_id, mgr, stale_days=days,
+                                             refresh=request.args.get('refresh') in ('1', 'true'))
+        label = _cluster_label(cluster_id, mgr)
+        rows = _assured(cluster_id, label, scope_vm_rows(cluster_id, rows), meta['settings'])
+        plan_gaps = _site_gaps(cluster_id)
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The recovery assurance could not be made')}), 500
+    gaps, counts, cut = assurance.gap_list(rows, label)
+    for p in plan_gaps:
+        counts[p['kind']] = counts.get(p['kind'], 0) + 1
+    for r in rows:
+        r.pop('last_checks', None)
+    crit = meta['settings']['critical_tags']
+    return jsonify({'cluster_id': cluster_id, 'cluster_name': label, 'stale_days': days,
+                    'backups_state': meta['backups_state'], 'critical_tags': crit,
+                    'coverage': assurance.coverage(rows), 'gap_counts': counts, 'gaps': gaps,
+                    'gaps_truncated': cut, 'plan_gaps': plan_gaps, 'guests': rows})
+
+
+@bp.route('/api/clusters/<cluster_id>/recovery-evidence', methods=['GET'])
+@require_auth(perms=['backup.view'])
+def get_recovery_evidence(cluster_id):
+    """The evidence of a cluster as a signed document: per guest what PegaProx measured (run
+    ids, times) apart from what an administrator confirmed, the coverage, the gaps, the
+    PegaProx version and the head of the audit chain. ?days=, ?format=json|csv."""
+    from pegaprox.core import assurance, recovery
+    mgr, err = _recovery_cluster(cluster_id)
+    if err:
+        return err
+    days, err = _report_days()
+    if err:
+        return err
+    fmt, err = _report_format()
+    if err:
+        return err
+    if not getattr(mgr, 'is_connected', False):
+        return jsonify({'error': 'cluster offline'}), 503
+    try:
+        rows, meta = recovery.cluster_report(cluster_id, mgr, stale_days=days)
+        label = _cluster_label(cluster_id, mgr)
+        confined = caller_is_scoped(_caller(), cluster_id)
+        rows = _assured(cluster_id, label, scope_vm_rows(cluster_id, rows), meta['settings'])
+        plan_gaps = _site_gaps(cluster_id)
+        _evidence_for(cluster_id, rows)
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The evidence could not be made')}), 500
+    gaps, _counts, _cut = assurance.gap_list(rows, label)
+    log_audit(request.session.get('user', 'system'), 'backup.recovery_evidence',
+              f'Exported the recovery evidence of {label} ({len(rows)} guests)', cluster=label)
+    doc = assurance.build_evidence(
+        'cluster', cluster_id, days, [{'cluster_id': cluster_id, 'cluster_name': label, 'state': 'ok'}],
+        rows, gaps, plan_gaps, assurance.coverage(rows), confined=confined)
+    return _evidence_response(doc, fmt, f'recovery-evidence-{cluster_id}')
+
+
+@bp.route('/api/tenants/<tenant_id>/recovery-evidence', methods=['GET'])
+@require_auth(perms=['backup.view'])
+def get_tenant_recovery_evidence(tenant_id):
+    """The evidence over every Proxmox cluster of a tenant the caller reaches, signed; a
+    cluster that is offline or unreadable is listed as such and its guests are not claimed
+    proven. ?days=, ?format=json|csv."""
+    from pegaprox.core import assurance, recovery
+    from pegaprox.utils.concurrent import run_concurrent
+    days, err = _report_days()
+    if err:
+        return err
+    fmt, err = _report_format()
+    if err:
+        return err
+    clusters, reach, err = _tenant_recovery_clusters(tenant_id)
+    if err:
+        return err
+    results = run_concurrent([lambda c=cid, m=mgr: recovery.cluster_report(c, m, stale_days=days)
+                              for cid, mgr, _e in reach], timeout=120)
+    rows, plan_gaps, confined = [], [], False
+    try:
+        for (cid, _mgr, entry), res in zip(reach, results):
+            if not res:
+                entry['state'] = 'unreadable'
+                continue
+            confined = confined or caller_is_scoped(_caller(), cid)
+            found = _assured(cid, entry['cluster_name'], scope_vm_rows(cid, res[0]), res[1]['settings'])
+            _evidence_for(cid, found)
+            rows += found
+            plan_gaps += [dict(g, cluster_id=cid) for g in _site_gaps(cid)]
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The evidence could not be made')}), 500
+    for c in clusters:
+        c.pop('summary', None)
+    gaps, _counts, _cut = assurance.gap_list(rows)
+    log_audit(request.session.get('user', 'system'), 'backup.recovery_evidence',
+              f'Exported the recovery evidence of tenant {tenant_id} ({len(rows)} guests)')
+    doc = assurance.build_evidence('tenant', tenant_id, days, clusters, rows, gaps, plan_gaps,
+                                   assurance.coverage(rows), confined=confined)
+    return _evidence_response(doc, fmt, f'recovery-evidence-{tenant_id}')
+
+
+@bp.route('/api/recovery-evidence/verify', methods=['POST'])
+@require_auth(perms=['backup.view'])
+def verify_recovery_evidence():
+    """Check an evidence document against this instance: whether it signed it, unchanged,
+    and whether the audit chain head it names is in this instance's chain."""
+    from pegaprox.core import assurance
+    res = assurance.verify_body(request.get_data()) if request.is_json else None
+    if res is None:
+        return jsonify({'error': 'The body must be a recovery evidence document'}), 400
+    return jsonify(res)
+
+
+@bp.route('/api/clusters/<cluster_id>/recovery-confirmations', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def post_recovery_confirmation(cluster_id):
+    """Record that an administrator confirmed a guest is recoverable (vmid, text, optional
+    expires_days). It is kept and shown apart; the guest stays 'not proven' until the
+    automatic checks say otherwise."""
+    from pegaprox.core import assurance, recovery
+    mgr, err = _recovery_cluster(cluster_id)
+    if err:
+        return err
+    refused = _recovery_admin(cluster_id)
+    if refused:
+        return refused
+    fields, bad = assurance.clean_confirmation(request.get_json(silent=True))
+    if bad:
+        return jsonify({'error': bad}), 400
+    if not getattr(mgr, 'is_connected', False):
+        return jsonify({'error': 'cluster offline'}), 503
+    if fields['vmid'] not in recovery.report_guests(mgr.get_vm_resources(max_age=60) or []):
+        return jsonify({'error': 'Guest not found'}), 404
+    user = request.session.get('user', '')
+    try:
+        cid = assurance.add_confirmation(cluster_id, fields, user)
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The confirmation could not be saved')}), 500
+    log_audit(user or 'system', 'backup.recovery_confirmation',
+              f"Confirmed the recoverability of guest {fields['vmid']} manually: {fields['text'][:200]}",
+              cluster=_cluster_label(cluster_id, mgr))
+    return jsonify({'success': True, 'id': cid})
+
+
+@bp.route('/api/clusters/<cluster_id>/recovery-confirmations/<conf_id>', methods=['DELETE'])
+@require_auth(roles=[ROLE_ADMIN])
+def delete_recovery_confirmation(cluster_id, conf_id):
+    """Withdraw a manual confirmation; the row stays, marked revoked."""
+    from pegaprox.core import assurance
+    mgr, err = _recovery_cluster(cluster_id)
+    if err:
+        return err
+    refused = _recovery_admin(cluster_id)
+    if refused:
+        return refused
+    if not re.fullmatch(r'[0-9a-f]{16}', conf_id or ''):
+        return jsonify({'error': 'Confirmation not found'}), 404
+    user = request.session.get('user', '')
+    try:
+        gone = assurance.revoke_confirmation(cluster_id, conf_id, user)
+    except Exception as e:
+        return jsonify({'error': safe_error(e, 'The confirmation could not be withdrawn')}), 500
+    if gone is None:
+        return jsonify({'error': 'Confirmation not found'}), 404
+    log_audit(user or 'system', 'backup.recovery_confirmation',
+              f"Withdrew the manual confirmation of guest {gone['vmid']}", cluster=_cluster_label(cluster_id, mgr))
+    return jsonify({'success': True})
 
 
 # ============================================================================
@@ -2985,13 +3741,11 @@ def get_pbs_health(pbs_id):
     import time as _t
     now = _t.time()
     oldest_gc_age_h = None
+    # MK Oct 2026 - gc-status carries no time at all, so this factor never counted
+    gc_jobs = _gc_jobs_by_store(mgr)
     for s in stores:
-        gc = s.get('gc-status') or {}
-        upid = gc.get('upid')
-        # If upid present, gc has run; we can't easily get the timestamp without
-        # parsing — fall back to checking the store's own timestamp if available.
-        last = s.get('last-gc') or 0
-        if last:
+        last = (gc_jobs.get(s.get('name') or s.get('store')) or {}).get('last-run-endtime')
+        if isinstance(last, (int, float)) and not isinstance(last, bool) and last > 0:
             age_h = (now - last) / 3600
             if oldest_gc_age_h is None or age_h > oldest_gc_age_h:
                 oldest_gc_age_h = age_h
@@ -3696,7 +4450,7 @@ def run_backup_job_now(cluster_id, job_id):
             log_audit(request.session.get('user', 'system'), 'backup.run_now',
                       f"Triggered backup job {job_id} on {pve_node}", cluster=cm.config.name)
             return jsonify({'success': True, 'upid': upid, 'node': pve_node})
-        return jsonify({'error': r.text or f'HTTP {r.status_code}'}), r.status_code
+        return upstream_failure(r.status_code, r.text or f'HTTP {r.status_code}')
     except Exception as e:
         return jsonify({'error': safe_error(e)}), 500
 
@@ -3737,48 +4491,24 @@ def restore_backup(cluster_id):
     if mode not in ('new', 'overwrite', 'test'):
         return jsonify({'error': "mode must be 'new', 'overwrite', or 'test'"}), 400
 
-    # NS Aug 2026 (audit) — authorize the SOURCE backup, not only the target. Every mode reads the
-    # backup's disk image (overwrite→qmrestore --force, test→boot, new→into a fresh VMID), so a
-    # vm.backup holder scoped to their own VM could otherwise restore/boot ANOTHER VM's backup and
-    # read its contents. Resolve the backup's owning VMID from the volid and require access to it.
-    import re as _re
     from pegaprox.utils.auth import build_authz_user
-    from pegaprox.utils.rbac import user_can_access_vm
-    _src_authz_user = build_authz_user(request.session.get('user', ''), request.session)
-    if not acts_as_admin(_src_authz_user):
-        _sm = _re.search(r'/(?:vm|ct)/(\d+)/', volid) or _re.search(r'vzdump-(?:qemu|lxc|openvz)-(\d+)-', volid)
-        _src_vmid = int(_sm.group(1)) if _sm else None
-        _src_is_lxc = '/ct/' in volid or 'vzdump-lxc' in volid or 'vzdump-openvz' in volid or volid.endswith('.lxc.tar')
-        if _src_vmid is None or not user_can_access_vm(_src_authz_user, cluster_id, _src_vmid,
-                                                       'vm.backup', 'lxc' if _src_is_lxc else 'qemu'):
-            return jsonify({'error': 'Permission denied for source backup'}), 403
+    _caller = build_authz_user(request.session.get('user', ''), request.session)
+    _refused = _restore_refusal(cluster_id, _caller, volid, target_node, target_vmid, mode)
+    if _refused:
+        return _refused
 
-    # MK Sep 2026 - mode='new' creates a guest, so it has to respect the same boundaries the
-    # create routes do. Only the SOURCE backup and (below) an existing target were authorized,
-    # which left the destination free: a scoped caller could restore into any VMID on any node,
-    # including one inside another tenant's configured VMID range, and onto storage they have
-    # no claim to. vms.py has enforced the range on create since the tenant-limits work; the
-    # restore path never learned about it.
-    if mode == 'new' and not acts_as_admin(_src_authz_user):
-        from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID as _DT
-        _rok, _rmsg = check_tenant_vmid(_src_authz_user.get('tenant_id') or _DT, target_vmid)
-        if not _rok:
-            return jsonify({'error': _rmsg}), 403
-        # and the node has to be one this caller may actually place a guest on
-        _nerr = _authz_restore_node(cluster_id, target_node, _src_authz_user)
-        if _nerr:
-            return _nerr
-
-    # NS Aug 2026 (Aikido pentest) — overwrite (destructive qmrestore --force) and test (boots into
-    # the VMID) both act on an EXISTING target VM, so require the same per-VM ACL as a direct VM op;
-    # cluster reachability alone let a vm.backup holder clobber/boot any VM in a reachable cluster.
-    if mode in ('overwrite', 'test'):
-        from pegaprox.utils.auth import build_authz_user
-        from pegaprox.utils.rbac import user_can_access_vm
-        _is_lxc = '/ct/' in volid or volid.endswith('.lxc.tar') or 'vzdump-lxc' in volid
-        if not user_can_access_vm(build_authz_user(request.session.get('user', ''), request.session),
-                                  cluster_id, target_vmid, 'vm.backup', 'lxc' if _is_lxc else 'qemu'):
-            return jsonify({'error': 'Permission denied for target VM'}), 403
+    # MK Oct 2026 - 'new' and 'test' leave a guest of their own behind, 'overwrite' grows the
+    # guest by what the backup has more of: the tenant quota counts it as a create would
+    from pegaprox.core.batch_restore import restore_adds
+    _src = next((r.search(volid) for r in _SOURCE_RES if r.search(volid)), None)
+    _qerr, _qwarn = tenant_quota_gate(
+        _caller, f'restore of {volid}',
+        lambda: restore_adds(cm, target_node, volid, int(_src.group(1)) if _src else 0, target_vmid,
+                             mode == 'overwrite'),
+        cluster=cm.config.name,
+        hold={'cluster_id': cluster_id, 'vmid': target_vmid, 'grow': mode == 'overwrite'})
+    if _qerr:
+        return _qerr
 
     # Test-mode = verify pipeline without cleanup
     if mode == 'test':
@@ -3788,45 +4518,396 @@ def restore_backup(cluster_id):
                 'cluster_id': cluster_id,
                 'node': target_node, 'vmid': target_vmid,
                 'backup_volid': volid,
-                # NS — pass auto_cleanup=False so the test VM survives for inspection
+                # NS - pass auto_cleanup=False so the test VM survives for inspection
                 'auto_cleanup': False,
             })
-            return jsonify({'success': True, 'task_id': task_id, 'mode': 'test'})
+            return jsonify({'success': True, 'task_id': task_id, 'mode': 'test',
+                            **({'quota_warning': _qwarn} if _qwarn else {})})
         except Exception as e:
             return jsonify({'error': safe_error(e)}), 500
 
-    # Choose vm_type from volid: pbs:backup/vm/100/... vs pbs:backup/ct/100/...
-    is_lxc = '/ct/' in volid or volid.endswith('.lxc.tar') or 'vzdump-lxc' in volid
-    cmd_path = 'lxc' if is_lxc else 'qemu'
-    restore_url = f'https://{cm.host}:{cm.api_port}/api2/json/nodes/{target_node}/{cmd_path}'
-
-    params = {
-        'vmid': target_vmid,
-        'archive': volid,
-    }
-    if target_storage:
-        params['storage'] = target_storage
-    if mode == 'overwrite':
-        params['force'] = 1
-
+    # qmrestore or pct restore by the backup (pbs:backup/vm/100/... vs pbs:backup/ct/100/...);
+    # a batch restore hands each of its backups through here too
+    from pegaprox.core.batch_restore import start_restore
     try:
-        r = cm._api_post(restore_url, data=params, timeout=30)
-        if r.status_code == 200:
-            upid = r.json().get('data')
+        got = start_restore(cm, volid, target_node, target_vmid, target_storage, mode == 'overwrite')
+        if 'upid' in got:
             log_audit(request.session.get('user', 'system'), 'backup.restored',
-                      f"Restoring {volid} → {cmd_path}/{target_vmid} on {target_node} (mode={mode})",
+                      f"Restoring {volid} → {got['kind']}/{target_vmid} on {target_node} (mode={mode})",
                       cluster=cm.config.name)
-            return jsonify({'success': True, 'upid': upid, 'mode': mode, 'target_vmid': target_vmid})
-        # surface PVE body
-        try:
-            err = r.json().get('errors') or r.json().get('message') or r.text
-            if isinstance(err, dict):
-                err = ', '.join(f'{k}: {v}' for k, v in err.items())
-        except Exception:
-            err = r.text or f'HTTP {r.status_code}'
-        return jsonify({'error': err, 'pve_status': r.status_code}), r.status_code
+            return jsonify({'success': True, 'upid': got['upid'], 'mode': mode, 'target_vmid': target_vmid,
+                            **({'quota_warning': _qwarn} if _qwarn else {})})
+        return upstream_failure(got['status'], got['error'], pve_status=got['status'])
     except Exception as e:
         return jsonify({'error': safe_error(e)}), 500
+
+
+def guest_is_there(cluster_id, vmid):
+    """Whether the live view of the cluster has this VMID. A list that cannot be read counts
+    as not there, so a restore over it is asked what a new guest is."""
+    try:
+        return any(str(g.get('vmid')) == str(vmid)
+                   for g in (cluster_managers[cluster_id].get_vm_resources(max_age=5) or []))
+    except Exception:
+        return False
+
+
+def _restore_refusal(cluster_id, user, volid, target_node, target_vmid, mode, node_checked=False):
+    """The checks of a restore: an error response when `user` may not restore `volid` into
+    `target_vmid` on `target_node` this way, else None. node_checked: the caller asked
+    _authz_restore_node already (a batch does once, for all of its backups)."""
+    import re as _re
+    from pegaprox.utils.rbac import user_can_access_vm
+
+    # NS Aug 2026 (audit) — authorize the SOURCE backup, not only the target. Every mode reads the
+    # backup's disk image (overwrite→qmrestore --force, test→boot, new→into a fresh VMID), so a
+    # vm.backup holder scoped to their own VM could otherwise restore/boot ANOTHER VM's backup and
+    # read its contents. Resolve the backup's owning VMID from the volid and require access to it.
+    if not acts_as_admin(user):
+        _sm = _re.search(r'/(?:vm|ct)/(\d+)/', volid) or _re.search(r'vzdump-(?:qemu|lxc|openvz)-(\d+)-', volid)
+        _src_vmid = int(_sm.group(1)) if _sm else None
+        _src_is_lxc = '/ct/' in volid or 'vzdump-lxc' in volid or 'vzdump-openvz' in volid or volid.endswith('.lxc.tar')
+        if _src_vmid is None or not user_can_access_vm(user, cluster_id, _src_vmid,
+                                                       'vm.backup', 'lxc' if _src_is_lxc else 'qemu'):
+            return jsonify({'error': 'Permission denied for source backup'}), 403
+
+    # MK Sep 2026 - mode='new' creates a guest, so it has to respect the same boundaries the
+    # create routes do. Only the SOURCE backup and (below) an existing target were authorized,
+    # which left the destination free: a scoped caller could restore into any VMID on any node,
+    # including one inside another tenant's configured VMID range, and onto storage they have
+    # no claim to. vms.py has enforced the range on create since the tenant-limits work; the
+    # restore path never learned about it.
+    # MK Oct 2026 - and so does an overwrite of a guest that is gone: it makes the guest anew,
+    # in the backup's VMID, on the node named
+    creates = mode == 'new' or (mode == 'overwrite' and not acts_as_admin(user)
+                                and not guest_is_there(cluster_id, target_vmid))
+    if creates and not acts_as_admin(user):
+        from pegaprox.utils.rbac import check_tenant_vmid, DEFAULT_TENANT_ID as _DT
+        _rok, _rmsg = check_tenant_vmid(user.get('tenant_id') or _DT, target_vmid)
+        if not _rok:
+            return jsonify({'error': _rmsg}), 403
+        # and the node has to be one this caller may actually place a guest on
+        if not node_checked:
+            _nerr = _authz_restore_node(cluster_id, target_node, user)
+            if _nerr:
+                return _nerr
+
+    # NS Aug 2026 (Aikido pentest) — overwrite (destructive qmrestore --force) and test (boots into
+    # the VMID) both act on an EXISTING target VM, so require the same per-VM ACL as a direct VM op;
+    # cluster reachability alone let a vm.backup holder clobber/boot any VM in a reachable cluster.
+    if mode in ('overwrite', 'test'):
+        _is_lxc = '/ct/' in volid or volid.endswith('.lxc.tar') or 'vzdump-lxc' in volid
+        if not user_can_access_vm(user, cluster_id, target_vmid, 'vm.backup', 'lxc' if _is_lxc else 'qemu'):
+            return jsonify({'error': 'Permission denied for target VM'}), 403
+    return None
+
+
+# MK Oct 2026 - several backups restored in one go (core/batch_restore.py). Each backup is
+# checked as the single restore above checks it before any of them starts; the batch asks
+# again before each one whether its starter may still restore it.
+_STORAGE_ID_RE = re.compile(r'[A-Za-z][A-Za-z0-9_.-]{0,63}')
+_VOLID_RE = re.compile(r'(?P<storage>[A-Za-z][A-Za-z0-9_.-]{0,63}):[^\s\x00]{1,400}')
+_SOURCE_RES = (re.compile(r'/(?:vm|ct)/(\d+)/'), re.compile(r'vzdump-(?:qemu|lxc|openvz)-(\d+)-'))
+
+
+def _vmid_arg(value):
+    """A VMID from a request body, None when it is none"""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return None
+    return v if 100 <= v <= 999999999 else None
+
+
+def _batch_items(cluster_id, cm, body):
+    """(rows, storage, None, clash) for the backups of a batch, or (None, None, error response,
+    None). clash is the answer for a VMID another batch or guest has already, or None: the
+    caller gives it only once the backups are checked, so it says nothing about guests
+    beyond them."""
+    from pegaprox.core import batch_restore as batch
+
+    def bad(msg, status=400):
+        return None, None, (jsonify({'error': msg}), status), None
+
+    items = body.get('items')
+    if not isinstance(items, list) or not 1 <= len(items) <= batch.MAX_ITEMS:
+        return bad(f'items lists 1 to {batch.MAX_ITEMS} backups')
+    mode = body['mode']
+    nxt = 100
+    if mode == 'new' and body.get('first_vmid') is not None:
+        nxt = _vmid_arg(body.get('first_vmid'))
+        if nxt is None:
+            return bad('first_vmid is a number from 100 on')
+    picked, storage = [], None
+    for item in items:
+        volid = item.get('volid') if isinstance(item, dict) else None
+        m = _VOLID_RE.fullmatch(volid) if isinstance(volid, str) else None
+        if not m:
+            return bad('Every item names a backup volume (storage:backup/...)')
+        if storage not in (None, m.group('storage')):
+            return bad('The backups of a batch come from one storage')
+        storage = m.group('storage')
+        src = next((r.search(volid) for r in _SOURCE_RES if r.search(volid)), None)
+        if src is None:
+            return bad(f'Cannot tell which guest {volid} belongs to')
+        is_lxc = '/ct/' in volid or volid.endswith('.lxc.tar') or 'vzdump-lxc' in volid or 'vzdump-openvz' in volid
+        want = None
+        if mode == 'new' and item.get('target_vmid') is not None:
+            want = _vmid_arg(item.get('target_vmid'))
+            if want is None:
+                return bad('target_vmid is a number from 100 on')
+        picked.append((volid, int(src.group(1)), 'lxc' if is_lxc else 'qemu', want))
+    if len({p[1] for p in picked}) != len(picked):
+        return bad('One backup per guest: two items restore the same guest')
+    wanted = [p[3] for p in picked if p[3] is not None]
+    if len(set(wanted)) != len(wanted):
+        return bad('Two items name the same target_vmid')
+
+    # the guests as the live view has them: which VMIDs are taken, and where a guest that is
+    # overwritten lives (Proxmox restores over a guest only on its own node). An empty
+    # cluster is fine - a restore after a loss starts from one
+    try:
+        where = {int(g.get('vmid')): g.get('node') for g in (cm.get_vm_resources(max_age=5) or [])
+                 if str(g.get('vmid', '')).isdigit()}
+    except Exception as e:
+        logging.error(f"[PBS] guest list of {cluster_id} unreadable for a batch restore: {e}")
+        return bad('Cannot read the guests of this cluster right now', 503)
+    busy = batch.busy_targets(cluster_id)
+    rows, clash = [], None
+    if mode == 'overwrite':
+        if busy & {p[1] for p in picked}:
+            clash = (jsonify({'error': 'Another batch restore is restoring one of these guests'}), 409)
+        for volid, src, kind, _want in picked:
+            rows.append(batch.new_row(src, kind, volid, src, where.get(src) or body['target_node']))
+            if src not in where:
+                rows[-1]['creates'] = True       # the guest is gone: this makes it anew
+        return rows, storage, None, clash
+    taken = set(where) | busy
+    if taken & set(wanted):
+        clash = (jsonify({'error': 'A target VMID is taken already'}), 409)
+    taken |= set(wanted)
+    for volid, src, kind, want in picked:
+        if want is None:
+            while nxt in taken:
+                nxt += 1
+            want, nxt = nxt, nxt + 1
+            taken.add(want)
+        rows.append(batch.new_row(src, kind, volid, want, body['target_node']))
+    return rows, storage, None, clash
+
+
+@bp.route('/api/clusters/<cluster_id>/backup-restore/batch', methods=['POST'])
+@require_auth(perms=['vm.backup'])
+def restore_backup_batch(cluster_id):
+    """Restore several backups in one go
+
+    Body: {items: [{volid, target_vmid?}], mode: 'new'|'overwrite', target_node,
+    target_storage?, first_vmid?, run: 'sequential'|'parallel', parallel? (2-4), confirm?}.
+    One backup per guest, all from one storage, 1 to 100 of them. 'new' restores each on
+    target_node into a VMID of its own (its target_vmid, else the next free one from
+    first_vmid on). 'overwrite' restores each over the guest it came from, on the node that
+    guest is on (target_node for one that is gone), and only with confirm: true. Every backup
+    is checked as POST /backup-restore checks it before anything starts: one refused and
+    none starts (403, refused names each). Answers 202 {run}, to follow with GET
+    /api/batch-restores/<run_id>.
+    """
+    from pegaprox.core import batch_restore as batch
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.sanitization import validate_hostname
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    cm = cluster_managers[cluster_id]
+    if getattr(cm, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'error': 'Batch restore is for Proxmox VE clusters'}), 400
+    if not cm.is_connected:
+        return jsonify({'error': 'cluster offline'}), 503
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({'error': 'A JSON object is expected'}), 400
+    if body.get('mode') not in batch.MODES:
+        return jsonify({'error': "mode is 'new' or 'overwrite'"}), 400
+    how = body.get('run', 'sequential')
+    if how not in batch.HOW:
+        return jsonify({'error': "run is 'sequential' or 'parallel'"}), 400
+    parallel = 1
+    if how == 'parallel':
+        parallel = body.get('parallel', 2)
+        if isinstance(parallel, bool) or not isinstance(parallel, int) or not 2 <= parallel <= batch.PARALLEL_MAX:
+            return jsonify({'error': f'parallel is a number from 2 to {batch.PARALLEL_MAX}'}), 400
+    if body['mode'] == 'overwrite' and body.get('confirm') is not True:
+        return jsonify({'error': 'Overwriting guests needs confirm: true', 'code': 'CONFIRM_REQUIRED'}), 400
+    target_node = body.get('target_node')
+    if not isinstance(target_node, str) or not validate_hostname(target_node):
+        return jsonify({'error': 'target_node is required'}), 400
+    nodes = cm.get_node_status() or {}
+    tinfo = nodes.get(target_node)
+    if not isinstance(tinfo, dict):
+        return jsonify({'error': f'{target_node} is no node of this cluster'}), 400
+    if tinfo.get('offline') or tinfo.get('status', 'online') != 'online':
+        return jsonify({'error': f'{target_node} is not online'}), 400
+    target_storage = body.get('target_storage') or ''
+    if not isinstance(target_storage, str) or (target_storage and not _STORAGE_ID_RE.fullmatch(target_storage)):
+        return jsonify({'error': 'target_storage is a storage ID'}), 400
+
+    rows, storage, rerr, clash = _batch_items(cluster_id, cm, body)
+    if rerr:
+        return rerr
+
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    refused = []
+    if body['mode'] == 'new' and not acts_as_admin(user):
+        # one node for the whole batch: asked once, it walks the guests of the cluster
+        _nerr = _authz_restore_node(cluster_id, target_node, user)
+        if _nerr:
+            return _nerr
+    for row in rows:
+        # an overwrite of a guest that is gone asks for its node itself
+        r = _restore_refusal(cluster_id, user, row['volid'], row['node'], row['target_vmid'],
+                             body['mode'], node_checked=body['mode'] == 'new')
+        if r:
+            refused.append({'volid': row['volid'], 'vmid': row['vmid'],
+                            'error': (r[0].get_json(silent=True) or {}).get('error') or 'Refused'})
+    if refused:
+        return jsonify({'error': f'{len(refused)} of these backups cannot be restored by you - nothing was started',
+                        'refused': refused}), 403
+    if clash:
+        return clash
+
+    # MK Oct 2026 - the whole batch against the tenant quota before any of it starts, each
+    # item by what its backup brings back: the backup's own config, read 8 at a time, never
+    # the guest it came from as it is now (shrunk since, an old big backup of it went
+    # through). Only where that config cannot be read does the guest stand in for it. Only
+    # for a tenant that has a quota at all
+    def _batch_adds():
+        from pegaprox.core.batch_restore import restore_adds, backup_footprint
+        from pegaprox.utils.concurrent import run_per_node
+        live = {int(g['vmid']): g for g in (cm.get_vm_resources(max_age=30) or [])
+                if str(g.get('vmid', '')).isdigit()}
+        fps = run_per_node({str(i): (lambda _k, r=row: backup_footprint(cm, r['node'], r['volid']))
+                            for i, row in enumerate(rows)}, max_concurrent=8, timeout=120)
+        total = {'vms': 0, 'cores': 0, 'memory_gb': 0.0, 'disk_gb': 0.0}
+        for i, row in enumerate(rows):
+            got = restore_adds(cm, row['node'], row['volid'], row['vmid'], row['target_vmid'],
+                               body['mode'] == 'overwrite', rows=live, footprint=fps.get(str(i)),
+                               read_backup=False)
+            for k in total:
+                total[k] += (got or {}).get(k, 0) or 0
+        return total
+    _qerr, _qwarn = tenant_quota_gate(
+        user, f'batch restore of {len(rows)} backup(s)', _batch_adds, cluster=cm.config.name,
+        hold={'cluster_id': cluster_id, 'vmids': [r['target_vmid'] for r in rows] if body['mode'] == 'new' else []})
+    if _qerr:
+        return _qerr
+
+    usr = request.session.get('user', 'system')
+    from pegaprox.utils.audit import get_client_ip
+    run = batch.BatchRun(cluster_id, cm.config.name, usr, request.session, get_client_ip(), storage,
+                         body['mode'], target_node, target_storage, how, parallel, rows)
+    try:
+        batch.register(run)
+    except batch.TooMany as e:
+        return jsonify({'error': str(e)}), 409
+    listed = ', '.join(f"{r['vmid']}->{r['target_vmid']}" for r in rows[:50]) + (' ...' if len(rows) > 50 else '')
+    log_audit(usr, 'backup.batch_restore',
+              f"Batch restore {run.id} of {len(rows)} backup(s) from {storage} onto {target_node} "
+              f"(mode={body['mode']}, {how}{f' {parallel}' if how == 'parallel' else ''}): {listed}",
+              cluster=cm.config.name)
+    # the quota's hold on the batch lasts while it runs; what it restored is counted by then
+    from pegaprox.api.helpers import quota_hold_alive
+    quota_hold_alive(alive=lambda: run.state == 'running')
+    batch.launch(run)
+    return jsonify({'run': run.view(run.rows_copy(), me=usr),
+                    **({'quota_warning': _qwarn} if _qwarn else {})}), 202
+
+
+def _batch_view(run, with_rows=True):
+    """The batch as the caller may see it, None when they may see none of it: the cluster
+    out of their reach, or not one of its guests theirs to see"""
+    if run is None:
+        return None
+    ok, _err = check_cluster_access(run.cluster_id)
+    if not ok:
+        return None
+    rows = scope_vm_rows(run.cluster_id, run.rows_copy())
+    if not rows:
+        return None
+    return run.view(rows, with_rows=with_rows, me=request.session.get('user', ''))
+
+
+def _may_cancel_batch(run):
+    """Who started it, or a caller with vm.backup on the whole cluster"""
+    if request.session.get('user') == run.user:
+        return True
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import has_permission
+    from pegaprox.api.helpers import caller_is_scoped
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    return has_permission(user, 'vm.backup') and not caller_is_scoped(user, run.cluster_id)
+
+
+@bp.route('/api/batch-restores', methods=['GET'])
+@require_auth(perms=['backup.view'])
+def list_batch_restores():
+    """Batch restores of the last hour
+
+    The batches on the clusters the caller reaches, newest first, with their counts and
+    without the backups. A batch counts only the guests the caller may see. They run in
+    the process of the active instance: a restart ends them."""
+    from pegaprox.core import batch_restore as batch
+    out = []
+    for run in batch.runs():
+        view = _batch_view(run, with_rows=False)
+        if view:
+            out.append(view)
+    return jsonify({'runs': out})
+
+
+@bp.route('/api/batch-restores/<run_id>', methods=['GET'])
+@require_auth(perms=['backup.view'])
+def get_batch_restore(run_id):
+    """One batch restore, a line per backup
+
+    Each with its state (wait, restoring, done, failed, skipped, cancelled, unknown), a
+    note, its task and the VMID it restores into; may_cancel says whether the caller may
+    cancel the rest."""
+    from pegaprox.core import batch_restore as batch
+    run = batch.get(run_id)
+    view = _batch_view(run)
+    if not view:
+        return jsonify({'error': 'Batch restore not found'}), 404
+    view['may_cancel'] = view['state'] == 'running' and not view['cancelled_by'] and _may_cancel_batch(run)
+    return jsonify({'run': view})
+
+
+@bp.route('/api/batch-restores/<run_id>/cancel', methods=['POST'])
+@require_auth(perms=['vm.backup'])
+def cancel_batch_restore(run_id):
+    """Cancel the rest of a batch restore
+
+    No further backup is restored. What is restoring finishes in Proxmox."""
+    from pegaprox.core import batch_restore as batch
+    run = batch.get(run_id)
+    if not _batch_view(run, with_rows=False):
+        return jsonify({'error': 'Batch restore not found'}), 404
+    if not _may_cancel_batch(run):
+        return jsonify({'error': 'Only who started it, or someone who restores on the whole '
+                                 'cluster, cancels a batch restore'}), 403
+    usr = request.session.get('user', 'system')
+    if not batch.cancel(run, usr):
+        return jsonify({'error': 'This batch restore is over'}), 409
+    waiting = sum(1 for r in run.rows_copy() if r['state'] == batch.WAITING)
+    log_audit(usr, 'backup.batch_restore_cancelled',
+              f"Batch restore {run.id} (started by {run.user}): {waiting} backup(s) not started",
+              cluster=run.cluster_name)
+    view = _batch_view(run) or {}
+    view['may_cancel'] = False
+    return jsonify({'run': view})
 
 
 @bp.route('/api/pbs/<pbs_id>/backup-diff', methods=['GET'])
@@ -3922,6 +5003,19 @@ def diff_pbs_backups(pbs_id):
 # ============================================================================
 # Verify auto-schedule — global setting + worker hook
 # ============================================================================
+def _confined_anywhere():
+    """Whether the caller is held to part of any cluster, or to some clusters only. The
+    weekly run restores and boots guests on every cluster."""
+    from pegaprox.api.helpers import caller_is_scoped
+    from pegaprox.utils.rbac import get_user_clusters
+    user = _caller()
+    if acts_as_admin(user):
+        return False
+    if get_user_clusters(user) is not None:
+        return True
+    return any(caller_is_scoped(user, cid) for cid in list(cluster_managers))
+
+
 @bp.route('/api/pbs/verify-schedule', methods=['GET', 'PUT'])
 @require_auth(perms=['pbs.config'])
 def verify_schedule_config():
@@ -3929,37 +5023,65 @@ def verify_schedule_config():
 
     Schema (in pegaprox config row 'pbs_verify_schedule'):
       {"enabled": bool, "weekly_count": int, "day": "sun", "hour": 4,
-       "scope": "all"|"latest_per_vm", "max_age_days": int}
+       "scope": "all"|"latest_per_vm", "max_age_days": int, "max_backup_gb": int,
+       "confirmed_at": epoch|null}
+
+    MK Oct 2026 - background/restore_tests.py runs it now; until then nothing read it. A
+    PUT takes what it sends on top of what is stored and answers 400 for a field out of
+    range (an int() of a word was a 500). max_backup_gb (1-2048, 32 where a stored policy
+    has none) is the largest backup the run restores. "confirmed": true with the run on
+    is the dialog's yes to real restores; confirmed_at keeps it until the run is off.
     """
-    db = get_db()
-    cur = db.conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS pegaprox_kv (k TEXT PRIMARY KEY, v TEXT)")
-    db.conn.commit()
+    from pegaprox.core import recovery
     if request.method == 'GET':
-        row = cur.execute("SELECT v FROM pegaprox_kv WHERE k=?",
-                          ('pbs_verify_schedule',)).fetchone()
-        import json as _j
-        if row and row['v']:
-            return jsonify(_j.loads(row['v']))
-        return jsonify({'enabled': False, 'weekly_count': 5, 'day': 'sun',
-                        'hour': 4, 'scope': 'latest_per_vm', 'max_age_days': 30})
+        return jsonify(recovery.load_schedule())
     # PUT
-    body = request.json or {}
-    cleaned = {
-        'enabled': bool(body.get('enabled')),
-        'weekly_count': max(1, min(50, int(body.get('weekly_count') or 5))),
-        'day': body.get('day') if body.get('day') in ('mon','tue','wed','thu','fri','sat','sun') else 'sun',
-        'hour': max(0, min(23, int(body.get('hour') or 4))),
-        'scope': body.get('scope') if body.get('scope') in ('all', 'latest_per_vm') else 'latest_per_vm',
-        'max_age_days': max(1, min(365, int(body.get('max_age_days') or 30))),
-    }
-    import json as _j
-    cur.execute("INSERT OR REPLACE INTO pegaprox_kv (k, v) VALUES (?, ?)",
-                ('pbs_verify_schedule', _j.dumps(cleaned)))
-    db.conn.commit()
+    if _confined_anywhere():
+        return jsonify({'error': 'The restore test schedule runs on every cluster - only a caller '
+                                 'confined to none of them sets it'}), 403
+    before = recovery.load_schedule()
+    cleaned, bad = recovery.clean_schedule(request.get_json(silent=True), before)
+    if bad:
+        return jsonify({'error': bad}), 400
+    recovery.save_schedule(cleaned, before)
+    yes = cleaned['confirmed_at'] and cleaned['confirmed_at'] != before.get('confirmed_at')
     log_audit(request.session.get('user', 'system'), 'pbs.verify_schedule_updated',
-              f"Auto-verify schedule: {cleaned}")
+              f"Auto-verify schedule: {cleaned}" + (' - real restores confirmed' if yes else ''))
     return jsonify(cleaned)
+
+
+@bp.route('/api/pbs/verify-schedule/status', methods=['GET'])
+@require_auth(perms=['backup.view'])
+def verify_schedule_status():
+    """The policy, when it runs next (on the group's clock), whether a run is going on, and
+    the last run with what it picked and how each test went: the guests of the clusters
+    and pools the caller sees only."""
+    from pegaprox.background import restore_tests
+    from pegaprox.utils.rbac import user_can_access_vm
+    view = restore_tests.status_view()
+    last = view.get('last_run')
+    if last:
+        user, reach = _caller(), {}
+
+        def visible(item):
+            cid = item.get('cluster_id')
+            if cid not in reach:
+                reach[cid] = check_cluster_access(cid)[0]
+            try:
+                return reach[cid] and user_can_access_vm(user, cid, int(item.get('vmid')), 'vm.view')
+            except (TypeError, ValueError):
+                return False
+        last = dict(last)
+        last['picked'] = [p for p in last.get('picked') or [] if visible(p)]
+        last['results'] = [r for r in last.get('results') or [] if visible(r)]
+        last['counts'] = {
+            'picked': len(last['picked']),
+            'passed': sum(1 for r in last['results'] if r.get('status') == 'passed'),
+            'failed': sum(1 for r in last['results'] if r.get('status') in ('failed', 'error')),
+            'skipped': sum(1 for r in last['results'] if r.get('status') == 'skipped'),
+        }
+        view['last_run'] = last
+    return jsonify(view)
 
 
 @bp.route('/api/pbs/encryption-key/generate', methods=['POST'])

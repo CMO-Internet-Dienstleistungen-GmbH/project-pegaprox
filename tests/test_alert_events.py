@@ -739,13 +739,14 @@ def test_a_metric_rule_that_asks_hears_its_incident_is_over(db, sent, monkeypatc
 # --- patterns --------------------------------------------------------------------------
 
 @pytest.mark.parametrize('pattern', ['vzdump', 'qm.*|vz.*', '.*error.*', 'job errors|unexpected',
-                                     '^vz(dump|migrate)$', '(?:qm)?start', '[a-z]+ failed'])
+                                     '^vz(dump|migrate)$', '(?:qm)?start', '[a-z]+ failed',
+                                     'vz(dump|restore)?', '(OK|WARNINGS)?', '(qm|vz)?(start|stop)'])
 def test_patterns_people_write_are_taken(pattern):
     assert E.check_pattern(pattern)
 
 
 @pytest.mark.parametrize('pattern', ['(a+)+b', '(ab|cd)*', r'(a)\1', '.*.*.*x', '(x*y)*', '[', 'a' * 121,
-                                     '(?:a|aa)+$'])
+                                     '(?:a|aa)+$', '.?' * 20 + 'Z', '.*x?.*', '(ab?)+'])
 def test_patterns_that_can_hold_up_the_loop_are_refused(pattern):
     with pytest.raises(ValueError):
         E.check_pattern(pattern)
@@ -761,6 +762,34 @@ def test_what_is_refused_would_really_take_long_and_what_is_taken_does_not():
     t = time.monotonic()
     ok.search('a' * E.SUBJECT_MAX)
     assert time.monotonic() - t < 0.05
+
+
+def test_optional_parts_count_as_repeats():
+    import re
+    # a run of optional parts backtracks too: each one doubles the ways to fail
+    slow = re.compile('.?' * 18 + 'Z')
+    t = time.monotonic()
+    slow.search("can't lock file '/var/lock/qemu-server/lock-101.conf' - got timeout")
+    assert time.monotonic() - t > 0.05, 'the counterproof pattern got fast - pick another'
+    assert E.check_pattern('colou?r .*failed')
+    assert E.check_pattern('x{3}.*y')
+
+
+@pytest.mark.parametrize('pattern', ['(.*a){10}', '(a|aa){25}', r'(\w+\s?){12}Z', '(?:x?){20}Z'])
+def test_a_fixed_count_of_a_part_that_varies_is_refused(pattern):
+    # {n} is no choice of its own, but the part it repeats chooses n times over
+    with pytest.raises(ValueError):
+        E.check_pattern(pattern)
+
+
+def test_a_fixed_count_of_a_plain_part_is_taken_and_the_refused_ones_are_slow():
+    import re
+    for slow, subject in (('(.*a){10}Z', 'a' * 28), ('(a|aa){25}Z', 'a' * 36)):
+        t = time.monotonic()
+        re.search(slow, subject)
+        assert time.monotonic() - t > 0.05, f'the counterproof {slow} got fast - pick another'
+    for pattern in (r'UPID:\w+:[0-9A-F]{8}', r'\d{4}-\d{2}', '(ab){3}', '(vz(dump|restore)){1}', 'x{3}.*y'):
+        assert E.check_pattern(pattern), pattern
 
 
 # --- the routes ------------------------------------------------------------------------
@@ -994,6 +1023,21 @@ def test_a_confined_caller_sees_only_mutes_of_guests_it_sees(routes, monkeypatch
     keys = sorted((m['rule_id'], m['object_key']) for m in c.get('/api/clusters/c1/alert-mutes').get_json()['mutes'])
     assert keys == [('', 'vm:101'), ('r1', '')]
     # counterproof: the admin sees all four
+    assert len(routes.admin.get('/api/clusters/c1/alert-mutes').get_json()['mutes']) == 4
+
+
+def test_a_confined_caller_sees_no_mute_of_a_node_object(routes, monkeypatch, db):
+    _store(monkeypatch, [_rule()])
+    _mute(db, object_key='vm:101')
+    _mute(db, object_key='node:pve2')
+    _mute(db, object_key='task:pve2:aptupdate:')
+    _mute(db, object_key='zfs:pve2:tank')
+    from pegaprox.utils import rbac
+    monkeypatch.setattr(rbac, 'user_can_access_vm', lambda u, cid, vmid, perm='vm.view', vt=None: int(vmid) == 101)
+    c = _who(routes, 'pool_confined')
+    keys = [m['object_key'] for m in c.get('/api/clusters/c1/alert-mutes').get_json()['mutes']]
+    assert keys == ['vm:101']
+    # counterproof: the admin sees the node objects too
     assert len(routes.admin.get('/api/clusters/c1/alert-mutes').get_json()['mutes']) == 4
 
 

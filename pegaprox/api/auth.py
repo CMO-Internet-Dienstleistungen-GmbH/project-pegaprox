@@ -35,9 +35,10 @@ from pegaprox.utils.ldap import (get_ldap_settings, ldap_authenticate, ldap_prov
                                  ldap_build_user_row, LDAP_AUTH_SOURCES)
 from pegaprox.utils.oidc import (
     get_oidc_settings, get_oidc_endpoints, oidc_build_auth_url,
-    oidc_exchange_code, oidc_decode_id_token, oidc_get_user_info,
+    oidc_exchange_code, oidc_decode_id_token, oidc_get_user_info, oidc_name_from_id_token,
     oidc_get_user_groups, oidc_get_user_groups_ex, oidc_map_groups_to_role, oidc_provision_user,
-    oidc_derive_username, oidc_build_user_row, OIDC_AUTH_SOURCES,
+    oidc_derive_username, oidc_build_user_row, OIDC_AUTH_SOURCES, oidc_username_claim_value,
+    oidc_username_claim_refusal, oidc_id_token_verified,
 )
 from pegaprox.utils.rbac import get_user_permissions, DEFAULT_TENANT_ID
 from pegaprox.api.helpers import load_server_settings, save_server_settings, get_login_settings, get_session_timeout, safe_error, effective_reverse_proxy
@@ -202,13 +203,72 @@ def oidc_callback():
             return jsonify({'error': f"Authentication failed - {id_claims['error']}"}), 401
     
     # Step 3: Get user info from provider
-    user_info = oidc_get_user_info(config, access_token)
-    if not user_info:
+    userinfo_answer = oidc_get_user_info(config, access_token)
+    if userinfo_answer and not isinstance(userinfo_answer, dict):
+        logging.warning("[OIDC] The userinfo endpoint answered with something other than an "
+                        "object - ignored")
+        userinfo_answer = None
+    if not userinfo_answer:
         # MK: Fallback to ID token claims
         user_info = id_claims
+    else:
+        # MK Oct 2026 (#1141) - a userinfo answer without a name takes it from the
+        # signature-checked ID token, so the account is not keyed on the sub
+        user_info = oidc_name_from_id_token(userinfo_answer, id_claims)
     
     if not user_info or not (user_info.get('preferred_username') or user_info.get('email') or user_info.get('sub')):
         return jsonify({'error': 'Could not retrieve user information from provider'}), 401
+
+    # NS Oct 2026 (#1149) - the claim the admin picked names the account, or the sign-in
+    # stops here: no quiet fallback to another naming scheme
+    claim = config.get('username_claim') or ''
+    picked_name = None
+    subjects = None
+    unmatched = None
+    if claim:
+        unmatched = 'This sign-in could not be matched to a PegaProx account. Contact an administrator.'
+        no_claim = jsonify({'error': f"This sign-in carries no usable '{claim}' claim. Ask an "
+                                     f"administrator to check the OIDC settings and the claims "
+                                     f"the identity provider issues."}), 401
+        entra = config.get('provider') == 'entra'
+        if claim == 'email' and (entra or (oidc_id_token_verified(id_claims) and id_claims.get('tid'))):
+            # what the settings refuse too: Entra's email is the unverified mail attribute. An
+            # Entra tenant set up as a generic provider is told by the tenant id in its token.
+            logging.warning("[OIDC] Sign-in refused: email cannot name Entra accounts")
+            return no_claim
+
+        def _sid(value):
+            return value if isinstance(value, str) and value else None
+
+        verified = oidc_id_token_verified(id_claims)
+        token_ids = set()
+        if verified:
+            token_ids = {_sid(id_claims.get('sub'))}
+            if entra:
+                token_ids.add(_sid(id_claims.get('oid')))   # the id Graph /me answers with
+            token_ids.discard(None)
+        subject_info = userinfo_answer
+        if isinstance(subject_info, dict) and verified and (
+                set(subject_info) <= {'sub'} or (entra and not _sid(id_claims.get('oid')))):
+            # AD FS answers userinfo with a sub and nothing else, and that sub need not be the
+            # token's: an answer like that says nothing about the user. An Entra token without
+            # an oid cannot be tied to a Graph answer either. Either way the signature-checked
+            # ID token is the identity, its sub included.
+            subject_info = None
+            user_info = dict(id_claims)
+        elif isinstance(subject_info, dict) and verified and _sid(subject_info.get('sub')) not in token_ids:
+            logging.warning("[OIDC] Sign-in refused: the userinfo answer is about another subject "
+                            "than the verified ID token")
+            return no_claim
+        if not _sid(user_info.get('sub')):
+            logging.warning("[OIDC] Sign-in refused: the sign-in carries no usable subject id")
+            return no_claim
+        picked_name = oidc_username_claim_value(subject_info, id_claims, claim)
+        if picked_name is None:
+            logging.warning(f"[OIDC] Sign-in refused: no usable '{claim}' claim - "
+                            f"{oidc_username_claim_refusal(subject_info, id_claims, claim)}")
+            return no_claim
+        subjects = token_ids | {user_info.get('sub')}
     
     # Step 4: Get group memberships for role mapping
     # NS Sep 2026 - _ex also reports whether the group set is complete. That decides
@@ -223,9 +283,9 @@ def oidc_callback():
         # MK: this has to match the logic in oidc_provision_user or we get mismatches
         # (had a bug where "john.doe" here vs "johndoe" in provision caused 403s)
         users = load_users()
-        check_username = oidc_derive_username(user_info, users)
+        check_username = oidc_derive_username(user_info, users, name=picked_name)
         if check_username not in users:
-            return jsonify({'error': 'User account does not exist. Contact an administrator.'}), 403
+            return jsonify({'error': unmatched or 'User account does not exist. Contact an administrator.'}), 403
     
     # Determine auth_source label
     provider = config.get('provider', 'oidc')
@@ -240,11 +300,21 @@ def oidc_callback():
         # sign-in goes through only when the account is here already and the identity
         # provider says what the synced row says. A serving member is a standby too.
         users = load_users()
-        built = oidc_build_user_row(user_info, role_mapping, auth_source, users)
+        built = oidc_build_user_row(user_info, role_mapping, auth_source, users, name=picked_name,
+                                    subjects=subjects)
         user = None  # another source owns the name: the answer below, as on the active
+        if built is None and claim:
+            # NS Oct 2026 (#1149) - with a picked claim a name held by another subject, or one
+            # with no subject stored, answers like a missing account: a standby writes nothing,
+            # so a different answer would let anyone probe which names are taken unseen
+            logging.warning("[OIDC] A sign-in on a standby names an account it may not use "
+                            "(another subject's, or none stored) - answered like a missing one")
+            if not config['auto_create_users']:
+                return jsonify({'error': unmatched}), 403   # what a missing name got above
+            built = (oidc_derive_username(user_info, users, name=picked_name) or '', None)
         if built is not None:
             username, would_be = built
-            row = users.get(username)
+            row = users.get(username) if would_be is not None else None
             if not isinstance(row, dict):
                 logging.warning(f"[OIDC] '{username}' signs in on a standby that does not "
                                 f"hold the account yet - refused")
@@ -266,11 +336,12 @@ def oidc_callback():
             user = {**row, 'username': username}
             logging.info(f"[OIDC] User '{username}' authenticated via {provider} from {client_ip} (standby, synced row)")
     else:
-        user = oidc_provision_user(user_info, role_mapping, auth_source=auth_source)
+        user = oidc_provision_user(user_info, role_mapping, auth_source=auth_source, name=picked_name,
+                                   subjects=subjects)
     
     # NS: SECURITY - oidc_provision_user returns None if local account would be overwritten
     if not user:
-        return jsonify({'error': 'A local account with this username already exists. Contact an administrator.'}), 403
+        return jsonify({'error': unmatched or 'A local account with this username already exists. Contact an administrator.'}), 403
     
     username = user.get('username', '')
     
@@ -1179,7 +1250,7 @@ def list_own_sessions():
     session_id = request.headers.get('X-Session-ID') or request.cookies.get('session_id')
     current = validate_session(session_id)
     if not current:
-        return jsonify({'error': 'not authenticated'}), 401
+        return jsonify({'error': 'not authenticated', 'code': 'AUTH_REQUIRED'}), 401
     from pegaprox.utils.auth import active_sessions, sessions_lock
     username = current['user']
     out = []
@@ -1211,7 +1282,7 @@ def revoke_own_session(token):
     session_id = request.headers.get('X-Session-ID') or request.cookies.get('session_id')
     current = validate_session(session_id)
     if not current:
-        return jsonify({'error': 'not authenticated'}), 401
+        return jsonify({'error': 'not authenticated', 'code': 'AUTH_REQUIRED'}), 401
     from pegaprox.utils.auth import active_sessions, sessions_lock
     import hmac as _hmac
     username = current['user']
@@ -1467,11 +1538,11 @@ def get_cluster_creds_internal(cluster_id):
     session_id = request.cookies.get('session') or request.cookies.get('session_id')
     
     if not session_id:
-        return jsonify({'error': 'No session'}), 401
+        return jsonify({'error': 'No session', 'code': 'AUTH_REQUIRED'}), 401
     
     session = validate_session(session_id)
     if not session:
-        return jsonify({'error': 'Invalid session'}), 401
+        return jsonify({'error': 'Invalid session', 'code': 'INVALID_SESSION'}), 401
 
     # MK May 2026 - check_cluster_access reads request.session['user'], which
     # @require_auth normally sets. This endpoint does its own cookie-based session
@@ -1541,7 +1612,12 @@ def get_cluster_creds_internal(cluster_id):
             for n in nodes:
                 nname = n.get('node', '')
                 if nname:
-                    ip = mgr._get_host_ip(nname)
+                    # #1143 - not _get_host_ip, which answers the pool's own host for a
+                    # host it cannot find: the shell of that node would open there
+                    ip = mgr.member_node_ip(nname)
+                    if not ip:
+                        logging.warning(f"[CLUSTER-CREDS] no address for XCP-ng node {nname}")
+                        continue
                     node_ips[nname] = ip
                     node_ips[nname.lower()] = ip
                     logging.info(f"[CLUSTER-CREDS] XCP-ng node {nname} ip={ip}")

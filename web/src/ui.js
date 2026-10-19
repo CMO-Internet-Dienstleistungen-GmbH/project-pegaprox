@@ -420,12 +420,158 @@
             return new Date(ts * 1000).toLocaleString();
         };
 
+        // LW Oct 2026 - a time range is picked by dragging along a chart. The charts of one
+        // view share a zoom (useChartZoom, handed down through ChartZoomContext): a range
+        // picked on one of them zooms all of them, and where the loaded preset has only a
+        // few points in it the view loads finer data. No zoom plugin, LineChart draws the band
+        const ChartZoomContext = React.createContext(null);
+        const CHART_PRESET_SECONDS = { hour: 3600, day: 86400, week: 7 * 86400, month: 30 * 86400, year: 365 * 86400 };
+        // with fewer points than this in a picked range the view looks for finer data
+        const ZOOM_ENOUGH_POINTS = 40;
+        // what PegaProx stores itself: a snapshot every 5 minutes, 200 a range at most (metrics.py)
+        const HISTORY_STEP = 300;
+        const HISTORY_ROWS = 200;
+
+        // the samples of `key` in from..to, -1 where src has no such series
+        function zoomPoints(src, key, from, to) {
+            const ts = src && src.timestamps;
+            const vals = src && src.metrics && src.metrics[key];
+            if (!Array.isArray(ts) || !Array.isArray(vals) || vals.length !== ts.length) return -1;
+            let n = 0;
+            for (let i = 0; i < ts.length; i++) {
+                if (ts[i] >= from && ts[i] <= to && typeof vals[i] === 'number') n++;
+            }
+            return n;
+        }
+
+        // The zoom of one view's charts. loaded is what the preset brought ({timestamps,
+        // metrics}). A picked range with few of its points in it brings the finest preset
+        // that still reaches back to it (loadPreset), and where that is sparse too the
+        // snapshots PegaProx keeps (loadRange, CPU and memory). Each chart then takes the
+        // source with the most samples in the range: series(key), or source(...keys) for
+        // a chart of several series that have to share their timestamps.
+        function useChartZoom({ preset, loaded, loadPreset, loadRange, resetKey }) {
+            const [range, setRange] = useState(null);
+            const [finer, setFiner] = useState([]);
+            const [busy, setBusy] = useState(false);
+            const seqRef = useRef(0);
+            const cacheRef = useRef({});
+            const live = useRef({});
+            live.current = { preset, loaded, loadPreset, loadRange };
+
+            const reset = useCallback(() => {
+                seqRef.current++;
+                cacheRef.current = {};
+                setRange(null);
+                setFiner(f => f.length ? [] : f);
+                setBusy(false);
+            }, []);
+            // another preset, guest or node starts with the whole of it
+            useEffect(reset, [preset, resetKey]);
+
+            const select = useCallback(async (from, to) => {
+                const seq = ++seqRef.current;
+                const cur = live.current;
+                setRange({ from, to });
+                setFiner([]);
+                let best = zoomPoints(cur.loaded, 'cpu', from, to);
+                if (best >= ZOOM_ENOUGH_POINTS) { setBusy(false); return; }
+                const names = Object.keys(CHART_PRESET_SECONDS);
+                const now = Date.now() / 1000;
+                const tf = cur.loadPreset && names.slice(0, names.indexOf(cur.preset))
+                    .find(n => from >= now - CHART_PRESET_SECONDS[n]);
+                const got = [];
+                setBusy(true);
+                try {
+                    if (tf) {
+                        if (!cacheRef.current[tf]) cacheRef.current[tf] = Promise.resolve(cur.loadPreset(tf)).catch(() => null);
+                        const d = await cacheRef.current[tf];
+                        if (seq !== seqRef.current) return;
+                        const n = zoomPoints(d, 'cpu', from, to);
+                        if (n > best) { got.push(d); best = n; }
+                    }
+                    if (cur.loadRange && best < ZOOM_ENOUGH_POINTS && to - from >= 2 * HISTORY_STEP
+                            && Math.min((to - from) / HISTORY_STEP, HISTORY_ROWS) > best * 1.5) {
+                        const d = await Promise.resolve(cur.loadRange(from, to)).catch(() => null);
+                        if (seq !== seqRef.current) return;
+                        if (zoomPoints(d, 'cpu', from, to) > best) got.push(d);
+                    }
+                } finally {
+                    if (seq === seqRef.current) { setFiner(got); setBusy(false); }
+                }
+            }, []);
+
+            const source = useCallback((...keys) => {
+                const base = loaded && loaded.metrics ? loaded : { metrics: {} };
+                if (!range || !finer.length) return base;
+                let pick = base, n = zoomPoints(loaded, keys[0], range.from, range.to);
+                for (const d of finer) {
+                    if (!keys.every(k => d && d.metrics && Array.isArray(d.metrics[k]))) continue;
+                    const m = zoomPoints(d, keys[0], range.from, range.to);
+                    if (m > n) { pick = d; n = m; }
+                }
+                return pick;
+            }, [loaded, finer, range]);
+            const series = useCallback(key => {
+                const s = source(key);
+                return { data: s.metrics ? s.metrics[key] : undefined, timestamps: s.timestamps };
+            }, [source]);
+
+            return useMemo(() => ({
+                range, busy, select, reset, source, series,
+                fromHistory: finer.some(d => d && d.source === 'history'),
+            }), [range, busy, select, reset, source, series, finer]);
+        }
+
+        // what a zoom shows beside the preset picker: the range and the way back to the preset
+        function ChartZoomBar({ zoom }) {
+            const { t } = useTranslation();
+            const { isCorporate } = useLayout();
+            if (!zoom) return null;
+            const muted = isCorporate ? { color: 'var(--corp-text-muted)' } : undefined;
+            if (!zoom.range) {
+                return <span className="hidden md:inline-flex text-xs text-gray-500 whitespace-nowrap" style={muted}>{t('chartDragToZoom')}</span>;
+            }
+            const { from, to } = zoom.range;
+            const dated = to - from > 86400 || new Date(from * 1000).toDateString() !== new Date().toDateString();
+            const fmt = s => fmtClock(s, dated ? { month: 'short', day: 'numeric' } : null);
+            return (
+                <span className="flex items-center gap-2 text-xs whitespace-nowrap" data-chart-zoom="">
+                    <span className="flex items-center gap-1 text-gray-300" style={isCorporate ? { color: 'var(--corp-text-secondary)' } : undefined}>
+                        <Icons.ZoomIn className="w-3.5 h-3.5" />
+                        <span className="font-mono" data-chart-zoom-range="">{fmt(from)} - {fmt(to)}</span>
+                    </span>
+                    {zoom.busy && <span title={t('chartLoadingFiner')} className="text-gray-400" style={muted}><Icons.RotateCw /></span>}
+                    {zoom.fromHistory && !zoom.busy && (
+                        <span className="hidden md:inline-flex text-gray-500" style={muted} data-chart-zoom-history="">{t('chartZoomFromHistory')}</span>
+                    )}
+                    <button type="button" onClick={zoom.reset} data-chart-zoom-reset=""
+                        className={isCorporate ? 'flex items-center gap-1 px-2 py-0.5 text-[11px]'
+                            : 'flex items-center gap-1 px-2 py-1 rounded-lg bg-proxmox-dark border border-proxmox-border text-gray-300 hover:text-white'}
+                        style={isCorporate ? { color: 'var(--corp-text-secondary)', border: '1px solid var(--corp-border-medium)' } : undefined}>
+                        <Icons.ZoomOut className="w-3.5 h-3.5" />{t('resetZoom')}
+                    </button>
+                </span>
+            );
+        }
+
         // Chart.js line chart component - uses canvas for interactive charts
         const LineChart = React.memo(function LineChart({ data, datasets, timestamps, label, color, unit, formatValue, yMin, yMax }) {
+            const { t } = useTranslation();
             const canvasRef = React.useRef(null);
             const chartRef = React.useRef(null);
             const formatRef = React.useRef(formatValue);
             formatRef.current = formatValue;
+            // the view's zoom, or this chart's own where it stands alone
+            const zoom = React.useContext(ChartZoomContext);
+            const [ownRange, setOwnRange] = React.useState(null);
+            const range = zoom ? zoom.range : ownRange;
+            const selectRef = React.useRef(null);
+            selectRef.current = zoom ? zoom.select : (from, to) => setOwnRange({ from, to });
+            React.useEffect(() => { setOwnRange(null); }, [timestamps]);
+            // the time of each drawn point, and the drag in progress ({x0, x1} in canvas pixels)
+            const shownTsRef = React.useRef(null);
+            const bandRef = React.useRef(null);
 
             // Normalize input to array of datasets
             const chartDatasets = React.useMemo(() => {
@@ -435,15 +581,19 @@
             }, [data, datasets, label, color]);
 
             // Stable fingerprint of data to avoid re-creating chart on parent re-renders
+            // (with the span of the timestamps: a finer source can start with the same values)
             const dataFingerprint = React.useMemo(() => {
                 if (chartDatasets.length === 0) return '';
+                const span = timestamps && timestamps.length
+                    ? timestamps.length + '@' + timestamps[0] + '-' + timestamps[timestamps.length - 1] : '';
                 // Simple fingerprint: length + first + middle + last values of all datasets
-                return chartDatasets.map(ds => {
+                return span + '|' + chartDatasets.map(ds => {
                     const d = ds.data;
                     if (!d || d.length === 0) return '0';
-                    return d.length + ':' + (d[0] || 0) + ':' + (d[Math.floor(d.length/2)] || 0) + ':' + (d[d.length-1] || 0);
+                    return d.length + ':' + d[0] + ':' + d[Math.floor(d.length/2)] + ':' + d[d.length-1];
                 }).join('|');
-            }, [chartDatasets]);
+            }, [chartDatasets, timestamps]);
+            const rangeKey = range ? range.from + '-' + range.to : '';
 
             // Cleanup on unmount
             React.useEffect(() => {
@@ -464,6 +614,7 @@
                     chartRef.current.destroy();
                     chartRef.current = null;
                 }
+                shownTsRef.current = null;
 
                 if (chartDatasets.length === 0) return;
 
@@ -472,20 +623,36 @@
                 let finalLabels = [];
 
                 // Determine timestamps/labels from first valid dataset or timestamps prop
-                const rawLength = (chartDatasets[0] && chartDatasets[0].data) ? chartDatasets[0].data.length : 0;
-                if (rawLength === 0) return;
+                const fullLength = (chartDatasets[0] && chartDatasets[0].data) ? chartDatasets[0].data.length : 0;
+                if (fullLength === 0) return;
+
+                // zoomed: only the samples in the range go on from here. A range that falls
+                // between two samples keeps the neighbours, so there is still a line to see
+                const hasTs = timestamps && timestamps.length === fullLength;
+                let lo = 0, hi = fullLength - 1;
+                if (range && hasTs) {
+                    while (lo < fullLength && timestamps[lo] < range.from) lo++;
+                    while (hi >= 0 && timestamps[hi] > range.to) hi--;
+                    if (hi - lo < 1) {
+                        const a = Math.min(lo, hi), b = Math.max(lo, hi), pad = a === b ? 1 : 0;
+                        lo = Math.max(0, a - pad);
+                        hi = Math.min(fullLength - 1, b + pad);
+                    }
+                }
+                const rawLength = hi - lo + 1;
+                const ts = hasTs ? timestamps.slice(lo, hi + 1) : null;
 
                 // Build raw labels first
                 const rawLabels = [];
-                if (timestamps && timestamps.length === rawLength) {
+                if (ts) {
                     // #231: auto-detect span to choose label format
-                    const span = timestamps[timestamps.length - 1] - timestamps[0];
+                    const span = ts[ts.length - 1] - ts[0];
                     const useDateOnly = span > 86400 * 14;  // > 2 weeks
                     const useDate = span > 86400 * 2;        // > 2 days
                     // LW Oct 2026 - the time through fmtClock: browser time, and the 12h/24h
                     // setting the rest of the UI keeps (the locale's default ignored it)
-                    for (let i = 0; i < timestamps.length; i++) {
-                        const d = new Date(timestamps[i] * 1000);
+                    for (let i = 0; i < ts.length; i++) {
+                        const d = new Date(ts[i] * 1000);
                         if (useDateOnly) {
                             rawLabels.push(d.toLocaleDateString([], { month: 'short', day: 'numeric' }));
                         } else if (useDate) {
@@ -511,24 +678,35 @@
                 } else {
                     finalLabels = rawLabels;
                 }
+                if (ts) {
+                    const shown = [];
+                    for (let i = 0; i < rawLength; i += step) shown.push(ts[i]);
+                    shownTsRef.current = shown;
+                }
 
                 // Process each dataset
+                // LW Oct 2026 - a slot without a sample (null, undefined, NaN) stays null and
+                // the line breaks there: it used to be drawn as a measured 0. A bucket of the
+                // decimation takes its first real value, a sample between two gaps gets a dot
                 chartDatasets.forEach(ds => {
                     if (!ds.data || ds.data.length === 0) return;
                     const cleanData = [];
-                    for (let i = 0; i < ds.data.length; i++) {
+                    for (let i = lo; i <= hi && i < ds.data.length; i++) {
                         const v = ds.data[i];
-                        cleanData.push((v === null || v === undefined || v !== v) ? 0 : v);
+                        cleanData.push((typeof v === 'number' && isFinite(v)) ? v : null);
                     }
 
                     let finalData = [];
                     if (step > 1) {
                         for (let i = 0; i < cleanData.length; i += step) {
-                            finalData.push(cleanData[i]);
+                            let v = null;
+                            for (let j = i; j < Math.min(i + step, cleanData.length) && v === null; j++) v = cleanData[j];
+                            finalData.push(v);
                         }
                     } else {
                         finalData = cleanData;
                     }
+                    const lone = finalData.map((v, i) => v !== null && (i === 0 || finalData[i - 1] === null) && (i === finalData.length - 1 || finalData[i + 1] === null));
 
                     processedDatasets.push({
                         label: ds.label || label,
@@ -536,8 +714,10 @@
                         borderColor: ds.color || color,
                         backgroundColor: (ds.color || color) + '33',
                         fill: ds.fill !== undefined ? ds.fill : true,
+                        spanGaps: false,
                         tension: 0.4,
-                        pointRadius: 0,
+                        pointRadius: lone.some(Boolean) ? (c => lone[c.dataIndex] ? 2 : 0) : 0,
+                        pointBackgroundColor: ds.color || color,
                         pointHitRadius: 8,
                         borderWidth: 2,
                     });
@@ -550,6 +730,34 @@
                     canvas.width = parent.clientWidth || 600;
                     canvas.height = 180;
                 }
+                // a horizontal drag on a touch screen picks a range, a vertical one scrolls on
+                canvas.style.touchAction = shownTsRef.current ? 'pan-y pinch-zoom' : '';
+
+                // the band of a drag, in the accent of the layout and theme (Corporate has its
+                // own, darker on the light theme; Modern the primary of its theme)
+                const bandPlugin = {
+                    id: 'ppZoomBand',
+                    afterDatasetsDraw(ch) {
+                        const d = bandRef.current, a = ch.chartArea;
+                        if (!d || !a || Math.abs(d.x1 - d.x0) < 1) return;
+                        const css = getComputedStyle(ch.canvas);
+                        const accent = (css.getPropertyValue('--corp-accent') || css.getPropertyValue('--color-primary')).trim() || '#E57000';
+                        const x = Math.min(d.x0, d.x1), w = Math.abs(d.x1 - d.x0);
+                        const c = ch.ctx;
+                        c.save();
+                        c.fillStyle = accent;
+                        c.strokeStyle = accent;
+                        c.globalAlpha = 0.18;
+                        c.fillRect(x, a.top, w, a.bottom - a.top);
+                        c.globalAlpha = 0.9;
+                        c.lineWidth = 1;
+                        c.beginPath();
+                        c.moveTo(x + 0.5, a.top); c.lineTo(x + 0.5, a.bottom);
+                        c.moveTo(x + w - 0.5, a.top); c.lineTo(x + w - 0.5, a.bottom);
+                        c.stroke();
+                        c.restore();
+                    }
+                };
 
                 const unitStr = unit || '%';
                 const ctx = canvas.getContext('2d');
@@ -561,6 +769,7 @@
                             labels: finalLabels,
                             datasets: processedDatasets
                         },
+                        plugins: [bandPlugin],
                         options: {
                             responsive: false,
                             animation: false,
@@ -588,6 +797,7 @@
                                     callbacks: {
                                         label: function(c) {
                                             var val = c.parsed.y;
+                                            if (val === null || val === undefined || val !== val) return ' ' + c.dataset.label + ': -';
                                             var fn = formatRef.current;
                                             var str = fn ? fn(val) : val.toFixed(2);
                                             return ' ' + c.dataset.label + ': ' + str + (unitStr.trim() ? unitStr : '');
@@ -628,7 +838,91 @@
                 } catch(e) {
                     console.error('Chart.js error for ' + label + ':', e);
                 }
-            }, [dataFingerprint, unit, yMin, yMax]); // re-run if data changes
+            }, [dataFingerprint, unit, yMin, yMax, rangeKey]); // re-run if data or the zoom changes
+
+            // the drag: pointer events on the canvas, so mouse, pen and touch work alike
+            const hasCanvas = chartDatasets.length > 0;
+            React.useEffect(() => {
+                const canvas = canvasRef.current;
+                if (!canvas) return;
+                let drag = null;
+                const at = e => {
+                    const r = canvas.getBoundingClientRect();
+                    return { x: e.clientX - r.left, y: e.clientY - r.top };
+                };
+                const area = () => (chartRef.current && shownTsRef.current && shownTsRef.current.length > 1)
+                    ? chartRef.current.chartArea : null;
+                const inside = (p, a) => !!a && p.x >= a.left && p.x <= a.right && p.y >= a.top && p.y <= a.bottom;
+                const redraw = () => { if (chartRef.current) chartRef.current.draw(); };
+                // pixel -> unix time, between the two drawn points around it
+                const timeAt = px => {
+                    const ch = chartRef.current, shown = shownTsRef.current;
+                    if (!ch || !shown || shown.length < 2) return null;
+                    const sc = ch.scales.x;
+                    const p0 = sc.getPixelForValue(0), p1 = sc.getPixelForValue(shown.length - 1);
+                    const f = Math.min(1, Math.max(0, (px - p0) / ((p1 - p0) || 1))) * (shown.length - 1);
+                    const i = Math.floor(f), j = Math.min(shown.length - 1, i + 1);
+                    return shown[i] + (shown[j] - shown[i]) * (f - i);
+                };
+                const stop = () => {
+                    window.removeEventListener('keydown', onKey, true);
+                    const d = drag;
+                    drag = null;
+                    bandRef.current = null;
+                    if (d) { try { canvas.releasePointerCapture(d.id); } catch (_) {} }
+                    redraw();
+                };
+                // Escape drops the drag, and only the drag: the dialog around stays open
+                const onKey = e => {
+                    if (e.key !== 'Escape' || !drag) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    stop();
+                };
+                const onDown = e => {
+                    if (drag || (e.pointerType === 'mouse' && e.button !== 0)) return;
+                    const p = at(e);
+                    if (!inside(p, area())) return;
+                    drag = { id: e.pointerId, x0: p.x, x1: p.x };
+                    bandRef.current = drag;
+                    try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+                    window.addEventListener('keydown', onKey, true);
+                };
+                const onMove = e => {
+                    const p = at(e), a = area();
+                    if (!drag) {
+                        canvas.style.cursor = inside(p, a) ? 'crosshair' : '';
+                        return;
+                    }
+                    if (e.pointerId !== drag.id || !a) return;
+                    drag.x1 = Math.min(a.right, Math.max(a.left, p.x));
+                    redraw();
+                };
+                const onUp = e => {
+                    if (!drag || e.pointerId !== drag.id) return;
+                    const { x0, x1 } = drag;
+                    stop();
+                    // a click, or a hand that twitched, picks nothing
+                    if (Math.abs(x1 - x0) < 6) return;
+                    const from = timeAt(Math.min(x0, x1)), to = timeAt(Math.max(x0, x1));
+                    if (from !== null && to !== null && to > from) selectRef.current(from, to);
+                };
+                const onCancel = e => { if (drag && e.pointerId === drag.id) stop(); };
+                canvas.addEventListener('pointerdown', onDown);
+                canvas.addEventListener('pointermove', onMove);
+                canvas.addEventListener('pointerup', onUp);
+                canvas.addEventListener('pointercancel', onCancel);
+                canvas.addEventListener('lostpointercapture', onCancel);
+                return () => {
+                    canvas.removeEventListener('pointerdown', onDown);
+                    canvas.removeEventListener('pointermove', onMove);
+                    canvas.removeEventListener('pointerup', onUp);
+                    canvas.removeEventListener('pointercancel', onCancel);
+                    canvas.removeEventListener('lostpointercapture', onCancel);
+                    window.removeEventListener('keydown', onKey, true);
+                    bandRef.current = null;
+                };
+            }, [hasCanvas]);
 
             if (chartDatasets.length === 0) return null;
 
@@ -636,6 +930,10 @@
                 React.createElement('div', { className: 'bg-proxmox-dark rounded-lg p-4' },
                     React.createElement('div', { className: 'flex justify-between items-center mb-2' },
                         React.createElement('span', { className: 'text-sm font-medium text-gray-300' }, label),
+                        !zoom && ownRange && React.createElement('button', {
+                            type: 'button', onClick: () => setOwnRange(null), 'data-chart-zoom-reset': '',
+                            className: 'text-xs text-gray-400 hover:text-white',
+                        }, t('resetZoom')),
                     ),
                     React.createElement('div', { style: { width: '100%', height: '180px' } },
                         React.createElement('canvas', { ref: canvasRef })
@@ -675,12 +973,24 @@
                 };
                 fetchMetrics();
             }, [timeframe, vm.vmid]);
+            // LW Oct 2026 - drag along a chart to zoom all of them; finer data for a narrow range
+            const zoom = useChartZoom({
+                preset: timeframe, loaded: data, resetKey: `${clusterId}/${vm.vmid}`,
+                loadPreset: tf => authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.node}/${vm.type}/${vm.vmid}/rrd/${tf}`)
+                    .then(r => r.ok ? r.json() : null),
+                loadRange: (from, to) => authFetch(`${API_URL}/clusters/${clusterId}/vms/${vm.vmid}/metrics-history?from=${Math.floor(from)}&to=${Math.ceil(to)}`)
+                    .then(r => r.ok ? r.json() : null),
+            });
             // Prepare memory data in GB
             const maxMemGB = vm.maxmem ? vm.maxmem / (1024 * 1024 * 1024) : 0;
+            const mem = zoom.series('memory');
             const memDataGB = React.useMemo(() => {
-                if (!data || !data.metrics || !data.metrics.memory || !maxMemGB) return [];
-                return data.metrics.memory.map(p => (p / 100) * maxMemGB);
-            }, [data, maxMemGB]);
+                if (!mem.data || !maxMemGB) return [];
+                return mem.data.map(p => p === null ? null : (p / 100) * maxMemGB);
+            }, [mem.data, maxMemGB]);
+            const psiCpu = zoom.source('pressurecpusome', 'pressurecpufull');
+            const psiMem = zoom.source('pressurememorysome', 'pressurememoryfull');
+            const psiIo = zoom.source('pressureiosome', 'pressureiofull');
 
             return(
                 <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
@@ -693,6 +1003,7 @@
                                 <p className="text-sm text-gray-500">Node: {vm.node}</p>
                             </div>
                             <div className="flex items-center gap-4">
+                                <ChartZoomBar zoom={zoom} />
                                 <select
                                     value={timeframe}
                                     onChange={e => setTimeframe(e.target.value)}
@@ -719,17 +1030,17 @@
                             ) : err ? (
                                 <div className="text-center py-12 text-red-400">{err}</div>
                             ) : data && data.metrics ? (
+                                <ChartZoomContext.Provider value={zoom}>
                                 <div className="space-y-4">
                                     <LineChart 
-                                        data={data.metrics.cpu}
-                                        timestamps={data.timestamps}
+                                        {...zoom.series('cpu')}
                                         label="CPU" 
                                         color="#3b82f6" 
                                         unit="%" 
                                     />
                                     <LineChart 
                                         data={memDataGB}
-                                        timestamps={data.timestamps}
+                                        timestamps={mem.timestamps}
                                         label="Memory" 
                                         color="#22c55e" 
                                         unit=" GB"
@@ -739,16 +1050,14 @@
                                     />
                                     <div className="grid grid-cols-2 gap-4">
                                         <LineChart 
-                                            data={data.metrics.disk_read}
-                                            timestamps={data.timestamps}
+                                            {...zoom.series('disk_read')}
                                             label="Disk Read" 
                                             color="#eab308" 
                                             unit="/s"
                                             formatValue={formatBytes}
                                         />
                                         <LineChart 
-                                            data={data.metrics.disk_write}
-                                            timestamps={data.timestamps}
+                                            {...zoom.series('disk_write')}
                                             label="Disk Write" 
                                             color="#f97316" 
                                             unit="/s"
@@ -757,16 +1066,14 @@
                                     </div>
                                     <div className="grid grid-cols-2 gap-4">
                                         <LineChart 
-                                            data={data.metrics.net_in}
-                                            timestamps={data.timestamps}
+                                            {...zoom.series('net_in')}
                                             label="Network In" 
                                             color="#06b6d4" 
                                             unit="/s"
                                             formatValue={formatBytes}
                                         />
                                         <LineChart 
-                                            data={data.metrics.net_out}
-                                            timestamps={data.timestamps}
+                                            {...zoom.series('net_out')}
                                             label="Network Out" 
                                             color="#8b5cf6" 
                                             unit="/s"
@@ -777,10 +1084,10 @@
                                     {data.metrics.pressurecpusome && (
                                         <LineChart
                                             datasets={[
-                                                { label: 'Some', data: data.metrics.pressurecpusome, color: '#3b82f6' },
-                                                { label: 'Full', data: data.metrics.pressurecpufull, color: '#ef4444' }
+                                                { label: 'Some', data: psiCpu.metrics.pressurecpusome, color: '#3b82f6' },
+                                                { label: 'Full', data: psiCpu.metrics.pressurecpufull, color: '#ef4444' }
                                             ]}
-                                            timestamps={data.timestamps}
+                                            timestamps={psiCpu.timestamps}
                                             label="CPU Pressure Stall"
                                             unit="%"
                                             yMin={0}
@@ -790,10 +1097,10 @@
                                     {data.metrics.pressurememorysome && (
                                         <LineChart
                                             datasets={[
-                                                { label: 'Some', data: data.metrics.pressurememorysome, color: '#22c55e' },
-                                                { label: 'Full', data: data.metrics.pressurememoryfull, color: '#ef4444' }
+                                                { label: 'Some', data: psiMem.metrics.pressurememorysome, color: '#22c55e' },
+                                                { label: 'Full', data: psiMem.metrics.pressurememoryfull, color: '#ef4444' }
                                             ]}
-                                            timestamps={data.timestamps}
+                                            timestamps={psiMem.timestamps}
                                             label="Memory Pressure Stall"
                                             unit="%"
                                             yMin={0}
@@ -803,10 +1110,10 @@
                                     {data.metrics.pressureiosome && (
                                         <LineChart
                                             datasets={[
-                                                { label: 'Some', data: data.metrics.pressureiosome, color: '#eab308' },
-                                                { label: 'Full', data: data.metrics.pressureiofull, color: '#ef4444' }
+                                                { label: 'Some', data: psiIo.metrics.pressureiosome, color: '#eab308' },
+                                                { label: 'Full', data: psiIo.metrics.pressureiofull, color: '#ef4444' }
                                             ]}
-                                            timestamps={data.timestamps}
+                                            timestamps={psiIo.timestamps}
                                             label="IO Pressure Stall"
                                             unit="%"
                                             yMin={0}
@@ -816,10 +1123,11 @@
                                     
                                     {data.timestamps && data.timestamps.length > 0 && (
                                         <div className="text-xs text-gray-500 text-center mt-4">
-                                            {formatTime(data.timestamps[0])} - {formatTime(data.timestamps[data.timestamps.length - 1])}
+                                            {formatTime(zoom.range ? zoom.range.from : data.timestamps[0])} - {formatTime(zoom.range ? zoom.range.to : data.timestamps[data.timestamps.length - 1])}
                                         </div>
                                     )}
                                 </div>
+                                </ChartZoomContext.Provider>
                             ) : (
                                 <div className="text-center py-12 text-gray-400">No data available</div>
                             )}
@@ -2817,13 +3125,18 @@
                         const r = await authFetch(`${apiUrl}/clusters/${clusterId}/nodes/${node}/tasks/${encodeURIComponent(upid)}/log?start=${startLine}`);
                         if (r && r.ok) {
                             const data = await r.json();
-                            const arr = Array.isArray(data) ? data : (data.data || []);
+                            // LW Oct 2026 - the route answers {log, lines}; this read an array that never came
+                            let arr = Array.isArray(data) ? data
+                                : Array.isArray(data.lines) ? data.lines
+                                : (data.data || []);
+                            // Proxmox answers an empty log with one 'no content' line
+                            if (arr.length === 1 && arr[0] === 'no content') arr = [];
                             if (arr.length) {
                                 if (cancelled) return;
-                                setLines(prev => [...prev, ...arr.map(l => l.t || l)]);
+                                setLines(prev => [...prev, ...arr.map(l => (l && l.t !== undefined) ? l.t : l)]);
                                 startLine += arr.length;
                                 // throughput sniff: look for "INFO: ... read X.X GiB/s" or "transferred"
-                                const recent = arr.map(l => l.t || l).join('\n');
+                                const recent = arr.map(l => (l && l.t !== undefined) ? l.t : l).join('\n');
                                 const m = recent.match(/(\d+(?:\.\d+)?)\s*(MiB|GiB)\/s/);
                                 if (m) {
                                     const mbps = parseFloat(m[1]) * (m[2] === 'GiB' ? 1024 : 1);
@@ -3174,6 +3487,656 @@
         }
         try { window.PegaProxBackupRestoreWizard = BackupRestoreWizard; } catch (_) {}
 
+        // LW Oct 2026 - what the runs of a backup job did, and several backups restored in one
+        // go. Both dialogs are wider than the bulk ones and follow the layout the same way.
+        const bkpFill = (s, vars) => String(s || '').replace(/\{(\w+)\}/g, (m, k) => (vars && vars[k] != null ? String(vars[k]) : m));
+        const bkpWhen = (ts) => (ts ? new Date(ts * 1000).toLocaleString() : '-');
+        function bkpTook(sec) {
+            if (sec == null) return '-';
+            const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+            return h ? `${h}h ${m}m` : m ? `${m}m ${s}s` : `${s}s`;
+        }
+        async function bkpError(res, t, haServing) {
+            if (!res) return t('actionFailed');
+            const body = await res.clone().json().catch(() => null);
+            if (body && body.code === 'HA_STANDBY') return haServing ? t('pgHaServingRefused') : t('pgHaStandbyRefused');
+            if (body && body.code === 'HA_ACTIVE_UNREACHABLE') return haServing ? t('pgHaLeaderUnreachable') : t('pgHaActiveUnreachable');
+            return (body && typeof body.error === 'string' && body.error) || `${t('actionFailed')} (HTTP ${res.status})`;
+        }
+        const BKP_STATE_CLS = {
+            ok: 'text-green-400', done: 'text-green-400', warning: 'text-yellow-400', failed: 'text-red-400',
+            running: 'text-blue-400', restoring: 'text-blue-400', wait: 'text-gray-400', skipped: 'text-yellow-400',
+            cancelled: 'text-gray-400', unknown: 'text-yellow-400',
+        };
+
+        function BackupFrame({ icon, title, meta, onClose, footer, children, testId }) {
+            const { t } = useTranslation();
+            const { isCorporate } = useLayout();
+            if (isCorporate) {
+                return (
+                    <div className="corp-vm-modal-overlay" onClick={onClose}>
+                        <div className="corp-vm-modal" data-testid={testId} role="dialog" aria-modal="true"
+                            style={{ maxWidth: '920px', width: '100%', alignSelf: 'center', maxHeight: '90vh' }}
+                            onClick={e => e.stopPropagation()}>
+                            <div className="corp-vm-modal-header">
+                                <div className="flex items-center gap-3 min-w-0 flex-1">
+                                    <span className="flex flex-shrink-0" style={{ color: 'var(--corp-accent, #49afd9)' }}>{icon}</span>
+                                    <div className="min-w-0">
+                                        <div className="corp-vm-modal-title truncate">{title}</div>
+                                        {meta && <div className="corp-vm-modal-meta">{meta}</div>}
+                                    </div>
+                                </div>
+                                <div className="corp-vm-modal-actions">
+                                    <button onClick={onClose} className="corp-vm-btn corp-vm-btn-ghost" title={t('close')}><Icons.X /></button>
+                                </div>
+                            </div>
+                            <div className="corp-vm-modal-body">{children}</div>
+                            {footer && <div className="corp-vm-modal-footer"><div className="flex items-center gap-2 ml-auto">{footer}</div></div>}
+                        </div>
+                    </div>
+                );
+            }
+            return (
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80" onClick={onClose}>
+                    <div className="w-full max-w-4xl max-h-[90vh] flex flex-col bg-proxmox-card border border-proxmox-border rounded-xl animate-scale-in"
+                        data-testid={testId} role="dialog" aria-modal="true" onClick={e => e.stopPropagation()}>
+                        <div className="flex items-center gap-3 p-5 border-b border-proxmox-border">
+                            <span className="flex flex-shrink-0 text-proxmox-orange">{icon}</span>
+                            <div className="min-w-0 flex-1">
+                                <h3 className="text-lg font-semibold text-white truncate">{title}</h3>
+                                {meta && <div className="text-xs text-gray-400">{meta}</div>}
+                            </div>
+                            <button onClick={onClose} className="p-1 text-gray-400 hover:text-white rounded" title={t('close')}><Icons.X /></button>
+                        </div>
+                        <div className="p-5 space-y-4 overflow-y-auto">{children}</div>
+                        {footer && <div className="flex justify-end gap-3 p-4 border-t border-proxmox-border">{footer}</div>}
+                    </div>
+                </div>
+            );
+        }
+
+        // the runs come from the vzdump tasks of the nodes, the guests of a run from its task
+        // logs and only once it is opened, the log of a guest only once that is opened
+        const BKP_GUEST_PAGE = 100;
+        const BKP_TASKS_PER_READ = 16;
+
+        function BackupJobRunsModal({ clusterId, job, onClose }) {
+            const { t } = useTranslation();
+            const { getAuthHeaders } = useAuth();
+            const { isCorporate } = useLayout();
+            const [days, setDays] = useState(14);
+            const [data, setData] = useState(null);
+            const [loading, setLoading] = useState(true);
+            const [error, setError] = useState('');
+            const [open, setOpen] = useState(null);
+            const [guests, setGuests] = useState({});
+            const [logs, setLogs] = useState({});
+            const [shown, setShown] = useState(BKP_GUEST_PAGE);
+            const [onlyFailed, setOnlyFailed] = useState(false);
+            const headers = useRef(getAuthHeaders);
+            headers.current = getAuthHeaders;
+            const base = `${API_URL}/clusters/${encodeURIComponent(clusterId)}/datacenter/backup/${encodeURIComponent(job.id)}/runs`;
+            const get = (url) => fetch(url, { credentials: 'include', headers: headers.current() });
+            // only the newest look may answer: a slow one for the period before must not land
+            const look = useRef(0);
+
+            const load = useCallback(async () => {
+                const mine = ++look.current;
+                setLoading(true);
+                setError('');
+                try {
+                    const res = await get(`${base}?days=${days}`);
+                    if (mine !== look.current) return;
+                    if (res.ok) setData(await res.json());
+                    else { setData(null); setError(await PegaProxApiErrors.message(res, t('bkpRunsLoadFailed'))); }
+                } catch (e) {
+                    if (mine === look.current) setError(t('bkpRunsLoadFailed'));
+                }
+                if (mine === look.current) setLoading(false);
+            }, [base, days]);  // eslint-disable-line react-hooks/exhaustive-deps
+            useEffect(() => { load(); }, [load]);
+
+            const openRun = async (run) => {
+                if (open === run.id) { setOpen(null); return; }
+                setOpen(run.id);
+                setShown(BKP_GUEST_PAGE);
+                const had = guests[run.id];
+                if (had && had.data && run.state !== 'running') return;
+                setGuests(g => ({ ...g, [run.id]: { loading: true } }));
+                // a few tasks per read keeps the address short on a cluster of many nodes
+                const merged = { guests: [], tasks: [], missing: null };
+                let failed = '';
+                for (let i = 0; i < run.tasks.length; i += BKP_TASKS_PER_READ) {
+                    const qs = run.tasks.slice(i, i + BKP_TASKS_PER_READ).map(x => 'upid=' + encodeURIComponent(x.upid)).join('&');
+                    try {
+                        const res = await get(`${base}/guests?${qs}`);
+                        if (!res.ok) { failed = await PegaProxApiErrors.message(res, t('bkpRunsLoadFailed')); break; }
+                        const body = await res.json();
+                        merged.guests = merged.guests.concat(body.guests || []);
+                        merged.tasks = merged.tasks.concat(body.tasks || []);
+                        const miss = new Set(body.missing || []);
+                        merged.missing = merged.missing === null ? miss : new Set([...merged.missing].filter(v => miss.has(v)));
+                    } catch (e) { failed = t('bkpRunsLoadFailed'); break; }
+                }
+                setGuests(g => ({ ...g, [run.id]: failed ? { error: failed } : { data: { ...merged, missing: [...(merged.missing || [])].sort((a, b) => a - b) } } }));
+            };
+
+            const toggleLog = async (key, upid, vmid) => {
+                if (logs[key]) { setLogs(l => { const n = { ...l }; delete n[key]; return n; }); return; }
+                setLogs(l => ({ ...l, [key]: { loading: true } }));
+                const q = `upid=${encodeURIComponent(upid)}` + (vmid != null ? `&vmid=${vmid}` : '');
+                try {
+                    const res = await get(`${base}/log?${q}`);
+                    if (res.ok) {
+                        const body = await res.json();
+                        setLogs(l => ({ ...l, [key]: { lines: body.lines || [], more: !!body.more } }));
+                    } else {
+                        const msg = await PegaProxApiErrors.message(res, t('bkpRunsLoadFailed'));
+                        setLogs(l => ({ ...l, [key]: { error: msg } }));
+                    }
+                } catch (e) {
+                    setLogs(l => ({ ...l, [key]: { error: t('bkpRunsLoadFailed') } }));
+                }
+            };
+
+            const stateText = (s) => ({ ok: t('bkpRunsStateOk'), warning: t('bkpRunsStateWarning'), failed: t('failed'),
+                running: t('bkpRunsStateRunning'), unknown: t('bkpRunsStateUnknown') })[s] || s;
+            const selection = Number(job.all) === 1 ? t('all') : (job.pool ? `pool ${job.pool}` : (job.vmid || '-'));
+            const meta = [job.schedule, job.storage, selection].filter(Boolean).join(' - ');
+            const selectCls = isCorporate ? '' : 'px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm';
+            const logBox = (entry) => (
+                <div className="mt-1" data-bkp-logbox>
+                    {entry.loading && <div className="text-xs text-gray-400">{t('loading')}</div>}
+                    {entry.error && <div className="text-xs text-red-400">{entry.error}</div>}
+                    {entry.lines && (
+                        <pre className="text-xs font-mono whitespace-pre-wrap break-all p-2 rounded-lg overflow-y-auto bg-proxmox-dark text-gray-300"
+                            style={{ maxHeight: '260px' }}>
+                            {entry.lines.join('\n')}
+                        </pre>
+                    )}
+                </div>
+            );
+
+            const guestPanel = (run) => {
+                const g = guests[run.id];
+                if (!g || g.loading) return <div className="text-sm text-gray-400 p-2">{t('bkpRunsGuestsLoading')}</div>;
+                if (g.error) return <div className="text-sm text-red-400 p-2">{g.error}</div>;
+                const all = g.data.guests || [];
+                const rank = (x) => (x.state === 'failed' ? 0 : x.state === 'unknown' ? 1 : x.state === 'running' ? 2 : 3);
+                const list = all.filter(x => !onlyFailed || x.state !== 'ok').slice().sort((a, b) => rank(a) - rank(b) || a.vmid - b.vmid);
+                const unread = (g.data.tasks || []).filter(x => !x.readable);
+                return (
+                    <div className="space-y-2 p-2" data-bkp-guests={run.id}>
+                        <div className="flex flex-wrap items-center gap-3 text-xs text-gray-400">
+                            <span>{bkpFill(t('bkpRunsGuestCount'), { n: all.length, failed: all.filter(x => x.state === 'failed').length })}</span>
+                            <label className="flex items-center gap-1 cursor-pointer">
+                                <input type="checkbox" checked={onlyFailed} onChange={e => setOnlyFailed(e.target.checked)} data-bkp-only-failed />
+                                {t('bkpRunsOnlyProblems')}
+                            </label>
+                        </div>
+                        {unread.map(x => <div key={x.upid} className="text-xs text-yellow-400">{bkpFill(t('bkpRunsTaskUnread'), { node: x.node })}</div>)}
+                        {g.data.missing && g.data.missing.length > 0 && (
+                            <div className="text-xs text-yellow-400" data-bkp-missing>{bkpFill(t('bkpRunsMissing'), { ids: g.data.missing.join(', ') })}</div>
+                        )}
+                        {!all.length && <div className="text-sm text-gray-400">{t('bkpRunsNoGuests')}</div>}
+                        {list.slice(0, shown).map(x => {
+                            const key = `${x.upid}#${x.vmid}`;
+                            return (
+                                <div key={key} className="text-sm border-t border-proxmox-border pt-1" data-bkp-guest={x.vmid} data-state={x.state}>
+                                    <div className="flex items-center gap-3">
+                                        <span className="font-mono text-xs text-gray-400 w-16">{x.vmid}</span>
+                                        <span className="text-xs text-gray-500 w-10">{x.type === 'lxc' ? 'CT' : 'VM'}</span>
+                                        <span className="text-xs text-gray-400 truncate flex-1">{x.node}</span>
+                                        <span className={`text-xs ${BKP_STATE_CLS[x.state] || ''}`}>{stateText(x.state)}</span>
+                                        <span className="text-xs text-gray-400 w-20 text-right">{x.took || '-'}</span>
+                                        <span className="text-xs text-gray-400 w-20 text-right">{x.size || ''}</span>
+                                        <button type="button" onClick={() => toggleLog(key, x.upid, x.vmid)} data-bkp-log={x.vmid}
+                                            className="text-xs text-blue-400 hover:text-blue-300">
+                                            {logs[key] ? t('bkpRunsHideLog') : t('bkpRunsLog')}
+                                        </button>
+                                    </div>
+                                    {x.error && <div className="text-xs text-red-400 break-all" style={{ paddingLeft: '4rem' }}>{x.error}</div>}
+                                    {logs[key] && logBox(logs[key])}
+                                </div>
+                            );
+                        })}
+                        {list.length > shown && (
+                            <button type="button" onClick={() => setShown(n => n + BKP_GUEST_PAGE)} className="text-xs text-blue-400 hover:text-blue-300" data-bkp-more>
+                                {bkpFill(t('bkpRunsShowMore'), { shown, total: list.length })}
+                            </button>
+                        )}
+                        <div className="flex flex-wrap gap-3 pt-1">
+                            {run.tasks.map(task => {
+                                const key = `task#${task.upid}`;
+                                return (
+                                    <div key={key} className="w-full">
+                                        <button type="button" onClick={() => toggleLog(key, task.upid, null)} data-bkp-tasklog={task.node}
+                                            className="text-xs text-gray-400 hover:text-white">
+                                            {bkpFill(t('bkpRunsTaskLog'), { node: task.node })}
+                                        </button>
+                                        {logs[key] && logBox(logs[key])}
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    </div>
+                );
+            };
+
+            const runsList = (data && data.runs) || [];
+            const footer = (
+                <button onClick={onClose} className={guestBulkButton(isCorporate, 'ghost')} data-bkp-close>{t('close')}</button>
+            );
+            return (
+                <BackupFrame testId="bkp-runs-modal" icon={<Icons.Clock />} onClose={onClose} footer={footer}
+                    title={bkpFill(t('bkpRunsTitle'), { id: job.id })} meta={meta}>
+                    <div className="space-y-3" data-bkp-runs={job.id}>
+                        <div className="flex flex-wrap items-center gap-3">
+                            <label className="text-sm text-gray-400 flex items-center gap-2">
+                                {t('bkpRunsPeriod')}
+                                <select value={days} onChange={e => setDays(parseInt(e.target.value, 10))} className={selectCls} data-bkp-days>
+                                    {[7, 14, 30, 60].map(d => <option key={d} value={d}>{bkpFill(t('bkpRunsDays'), { n: d })}</option>)}
+                                </select>
+                            </label>
+                            <button type="button" onClick={load} disabled={loading} className="flex items-center gap-1 text-sm text-gray-400 hover:text-white" data-bkp-refresh>
+                                <span className={`flex ${loading ? 'animate-spin' : ''}`}><Icons.RefreshCw /></span> {t('refresh')}
+                            </button>
+                        </div>
+                        <div className="text-xs text-gray-500">{t('bkpRunsHint')}</div>
+                        {error && <div className="text-sm text-red-400" data-bkp-error>{error}</div>}
+                        {data && data.partial && <div className="text-xs text-yellow-400" data-bkp-partial>{t('bkpRunsPartial')}</div>}
+                        {data && (data.unread_nodes || []).length > 0 && (
+                            <div className="text-xs text-yellow-400" data-bkp-unread>{bkpFill(t('bkpRunsUnread'), { nodes: data.unread_nodes.join(', ') })}</div>
+                        )}
+                        {loading && !data && <div className="text-sm text-gray-400">{t('loading')}</div>}
+                        {data && !runsList.length && <div className="text-sm text-gray-400" data-bkp-none>{t('bkpRunsNone')}</div>}
+                        {runsList.length > 0 && (
+                            <table className="w-full text-sm">
+                                <thead>
+                                    <tr className="text-left text-xs text-gray-500">
+                                        <th className="p-2">{t('bkpRunsStarted')}</th>
+                                        <th className="p-2">{t('duration')}</th>
+                                        <th className="p-2">{t('status')}</th>
+                                        <th className="p-2">{t('bkpRunsNodes')}</th>
+                                        <th className="p-2">{t('bkpRunsBy')}</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {runsList.map(run => (
+                                        <React.Fragment key={run.id}>
+                                            <tr className="border-t border-proxmox-border cursor-pointer hover:bg-proxmox-hover" data-bkp-run={run.start}
+                                                data-state={run.state} onClick={() => openRun(run)}>
+                                                <td className="p-2">
+                                                    <span className="inline-flex items-center gap-1">
+                                                        {open === run.id ? <Icons.ChevronDown /> : <Icons.ChevronRight />}
+                                                        {bkpWhen(run.start)}
+                                                    </span>
+                                                </td>
+                                                <td className="p-2 text-gray-400">{bkpTook(run.duration)}</td>
+                                                <td className="p-2">
+                                                    <span className={BKP_STATE_CLS[run.state] || ''}>{stateText(run.state)}</span>
+                                                    {run.failed_tasks > 0 && <span className="text-xs text-gray-500"> ({bkpFill(t('bkpRunsFailedNodes'), { n: run.failed_tasks })})</span>}
+                                                </td>
+                                                <td className="p-2 text-gray-400">{run.tasks.length}</td>
+                                                <td className="p-2 text-gray-400">{run.scheduled ? t('bkpRunsSchedule') : (run.started_by || (run.tasks[0] && run.tasks[0].user) || '-')}</td>
+                                            </tr>
+                                            {open === run.id && <tr><td colSpan={5}>{guestPanel(run)}</td></tr>}
+                                        </React.Fragment>
+                                    ))}
+                                </tbody>
+                            </table>
+                        )}
+                    </div>
+                </BackupFrame>
+            );
+        }
+        try { window.PegaProxBackupJobRunsModal = BackupJobRunsModal; } catch (_) {}
+
+        // one backup per guest from the storage shown, restored through POST
+        // /backup-restore/batch; the batch runs on the server and is followed here
+        const BR_PAGE = 100;
+        const BR_POLL_MS = 2500;
+        const brKind = (it) => (it.subtype === 'lxc' || /\/ct\/|vzdump-lxc|vzdump-openvz/.test(it.volid || '') ? 'lxc' : 'qemu');
+
+        function BatchRestoreModal({ clusterId, storage, items, nodes, datastores, defaultNode, startRunId, onClose }) {
+            const { t } = useTranslation();
+            const { getAuthHeaders, haReadOnly, haServing } = useAuth();
+            const { isCorporate } = useLayout();
+            const headers = useRef(getAuthHeaders);
+            headers.current = getAuthHeaders;
+            const call = (url, opts = {}) => fetch(url, { ...opts, credentials: 'include', headers: { ...(opts.headers || {}), ...headers.current() } });
+            const [phase, setPhase] = useState(startRunId ? 'run' : (items ? 'pick' : 'runs'));
+            const [filter, setFilter] = useState('');
+            const [shown, setShown] = useState(BR_PAGE);
+            const [picked, setPicked] = useState({});
+            const [mode, setMode] = useState('new');
+            const [firstVmid, setFirstVmid] = useState('');
+            const [node, setNode] = useState(defaultNode || (nodes || [])[0] || '');
+            const [targetStorage, setTargetStorage] = useState('');
+            const [how, setHow] = useState('sequential');
+            const [parallel, setParallel] = useState(2);
+            const [confirmed, setConfirmed] = useState(false);
+            const [busy, setBusy] = useState(false);
+            const [error, setError] = useState('');
+            const [refused, setRefused] = useState([]);
+            const [runId, setRunId] = useState(startRunId || null);
+            const [run, setRun] = useState(null);
+            const [gone, setGone] = useState(false);
+            const [asking, setAsking] = useState(false);
+            const [recent, setRecent] = useState(null);
+
+            const groups = useMemo(() => {
+                const by = new Map();
+                (items || []).forEach(it => {
+                    const vmid = parseInt(it.vmid, 10);
+                    if (!vmid || it.content !== 'backup' || !it.volid) return;
+                    if (!by.has(vmid)) by.set(vmid, { vmid, type: brKind(it), backups: [] });
+                    by.get(vmid).backups.push(it);
+                });
+                const out = Array.from(by.values());
+                out.forEach(g => g.backups.sort((a, b) => (b.ctime || 0) - (a.ctime || 0)));
+                return out.sort((a, b) => a.vmid - b.vmid);
+            }, [items]);
+            const q = filter.trim().toLowerCase();
+            const matching = q ? groups.filter(g => String(g.vmid).includes(q)
+                || g.backups.some(b => String(b.notes || '').toLowerCase().includes(q))) : groups;
+            const count = Object.keys(picked).length;
+
+            useEffect(() => {
+                if (phase !== 'options' || firstVmid) return;
+                call(`${API_URL}/clusters/${encodeURIComponent(clusterId)}/next-vmid`)
+                    .then(r => (r.ok ? r.json() : null)).then(j => { if (j && j.vmid) setFirstVmid(String(j.vmid)); })
+                    .catch(() => {});
+            }, [phase]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+            // the batch as the server has it, read again while it runs
+            const shownRun = useRef(runId);
+            shownRun.current = runId;
+            const loadRun = useCallback(async () => {
+                if (!runId) return;
+                try {
+                    const res = await call(`${API_URL}/batch-restores/${encodeURIComponent(runId)}`);
+                    if (shownRun.current !== runId) return;
+                    if (res.status === 404) { setGone(true); return; }
+                    if (res.ok) { const body = await res.json(); setRun(body.run); setGone(false); }
+                } catch (e) { /* the next look tries again */ }
+            }, [runId]);  // eslint-disable-line react-hooks/exhaustive-deps
+            useEffect(() => { if (phase === 'run') loadRun(); }, [phase, loadRun]);
+            const running = !!run && run.state === 'running';
+            useEffect(() => {
+                if (phase !== 'run' || !running) return undefined;
+                const id = setInterval(loadRun, BR_POLL_MS);
+                return () => clearInterval(id);
+            }, [phase, running, loadRun]);
+
+            useEffect(() => {
+                if (phase !== 'runs') return;
+                call(`${API_URL}/batch-restores`).then(r => (r.ok ? r.json() : { runs: [] }))
+                    .then(j => setRecent((j.runs || []).filter(r => r.cluster_id === clusterId)))
+                    .catch(() => setRecent([]));
+            }, [phase]);  // eslint-disable-line react-hooks/exhaustive-deps
+
+            const toggle = (g) => setPicked(p => {
+                const n = { ...p };
+                if (n[g.vmid]) delete n[g.vmid]; else n[g.vmid] = g.backups[0].volid;
+                return n;
+            });
+            const choose = (g, volid) => setPicked(p => ({ ...p, [g.vmid]: volid }));
+            const pickShown = () => setPicked(p => {
+                const n = { ...p };
+                matching.slice(0, shown).forEach(g => { if (!n[g.vmid]) n[g.vmid] = g.backups[0].volid; });
+                return n;
+            });
+
+            const targetStorages = useMemo(() => {
+                const ds = datastores || {};
+                const list = [].concat(ds.shared || [], (ds.local || {})[node] || []);
+                const seen = new Set();
+                return list.filter(s => s && s.storage && /images|rootdir/.test(s.content || '') && !seen.has(s.storage) && seen.add(s.storage))
+                    .map(s => s.storage);
+            }, [datastores, node]);
+
+            const firstOk = mode !== 'new' || (/^\d+$/.test(firstVmid) && parseInt(firstVmid, 10) >= 100);
+            const canStart = count > 0 && !!node && firstOk && (mode !== 'overwrite' || confirmed) && !busy && !haReadOnly;
+
+            const start = async () => {
+                setBusy(true); setError(''); setRefused([]);
+                const body = { items: Object.values(picked).map(volid => ({ volid })), mode, target_node: node, run: how };
+                if (how === 'parallel') body.parallel = parallel;
+                if (targetStorage) body.target_storage = targetStorage;
+                if (mode === 'new') body.first_vmid = parseInt(firstVmid, 10);
+                if (mode === 'overwrite') body.confirm = confirmed;
+                let res = null;
+                try {
+                    res = await call(`${API_URL}/clusters/${encodeURIComponent(clusterId)}/backup-restore/batch`,
+                        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+                } catch (e) { res = null; }
+                setBusy(false);
+                if (res && res.status === 202) {
+                    const j = await res.json();
+                    setRun(j.run); setRunId(j.run.id); setGone(false); setPhase('run');
+                    return;
+                }
+                setError(await bkpError(res, t, haServing));
+                const j = res ? await res.clone().json().catch(() => null) : null;
+                if (j && Array.isArray(j.refused)) setRefused(j.refused);
+            };
+
+            const cancelRest = async () => {
+                setBusy(true);
+                let res = null;
+                try { res = await call(`${API_URL}/batch-restores/${encodeURIComponent(runId)}/cancel`, { method: 'POST' }); } catch (e) { res = null; }
+                setBusy(false); setAsking(false);
+                if (res && res.ok) { const j = await res.json().catch(() => ({})); if (j.run) setRun(j.run); }
+                else setError(await bkpError(res, t, haServing));
+            };
+
+            const stateText = (s) => ({ wait: t('batchRestoreStateWait'), restoring: t('batchRestoreStateRestoring'),
+                done: t('batchRestoreStateDone'), failed: t('failed'), skipped: t('batchRestoreStateSkipped'),
+                cancelled: t('batchRestoreStateCancelled'), unknown: t('bkpRunsStateUnknown') })[s] || s;
+            const runText = (s) => ({ running: t('bkpRunsStateRunning'), done: t('batchRestoreStateDone'),
+                cancelled: t('batchRestoreRunCancelled'), stopped: t('batchRestoreRunStopped') })[s] || s;
+            const inputCls = isCorporate ? 'w-full' : 'w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm';
+            const labelCls = 'block text-sm text-gray-400 mb-1';
+            const optionCls = (on) => `w-full px-3 py-2 rounded-lg text-sm text-left border ${on ? 'border-blue-500 bg-blue-500/10' : 'border-proxmox-border'}`;
+            const optionStyle = (on) => (isCorporate ? { borderColor: on ? 'var(--corp-accent, #49afd9)' : 'var(--corp-border-medium, #485764)',
+                background: on ? 'var(--corp-selection, #324f61)' : 'transparent', color: 'var(--corp-text, #e9ecef)' } : undefined);
+
+            let body = null;
+            let footer = null;
+            let title = t('batchRestoreTitle');
+            let meta = storage ? bkpFill(t('batchRestoreFrom'), { storage }) : null;
+
+            if (phase === 'pick') {
+                body = (
+                    <div className="space-y-3" data-br-pick>
+                        <div className="text-sm text-gray-400">{t('batchRestorePickHint')}</div>
+                        <div className="flex flex-wrap items-center gap-3">
+                            <input type="text" value={filter} onChange={e => { setFilter(e.target.value); setShown(BR_PAGE); }}
+                                placeholder={t('batchRestoreFilter')} className={inputCls} style={{ maxWidth: '280px' }} data-br-filter />
+                            <button type="button" onClick={pickShown} className="text-xs text-blue-400 hover:text-blue-300" data-br-pick-shown>{t('batchRestorePickShown')}</button>
+                            <button type="button" onClick={() => setPicked({})} className="text-xs text-gray-400 hover:text-white">{t('batchRestoreClear')}</button>
+                            <span className="text-xs text-gray-400 ml-auto" data-br-count>{bkpFill(t('batchRestoreSelected'), { n: count })}</span>
+                        </div>
+                        {!groups.length && <div className="text-sm text-gray-400">{t('batchRestoreNothing')}</div>}
+                        <div className="space-y-1">
+                            {matching.slice(0, shown).map(g => {
+                                const on = !!picked[g.vmid];
+                                return (
+                                    <div key={g.vmid} className="flex items-center gap-3 text-sm py-1 border-t border-proxmox-border" data-br-row={g.vmid}>
+                                        <input type="checkbox" checked={on} onChange={() => toggle(g)} data-br-check={g.vmid} />
+                                        <span className="font-mono text-xs text-gray-400 w-16">{g.vmid}</span>
+                                        <span className="text-xs text-gray-500 w-8">{g.type === 'lxc' ? 'CT' : 'VM'}</span>
+                                        <select value={picked[g.vmid] || g.backups[0].volid} disabled={!on}
+                                            onChange={e => choose(g, e.target.value)} className={isCorporate ? 'flex-1 min-w-0 text-xs' : 'flex-1 min-w-0 px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-xs'}
+                                            data-br-backup={g.vmid}>
+                                            {g.backups.map(b => (
+                                                <option key={b.volid} value={b.volid}>
+                                                    {bkpWhen(b.ctime)}{b.size_human ? ` - ${b.size_human}` : ''}{b.notes ? ` - ${String(b.notes).slice(0, 40)}` : ''}
+                                                </option>
+                                            ))}
+                                        </select>
+                                        <span className="text-xs text-gray-500 w-24 text-right">{bkpFill(t('batchRestoreBackups'), { n: g.backups.length })}</span>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                        {matching.length > shown && (
+                            <button type="button" onClick={() => setShown(n => n + BR_PAGE)} className="text-xs text-blue-400 hover:text-blue-300" data-br-more>
+                                {bkpFill(t('bkpRunsShowMore'), { shown, total: matching.length })}
+                            </button>
+                        )}
+                    </div>
+                );
+                footer = (<>
+                    <button onClick={onClose} className={guestBulkButton(isCorporate, 'ghost')}>{t('cancel')}</button>
+                    <button onClick={() => setPhase('options')} disabled={!count} className={guestBulkButton(isCorporate, 'primary')} data-br-next>
+                        {bkpFill(t('batchRestoreNext'), { n: count })}
+                    </button>
+                </>);
+            } else if (phase === 'options') {
+                body = (
+                    <div className="space-y-4" data-br-options>
+                        <div className="grid grid-cols-2 gap-2">
+                            {['new', 'overwrite'].map(m => (
+                                <button key={m} type="button" onClick={() => { setMode(m); setConfirmed(false); }} className={optionCls(mode === m)}
+                                    style={optionStyle(mode === m)} data-br-mode={m} data-on={mode === m ? '1' : '0'}>
+                                    <div className={`font-medium ${isCorporate ? '' : 'text-white'}`}>{m === 'new' ? t('batchRestoreModeNew') : t('batchRestoreModeOverwrite')}</div>
+                                    <div className="text-xs text-gray-400">{m === 'new' ? t('batchRestoreModeNewDesc') : t('batchRestoreModeOverwriteDesc')}</div>
+                                </button>
+                            ))}
+                        </div>
+                        <div className="grid grid-cols-2 gap-4">
+                            <div>
+                                <label className={labelCls}>{mode === 'new' ? t('batchRestoreNode') : t('batchRestoreNodeGone')}</label>
+                                <select value={node} onChange={e => { setNode(e.target.value); setTargetStorage(''); }} className={inputCls} data-br-node>
+                                    {(nodes || []).map(n => <option key={n} value={n}>{n}</option>)}
+                                </select>
+                            </div>
+                            <div>
+                                <label className={labelCls}>{t('batchRestoreStorage')}</label>
+                                <select value={targetStorage} onChange={e => setTargetStorage(e.target.value)} className={inputCls} data-br-storage>
+                                    <option value="">{t('batchRestoreStorageDefault')}</option>
+                                    {targetStorages.map(s => <option key={s} value={s}>{s}</option>)}
+                                </select>
+                            </div>
+                            {mode === 'new' && (
+                                <div>
+                                    <label className={labelCls}>{t('batchRestoreFirstId')}</label>
+                                    <input type="number" min="100" value={firstVmid} onChange={e => setFirstVmid(e.target.value)} className={inputCls} data-br-first />
+                                    <div className="text-xs text-gray-500 mt-1">{t('batchRestoreFirstIdHint')}</div>
+                                </div>
+                            )}
+                            <div>
+                                <label className={labelCls}>{t('batchRestoreHow')}</label>
+                                <select value={how === 'sequential' ? '1' : String(parallel)} className={inputCls} data-br-how
+                                    onChange={e => { const v = parseInt(e.target.value, 10); if (v === 1) setHow('sequential'); else { setHow('parallel'); setParallel(v); } }}>
+                                    <option value="1">{t('batchRestoreOneByOne')}</option>
+                                    {[2, 3, 4].map(n => <option key={n} value={String(n)}>{bkpFill(t('batchRestoreSomeAtOnce'), { n })}</option>)}
+                                </select>
+                            </div>
+                        </div>
+                        {mode === 'overwrite' && (
+                            <label className="flex items-start gap-2 text-sm text-red-400" data-br-confirm-row>
+                                <input type="checkbox" checked={confirmed} onChange={e => setConfirmed(e.target.checked)} className="mt-0.5" data-br-confirm />
+                                <span>{bkpFill(t('batchRestoreConfirm'), { n: count })}</span>
+                            </label>
+                        )}
+                        {error && <div className="text-sm text-red-400 break-all" data-br-error>{error}</div>}
+                        {refused.length > 0 && (
+                            <div className="text-xs text-red-400 space-y-0.5" data-br-refused>
+                                {refused.slice(0, 50).map(r => <div key={r.volid}>{r.vmid}: {r.error}</div>)}
+                            </div>
+                        )}
+                    </div>
+                );
+                footer = (<>
+                    <button onClick={() => setPhase('pick')} disabled={busy} className={guestBulkButton(isCorporate, 'ghost')}>{t('batchRestoreBack')}</button>
+                    <button onClick={start} disabled={!canStart} className={guestBulkButton(isCorporate, mode === 'overwrite' ? 'danger' : 'primary')} data-br-start>
+                        {busy && <span className="flex animate-spin"><Icons.RotateCw /></span>}
+                        {bkpFill(t('batchRestoreStart'), { n: count })}
+                    </button>
+                </>);
+            } else if (phase === 'runs') {
+                title = t('batchRestoreRecent');
+                meta = null;
+                body = (
+                    <div className="space-y-2" data-br-runs>
+                        {recent === null && <div className="text-sm text-gray-400">{t('loading')}</div>}
+                        {recent && !recent.length && <div className="text-sm text-gray-400">{t('batchRestoreNoRecent')}</div>}
+                        {(recent || []).map(r => {
+                            const c = r.counts || {};
+                            return (
+                                <button key={r.id} type="button" onClick={() => { setRunId(r.id); setRun(null); setPhase('run'); }}
+                                    className="w-full flex items-center gap-3 text-sm text-left py-2 border-t border-proxmox-border hover:bg-proxmox-hover" data-br-recent={r.id}>
+                                    <span className={`text-xs ${BKP_STATE_CLS[r.state === 'running' ? 'running' : (c.failed ? 'failed' : 'done')]}`}>{runText(r.state)}</span>
+                                    <span className="text-gray-300 flex-1 truncate">{bkpFill(t('batchRestoreFrom'), { storage: r.storage })} - {r.user}</span>
+                                    <span className="text-xs text-gray-400">{bkpFill(t('batchRestoreSummary'), { done: c.done || 0, failed: c.failed || 0, total: r.total })}</span>
+                                    <span className="text-xs text-gray-500">{bkpWhen(r.created)}</span>
+                                </button>
+                            );
+                        })}
+                    </div>
+                );
+                footer = <button onClick={onClose} className={guestBulkButton(isCorporate, 'ghost')}>{t('close')}</button>;
+            } else {
+                const c = (run && run.counts) || {};
+                if (run) {
+                    title = bkpFill(t('batchRestoreFrom'), { storage: run.storage });
+                    meta = `${runText(run.state)} - ${bkpFill(t('batchRestoreSummary'), { done: c.done || 0, failed: c.failed || 0, total: run.total })}`;
+                }
+                const over = run ? run.total - (c.wait || 0) - (c.restoring || 0) : 0;
+                body = (
+                    <div className="space-y-3" data-br-run={runId}>
+                        {gone && <div className="text-sm text-yellow-400" data-br-gone>{t('batchRestoreGone')}</div>}
+                        {!run && !gone && <div className="text-sm text-gray-400">{t('loading')}</div>}
+                        {run && (<>
+                            {running && (
+                                <div className="h-1.5 rounded-full bg-proxmox-dark overflow-hidden">
+                                    <div className="h-full bg-blue-500" style={{ width: `${run.total ? Math.round(over * 100 / run.total) : 0}%` }} />
+                                </div>
+                            )}
+                            {run.state === 'stopped' && run.reason && <div className="text-sm text-yellow-400">{run.reason}</div>}
+                            {run.cancelled_by && <div className="text-sm text-gray-400">{bkpFill(t('batchRestoreCancelledBy'), { user: run.cancelled_by })}</div>}
+                            {asking && <div className="text-sm text-yellow-400" data-br-cancel-ask>{t('batchRestoreCancelAsk')}</div>}
+                            <div className="space-y-1">
+                                {(run.rows || []).map(r => (
+                                    <div key={r.vmid} className="text-sm border-t border-proxmox-border pt-1" data-br-run-row={r.vmid} data-state={r.state}>
+                                        <div className="flex items-center gap-3">
+                                            <span className="font-mono text-xs text-gray-400">{r.vmid} &gt; {r.target_vmid}</span>
+                                            <span className="text-xs text-gray-500 truncate flex-1">{r.node}</span>
+                                            <span className={`text-xs ${BKP_STATE_CLS[r.state] || ''}`}>
+                                                {r.state === 'restoring' && <span className="inline-flex animate-spin mr-1"><Icons.RotateCw /></span>}
+                                                {stateText(r.state)}
+                                            </span>
+                                        </div>
+                                        {r.note && <div className={`text-xs break-all ${r.state === 'failed' || r.state === 'skipped' ? 'text-red-400' : 'text-gray-500'}`}>{r.note}</div>}
+                                    </div>
+                                ))}
+                            </div>
+                        </>)}
+                        <div className="text-xs text-gray-400 flex items-start gap-2"><Icons.Info /><span>{t('batchRestoreServerNote')}</span></div>
+                        {error && <div className="text-sm text-red-400 break-all" data-br-error>{error}</div>}
+                    </div>
+                );
+                footer = (<>
+                    {running && run.may_cancel && !haReadOnly && (asking ? (<>
+                        <button onClick={() => setAsking(false)} disabled={busy} className={guestBulkButton(isCorporate, 'ghost')}>{t('batchRestoreKeep')}</button>
+                        <button onClick={cancelRest} disabled={busy} className={guestBulkButton(isCorporate, 'danger')} data-br-cancel-yes>{t('batchRestoreCancelYes')}</button>
+                    </>) : (
+                        <button onClick={() => setAsking(true)} className={guestBulkButton(isCorporate, 'danger')} data-br-cancel>{t('batchRestoreCancel')}</button>
+                    ))}
+                    <button onClick={onClose} className={guestBulkButton(isCorporate, 'ghost')} data-br-close>{t('close')}</button>
+                </>);
+            }
+            return (
+                <BackupFrame testId="batch-restore-modal" icon={<Icons.RotateCcw />} onClose={onClose} footer={footer} title={title} meta={meta}>
+                    {body}
+                </BackupFrame>
+            );
+        }
+        try { window.PegaProxBatchRestoreModal = BatchRestoreModal; } catch (_) {}
+
         // LW May 2026 — Encryption key generator. Generates server-side, shows
         // once, lets the user download the JSON envelope + a printable sheet.
         function EncryptionKeyModal({ authFetch, apiUrl, onClose }) {
@@ -3292,18 +4255,53 @@ pre{white-space:pre-wrap;word-break:break-all;border:1px solid #ccc;padding:12px
         }
         try { window.PegaProxEncryptionKeyModal = EncryptionKeyModal; } catch (_) {}
 
+        // LW Oct 2026 - real restores of real backups: before the weekly run is switched on (or an
+        // enabled one nobody said yes to is saved) the dialog says what it will do and waits for a yes
+        function VerifyScheduleConsent({ cfg, busy, onConfirm, onCancel }) {
+            const { t } = useTranslation();
+            const when = `${String(cfg.day || 'sun').toUpperCase()} ${String(cfg.hour ?? 4).padStart(2, '0')}:00`;
+            return (
+                <div className="p-5 space-y-3" data-rtest-consent>
+                    <div className="text-sm font-semibold flex items-center gap-2">
+                        <Icons.AlertTriangle />
+                        {t('rtestConsentTitle')}
+                    </div>
+                    <p className="text-sm">{bkpFill(t('rtestConsentText'), { when })}</p>
+                    <ul className="text-sm list-disc pl-5 space-y-1">
+                        <li data-rtest-consent-count>{bkpFill(t('rtestConsentCount'), { n: cfg.weekly_count ?? 5 })}</li>
+                        <li data-rtest-consent-size>{bkpFill(t('rtestConsentSize'), { gb: cfg.max_backup_gb ?? 32 })}</li>
+                        <li>{t('rtestConsentSpace')}</li>
+                    </ul>
+                    <div className="flex justify-end gap-2 pt-2" style={{ borderTop: '1px solid var(--corp-border, #29414e)' }}>
+                        <button onClick={onCancel} data-rtest-consent-cancel
+                            className="px-3 py-1.5 text-sm"
+                            style={{ background: 'transparent', color: 'var(--corp-text)', border: '1px solid var(--corp-border, #485764)', borderRadius: '3px' }}>
+                            {t('cancel') || 'Cancel'}
+                        </button>
+                        <button onClick={onConfirm} disabled={busy} data-rtest-consent-confirm
+                            className="px-3 py-1.5 text-sm font-medium"
+                            style={{ background: 'var(--corp-accent, #0078a8)', color: '#fff', border: 'none', borderRadius: '3px', opacity: busy ? 0.5 : 1 }}>
+                            {t('rtestConsentConfirm')}
+                        </button>
+                    </div>
+                </div>
+            );
+        }
+
         // NS May 2026 — settings panel for the auto-verify schedule.
         // Backend at /api/pbs/verify-schedule (GET/PUT). Single dialog toggle.
         function VerifyScheduleModal({ authFetch, apiUrl, onClose }) {
             const { t } = useTranslation();
             const [cfg, setCfg] = React.useState(null);
+            const [stored, setStored] = React.useState(null);
+            const [confirming, setConfirming] = React.useState(false);
             const [busy, setBusy] = React.useState(false);
             const [err, setErr] = React.useState(null);
             React.useEffect(() => {
                 (async () => {
                     try {
                         const r = await authFetch(`${apiUrl}/pbs/verify-schedule`);
-                        if (r && r.ok) setCfg(await r.json());
+                        if (r && r.ok) { const body = await r.json(); setCfg(body); setStored(body); }
                         else setErr(`HTTP ${r?.status}`);
                     } catch (e) { setErr(String(e)); }
                 })();
@@ -3311,20 +4309,27 @@ pre{white-space:pre-wrap;word-break:break-all;border:1px solid #ccc;padding:12px
                 window.addEventListener('keydown', onKey);
                 return () => window.removeEventListener('keydown', onKey);
             }, [authFetch, apiUrl, onClose]);
-            const save = async () => {
+            const save = async (confirmed) => {
+                // LW Oct 2026 - switched on, or on without a yes on record: ask first
+                if (!confirmed && cfg.enabled && !(stored && stored.enabled && stored.confirmed_at)) { setConfirming(true); return; }
                 setBusy(true); setErr(null);
                 try {
+                    const { confirmed_at, ...body } = cfg;  // eslint-disable-line no-unused-vars
+                    if (confirmed) body.confirmed = true;
                     const r = await authFetch(`${apiUrl}/pbs/verify-schedule`, {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(cfg),
+                        body: JSON.stringify(body),
                     });
                     if (r && r.ok) onClose();
-                    else setErr(`HTTP ${r?.status}`);
-                } catch (e) { setErr(String(e)); }
+                    // LW Oct 2026 - what the server refuses, in its words (a field out of range is a 400 now)
+                    else { setConfirming(false); setErr(await PegaProxApiErrors.message(r, `HTTP ${r?.status}`)); }
+                } catch (e) { setConfirming(false); setErr(String(e)); }
                 finally { setBusy(false); }
             };
             const update = (k, v) => setCfg(c => ({ ...c, [k]: v }));
+            // no yes: the run stays off, nothing is saved
+            const decline = () => { setConfirming(false); update('enabled', false); };
             // portal to <body> so an ancestor stacking context (a transform/filter on the PBS
             // view) can't trap this fixed overlay under the PBS table — #701
             return ReactDOM.createPortal(
@@ -3343,13 +4348,15 @@ pre{white-space:pre-wrap;word-break:break-all;border:1px solid #ccc;padding:12px
                         </div>
                         {!cfg ? (
                             <div className="p-6 text-center opacity-70">{err || (t('pbsLoadingEllipsis') || 'Loading…')}</div>
+                        ) : confirming ? (
+                            <VerifyScheduleConsent cfg={cfg} busy={busy} onConfirm={() => save(true)} onCancel={decline} />
                         ) : (
                             <div className="p-5 space-y-3">
                                 <p className="text-xs opacity-70">
                                     {t('pbsAutoBackupVerificationDesc') || 'Schedules a weekly backup-verification: a small set of recent snapshots is restored to scratch, booted, then cleaned up. Catches silent backup corruption.'}
                                 </p>
                                 <label className="flex items-center gap-3">
-                                    <input type="checkbox" checked={!!cfg.enabled} onChange={(e) => update('enabled', e.target.checked)} />
+                                    <input type="checkbox" checked={!!cfg.enabled} onChange={(e) => update('enabled', e.target.checked)} data-rtest-enabled />
                                     <span>{t('pbsEnableScheduledAutoVerification') || 'Enable scheduled auto-verification'}</span>
                                 </label>
                                 <div style={{ opacity: cfg.enabled ? 1 : 0.5 }}>
@@ -3389,6 +4396,23 @@ pre{white-space:pre-wrap;word-break:break-all;border:1px solid #ccc;padding:12px
                                             <option value="all">{t('pbsAllSnapshotsInPool') || 'All snapshots in pool'}</option>
                                         </select>
                                     </label>
+                                    <label className="text-sm block mt-3">
+                                        <div className="opacity-70 mb-1">{t('rtestMaxAge')}</div>
+                                        <input type="number" min="1" max="365" value={cfg.max_age_days ?? 30} data-rtest-max-age
+                                            onChange={(e) => update('max_age_days', Math.max(1, Math.min(365, parseInt(e.target.value) || 1)))}
+                                            disabled={!cfg.enabled}
+                                            className="w-full px-2 py-1.5 text-sm"
+                                            style={{ background: 'var(--corp-surface-2, #29414e)', color: 'var(--corp-text)', border: '1px solid var(--corp-border, #485764)' }} />
+                                    </label>
+                                    <label className="text-sm block mt-3">
+                                        <div className="opacity-70 mb-1">{t('rtestMaxBackupGb')}</div>
+                                        <input type="number" min="1" max="2048" value={cfg.max_backup_gb ?? 32} data-rtest-max-gb
+                                            onChange={(e) => update('max_backup_gb', Math.max(1, Math.min(2048, parseInt(e.target.value) || 1)))}
+                                            disabled={!cfg.enabled}
+                                            className="w-full px-2 py-1.5 text-sm"
+                                            style={{ background: 'var(--corp-surface-2, #29414e)', color: 'var(--corp-text)', border: '1px solid var(--corp-border, #485764)' }} />
+                                    </label>
+                                    <p className="text-xs opacity-60 mt-2">{t('rtestIsoNote')}</p>
                                 </div>
                                 {err && <div style={{ color: '#f54f47', fontSize: '12px' }}>{err}</div>}
                                 <div className="flex justify-end gap-2 pt-2" style={{ borderTop: '1px solid var(--corp-border, #29414e)' }}>
@@ -3397,7 +4421,7 @@ pre{white-space:pre-wrap;word-break:break-all;border:1px solid #ccc;padding:12px
                                         style={{ background: 'transparent', color: 'var(--corp-text)', border: '1px solid var(--corp-border, #485764)', borderRadius: '3px' }}>
                                         {t('cancel') || 'Cancel'}
                                     </button>
-                                    <button onClick={save} disabled={busy}
+                                    <button onClick={() => save(false)} disabled={busy}
                                         className="px-3 py-1.5 text-sm font-medium"
                                         style={{ background: 'var(--corp-accent, #0078a8)', color: '#fff', border: 'none', borderRadius: '3px',
                                                  opacity: busy ? 0.5 : 1 }}>
@@ -3412,3 +4436,654 @@ pre{white-space:pre-wrap;word-break:break-all;border:1px solid #ccc;padding:12px
             );
         }
         try { window.PegaProxVerifyScheduleModal = VerifyScheduleModal; } catch (_) {}
+
+        // LW Oct 2026 - the restore tests of a cluster: the weekly run, what the tests check, and
+        // how recoverable each guest looks from the last one that passed. One read of the report
+        // for the whole cluster; the tests of a guest only once its row is opened.
+        const RT_PAGE = 100;
+        const RT_STATES = ['ok', 'stale', 'failing', 'never', 'rto_missed'];
+        const RT_STATE_CLS = {
+            ok: 'bg-green-500/20 text-green-400', stale: 'bg-yellow-500/20 text-yellow-400',
+            failing: 'bg-red-500/20 text-red-400', never: 'bg-orange-500/20 text-orange-400',
+            rto_missed: 'bg-yellow-500/20 text-yellow-400',
+        };
+        const RT_RPO_CLS = { ok: 'text-green-400', warning: 'text-yellow-400', breached: 'text-red-400', no_backup: 'text-orange-400' };
+        function rtAge(hours) {
+            if (hours == null) return '-';
+            return hours < 48 ? `${Number(hours).toFixed(1)} h` : `${Math.floor(hours / 24)} d`;
+        }
+        function rtPorts(text) {
+            return String(text || '').split(/[\s,;]+/).filter(Boolean).map(p => (/^\d+$/.test(p) ? parseInt(p, 10) : p));
+        }
+
+        // LW Oct 2026 - recovery assurance under the restore tests: how much of the cluster is
+        // proven recoverable (restore test + agent check + application check), the gaps behind
+        // the rest, the signed evidence, and manual confirmations that sit beside the proof
+        const RASR_PAGE = 25;
+        const RASR_KINDS = ['restore_failing', 'app_failing', 'agent_failing', 'never_tested', 'no_agent_check', 'no_app_checks',
+                            'rto_missed', 'test_stale', 'backup_old', 'no_backup', 'plan_target_unreachable', 'plan_no_replication'];
+        const rasrKindKey = (k) => 'rasrGap' + k.charAt(0).toUpperCase() + k.slice(1);
+        function RecoveryAssurance({ clusterId, base, call, days, stamp, canWrite, canTags, say, card, haServing }) {
+            const { t } = useTranslation();
+            const [data, setData] = useState(null);
+            const [error, setError] = useState('');
+            const [kind, setKind] = useState('all');
+            const [shown, setShown] = useState(RASR_PAGE);
+            const [tags, setTags] = useState('');
+            const [dialog, setDialog] = useState(null);
+            const [busy, setBusy] = useState('');
+            const [verdict, setVerdict] = useState(null);
+            const look = useRef(0);
+            const field = 'w-full px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm';
+
+            const load = useCallback(async () => {
+                const mine = ++look.current;
+                try {
+                    const res = await call(`${base}/recovery-assurance?days=${days}`);
+                    if (mine !== look.current) return;
+                    if (res.ok) {
+                        const body = await res.json();
+                        setData(body);
+                        setTags((body.critical_tags || []).join(', '));
+                        setError('');
+                    } else { setData(null); setError(await PegaProxApiErrors.message(res, t('rtestLoadFailed'))); }
+                } catch (e) { if (mine === look.current) setError(t('rtestLoadFailed')); }
+            }, [base, days, call]);  // eslint-disable-line react-hooks/exhaustive-deps
+            useEffect(() => { load(); }, [load, stamp]);
+
+            const send = async (key, method, url, body, done) => {
+                setBusy(key);
+                try {
+                    const res = await call(url, { method, headers: { 'Content-Type': 'application/json' },
+                                                  body: body === undefined ? undefined : JSON.stringify(body) });
+                    if (res.ok) { say(done, 'success'); setDialog(null); await load(); }
+                    else say(await bkpError(res, t, haServing), 'error');
+                } catch (e) { say(t('connectionError'), 'error'); }
+                setBusy('');
+            };
+            const saveTags = () => send('tags', 'PUT', `${base}/recovery-settings`,
+                { critical_tags: tags.split(',').map(s => s.trim()).filter(Boolean) }, t('rtestSaved'));
+            const saveConfirm = () => {
+                const body = { vmid: Number(dialog.vmid) || dialog.vmid, text: dialog.text.trim() };
+                if (String(dialog.days).trim() !== '') body.expires_days = Number(dialog.days);
+                send('confirm', 'POST', `${base}/recovery-confirmations`, body, t('rasrConfirmSaved'));
+            };
+            const verifyFile = async (file) => {
+                setVerdict(null);
+                if (!file) return;
+                try {
+                    const res = await call(`${API_URL}/recovery-evidence/verify`, { method: 'POST',
+                        headers: { 'Content-Type': 'application/json' }, body: await file.text() });
+                    if (!res.ok) { setVerdict({ bad: true, text: t('rasrVerifyFailed') }); return; }
+                    const v = await res.json();
+                    setVerdict(!v.signature_valid ? { bad: true, text: t('rasrVerifyBad') }
+                        : v.audit_chain === 'absent' ? { bad: true, text: t('rasrVerifyChainAbsent') }
+                        : { bad: false, text: t('rasrVerifyOk') });
+                } catch (e) { setVerdict({ bad: true, text: t('rasrVerifyFailed') }); }
+            };
+
+            if (!data) return error ? <div className="text-sm text-red-400" data-rasr-error>{error}</div> : null;
+            const cov = data.coverage || {};
+            const counts = data.gap_counts || {};
+            const all = [...(data.gaps || []), ...(data.plan_gaps || []).map(p => ({ kind: p.kind, vmid: p.vmid, name: p.name || '', plan: p.plan, plan_id: p.plan_id }))];
+            const list = kind === 'all' ? all : all.filter(g => g.kind === kind);
+            const kinds = RASR_KINDS.filter(k => counts[k]);
+            const confirmed = (data.guests || []).filter(g => g.confirmation);
+            const pct = (p) => (p == null ? '-' : `${p}%`);
+            const tile = (key, label, c) => (
+                <div className={card} data-rasr-tile={key} data-proven={c.proven} data-total={c.total}>
+                    <div className="text-xs text-gray-400">{label}</div>
+                    <div className={`text-2xl font-bold ${c.percent == null ? 'text-gray-500' : c.percent >= 90 ? 'text-green-400' : c.percent >= 60 ? 'text-yellow-400' : 'text-red-400'}`}>{pct(c.percent)}</div>
+                    <div className="text-xs text-gray-500 mt-1">{c.total ? bkpFill(t('rasrProvenOf'), { proven: c.proven, total: c.total }) : (key === 'critical' ? t('rasrNoCritical') : '-')}</div>
+                </div>
+            );
+            return (
+                <div className="space-y-3" data-rasr-panel={clusterId}>
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                        <div>
+                            <div className="text-sm font-medium text-white flex items-center gap-2"><Icons.Shield className="w-4 h-4" /> {t('rasrTitle')}</div>
+                            <p className="text-xs text-gray-500 mt-1">{t('rasrDesc')}</p>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                            <a href={`${base}/recovery-evidence?days=${days}&format=json`} download data-rasr-export="json"
+                                className="flex items-center gap-1 px-3 py-1.5 text-sm text-gray-300 hover:text-white border border-proxmox-border rounded"><Icons.Download className="w-4 h-4" /> {t('rasrExportJson')}</a>
+                            <a href={`${base}/recovery-evidence?days=${days}&format=csv`} download data-rasr-export="csv"
+                                className="flex items-center gap-1 px-3 py-1.5 text-sm text-gray-300 hover:text-white border border-proxmox-border rounded"><Icons.Download className="w-4 h-4" /> {t('rasrExportCsv')}</a>
+                            <label className="flex items-center gap-1 px-3 py-1.5 text-sm text-gray-300 hover:text-white border border-proxmox-border rounded cursor-pointer">
+                                <Icons.Check className="w-4 h-4" /> {t('rasrVerify')}
+                                <input type="file" accept="application/json,.json" className="hidden" data-rasr-verify
+                                    onChange={e => { verifyFile(e.target.files && e.target.files[0]); e.target.value = ''; }} />
+                            </label>
+                        </div>
+                    </div>
+                    {verdict && <div className={`text-xs ${verdict.bad ? 'text-red-400' : 'text-green-400'}`} data-rasr-verdict={verdict.bad ? 'bad' : 'ok'}>{verdict.text}</div>}
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        {tile('critical', t('rasrCritical'), cov.critical || {})}
+                        {tile('all', t('rasrAll'), cov.all || {})}
+                    </div>
+                    {canTags && (
+                        <div className="flex flex-wrap items-end gap-2">
+                            <label className="text-xs text-gray-400 flex-1" style={{ minWidth: '200px' }}>{t('rasrCriticalTags')}
+                                <input value={tags} onChange={e => setTags(e.target.value)} placeholder={t('rasrCriticalTagsHint')} className={`${field} font-mono`} data-rasr-tags />
+                            </label>
+                            <button onClick={saveTags} disabled={busy === 'tags'} data-rasr-save-tags
+                                className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded text-sm font-medium disabled:opacity-50">{t('save')}</button>
+                        </div>
+                    )}
+
+                    <div className={card} data-rasr-gaps={all.length}>
+                        <div className="flex flex-wrap items-center gap-2 mb-2">
+                            <span className="text-sm font-medium text-white">{t('rasrGaps')}</span>
+                            <button onClick={() => { setKind('all'); setShown(RASR_PAGE); }} data-rasr-kind="all"
+                                className={`px-2 py-0.5 rounded text-xs border ${kind === 'all' ? 'border-proxmox-orange text-white' : 'border-proxmox-border text-gray-400'}`}>{t('all')} ({all.length})</button>
+                            {kinds.map(k => (
+                                <button key={k} onClick={() => { setKind(k); setShown(RASR_PAGE); }} data-rasr-kind={k}
+                                    className={`px-2 py-0.5 rounded text-xs border ${kind === k ? 'border-proxmox-orange text-white' : 'border-proxmox-border text-gray-400'}`}>{t(rasrKindKey(k))} ({counts[k]})</button>
+                            ))}
+                        </div>
+                        {!list.length && <div className="text-sm text-gray-400" data-rasr-nogaps>{t('rasrNoGaps')}</div>}
+                        <div className="space-y-1">
+                            {list.slice(0, shown).map((g, i) => (
+                                <div key={`${g.kind}-${g.plan_id || ''}-${g.vmid}-${i}`} className="flex items-center gap-3 text-xs" data-rasr-gap={g.kind} data-vmid={g.vmid ?? ''}>
+                                    <span className="font-mono text-gray-400 w-16">{g.vmid ?? '-'}</span>
+                                    <span className="text-gray-300 truncate flex-1">{g.name || ''}{g.plan ? ` ${bkpFill(t('rasrPlanOf'), { plan: g.plan })}` : ''}</span>
+                                    {g.critical && <span className="px-1.5 py-0.5 rounded bg-red-500/20 text-red-400">{t('rasrCritical')}</span>}
+                                    <span className="text-yellow-400">{t(rasrKindKey(g.kind))}</span>
+                                    {canWrite && g.vmid != null && (
+                                        <button onClick={() => setDialog({ vmid: g.vmid, name: g.name, text: '', days: '' })} data-rasr-confirm-open={g.vmid}
+                                            className="text-blue-400 hover:text-blue-300">{t('rasrConfirm')}</button>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                        {list.length > shown && (
+                            <button onClick={() => setShown(n => n + RASR_PAGE)} className="mt-2 text-xs text-blue-400 hover:text-blue-300" data-rasr-more>
+                                {bkpFill(t('bkpRunsShowMore'), { shown, total: list.length })}
+                            </button>
+                        )}
+                    </div>
+
+                    {confirmed.length > 0 && (
+                        <div className={card} data-rasr-confirmations={confirmed.length}>
+                            <div className="text-sm font-medium text-white mb-2">{t('rasrConfirmations')}</div>
+                            {confirmed.map(g => (
+                                <div key={g.vmid} className="flex items-center gap-3 text-xs py-0.5" data-rasr-confirmation={g.vmid} data-proof={g.proof}>
+                                    <span className="font-mono text-gray-400 w-16">{g.vmid}</span>
+                                    <span className="text-gray-300 truncate flex-1" title={g.confirmation.text}>{g.name} - {g.confirmation.text}</span>
+                                    <span className="text-gray-500">{bkpFill(t('rasrConfirmBy'), { who: g.confirmation.confirmed_by, when: new Date(g.confirmation.confirmed_at).toLocaleDateString() })}
+                                        {g.confirmation.expires_at ? ` ${bkpFill(t('rasrConfirmUntil'), { when: new Date(g.confirmation.expires_at).toLocaleDateString() })}` : ''}</span>
+                                    <span className="px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-400">{g.proof === 'proven' ? t('rasrProven') : t('rasrNotProven')}</span>
+                                    {canWrite && <button onClick={() => send('revoke', 'DELETE', `${base}/recovery-confirmations/${g.confirmation.id}`, undefined, t('rasrWithdrawn'))}
+                                        disabled={busy === 'revoke'} data-rasr-withdraw={g.vmid} className="text-red-400 hover:text-red-300">{t('rasrWithdraw')}</button>}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
+                    {dialog && (
+                        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4" onClick={() => setDialog(null)} data-rasr-dialog>
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-md p-5 space-y-3" onClick={e => e.stopPropagation()}>
+                                <div className="text-base font-semibold text-white">{t('rasrConfirmTitle')}</div>
+                                <p className="text-xs text-gray-400">{t('rasrConfirmNote')}</p>
+                                <label className="text-xs text-gray-400 block">{t('rasrConfirmGuest')}
+                                    <input value={dialog.vmid} onChange={e => setDialog({ ...dialog, vmid: e.target.value })} className={`${field} font-mono`} data-rasr-field="vmid" />
+                                </label>
+                                <label className="text-xs text-gray-400 block">{t('rasrConfirmText')}
+                                    <textarea value={dialog.text} maxLength={500} rows={3} onChange={e => setDialog({ ...dialog, text: e.target.value })} className={field} data-rasr-field="text" />
+                                </label>
+                                <label className="text-xs text-gray-400 block">{t('rasrConfirmExpiry')}
+                                    <input type="number" min="1" max="3650" value={dialog.days} onChange={e => setDialog({ ...dialog, days: e.target.value })} className={field} data-rasr-field="days" />
+                                </label>
+                                <div className="flex justify-end gap-2">
+                                    <button onClick={() => setDialog(null)} className="px-3 py-1.5 text-sm text-gray-300 border border-proxmox-border rounded">{t('cancel')}</button>
+                                    <button onClick={saveConfirm} disabled={busy === 'confirm' || !dialog.text.trim()} data-rasr-save-confirm
+                                        className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded text-sm font-medium disabled:opacity-50">{t('save')}</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        function RestoreTestsPanel({ clusterId, addToast }) {
+            const { t } = useTranslation();
+            const { getAuthHeaders, isAdmin, haReadOnly, haServing } = useAuth();
+            const { isCorporate } = useLayout();
+            const headers = useRef(getAuthHeaders);
+            headers.current = getAuthHeaders;
+            const call = useCallback((url, opts = {}) => fetch(url, { ...opts, credentials: 'include',
+                headers: { ...(opts.headers || {}), ...headers.current() } }), []);
+            const base = `${API_URL}/clusters/${encodeURIComponent(clusterId)}`;
+            const [days, setDays] = useState(30);
+            const [report, setReport] = useState(null);
+            const [loading, setLoading] = useState(true);
+            const [error, setError] = useState('');
+            const [filter, setFilter] = useState('all');
+            const [query, setQuery] = useState('');
+            const [shown, setShown] = useState(RT_PAGE);
+            const [schedule, setSchedule] = useState(null);
+            const [settings, setSettings] = useState(null);
+            const [draft, setDraft] = useState(null);
+            const [rule, setRule] = useState({ scope: 'guest', key: '', rto: '', agent: '', ports: '', command: '' });
+            const [busy, setBusy] = useState('');
+            const [open, setOpen] = useState(null);
+            const [details, setDetails] = useState({});
+            const [editSchedule, setEditSchedule] = useState(false);
+            const look = useRef(0);
+            const say = (msg, kind) => { if (addToast) addToast(msg, kind); };
+
+            const loadSchedule = useCallback(async () => {
+                try {
+                    const res = await call(`${API_URL}/pbs/verify-schedule/status`);
+                    setSchedule(res.ok ? await res.json() : null);
+                } catch (e) { setSchedule(null); }
+            }, [call]);
+            const loadSettings = useCallback(async () => {
+                try {
+                    const res = await call(`${base}/recovery-settings`);
+                    const body = res.ok ? await res.json() : null;
+                    setSettings(body);
+                    if (body && body.cluster) {
+                        const c = body.cluster;
+                        setDraft({ rto: c.rto_minutes ?? '', isolation: c.isolation || 'link_down', bridge: c.test_bridge || '',
+                                   storage: c.test_storage || '', boot: c.boot_timeout ?? '', agent: c.agent || 'auto',
+                                   ports: (c.ports || []).join(', '), command: c.command || '' });
+                    }
+                } catch (e) { setSettings(null); }
+            }, [base, call]);
+            const load = useCallback(async (refresh) => {
+                const mine = ++look.current;
+                setLoading(true);
+                setError('');
+                try {
+                    const res = await call(`${base}/recovery-report?days=${days}${refresh ? '&refresh=1' : ''}`);
+                    if (mine !== look.current) return;
+                    if (res.ok) setReport(await res.json());
+                    else { setReport(null); setError(await PegaProxApiErrors.message(res, t('rtestLoadFailed'))); }
+                } catch (e) {
+                    if (mine === look.current) setError(t('rtestLoadFailed'));
+                }
+                if (mine === look.current) setLoading(false);
+            }, [base, days, call]);  // eslint-disable-line react-hooks/exhaustive-deps
+            useEffect(() => { load(false); }, [load]);
+            useEffect(() => { loadSchedule(); loadSettings(); }, [loadSchedule, loadSettings]);
+            const closeSchedule = useCallback(() => { setEditSchedule(false); loadSchedule(); }, [loadSchedule]);
+
+            const openGuest = async (vmid) => {
+                if (open === vmid) { setOpen(null); return; }
+                setOpen(vmid);
+                if (details[vmid] && details[vmid].data) return;
+                setDetails(d => ({ ...d, [vmid]: { loading: true } }));
+                try {
+                    const res = await call(`${base}/recovery-report/${vmid}`);
+                    const entry = res.ok ? { data: await res.json() } : { error: await PegaProxApiErrors.message(res, t('rtestLoadFailed')) };
+                    setDetails(d => ({ ...d, [vmid]: entry }));
+                } catch (e) {
+                    setDetails(d => ({ ...d, [vmid]: { error: t('rtestLoadFailed') } }));
+                }
+            };
+
+            const write = async (key, method, url, body, done) => {
+                setBusy(key);
+                try {
+                    const res = await call(url, { method, headers: { 'Content-Type': 'application/json' },
+                                                  body: body === undefined ? undefined : JSON.stringify(body) });
+                    if (res.ok) { say(done, 'success'); await loadSettings(); load(false); }
+                    else say(await bkpError(res, t, haServing), 'error');
+                } catch (e) { say(t('connectionError'), 'error'); }
+                setBusy('');
+            };
+            const saveSettings = () => {
+                const d = draft;
+                write('settings', 'PUT', `${base}/recovery-settings`, {
+                    rto_minutes: d.rto === '' ? null : Number(d.rto), isolation: d.isolation,
+                    test_bridge: d.isolation === 'bridge' ? d.bridge.trim() : null, test_storage: d.storage.trim() || null,
+                    boot_timeout: d.boot === '' ? null : Number(d.boot), agent: d.agent,
+                    ports: rtPorts(d.ports), command: d.command.trim() || null,
+                }, t('rtestSaved'));
+            };
+            const addRule = () => {
+                const body = { scope: rule.scope, key: rule.scope === 'guest' ? Number(rule.key) || rule.key : rule.key.trim() };
+                if (rule.rto !== '') body.rto_minutes = Number(rule.rto);
+                if (rule.agent) body.agent = rule.agent;
+                if (rule.ports.trim()) body.ports = rtPorts(rule.ports);
+                if (rule.command.trim()) body.command = rule.command.trim();
+                write('rule', 'PUT', `${base}/recovery-settings/rules`, body, t('rtestSaved'));
+            };
+
+            const canEdit = !!(settings && settings.can_edit) && isAdmin && !haReadOnly;
+            const rows = (report && report.guests) || [];
+            const q = query.trim().toLowerCase();
+            const list = rows.filter(r => (filter === 'all' || r.state === filter || (filter === 'rpo' && r.rpo_state === 'breached'))
+                && (!q || String(r.vmid).includes(q) || (r.name || '').toLowerCase().includes(q)));
+            const sum = (report && report.summary) || {};
+            const stateText = (s) => ({ ok: t('rtestStateOk'), stale: t('rtestStateStale'), failing: t('rtestStateFailing'),
+                never: t('rtestStateNever'), rto_missed: t('rtestStateRto') })[s] || s;
+            const filterText = (k) => (k === 'all' ? t('rtestTileTotal') : k === 'rpo' ? t('rtestTileRpo') : stateText(k));
+            const runText = (s) => ({ done: t('rtestRunDone'), running: t('rtestRunRunning'), starting: t('rtestRunRunning'),
+                stopped: t('rtestRunStopped'), missed: t('rtestRunMissed'), error: t('rtestRunError') })[s] || s;
+            const field = 'w-full px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm';
+            const card = isCorporate ? 'p-3 bg-proxmox-dark border border-proxmox-border' : 'p-4 bg-proxmox-dark border border-proxmox-border rounded-lg';
+            // LW Oct 2026 - a command check comes without its command for anybody but an admin, as in the settings
+            const checkText = (c) => (c.check === 'agent' ? t('rtestCheckAgent') : c.check === 'port' ? bkpFill(t('rtestCheckPort'), { port: c.target })
+                : c.check === 'booted' ? t('rtestCheckBooted') : `${t('rtestCheckCommand')}: ${c.target || '***'}`);
+            const fmtSlot = (iso) => { const d = new Date(iso); return isNaN(d.getTime()) ? String(iso || '') : d.toLocaleString([], { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }); };
+
+            const last = schedule && schedule.last_run;
+            const mine = last ? (last.results || []).filter(r => r.cluster_id === clusterId) : [];
+            // LW Oct 2026 - what the last run left out and why: over the size cap, of unknown size, no room on the storage
+            const tested = mine.filter(r => r.status !== 'skipped');
+            const skippedRows = mine.filter(r => r.status === 'skipped');
+            const gb = (n) => (n == null ? '?' : (n / 1073741824).toFixed(1));
+            const skipText = (r) => (r.reason === 'too_large' ? bkpFill(t('rtestSkipTooLarge'), { size: gb(r.size), max: r.limit_gb ?? '?' })
+                : r.reason === 'size_unknown' ? t('rtestSkipSizeUnknown')
+                : r.reason === 'no_space' ? bkpFill(t('rtestSkipNoSpace'), { storage: r.storage || '?', free: gb(r.free), size: gb(r.size) })
+                : r.reason === 'space_unknown' ? t('rtestSkipSpaceUnknown') + (r.storage ? ` (${r.storage})` : '')
+                : (r.cause || ''));
+            const policy = (schedule && schedule.policy) || {};
+            const ruleRows = settings ? [...(settings.guests || []), ...(settings.tags || [])] : [];
+
+            return (
+                <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-6 space-y-4" data-rtest-panel={clusterId}>
+                    <div className="flex items-start justify-between">
+                        <div>
+                            <h3 className="text-lg font-semibold text-white flex items-center gap-2">
+                                <Icons.LifeBuoy className="w-5 h-5" />
+                                {t('rtestTitle')}
+                            </h3>
+                            <p className="text-sm text-gray-500 mt-1">{t('rtestDesc')}</p>
+                        </div>
+                        <div className="flex items-center gap-2">
+                            <a href={`${base}/recovery-report?days=${days}&format=csv`} download data-rtest-csv
+                                className="flex items-center gap-1 px-3 py-1.5 text-sm text-gray-300 hover:text-white border border-proxmox-border rounded">
+                                <Icons.Download className="w-4 h-4" /> {t('rtestExportCsv')}
+                            </a>
+                            <button onClick={() => { load(true); loadSchedule(); }} className="p-1.5 text-gray-400 hover:text-white transition-colors" title={t('refresh')} data-rtest-refresh>
+                                <Icons.RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* the weekly run */}
+                    <div className={card} data-rtest-schedule={schedule && schedule.policy && schedule.policy.enabled ? 'on' : 'off'}>
+                        <div className="flex items-center gap-3">
+                            <Icons.Clock className="w-4 h-4 text-gray-400 flex-shrink-0" />
+                            <span className="text-sm font-medium text-white">{t('rtestSchedule')}</span>
+                            <span className="text-sm text-gray-400 flex-1" data-rtest-next>
+                                {!schedule ? '...' : schedule.running ? t('rtestRunning')
+                                    : schedule.policy && schedule.policy.enabled && schedule.next_run
+                                        ? bkpFill(t('rtestNextRun'), { when: fmtSlot(schedule.next_run) + (schedule.timezone ? ` (${schedule.timezone})` : '') })
+                                        : t('rtestScheduleOff')}
+                                {policy.enabled && (
+                                    <span className="text-gray-500" data-rtest-limits>
+                                        {' - '}{bkpFill(t('rtestScheduleLimits'), { n: policy.weekly_count ?? 5, gb: policy.max_backup_gb ?? 32 })}
+                                    </span>
+                                )}
+                            </span>
+                            {isAdmin && !haReadOnly && (
+                                <button onClick={() => setEditSchedule(true)} className="px-3 py-1 text-sm text-gray-300 hover:text-white border border-proxmox-border rounded" data-rtest-edit-schedule>
+                                    {t('rtestScheduleEdit')}
+                                </button>
+                            )}
+                        </div>
+                        <div className="text-xs text-gray-400 mt-2" data-rtest-last>
+                            {!last ? t('rtestNoRunYet') : (
+                                <span>
+                                    {bkpFill(t('rtestLastRun'), { when: bkpWhen(last.finished_at || last.started_at), state: runText(last.state) })}
+                                    {last.counts && ` - ${bkpFill(t('rtestLastRunCounts'), last.counts)}`}
+                                    {last.reason && ` - ${last.reason}`}
+                                </span>
+                            )}
+                        </div>
+                        {tested.length > 0 && (
+                            <div className="mt-2 space-y-1">
+                                {tested.slice(0, 50).map(r => (
+                                    <div key={`${r.vmid}-${r.task_id}`} className="flex items-center gap-3 text-xs" data-rtest-result={r.vmid} data-state={r.status}>
+                                        <span className="font-mono text-gray-400 w-16">{r.vmid}</span>
+                                        <span className="text-gray-300 truncate flex-1">{r.name || ''}</span>
+                                        <span className={BKP_STATE_CLS[r.status === 'passed' ? 'ok' : 'failed']}>{r.status}</span>
+                                        {r.cause && <span className="text-gray-500 truncate">{r.cause}</span>}
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                        {skippedRows.length > 0 && (
+                            <div className="mt-2 space-y-1" data-rtest-skipped>
+                                <div className="text-xs text-gray-400">{bkpFill(t('rtestSkippedTitle'), { n: skippedRows.length })}</div>
+                                {skippedRows.slice(0, 50).map((r, i) => (
+                                    <div key={`${r.vmid}-${r.volid || i}`} className="flex items-center gap-3 text-xs" data-rtest-skip={r.vmid} data-reason={r.reason || ''}>
+                                        <span className="font-mono text-gray-400 w-16">{r.vmid}</span>
+                                        <span className="text-gray-300 truncate flex-1">{r.name || ''}</span>
+                                        <span className="text-yellow-400 truncate" title={r.cause || ''}>{skipText(r)}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </div>
+
+                    {/* how much of the cluster is proven recoverable */}
+                    <RecoveryAssurance clusterId={clusterId} base={base} call={call} days={days} stamp={report} card={card} say={say}
+                        canWrite={isAdmin && !haReadOnly} canTags={canEdit} haServing={haServing} />
+
+                    {/* what the tests do on this cluster */}
+                    {settings && settings.cluster && draft && 'isolation' in settings.cluster && (
+                        <div className={card} data-rtest-settings>
+                            <div className="text-sm font-medium text-white mb-1">{t('rtestSettings')}</div>
+                            <p className="text-xs text-gray-500 mb-3">{t('rtestIsoNote')}</p>
+                            <fieldset disabled={!canEdit || busy === 'settings'} className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                                <label className="text-xs text-gray-400">{t('rtestRtoDefault')}
+                                    <input type="number" min="1" max="10080" value={draft.rto} onChange={e => setDraft({ ...draft, rto: e.target.value })} className={field} data-rtest-field="rto" />
+                                </label>
+                                <label className="text-xs text-gray-400">{t('rtestIsolation')}
+                                    <select value={draft.isolation} onChange={e => setDraft({ ...draft, isolation: e.target.value })} className={field} data-rtest-field="isolation">
+                                        <option value="link_down">{t('rtestIsoLinkDown')}</option>
+                                        <option value="bridge">{t('rtestIsoBridge')}</option>
+                                    </select>
+                                </label>
+                                {draft.isolation === 'bridge' && (
+                                    <label className="text-xs text-gray-400">{t('rtestBridgeName')}
+                                        <input value={draft.bridge} maxLength={32} placeholder="vmbr99" onChange={e => setDraft({ ...draft, bridge: e.target.value })} className={`${field} font-mono`} data-rtest-field="bridge" />
+                                    </label>
+                                )}
+                                <label className="text-xs text-gray-400">{t('rtestStorage')}
+                                    <input value={draft.storage} maxLength={64} placeholder={t('rtestStorageHint')} onChange={e => setDraft({ ...draft, storage: e.target.value })} className={`${field} font-mono`} data-rtest-field="storage" />
+                                </label>
+                                <label className="text-xs text-gray-400">{t('rtestBootTimeout')}
+                                    <input type="number" min="30" max="1800" value={draft.boot} placeholder="180" onChange={e => setDraft({ ...draft, boot: e.target.value })} className={field} data-rtest-field="boot" />
+                                </label>
+                                <label className="text-xs text-gray-400">{t('rtestAgentMode')}
+                                    <select value={draft.agent} onChange={e => setDraft({ ...draft, agent: e.target.value })} className={field} data-rtest-field="agent">
+                                        <option value="auto">{t('rtestAgentAuto')}</option>
+                                        <option value="require">{t('rtestAgentRequire')}</option>
+                                        <option value="off">{t('rtestAgentOff')}</option>
+                                    </select>
+                                </label>
+                                <label className="text-xs text-gray-400">{t('rtestPorts')}
+                                    <input value={draft.ports} placeholder={t('rtestPortsHint')} onChange={e => setDraft({ ...draft, ports: e.target.value })} className={`${field} font-mono`} data-rtest-field="ports" />
+                                </label>
+                                <label className="text-xs text-gray-400 col-span-2">{t('rtestCommand')}
+                                    <input value={draft.command} maxLength={500} placeholder={settings.cluster.command_set ? '***' : 'systemctl is-active nginx'} onChange={e => setDraft({ ...draft, command: e.target.value })} className={`${field} font-mono`} data-rtest-field="command" />
+                                </label>
+                            </fieldset>
+                            {canEdit ? (
+                                <div className="flex justify-end mt-3">
+                                    <button onClick={saveSettings} disabled={busy === 'settings'} data-rtest-save
+                                        className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded text-sm font-medium disabled:opacity-50 flex items-center gap-1.5">
+                                        {busy === 'settings' && <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" />}
+                                        {t('save')}
+                                    </button>
+                                </div>
+                            ) : <div className="text-xs text-gray-500 mt-2" data-rtest-readonly>{t('rtestReadOnly')}</div>}
+
+                            <div className="text-sm font-medium text-white mt-4 mb-2">{t('rtestRules')}</div>
+                            {!ruleRows.length && <div className="text-xs text-gray-500" data-rtest-norules>{t('rtestNoRules')}</div>}
+                            {ruleRows.map(r => (
+                                <div key={`${r.scope}:${r.scope_key}`} className="flex items-center gap-3 text-xs border-t border-proxmox-border py-1" data-rtest-rule={`${r.scope}:${r.scope_key}`}>
+                                    <span className="text-gray-400 w-24">{r.scope === 'guest' ? t('rtestScopeGuest') : t('rtestScopeTag')}</span>
+                                    <span className="font-mono text-white w-24 truncate">{r.scope_key}</span>
+                                    <span className="text-gray-400 flex-1 truncate">
+                                        {[r.rto_minutes != null && `RTO ${r.rto_minutes} min`, r.agent && `${t('rtestAgentMode')}: ${r.agent}`,
+                                          r.ports && r.ports.length && `${t('rtestPorts')}: ${r.ports.join(', ')}`,
+                                          (r.command || r.command_set) && `${t('rtestCheckCommand')}: ${r.command || '***'}`].filter(Boolean).join(' - ') || t('rtestInherit')}
+                                    </span>
+                                    {canEdit && (
+                                        <button onClick={() => write('rule', 'DELETE', `${base}/recovery-settings/rules/${r.scope}/${encodeURIComponent(r.scope_key)}`, undefined, t('rtestSaved'))}
+                                            className="text-red-400 hover:text-red-300" title={t('rtestRemoveRule')} data-rtest-rule-remove={`${r.scope}:${r.scope_key}`}>
+                                            <Icons.Trash className="w-3.5 h-3.5" />
+                                        </button>
+                                    )}
+                                </div>
+                            ))}
+                            {canEdit && (
+                                <div className="grid grid-cols-2 md:grid-cols-6 gap-2 mt-2 items-end" data-rtest-rule-form>
+                                    <select value={rule.scope} onChange={e => setRule({ ...rule, scope: e.target.value })} className={field} data-rtest-rule-field="scope">
+                                        <option value="guest">{t('rtestScopeGuest')}</option>
+                                        <option value="tag">{t('rtestScopeTag')}</option>
+                                    </select>
+                                    <input value={rule.key} placeholder={t('rtestRuleKey')} onChange={e => setRule({ ...rule, key: e.target.value })} className={`${field} font-mono`} data-rtest-rule-field="key" />
+                                    <input type="number" min="1" max="10080" value={rule.rto} placeholder={t('rtestRtoDefault')} onChange={e => setRule({ ...rule, rto: e.target.value })} className={field} data-rtest-rule-field="rto" />
+                                    <input value={rule.ports} placeholder={t('rtestPorts')} onChange={e => setRule({ ...rule, ports: e.target.value })} className={`${field} font-mono`} data-rtest-rule-field="ports" />
+                                    <input value={rule.command} maxLength={500} placeholder={t('rtestCommand')} onChange={e => setRule({ ...rule, command: e.target.value })} className={`${field} font-mono`} data-rtest-rule-field="command" />
+                                    <button onClick={addRule} disabled={!rule.key.trim() || busy === 'rule'} data-rtest-rule-add
+                                        className="px-3 py-1 bg-proxmox-orange hover:bg-orange-600 rounded text-sm font-medium disabled:opacity-50 flex items-center justify-center gap-1">
+                                        <Icons.Plus className="w-3.5 h-3.5" /> {t('rtestAddRule')}
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {/* the guests */}
+                    {report && (
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                            {[['all', sum.total, 'text-blue-400', 'bg-blue-500/10'],
+                              ['ok', sum.ok, 'text-green-400', 'bg-green-500/10'],
+                              ['failing', sum.failing, 'text-red-400', 'bg-red-500/10'],
+                              ['never', sum.never, 'text-orange-400', 'bg-orange-500/10'],
+                              ['stale', sum.stale, 'text-yellow-400', 'bg-yellow-500/10'],
+                              ['rto_missed', sum.rto_missed, 'text-yellow-400', 'bg-yellow-500/10'],
+                              ['rpo', sum.rpo_breached, 'text-red-400', 'bg-red-500/10']].map(([key, val, color, bg]) => (
+                                <button key={key} onClick={() => { setFilter(key); setShown(RT_PAGE); }} data-rtest-tile={key}
+                                    className={`p-3 rounded-lg border ${filter === key ? 'border-proxmox-orange' : 'border-proxmox-border'} ${bg} text-left hover:border-proxmox-orange transition-colors`}>
+                                    <div className={`text-2xl font-bold ${color}`}>{val ?? 0}</div>
+                                    <div className="text-xs text-gray-400 mt-1">{filterText(key)}</div>
+                                </button>
+                            ))}
+                        </div>
+                    )}
+                    <div className="flex flex-wrap items-center gap-3">
+                        <label className="text-sm text-gray-400 flex items-center gap-2">
+                            {t('rtestWithin')}
+                            <select value={days} onChange={e => { setDays(parseInt(e.target.value, 10)); setShown(RT_PAGE); }} className="px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm" data-rtest-days>
+                                {[7, 14, 30, 60, 90].map(d => <option key={d} value={d}>{bkpFill(t('bkpRunsDays'), { n: d })}</option>)}
+                            </select>
+                        </label>
+                        <input value={query} onChange={e => { setQuery(e.target.value); setShown(RT_PAGE); }} placeholder={t('search')} data-rtest-search
+                            className="px-3 py-1 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm" />
+                        {filter !== 'all' && (
+                            <button onClick={() => setFilter('all')} className="flex items-center gap-1 text-xs text-blue-400 hover:text-blue-300" data-rtest-filter={filter}>
+                                {filterText(filter)} <Icons.X className="w-3 h-3" />
+                            </button>
+                        )}
+                    </div>
+                    {report && report.backups_state !== 'ok' && (
+                        <div className="text-xs text-yellow-400" data-rtest-backups-note>{report.backups_state === 'unreadable' ? t('rtestBackupsUnreadable') : t('rtestBackupsPartial')}</div>
+                    )}
+                    {error && <div className="text-sm text-red-400" data-rtest-error>{error}</div>}
+                    {loading && !report && <div className="text-sm text-gray-400">{t('loading')}</div>}
+                    {report && !list.length && <div className="text-sm text-gray-400" data-rtest-none>{t('rtestNoGuests')}</div>}
+                    {list.length > 0 && (
+                        <div className="bg-proxmox-dark border border-proxmox-border rounded-lg overflow-hidden">
+                            <table className="w-full text-sm">
+                                <thead className="bg-proxmox-card border-b border-proxmox-border">
+                                    <tr className="text-left text-xs uppercase text-gray-400">
+                                        <th className="px-3 py-2">{t('rtestColGuest')}</th>
+                                        <th className="px-3 py-2">{t('rtestColState')}</th>
+                                        <th className="px-3 py-2">{t('rtestColPassed')}</th>
+                                        <th className="px-3 py-2">{t('rtestColPoint')}</th>
+                                        <th className="px-3 py-2">{t('rtestColDuration')}</th>
+                                        <th className="px-3 py-2">{t('rtestColRpo')}</th>
+                                        <th className="px-3 py-2">{t('rtestColFailure')}</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {list.slice(0, shown).map(r => (
+                                        <React.Fragment key={r.vmid}>
+                                            <tr className="border-b border-proxmox-border/50 hover:bg-proxmox-hover cursor-pointer" data-rtest-row={r.vmid} data-state={r.state} onClick={() => openGuest(r.vmid)}>
+                                                <td className="px-3 py-2">
+                                                    <span className="inline-flex items-center gap-1 text-white">
+                                                        {open === r.vmid ? <Icons.ChevronDown /> : <Icons.ChevronRight />}
+                                                        <span className="font-mono text-gray-400">{r.vmid}</span> {r.name || '-'}
+                                                    </span>
+                                                </td>
+                                                <td className="px-3 py-2"><span className={`px-2 py-0.5 rounded text-xs ${RT_STATE_CLS[r.state] || ''}`}>{stateText(r.state)}</span></td>
+                                                <td className="px-3 py-2 text-xs text-gray-400">{r.last_success_age_days != null ? bkpFill(t('rtestAgo'), { t: rtAge(r.last_success_age_days * 24) }) : t('rtestNever')}</td>
+                                                <td className="px-3 py-2 text-xs text-gray-400">{r.tested_backup_age_hours != null ? bkpFill(t('rtestAgo'), { t: rtAge(r.tested_backup_age_hours) }) : '-'}</td>
+                                                <td className={`px-3 py-2 text-xs ${r.rto_state === 'missed' ? 'text-red-400' : r.rto_state === 'met' ? 'text-green-400' : 'text-gray-400'}`}>
+                                                    {r.measured_seconds == null ? '-' : r.rto_seconds ? bkpFill(t('rtestVsRto'), { took: bkpTook(Math.round(r.measured_seconds)), rto: bkpTook(r.rto_seconds) }) : `${bkpTook(Math.round(r.measured_seconds))} (${t('rtestNoRto')})`}
+                                                </td>
+                                                <td className={`px-3 py-2 text-xs ${RT_RPO_CLS[r.rpo_state] || 'text-gray-400'}`}>
+                                                    {r.rpo_state === 'no_backup' ? t('rtestNoBackup') : r.rpo_state === 'unknown' ? '?' : bkpFill(t('rtestAgo'), { t: rtAge(r.newest_backup_age_hours) })
+                                                        + (r.sla_hours ? ` / ${bkpFill(t('rtestSlaOf'), { h: r.sla_hours })}` : '')}
+                                                </td>
+                                                <td className="px-3 py-2 text-xs text-red-400 truncate" style={{ maxWidth: '260px' }} title={r.last_failure_cause || ''}>{r.last_failure_cause || ''}</td>
+                                            </tr>
+                                            {open === r.vmid && (
+                                                <tr><td colSpan={7} className="px-3 py-2" data-rtest-detail={r.vmid}>
+                                                    {(() => {
+                                                        const d = details[r.vmid];
+                                                        if (!d || d.loading) return <div className="text-xs text-gray-400">{t('loading')}</div>;
+                                                        if (d.error) return <div className="text-xs text-red-400">{d.error}</div>;
+                                                        const g = d.data.guest, plan = d.data.checks || {};
+                                                        return (
+                                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                                                                <div>
+                                                                    <div className="text-gray-400 mb-1">{t('rtestChecks')}</div>
+                                                                    <div className="text-gray-300">
+                                                                        {[`${t('rtestAgentMode')}: ${plan.agent}`, plan.ports && plan.ports.length ? `${t('rtestPorts')}: ${plan.ports.join(', ')}` : null,
+                                                                          plan.command || plan.command_set ? `${t('rtestCheckCommand')}: ${plan.command || '***'}` : null,
+                                                                          plan.rto_seconds ? `RTO ${bkpTook(plan.rto_seconds)}` : null].filter(Boolean).join(' - ')}
+                                                                    </div>
+                                                                    {(g.last_checks || []).map((c, i) => (
+                                                                        <div key={i} className="flex gap-2" data-rtest-check={c.check}>
+                                                                            <span className={c.ok === true ? 'text-green-400' : c.ok === false ? 'text-red-400' : 'text-gray-500'}>{c.ok === true ? 'OK' : c.ok === false ? 'X' : t('rtestCheckSkipped')}</span>
+                                                                            <span className="text-gray-300">{checkText(c)}</span>
+                                                                            <span className="text-gray-500 truncate">{c.detail}</span>
+                                                                        </div>
+                                                                    ))}
+                                                                </div>
+                                                                <div>
+                                                                    <div className="text-gray-400 mb-1">{t('rtestHistory')}</div>
+                                                                    {!(d.data.history || []).length && <div className="text-gray-500">{t('rtestNoRunYet')}</div>}
+                                                                    {(d.data.history || []).map(h => (
+                                                                        <div key={h.id} className="flex gap-2" data-rtest-history={h.id}>
+                                                                            <span className="text-gray-400">{h.started_at ? new Date(h.started_at).toLocaleString() : '-'}</span>
+                                                                            <span className={h.status === 'passed' ? 'text-green-400' : 'text-red-400'}>{h.status}</span>
+                                                                            <span className="text-gray-500">{h.source === 'schedule' ? t('rtestFromSchedule') : t('rtestByHand')}</span>
+                                                                            {h.measured_seconds != null && <span className="text-gray-400">{bkpTook(Math.round(h.measured_seconds))}</span>}
+                                                                            {h.cause && <span className="text-red-400 truncate">{h.cause}</span>}
+                                                                        </div>
+                                                                    ))}
+                                                                </div>
+                                                            </div>
+                                                        );
+                                                    })()}
+                                                </td></tr>
+                                            )}
+                                        </React.Fragment>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    )}
+                    {list.length > shown && (
+                        <button onClick={() => setShown(n => n + RT_PAGE)} className="text-xs text-blue-400 hover:text-blue-300" data-rtest-more>
+                            {bkpFill(t('bkpRunsShowMore'), { shown, total: list.length })}
+                        </button>
+                    )}
+                    {editSchedule && <VerifyScheduleModal authFetch={call} apiUrl={API_URL} onClose={closeSchedule} />}
+                </div>
+            );
+        }
+        try { window.PegaProxRestoreTestsPanel = RestoreTestsPanel; } catch (_) {}

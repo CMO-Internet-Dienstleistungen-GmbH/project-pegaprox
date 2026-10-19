@@ -7,6 +7,25 @@ No pegaprox imports allowed.
 from datetime import datetime
 
 
+# MK Oct 2026 - how long a guest the balancer moved is left where it is (was 900 s,
+# fixed). Per cluster; the API refuses anything outside the range.
+BALANCER_COOLDOWN_DEFAULT = 900
+BALANCER_COOLDOWN_MIN = 60
+BALANCER_COOLDOWN_MAX = 86400
+
+
+def balancer_cooldown(value):
+    """A stored or sent cooldown as whole seconds inside the range, the default when it
+    is no number at all."""
+    if isinstance(value, bool):
+        return BALANCER_COOLDOWN_DEFAULT
+    try:
+        secs = int(value)
+    except (TypeError, ValueError):
+        return BALANCER_COOLDOWN_DEFAULT
+    return min(max(secs, BALANCER_COOLDOWN_MIN), BALANCER_COOLDOWN_MAX)
+
+
 class MaintenanceTask:
     """Tracks a node evacuation/maintenance task"""
 
@@ -110,6 +129,8 @@ class PegaProxConfig:
         self.ssl_verification = cluster_data.get('ssl_verification', False)
         self.migration_threshold = cluster_data.get('migration_threshold', 20)
         self.migration_tolerance = cluster_data.get('migration_tolerance', 10)
+        self.migration_cooldown = balancer_cooldown(
+            cluster_data.get('migration_cooldown', BALANCER_COOLDOWN_DEFAULT))
         self.check_interval = cluster_data.get('check_interval', 300)
         self.auto_migrate = cluster_data.get('auto_migrate', False)
         self.balance_containers = cluster_data.get('balance_containers', False)
@@ -168,6 +189,9 @@ class PegaProxConfig:
         # (pve01) get "<suffix>" appended → pve01.example.local:8006. Empty string = links use the
         # node IP/host as before.
         self.node_ui_suffix = (cluster_data.get('node_ui_suffix', '') or '').strip().lstrip('.')
+        # MK Oct 2026 - CIDR the remote migrations into this cluster dial its nodes in
+        # (core/transfer_net.py). Empty = the management host, as before.
+        self.transfer_network = str(cluster_data.get('transfer_network', '') or '').strip()
         # NS May 2026 (#364) — load-balancer settings finally hydrated from db.
         # Were API-settable but never persisted before, so users saw "saved"
         # toasts that reverted within seconds.

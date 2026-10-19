@@ -180,7 +180,9 @@ def _files():
     """pegaprox/ and plugins/, and whatever else the root of the checkout lets the code
     import: a module next to pegaprox/ is a way out as much as one inside it, so is a
     package of its own. Not the tests, and not a virtualenv or a package build in the
-    checkout (no __init__.py at their top)."""
+    checkout (no __init__.py at their top). Not a dot file either: the SSH websocket server
+    (pegaprox/api/.ssh_ws_server.py) is written out by a running instance and git ignores it,
+    so a checkout an instance runs from would count calls the repository does not have."""
     out, tops = [], ['pegaprox', 'plugins']
     for name in sorted(os.listdir(ROOT)):
         path = os.path.join(ROOT, name)
@@ -193,7 +195,8 @@ def _files():
     for base in tops:
         for d, dirs, names in os.walk(os.path.join(ROOT, base)):
             dirs[:] = [n for n in dirs if n != '__pycache__']
-            out += [os.path.relpath(os.path.join(d, n), ROOT) for n in names if n.endswith('.py')]
+            out += [os.path.relpath(os.path.join(d, n), ROOT) for n in names
+                    if n.endswith('.py') and not n.startswith('.')]
     return sorted(out)
 
 
@@ -394,6 +397,9 @@ EXITS = {
     ('pegaprox/api/vms.py', 'test_node_connection', 'ssh-exec'): (4, 'read'),
     ('pegaprox/api/vms.py', 'join_node_to_cluster', 'ssh-exec'): (2, 'client'),
     ('pegaprox/api/vms.py', 'remove_node_from_cluster', 'ssh-exec'): (3, 'client'),
+    # a file from a backup into a running container, pct exec on stdin, on a client from
+    # the guarded _ssh_connect at the node's own address (#1139)
+    ('pegaprox/api/vms.py', 'restore_backup_file', 'ssh-exec'): (1, 'client'),
     # `id -u` on the guarded client, the shutdown on a channel of its transport after
     # guard_ssh (see test_a_channel_of_a_transport_asks_guard_ssh_first)
     ('pegaprox/api/vms.py', 'node_action_api', 'ssh-exec'): (5, 'guard'),
@@ -451,10 +457,9 @@ EXITS = {
     ('pegaprox/utils/oidc.py', 'oidc_get_user_info', 'http-direct'): (2, 'external'),
     ('pegaprox/utils/oidc.py', 'oidc_get_user_groups_ex', 'http-direct'): (1, 'external'),
     ('pegaprox/api/auth.py', 'oidc_test_connection', 'http-direct'): (2, 'external'),
-    ('pegaprox/core/acme.py', '_signed_request', 'http-direct'): (1, 'external'),
-    ('pegaprox/core/acme.py', '_get_nonce', 'http-direct'): (1, 'external'),
+    # ACME requests pass the URL guard before reaching this external CA session.
+    ('pegaprox/core/acme.py', '_acme_request', 'http-session'): (1, 'external'),
     ('pegaprox/core/acme.py', '_cloudflare_api', 'http-direct'): (1, 'external'),
-    ('pegaprox/core/acme.py', '_create_order', 'http-direct'): (1, 'external'),
     ('pegaprox/api/siem.py', '_http_post', 'http-urllib'): (1, 'external'),
     ('pegaprox/api/push.py', '_send_one', 'http-urllib'): (1, 'external'),
     ('pegaprox/app.py', 'download_static_files', 'http-urllib'): (3, 'external'),
@@ -503,12 +508,12 @@ def test_the_inventory_counts_what_the_report_says():
         by[verdict] += n
     # S4 with the witness and the lease link, and the connection check, the three restarts
     # asking systemctl in one helper, the join fingerprint read through tls_fingerprint:
-    # 257 calls out of this process, 152 (function, kind) pairs in 138 functions; 46 of
-    # them guarded at the exit and 84 execs on a client from a guarded factory. No route
+    # 256 calls out of this process, 151 (function, kind) pairs in 137 functions; 46 of
+    # them guarded at the exit and 85 execs on a client from a guarded factory. No route
     # relies on the write gate alone any more
-    assert sum(n for n, _v in EXITS.values()) == 257 and len(EXITS) == 152
-    assert len({(f, q) for f, q, _k in EXITS}) == 138
-    assert by['guard'] == 46 and by['client'] == 84
+    assert sum(n for n, _v in EXITS.values()) == 256 and len(EXITS) == 151
+    assert len({(f, q) for f, q, _k in EXITS}) == 137
+    assert by['guard'] == 46 and by['client'] == 85
 
 
 @pytest.mark.parametrize('key', sorted(k for k, v in EXITS.items() if v[1] == 'guard'),
@@ -704,7 +709,12 @@ AUTOMATIONS = {
     ('pegaprox/api/drift.py', 'start_scanner'): (1, 'read'),
     # the replication and backup reads behind the Prometheus series, API GETs only
     ('pegaprox/api/metrics_exporter.py', '_spawn'): (1, 'read'),
+    # the node network configs behind the transfer network view, API GETs only
+    ('pegaprox/core/transfer_net.py', '_spawn'): (1, 'read'),
     ('pegaprox/api/groups.py', 'trigger_xclb_balance_now'): (1, 'confirm'),
+    # a history report (power, costs, right-sizing) worked out in a greenlet of its own:
+    # the metrics history and the guest list (an API GET), nothing else
+    ('pegaprox/api/helpers.py', '_report_start'): (1, 'read'),
     ('pegaprox/api/multi_sdn.py', 'start_scanner'): (1, 'confirm'),
     ('pegaprox/api/realtime.py', 'update_sse_subscription'): (1, 'read'),
     ('pegaprox/api/reports.py', '<module>'): (2, 'read'),
@@ -713,7 +723,8 @@ AUTOMATIONS = {
     ('pegaprox/api/settings.py', 'perform_pegaprox_update'): (1, 'local'),
     ('pegaprox/api/settings.py', 'rollback_pegaprox_update'): (1, 'local'),
     ('pegaprox/api/settings.py', 'restart_server'): (1, 'local'),
-    ('pegaprox/api/settings.py', 'start_rolling_update'): (1, 'job'),
+    # the worker of a rolling update, for a start and for a Continue after a restart
+    ('pegaprox/api/settings.py', '_launch_rolling_update'): (1, 'job'),
     ('pegaprox/api/siem.py', 'start_worker'): (1, 'read'),
     ('pegaprox/api/site_recovery.py', '_safe_spawn_failover'): (1, 'job'),
     ('pegaprox/api/snapshots.py', 'start_scheduler'): (1, 'confirm'),
@@ -740,6 +751,8 @@ AUTOMATIONS = {
     ('pegaprox/api/vmware.py', 'start_vmware_migration'): (1, 'job'),
     ('pegaprox/api/xhm.py', 'xhm_start'): (1, 'job'),
     ('pegaprox/app.py', 'main'): (3, 'local'),
+    # the batch restore runs its restores in ha.as_job, like the server-side bulk migration
+    ('pegaprox/core/batch_restore.py', 'launch'): (1, 'job'),
     ('pegaprox/background/alerts.py', 'start_alert_thread'): (1, 'read'),
     ('pegaprox/background/broadcast.py', 'broadcast_resources_loop'): (4, 'read'),
     ('pegaprox/background/broadcast.py', 'start_broadcast_thread'): (1, 'read'),
@@ -751,15 +764,19 @@ AUTOMATIONS = {
     ('pegaprox/background/metrics.py', 'start_metrics_collector'): (1, 'read'),
     ('pegaprox/background/password_expiry.py', 'start_password_expiry_thread'): (1, 'read'),
     ('pegaprox/background/scheduler.py', 'start_scheduler_thread'): (1, 'confirm'),
+    # the weekly restore tests: the loop confirms each test, the run is a job of its own
+    ('pegaprox/background/restore_tests.py', 'start_restore_test_thread'): (1, 'confirm'),
+    ('pegaprox/background/restore_tests.py', 'tick'): (1, 'job'),
     ('pegaprox/background/site_recovery.py', '_migrate_vm_cross_cluster'): (1, 'job'),
     ('pegaprox/background/site_recovery.py', 'start_heartbeat'): (1, 'confirm'),
     ('pegaprox/background/syslog_server.py', '_tcp_listener'): (1, 'local'),
     ('pegaprox/background/syslog_server.py', '_syslog_loop'): (3, 'local'),
     ('pegaprox/background/syslog_server.py', 'start_syslog_server'): (1, 'local'),
-    ('pegaprox/core/backup_verify.py', 'start_verification.run'): (1, 'read'),
     ('pegaprox/core/backup_verify.py', 'start_verification'): (1, 'job'),
     # a bulk migration of a user, one guest after another (#952)
     ('pegaprox/core/bulk_migrate.py', 'launch'): (1, 'job'),
+    # one SSH login per node after a cluster was added, `sudo -n true` at most (#1136)
+    ('pegaprox/core/node_creds.py', 'check_in_background'): (1, 'read'),
     ('pegaprox/core/ha.py', '_later'): (1, 'lease'),
     ('pegaprox/core/ha.py', 'restart_process'): (1, 'lease'),
     ('pegaprox/core/ha.py', '_fan_out'): (1, 'peer'),
@@ -956,10 +973,13 @@ CONFIRM_SITES = [
     ('pegaprox/core/xcpng.py', 'XcpngManager.run_balance_check', ['_do_balance_migrate']),
     ('pegaprox/api/storage.py', 'run_auto_storage_balance', ['post']),
     ('pegaprox/background/scheduler.py', 'run_scheduled_tasks', ['execute_scheduled_task']),
+    ('pegaprox/background/restore_tests.py', '_run_slot', ['run_verification']),
+    # a test guest a run left behind, removed from the schedule loop
+    ('pegaprox/core/backup_verify.py', 'sweep', ['remove_test_guest']),
     ('pegaprox/api/schedules.py', 'check_schedules', ['execute_scheduled_action']),
     ('pegaprox/api/schedules.py', 'execute_scheduled_rolling_update.run_scheduled_update',
      ['enter_maintenance_mode', 'start_node_update']),
-    ('pegaprox/api/settings.py', 'start_rolling_update.run_rolling_update',
+    ('pegaprox/api/settings.py', 'run_rolling_update.run_node',
      ['enter_maintenance_mode', 'start_node_update']),
     ('pegaprox/api/snapshots.py', '_execute_policy', ['create_snapshot']),
     ('pegaprox/api/snapshots.py', '_prune', ['delete_snapshot', '_api_delete']),
@@ -1123,6 +1143,8 @@ READ_SITES = [
      {'_ssh_run_command_with_key_output': 1, '_ssh_run_command_output': 1,
       '_ssh_run_command_with_password_output': 1}),
     ('pegaprox/utils/vnc_grab.py', 'screendump_to_png', {'_pve_node_exec': 1}),
+    # the login check of a cluster just added: a login and `sudo -n true` per node (#1136)
+    ('pegaprox/core/node_creds.py', 'check_in_background.run', {'run_check': 1}),
     # the progress of an ESXi import: stat, lvs and the dd log of the target volume, from
     # a plain thread of the import job
     ('pegaprox/core/v2p.py', '_monitor_disk_write.probe', {'_pve_node_exec': 1}),

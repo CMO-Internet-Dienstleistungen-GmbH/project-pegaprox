@@ -16,12 +16,13 @@
             const [showLogin, setShowLogin] = useState(false);
             const [nodeInfo, setNodeInfo] = useState({});
             const [sshPort, setSshPort] = useState(null);
+            // LW Oct 2026 (#1143) - no host here any more: the server logs in on the node's
+            // own address and ignored a typed one anyway, the dialog only shows it
             const [credentials, setCredentials] = useState({ 
                 username: 'root', 
                 password: '',
                 privateKey: '',
                 authMethod: 'password',  // 'password' or 'key'
-                host: ''  // SSH host/IP (can be edited by user)
             });
             const wsRef = useRef(null);
             const termRef = useRef(null);
@@ -46,7 +47,7 @@
                     setStatus('connecting');
                     if (termRef.current) {
                         const method = authData.privateKey ? '(SSH Key)' : '';
-                        termRef.current.write(`\r\n${t('shellConnectingAs')} ${authData.username}@${authData.host} ${method}...\r\n`);
+                        termRef.current.write(`\r\n${t('shellConnectingAs')} ${authData.username}@${authData.host || node} ${method}...\r\n`);
                     }
                     return true;
                 }
@@ -58,7 +59,7 @@
                     username: credentials.username,
                     password: credentials.authMethod === 'password' ? credentials.password : '',
                     privateKey: credentials.authMethod === 'key' ? credentials.privateKey : '',
-                    host: credentials.host || nodeInfo.ip,
+                    host: nodeInfo.ip || '',
                 };
                 // If WS already open, send now. Otherwise queue and let the
                 // onopen handler flush as soon as the handshake completes.
@@ -82,6 +83,8 @@
                 let ws = null;
                 let fitAddon = null;
                 let cleanup = false;
+                let handleResize = null;
+                let boxWatch = null;
 
                 const loadTerminal = async () => {
                     try {
@@ -167,7 +170,8 @@
                         fitAddon = new window.FitAddon.FitAddon();
                         term.loadAddon(fitAddon);
                         term.open(terminalRef.current);
-                        setTimeout(() => fitAddon && fitAddon.fit(), 50);  // idk why 50ms but it works
+                        // not on a terminal the tab already disposed again (fit throws there)
+                        setTimeout(() => !cleanup && fitAddon && fitAddon.fit(), 50);  // idk why 50ms but it works
 
                         setStatus('connecting');
                         term.write(`${t('connectingToServer')}\r\n`);
@@ -180,7 +184,9 @@
                             });
                             if (ipResponse.ok) {
                                 const ipData = await ipResponse.json();
-                                nodeIp = ipData.ip || '';
+                                // the connection host stands in there when the node's own
+                                // address is unknown, and the shell does not open on it (#1143)
+                                nodeIp = /_fallback$/.test(ipData.source || '') ? '' : (ipData.ip || '');
                                 if (nodeIp) {
                                     term.write(`Node-IP: ${nodeIp} (${ipData.source})\r\n`);
                                 }
@@ -199,8 +205,7 @@
                         // the form on a server message that never arrived, so
                         // the user just saw a blank terminal with no way to
                         // enter credentials. Proactive form ⇒ always visible.
-                        setNodeInfo({ node, ip: nodeIp || '', allowManualIp: !nodeIp });
-                        setCredentials(prev => ({ ...prev, host: nodeIp || prev.host || '' }));
+                        setNodeInfo({ node, ip: nodeIp || '' });
                         setShowLogin(true);
                         setStatus('login');
 
@@ -215,6 +220,9 @@
                         } catch(e) {
                             console.warn('WS token fetch failed, falling back');
                         }
+                        // LW Oct 2026 (#1143) - closed while the two lookups ran: open no session
+                        // that nothing shows and nothing closes
+                        if (cleanup) return;
 
                         // Connect WebSocket - Shell runs on main port + 2 (unless reverse proxy port set)
                         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -226,7 +234,8 @@
                         }
 
                         setSshPort(sshPortNum);
-                        const wsUrl = `${wsProtocol}//${window.location.hostname}:${sshPortNum}/api/clusters/${clusterId}/nodes/${node}/shellws?token=${encodeURIComponent(wsToken)}&ip=${encodeURIComponent(nodeIp)}`;
+                        // no ?ip= any more: the server resolves the node and would not take one (#1143)
+                        const wsUrl = `${wsProtocol}//${window.location.hostname}:${sshPortNum}/api/clusters/${clusterId}/nodes/${node}/shellws?token=${encodeURIComponent(wsToken)}`;
                         
                         term.write(`${t('connectingWs')} (Port ${sshPortNum})...\r\n`);
                         // NS: Mar 2026 - don't log wsUrl, contains session token
@@ -257,18 +266,10 @@
                                         
                                         if (msg.status === 'need_credentials') {
                                             // NS May 2026 — dialog may already be visible (we open
-                                            // it proactively after IP fetch). Refresh metadata but
-                                            // don't trample a host the user has already edited.
-                                            setNodeInfo({
-                                                node: msg.node,
-                                                ip: msg.ip || '',
-                                                allowManualIp: msg.allowManualIp || !msg.ip
-                                            });
-                                            if (msg.ip) {
-                                                setCredentials(prev => (
-                                                    !prev.host ? { ...prev, host: msg.ip } : prev
-                                                ));
-                                            }
+                                            // it proactively after IP fetch). Refresh metadata.
+                                            // LW Oct 2026 (#1143) - the server's address is the
+                                            // one the shell logs in at, so it replaces ours
+                                            setNodeInfo({ node: msg.node, ip: msg.ip || '' });
                                             setShowLogin(true);
                                             setStatus('login');
                                             return;
@@ -279,9 +280,14 @@
                                             setStatus('connected');
                                             statusRef.current = 'connected';
                                             term.clear();
+                                            // the PTY starts at 120x40, tell it the real size
+                                            if (handleResize) handleResize();
                                             return;
                                         } else if (msg.status === 'error') {
                                             term.write(`\r\n\x1b[31m${msg.message}\x1b[0m\r\n`);
+                                            // a refusal before the login (no address for the node, say)
+                                            // stays readable instead of under the open dialog
+                                            setShowLogin(false);
                                             setStatus('error');
                                             // Show login again on auth failure
                                             if (msg.message.includes('Login') || msg.message.includes('auth') || msg.message.includes('Host')) {
@@ -366,10 +372,15 @@
                         });
 
                         // handle resize
-                        const handleResize = () => {
-                            if (fitAddon) {
-                                fitAddon.fit();
-                                if (ws && ws.readyState === WebSocket.OPEN && term && statusRef.current === 'connected') {
+                        // LW Oct 2026 (#1143) - also when only the box changes: fullscreen of the
+                        // panel around it resizes no window. The PTY hears of a new size once.
+                        let sentSize = '';
+                        handleResize = () => {
+                            if (fitAddon && term) {
+                                try { fitAddon.fit(); } catch (e) { return; }
+                                const size = `${term.cols}x${term.rows}`;
+                                if (ws && ws.readyState === WebSocket.OPEN && statusRef.current === 'connected' && size !== sentSize) {
+                                    sentSize = size;
                                     ws.send(JSON.stringify({
                                         type: 'resize',
                                         cols: term.cols,
@@ -379,6 +390,10 @@
                             }
                         };
                         window.addEventListener('resize', handleResize);
+                        if (window.ResizeObserver && terminalRef.current) {
+                            boxWatch = new ResizeObserver(() => handleResize && handleResize());
+                            boxWatch.observe(terminalRef.current);
+                        }
 
                     } catch (err) {
                         console.error('Terminal error:', err);
@@ -390,6 +405,9 @@
 
                 return () => {
                     cleanup = true;
+                    if (handleResize) window.removeEventListener('resize', handleResize);
+                    handleResize = null;
+                    if (boxWatch) boxWatch.disconnect();
                     if (ws) ws.close();
                     if (term) term.dispose();
                 };
@@ -411,27 +429,26 @@
                     
                     {/* Login form overlay - use fixed for reliable centering */}
                     {showLogin && (
-                        <div className="fixed inset-0 flex items-center justify-center bg-black/90 z-[100] p-4">
+                        <div data-shell-login className="fixed inset-0 flex items-center justify-center bg-black/90 z-[100] p-4">
                             <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-6 w-full max-w-md shadow-2xl max-h-[85vh] overflow-y-auto">
                                 <h3 className="text-white font-semibold mb-4 flex items-center gap-2">
                                     <Icons.Terminal />
                                     SSH Login - {nodeInfo.node}
                                 </h3>
                                 
-                                {/* Host/IP - editable */}
+                                {/* Host/IP - LW Oct 2026 (#1143) shown, not chosen: the server
+                                    opens the shell on the node's own address */}
                                 <div className="mb-4">
                                     <label className="block text-gray-400 text-sm mb-1">
                                         Host / IP
-                                        {nodeInfo.allowManualIp && (
-                                            <span className="text-yellow-500 ml-2 text-xs">({t('autoDetectionFailed')})</span>
-                                        )}
                                     </label>
                                     <input
                                         type="text"
-                                        value={credentials.host || nodeInfo.ip || ''}
-                                        onChange={(e) => setCredentials({...credentials, host: e.target.value})}
-                                        className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white focus:border-proxmox-orange focus:outline-none font-mono"
-                                        placeholder="192.168.1.100 oder hostname"
+                                        value={nodeInfo.ip || ''}
+                                        readOnly
+                                        data-shell-host
+                                        className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-gray-400 focus:outline-none font-mono cursor-default"
+                                        placeholder={t('nodeShellAddressFromServer')}
                                     />
                                 </div>
                                 
@@ -576,10 +593,7 @@
                                         </button>
                                         <button
                                             onClick={sendCredentials}
-                                            disabled={
-                                                !(credentials.host || nodeInfo.ip) ||
-                                                (credentials.authMethod === 'password' ? !credentials.password : !credentials.privateKey)
-                                            }
+                                            disabled={credentials.authMethod === 'password' ? !credentials.password : !credentials.privateKey}
                                             className="flex-1 py-2 bg-proxmox-orange text-white rounded-lg hover:bg-orange-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                                         >
                                             {t('connect') || 'Connect'}
@@ -589,6 +603,43 @@
                             </div>
                         </div>
                     )}
+                </div>
+            );
+        }
+
+        // LW Oct 2026 (#1143) - the node shell tab with its fullscreen. Fullscreen used to mount
+        // a second NodeShellTerminal on top: a second WebSocket and SSH login, the credentials
+        // asked again, no scrollback, and the first session left open underneath. Now the one
+        // terminal's box fills the window, as that overlay did, and the terminal refits itself
+        // to it (ResizeObserver). Not the browser's fullscreen: that keeps Escape for itself,
+        // and a shell needs it (vim, less). Escape stays the shell's, the button leaves.
+        function NodeShellPanel({ node, clusterId, addToast }) {
+            const { t } = useTranslation();
+            const [full, setFull] = useState(false);
+
+            // same tree in both states, so React keeps the terminal and its session
+            return (
+                <div data-node-shell={full ? 'window' : 'tab'}
+                    className={full ? 'fixed inset-0 z-[70] bg-black flex flex-col' : 'h-full flex flex-col'}>
+                    <div className={full ? 'flex items-center justify-between px-4 py-2 bg-proxmox-dark border-b border-proxmox-border' : 'flex items-center justify-between mb-4'}>
+                        <div className="flex items-center gap-3">
+                            <Icons.Terminal />
+                            <span className="text-white font-medium">{full ? `${node} - Shell` : 'Node Shell'}</span>
+                        </div>
+                        <button
+                            onClick={() => setFull(f => !f)}
+                            data-node-shell-toggle
+                            title={full ? t('exitFullscreen') : t('fullscreen')}
+                            className="flex items-center gap-2 px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-gray-300 hover:text-white text-sm"
+                        >
+                            {full ? <Icons.Minimize /> : <Icons.Maximize />}
+                            {full ? t('exitFullscreen') : t('fullscreen')}
+                        </button>
+                    </div>
+                    <div className={full ? 'flex-1 bg-black overflow-hidden' : 'flex-1 bg-black rounded-lg border border-proxmox-border overflow-hidden min-h-[400px]'}
+                        style={full ? { minHeight: 0 } : undefined}>
+                        <NodeShellTerminal node={node} clusterId={clusterId} addToast={addToast} />
+                    </div>
                 </div>
             );
         }
@@ -1245,6 +1296,181 @@
             );
         }
 
+        // LW Oct 2026 (#1137) - the QDevice of a cluster as GET /clusters/<id>/qdevice has it: what
+        // the QDevice daemon of each node PegaProx reaches says. Shows only, on every instance; the
+        // QNetd host is no Proxmox node, there is nothing of it to act on from here.
+        function qdeviceTone(q) {
+            const answered = ((q && q.nodes) || []).filter(n => n.answered);
+            // stale: the last read failed, what is kept says nothing about now
+            if (!q || !q.present || q.stale || !answered.length) return 'none';
+            const up = answered.filter(n => n.connected).length;
+            return up === answered.length ? 'ok' : up === 0 ? 'bad' : 'warn';
+        }
+        const QDEVICE_TONES = { ok: '#60b515', warn: '#efc006', bad: '#f54f47', none: '#728b9a' };
+
+        function qdeviceConnectedText(q, t) {
+            if (q && q.stale) return t('qdeviceStale');
+            const answered = ((q && q.nodes) || []).filter(n => n.answered);
+            return t('qdeviceConnectedOf').replace('{up}', answered.filter(n => n.connected).length).replace('{n}', answered.length);
+        }
+
+        function QdeviceDot({ q }) {
+            const { t } = useTranslation();
+            const tone = qdeviceTone(q);
+            return <span data-qdevice-dot={tone} title={qdeviceConnectedText(q, t)} className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: QDEVICE_TONES[tone] }} />;
+        }
+
+        function QdeviceDetail({ q, clusterName, corporate = false, onClose }) {
+            const { t } = useTranslation();
+            const d = q && q.present ? q : null;
+            const muted = corporate ? { color: 'var(--corp-text-secondary)' } : undefined;
+            const nodeState = (n) => {
+                if (!n.asked) return { tone: 'none', text: n.online ? t('qdeviceNotAsked') : t('offline') };
+                if (!n.answered) return { tone: 'none', text: n.error ? `${t('qdeviceNoAnswer')} (${n.error})` : t('qdeviceNoAnswer') };
+                if (!n.present) return { tone: 'bad', text: t('qdeviceNoDaemon') };
+                return { tone: n.connected ? 'ok' : 'bad', text: n.state || '-' };
+            };
+            const fields = d ? [
+                ['qnetd_host', t('qdeviceQnetdHost'), d.qnetd_host],
+                ['state', t('qdeviceState'), d.state],
+                ['model', t('qdeviceModel'), d.model],
+                ['algorithm', t('qdeviceAlgorithm'), d.algorithm],
+                ['tie_breaker', t('qdeviceTieBreaker'), d.tie_breaker],
+                ['last_poll', t('qdeviceLastPoll'), d.last_poll],
+                ['echo_reply', t('qdeviceEchoReply'), d.echo_reply],
+                ['answered_by', t('qdeviceAnsweredBy'), d.answered_by],
+            ] : [];
+            const readAt = d && d.read_at ? new Date(d.read_at) : null;
+            const readText = readAt && !isNaN(readAt.getTime()) ? `${t('qdeviceReadAt')} ${readAt.toLocaleTimeString()}` : '';
+            const note = (
+                <div data-qdevice-note className={corporate ? 'flex items-start gap-2 p-2 text-[12px]' : 'flex items-start gap-2 bg-blue-500/10 border border-blue-500/30 rounded p-3 text-sm text-gray-300'}
+                    style={corporate ? { border: '1px solid var(--corp-border-medium)', color: 'var(--corp-text-secondary)' } : undefined}>
+                    <Icons.Info />
+                    <span>{t('qdeviceNote')}</span>
+                </div>
+            );
+            const staleNote = d && d.stale ? (
+                <div data-qdevice-stale="" className={corporate ? 'p-2 text-[12px]' : 'bg-yellow-500/10 border border-yellow-500/30 rounded p-3 text-sm text-yellow-300'}
+                    style={corporate ? { border: '1px solid var(--color-warning)', color: 'var(--color-warning)' } : undefined}>
+                    {t('qdeviceStale')}
+                </div>
+            ) : null;
+            const rows = ((d && d.nodes) || []).map(n => {
+                const s = nodeState(n);
+                const cell = corporate ? '' : 'p-2';
+                return (
+                    <tr key={n.node} data-qdevice-node={n.node} className={corporate ? '' : 'border-t border-proxmox-border'}>
+                        <td className={cell}>
+                            {n.node}{n.api_host && <span className="ml-2 text-xs" style={muted || { color: '#9ca3af' }}>({t('qdeviceApiHost')})</span>}
+                        </td>
+                        <td className={cell}>
+                            <span className="flex items-center gap-2">
+                                <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ background: QDEVICE_TONES[s.tone] }} />
+                                <span data-qdevice-node-state>{s.text}</span>
+                            </span>
+                        </td>
+                        <td className={`${cell} text-xs`} style={muted}>{n.last_poll || '-'}</td>
+                        <td className={`${cell} text-xs`} style={muted}>{n.echo_reply || '-'}</td>
+                    </tr>
+                );
+            });
+            const table = (
+                <div className="overflow-x-auto">
+                    <table className={corporate ? 'corp-datagrid' : 'w-full text-sm'}>
+                        <thead className={corporate ? '' : 'bg-proxmox-dark text-xs text-gray-400'}>
+                            <tr>
+                                <th className={corporate ? '' : 'text-left p-2'}>{t('node')}</th>
+                                <th className={corporate ? '' : 'text-left p-2'}>{t('qdeviceState')}</th>
+                                <th className={corporate ? '' : 'text-left p-2'}>{t('qdeviceLastPoll')}</th>
+                                <th className={corporate ? '' : 'text-left p-2'}>{t('qdeviceEchoReply')}</th>
+                            </tr>
+                        </thead>
+                        <tbody>{rows}</tbody>
+                    </table>
+                </div>
+            );
+
+            if (corporate) return (
+                <div className="space-y-0" data-qdevice-view="">
+                    <div className="flex items-center justify-between px-4 py-2 border-b border-proxmox-border" style={{ background: 'var(--corp-header-bg)' }}>
+                        <div className="flex items-center gap-2">
+                            <button onClick={onClose} className="p-1 hover:text-white" style={{ color: 'var(--corp-text-secondary)' }} title={t('backToList')}>
+                                <Icons.ChevronLeft className="w-4 h-4" />
+                            </button>
+                            <span className="flex" style={{ color: '#49afd9' }}><Icons.Scale className="w-4 h-4" /></span>
+                            <span className="text-[14px] font-medium" style={{ color: 'var(--color-text)' }}>{t('qdeviceTitle')}</span>
+                            <span className="text-[12px]" style={muted}>{clusterName}</span>
+                            <QdeviceDot q={q} />
+                        </div>
+                        <span className="text-[11px]" style={{ color: 'var(--corp-text-muted)' }}>{readText}</span>
+                    </div>
+                    <div className="p-4 space-y-4">
+                        {note}
+                        {staleNote}
+                        {!d &&<div className="text-[13px]" style={muted}>{t('qdeviceNoDaemon')}</div>}
+                        {d && (
+                            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                                <div style={{ border: '1px solid var(--corp-border-medium)' }}>
+                                    <div className="px-3 py-2" style={{ background: 'var(--corp-header-bg)', borderBottom: '1px solid var(--corp-border-medium)' }}>
+                                        <span className="text-[13px] font-medium" style={{ color: 'var(--color-text)' }}>{t('qdeviceTitle')}</span>
+                                    </div>
+                                    <table className="corp-property-grid">
+                                        <tbody>
+                                            {fields.map(([k, label, v]) => <tr key={k} data-qdevice-field={k}><td>{label}</td><td>{v || '-'}</td></tr>)}
+                                        </tbody>
+                                    </table>
+                                </div>
+                                <div style={{ border: '1px solid var(--corp-border-medium)' }}>
+                                    <div className="px-3 py-2" style={{ background: 'var(--corp-header-bg)', borderBottom: '1px solid var(--corp-border-medium)' }}>
+                                        <span className="text-[13px] font-medium" style={{ color: 'var(--color-text)' }}>{t('qdevicePerNode')}</span>
+                                    </div>
+                                    {table}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            );
+            return (
+                <div className="fixed inset-0 z-[60] bg-black/60 flex items-center justify-center p-4" onClick={onClose}>
+                    <div data-qdevice-view="" className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-4xl max-h-[85vh] overflow-hidden flex flex-col" onClick={e => e.stopPropagation()}>
+                        <div className="p-4 border-b border-proxmox-border flex items-center justify-between">
+                            <div>
+                                <h3 className="font-medium text-white flex items-center gap-2">
+                                    <Icons.Scale />
+                                    {t('qdeviceTitle')}
+                                    <QdeviceDot q={q} />
+                                </h3>
+                                <div className="text-xs text-gray-500 mt-1">{clusterName}{readText ? ` - ${readText}` : ''}</div>
+                            </div>
+                            <button onClick={onClose} title={t('close')} className="p-2 hover:bg-proxmox-hover rounded-lg text-gray-400 hover:text-white"><Icons.X /></button>
+                        </div>
+                        <div className="flex-1 overflow-y-auto p-4 space-y-4 text-sm">
+                            {note}
+                            {staleNote}
+                            {!d &&<div className="text-gray-400">{t('qdeviceNoDaemon')}</div>}
+                            {d && (
+                                <>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                        {fields.map(([k, label, v]) => (
+                                            <div key={k} data-qdevice-field={k}>
+                                                <div className="text-xs text-gray-400 mb-1">{label}</div>
+                                                <div className="text-white">{v || '-'}</div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                    <div>
+                                        <div className="text-xs text-gray-400 mb-1">{t('qdevicePerNode')}</div>
+                                        {table}
+                                    </div>
+                                </>
+                            )}
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
         // Node Management Modal Component
         // NS: Full node management - shell, network, disks, etc.
         // Shell tab uses xterm.js (web terminal), pretty cool
@@ -1277,6 +1503,20 @@
 
             const authHeaders = getAuthHeaders();  // NS: Get auth headers
 
+            // LW Oct 2026 - the performance charts zoom together, finer data for a narrow range
+            const perfFetch = u => fetch(u, { credentials: 'include', headers: authHeaders }).then(r => r.ok ? r.json() : null);
+            const perfZoom = useChartZoom({
+                preset: perfTimeframe, loaded: data.performance, resetKey: `${clusterId}/${node}`,
+                loadPreset: tf => perfFetch(`${API_URL}/clusters/${clusterId}/nodes/${node}/rrddata?timeframe=${tf}`),
+                loadRange: (from, to) => perfFetch(`${API_URL}/clusters/${clusterId}/nodes/${node}/metrics-history?from=${Math.floor(from)}&to=${Math.ceil(to)}`),
+            });
+            const perfNet = perfZoom.source('net_in', 'net_out');
+            const perfPsi = {
+                cpu: perfZoom.source('pressurecpusome', 'pressurecpufull'),
+                memory: perfZoom.source('pressurememorysome', 'pressurememoryfull'),
+                io: perfZoom.source('pressureiosome', 'pressureiofull'),
+            };
+
             // LW: XCP-ng doesn't have Ceph, repos differ, subscription not applicable
             const allTabs = isXcpng ? [
                 { id: 'summary', label: 'Summary', icon: Icons.Activity },
@@ -1286,6 +1526,7 @@
                 { id: 'system', label: 'System', icon: Icons.Cog },
                 { id: 'disks', label: t('storageRepos') || 'Storage', icon: Icons.HardDrive },
                 { id: 'tasks', label: 'Tasks', icon: Icons.Play },
+                { id: 'timeline', label: t('tlTab'), icon: Icons.Clock },
             ] : [
                 { id: 'summary', label: 'Summary', icon: Icons.Activity },
                 { id: 'performance', label: 'Performance', icon: Icons.BarChart },
@@ -1296,6 +1537,8 @@
                 { id: 'disks', label: 'Disks', icon: Icons.HardDrive },
                 { id: 'repos', label: 'Repositories', icon: Icons.Package },
                 { id: 'tasks', label: 'Tasks', icon: Icons.Play },
+                // LW Oct 2026 - what happened on this node, from the flight recorder
+                { id: 'timeline', label: t('tlTab'), icon: Icons.Clock },
                 { id: 'subscription', label: 'Subscription', icon: Icons.Shield },
                 { id: 'ceph', label: 'Ceph', icon: Icons.Database },
             ];
@@ -1304,7 +1547,7 @@
             // changes it through the active, so only a read-only one locks them. The shell
             // tab points to the shell on the active instead, unless this one serves users.
             const tabs = allTabs;
-            const lockedTab = haReadOnly && !['summary', 'performance', 'tasks'].includes(activeTab);
+            const lockedTab = haReadOnly && !['summary', 'performance', 'tasks', 'timeline'].includes(activeTab);
             // spread on the fieldsets around the parts that change the node; what only reads
             // (Refresh, SMART) sits outside them and keeps working on a standby
             const haLock = { disabled: lockedTab, 'data-ha-locked': lockedTab ? '' : undefined };
@@ -1312,6 +1555,10 @@
             useEffect(() => { loadTabData(activeTab); }, [activeTab, perfTimeframe]);
 
             const loadTabData = async (tab) => {
+                // LW Oct 2026 (#1143) - the shell loads nothing here, and the spinner in between
+                // unmounted its terminal right after it mounted: two sessions per visit
+                // the timeline loads itself (TimelineView)
+                if (tab === 'shell' || tab === 'timeline') return;
                 setLoading(true);
                 try {
                     const endpoints = {
@@ -1970,7 +2217,8 @@
                                                 <h3 className="text-lg font-semibold text-white flex items-center gap-2">
                                                     <Icons.BarChart /> Performance Metrics
                                                 </h3>
-                                                <div className="flex gap-2">
+                                                <div className="flex items-center gap-2">
+                                                    <ChartZoomBar zoom={perfZoom} />
                                                     {['hour', 'day', 'week', 'month', 'year'].map(tf => (
                                                         <button
                                                             key={tf}
@@ -1986,11 +2234,11 @@
                                             </div>
                                             
                                             {data.performance?.metrics ? (
+                                                <ChartZoomContext.Provider value={perfZoom}>
                                                 <div className="space-y-4">
                                                     <div className="grid grid-cols-2 gap-4">
                                                         <LineChart
-                                                            data={data.performance.metrics.cpu}
-                                                            timestamps={data.performance.timestamps}
+                                                            {...perfZoom.series('cpu')}
                                                             label="CPU Usage"
                                                             color="#f97316"
                                                             unit="%"
@@ -1998,8 +2246,7 @@
                                                             yMax={100}
                                                         />
                                                         <LineChart
-                                                            data={data.performance.metrics.memory}
-                                                            timestamps={data.performance.timestamps}
+                                                            {...perfZoom.series('memory')}
                                                             label="Memory Usage"
                                                             color="#3b82f6"
                                                             unit="%"
@@ -2007,15 +2254,13 @@
                                                             yMax={100}
                                                         />
                                                         <LineChart
-                                                            data={data.performance.metrics.iowait}
-                                                            timestamps={data.performance.timestamps}
+                                                            {...perfZoom.series('iowait')}
                                                             label="IO Wait"
                                                             color="#eab308"
                                                             unit="%"
                                                         />
                                                         <LineChart
-                                                            data={data.performance.metrics.loadavg}
-                                                            timestamps={data.performance.timestamps}
+                                                            {...perfZoom.series('loadavg')}
                                                             label="Load Average"
                                                             color="#22c55e"
                                                             unit=""
@@ -2023,17 +2268,16 @@
                                                     </div>
                                                     <LineChart
                                                         datasets={[
-                                                            { label: 'Net In', data: data.performance.metrics.net_in, color: '#06b6d4' },
-                                                            { label: 'Net Out', data: data.performance.metrics.net_out, color: '#8b5cf6' }
+                                                            { label: 'Net In', data: perfNet.metrics.net_in, color: '#06b6d4' },
+                                                            { label: 'Net Out', data: perfNet.metrics.net_out, color: '#8b5cf6' }
                                                         ]}
-                                                        timestamps={data.performance.timestamps}
+                                                        timestamps={perfNet.timestamps}
                                                         label="Network I/O"
                                                         unit=" KB/s"
                                                     />
                                                     <div className="grid grid-cols-2 gap-4">
                                                         <LineChart
-                                                            data={data.performance.metrics.swap}
-                                                            timestamps={data.performance.timestamps}
+                                                            {...perfZoom.series('swap')}
                                                             label="Swap Usage"
                                                             color="#ec4899"
                                                             unit="%"
@@ -2041,8 +2285,7 @@
                                                             yMax={100}
                                                         />
                                                         <LineChart
-                                                            data={data.performance.metrics.rootfs}
-                                                            timestamps={data.performance.timestamps}
+                                                            {...perfZoom.series('rootfs')}
                                                             label="Root FS Usage"
                                                             color="#a855f7"
                                                             unit="%"
@@ -2054,10 +2297,10 @@
                                                     {data.performance.metrics.pressurecpusome && (
                                                         <LineChart
                                                             datasets={[
-                                                                { label: 'Some', data: data.performance.metrics.pressurecpusome, color: '#3b82f6' },
-                                                                { label: 'Full', data: data.performance.metrics.pressurecpufull, color: '#ef4444' }
+                                                                { label: 'Some', data: perfPsi.cpu.metrics.pressurecpusome, color: '#3b82f6' },
+                                                                { label: 'Full', data: perfPsi.cpu.metrics.pressurecpufull, color: '#ef4444' }
                                                             ]}
-                                                            timestamps={data.performance.timestamps}
+                                                            timestamps={perfPsi.cpu.timestamps}
                                                             label="CPU Pressure Stall"
                                                             unit="%"
                                                             yMin={0}
@@ -2067,10 +2310,10 @@
                                                     {data.performance.metrics.pressurememorysome && (
                                                         <LineChart
                                                             datasets={[
-                                                                { label: 'Some', data: data.performance.metrics.pressurememorysome, color: '#22c55e' },
-                                                                { label: 'Full', data: data.performance.metrics.pressurememoryfull, color: '#ef4444' }
+                                                                { label: 'Some', data: perfPsi.memory.metrics.pressurememorysome, color: '#22c55e' },
+                                                                { label: 'Full', data: perfPsi.memory.metrics.pressurememoryfull, color: '#ef4444' }
                                                             ]}
-                                                            timestamps={data.performance.timestamps}
+                                                            timestamps={perfPsi.memory.timestamps}
                                                             label="Memory Pressure Stall"
                                                             unit="%"
                                                             yMin={0}
@@ -2080,10 +2323,10 @@
                                                     {data.performance.metrics.pressureiosome && (
                                                         <LineChart
                                                             datasets={[
-                                                                { label: 'Some', data: data.performance.metrics.pressureiosome, color: '#eab308' },
-                                                                { label: 'Full', data: data.performance.metrics.pressureiofull, color: '#ef4444' }
+                                                                { label: 'Some', data: perfPsi.io.metrics.pressureiosome, color: '#eab308' },
+                                                                { label: 'Full', data: perfPsi.io.metrics.pressureiofull, color: '#ef4444' }
                                                             ]}
-                                                            timestamps={data.performance.timestamps}
+                                                            timestamps={perfPsi.io.timestamps}
                                                             label="IO Pressure Stall"
                                                             unit="%"
                                                             yMin={0}
@@ -2093,10 +2336,11 @@
 
                                                     {data.performance.timestamps?.length > 0 && (
                                                         <div className="text-xs text-gray-500 text-center mt-2">
-                                                            {formatTime(data.performance.timestamps[0])} - {formatTime(data.performance.timestamps[data.performance.timestamps.length - 1])}
+                                                            {formatTime(perfZoom.range ? perfZoom.range.from : data.performance.timestamps[0])} - {formatTime(perfZoom.range ? perfZoom.range.to : data.performance.timestamps[data.performance.timestamps.length - 1])}
                                                         </div>
                                                     )}
                                                 </div>
+                                                </ChartZoomContext.Provider>
                                             ) : (
                                                 <div className="text-center text-gray-500 py-12">
                                                     <Icons.BarChart className="mx-auto mb-3 w-12 h-12 opacity-50" />
@@ -2110,28 +2354,7 @@
                                     {activeTab === 'shell' && haConsolesElsewhere && <HaConsoleOnActive />}
 
                                     {activeTab === 'shell' && !haConsolesElsewhere && (
-                                        <div className="h-full flex flex-col">
-                                            <div className="flex items-center justify-between mb-4">
-                                                <div className="flex items-center gap-3">
-                                                    <Icons.Terminal />
-                                                    <span className="text-white font-medium">Node Shell</span>
-                                                </div>
-                                                <button
-                                                    onClick={() => setData({...data, shellFullscreen: true})}
-                                                    className="flex items-center gap-2 px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-gray-300 hover:text-white text-sm"
-                                                >
-                                                    <Icons.Maximize />
-                                                    Fullscreen
-                                                </button>
-                                            </div>
-                                            <div className="flex-1 bg-black rounded-lg border border-proxmox-border overflow-hidden min-h-[400px]">
-                                                <NodeShellTerminal 
-                                                    node={node} 
-                                                    clusterId={clusterId} 
-                                                    addToast={addToast}
-                                                />
-                                            </div>
-                                        </div>
+                                        <NodeShellPanel node={node} clusterId={clusterId} addToast={addToast} />
                                     )}
 
                                     {activeTab === 'network' && (
@@ -3402,6 +3625,11 @@
                                         </div>
                                     )}
 
+                                    {activeTab === 'timeline' && (
+                                        <TimelineView clusterId={clusterId} node={node} t={t}
+                                            authFetch={(u, o = {}) => fetch(u, { ...o, credentials: 'include', headers: { ...(o.headers || {}), ...authHeaders } }).catch(() => null)} />
+                                    )}
+
                                     {activeTab === 'subscription' && (
                                         <div className="space-y-6">
                                             <div className="p-6 bg-proxmox-dark rounded-lg border border-proxmox-border">
@@ -3790,31 +4018,6 @@
                             )}
                         </div>
                     </div>
-
-                    {/* Fullscreen Shell Modal */}
-                    {!haConsolesElsewhere && data.shellFullscreen && (
-                        <div className="fixed inset-0 z-[70] bg-black flex flex-col">
-                            <div className="flex items-center justify-between px-4 py-2 bg-proxmox-dark border-b border-proxmox-border">
-                                <div className="flex items-center gap-3">
-                                    <Icons.Terminal />
-                                    <span className="text-white font-medium">{node} - Shell</span>
-                                </div>
-                                <button
-                                    onClick={() => setData({...data, shellFullscreen: false})}
-                                    className="p-2 rounded-lg hover:bg-red-500/20 text-gray-400 hover:text-red-400"
-                                >
-                                    <Icons.X />
-                                </button>
-                            </div>
-                            <div className="flex-1">
-                                <NodeShellTerminal
-                                    node={node}
-                                    clusterId={clusterId}
-                                    addToast={addToast}
-                                />
-                            </div>
-                        </div>
-                    )}
 
                     {/* LW May 2026 — SMART Modal (replaces the alert(JSON) call site) */}
                     {smartModal && (
@@ -5118,6 +5321,16 @@
                 catch(e) { console.error(e); return null; }
             };
 
+            // LW Oct 2026 - the performance charts zoom together, finer data for a narrow range
+            const perfZoom = useChartZoom({
+                preset: perfTimeframe, loaded: data.performance, resetKey: navKey,
+                loadPreset: tf => authFetch(`${API_URL}/clusters/${clusterId}/nodes/${node}/rrddata?timeframe=${tf}`)
+                    .then(r => r?.ok ? r.json() : null),
+                loadRange: (from, to) => authFetch(`${API_URL}/clusters/${clusterId}/nodes/${node}/metrics-history?from=${Math.floor(from)}&to=${Math.ceil(to)}`)
+                    .then(r => r?.ok ? r.json() : null),
+            });
+            const perfNet = perfZoom.source('net_in', 'net_out');
+
             // LW: Feb 2026 - save handler for configure tab edits
             const handleSave = async (endpoint, payload, successMsg, method) => {
                 setSaving(true);
@@ -5512,13 +5725,15 @@
                                 <div className="corp-subnav">
                                     <button className={`corp-subnav-item ${monitorSubTab === 'performance' ? 'active' : ''}`} onClick={() => setMonitorSubTab('performance')}>{t('performance')}</button>
                                     <button className={`corp-subnav-item ${monitorSubTab === 'tasks' ? 'active' : ''}`} onClick={() => { setMonitorSubTab('tasks'); if (!data.tasks) loadTabData('tasks'); }}>{t('tasks')}</button>
+                                    <button className={`corp-subnav-item ${monitorSubTab === 'timeline' ? 'active' : ''}`} onClick={() => setMonitorSubTab('timeline')} data-corp-node-timeline>{t('tlTab')}</button>
                                 </div>
                                 <div className="flex-1 pl-4">
                                     {monitorSubTab === 'performance' && (
                                         <div className="space-y-4">
                                             <div className="flex items-center justify-between">
                                                 <span className="text-[13px] font-medium" style={{color: 'var(--color-text)'}}>{t('performance')}</span>
-                                                <div className="flex gap-1">
+                                                <div className="flex items-center gap-1">
+                                                    <span className="mr-2"><ChartZoomBar zoom={perfZoom} /></span>
                                                     {['hour', 'day', 'week', 'month', 'year'].map(tf => (
                                                         <button key={tf} onClick={() => handlePerfTimeframeChange(tf)}
                                                             className="px-2 py-1 text-[11px]"
@@ -5530,23 +5745,33 @@
                                             {loading && !data.performance ? (
                                                 <div className="flex items-center justify-center h-32"><Icons.RotateCw className="w-5 h-5 animate-spin" style={{color: '#49afd9'}} /></div>
                                             ) : data.performance?.metrics ? (
+                                                <ChartZoomContext.Provider value={perfZoom}>
                                                 <div className="space-y-3">
                                                     <div className="grid grid-cols-2 gap-3">
-                                                        <LineChart data={data.performance.metrics.cpu} timestamps={data.performance.timestamps} label="CPU" color="#49afd9" unit="%" yMin={0} yMax={100} />
-                                                        <LineChart data={data.performance.metrics.memory} timestamps={data.performance.timestamps} label="Memory" color="#9b59b6" unit="%" yMin={0} yMax={100} />
-                                                        <LineChart data={data.performance.metrics.iowait} timestamps={data.performance.timestamps} label="IO Wait" color="#eab308" unit="%" />
-                                                        <LineChart data={data.performance.metrics.loadavg} timestamps={data.performance.timestamps} label="Load Average" color="#22c55e" unit="" />
+                                                        <LineChart {...perfZoom.series('cpu')} label="CPU" color="#49afd9" unit="%" yMin={0} yMax={100} />
+                                                        <LineChart {...perfZoom.series('memory')} label="Memory" color="#9b59b6" unit="%" yMin={0} yMax={100} />
+                                                        <LineChart {...perfZoom.series('iowait')} label="IO Wait" color="#eab308" unit="%" />
+                                                        <LineChart {...perfZoom.series('loadavg')} label="Load Average" color="#22c55e" unit="" />
                                                     </div>
-                                                    <LineChart datasets={[{label: 'Net In', data: data.performance.metrics.net_in, color: '#06b6d4'}, {label: 'Net Out', data: data.performance.metrics.net_out, color: '#8b5cf6'}]} timestamps={data.performance.timestamps} label="Network I/O" unit=" KB/s" />
+                                                    <LineChart datasets={[{label: 'Net In', data: perfNet.metrics.net_in, color: '#06b6d4'}, {label: 'Net Out', data: perfNet.metrics.net_out, color: '#8b5cf6'}]} timestamps={perfNet.timestamps} label="Network I/O" unit=" KB/s" />
                                                     <div className="grid grid-cols-2 gap-3">
-                                                        <LineChart data={data.performance.metrics.swap} timestamps={data.performance.timestamps} label="Swap" color="#ec4899" unit="%" yMin={0} yMax={100} />
-                                                        <LineChart data={data.performance.metrics.rootfs} timestamps={data.performance.timestamps} label="Root FS" color="#a855f7" unit="%" yMin={0} yMax={100} />
+                                                        <LineChart {...perfZoom.series('swap')} label="Swap" color="#ec4899" unit="%" yMin={0} yMax={100} />
+                                                        <LineChart {...perfZoom.series('rootfs')} label="Root FS" color="#a855f7" unit="%" yMin={0} yMax={100} />
                                                     </div>
                                                 </div>
+                                                </ChartZoomContext.Provider>
                                             ) : (
                                                 <div className="text-center py-8" style={{color: '#728b9a'}}><Icons.BarChart className="w-8 h-8 mx-auto mb-2 opacity-50" /><p className="text-[13px]">No performance data available</p></div>
                                             )}
                                         </div>
+                                    )}
+                                    {/* LW Oct 2026 - what happened on this node, a guest opens its own view */}
+                                    {monitorSubTab === 'timeline' && (
+                                        <TimelineView key={navKey} clusterId={clusterId} node={node} authFetch={authFetch} t={t}
+                                            onOpenGuest={onSelectVm ? (vmid) => {
+                                                const vm = (clusterResources || []).find(r => Number(r.vmid) === Number(vmid));
+                                                if (vm) onSelectVm(vm);
+                                            } : undefined} />
                                     )}
                                     {monitorSubTab === 'tasks' && (
                                         <div>
@@ -6246,19 +6471,9 @@
                     </div>
 
                     {showMaintConfirm && !haReadOnly && (
-                        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60" onClick={() => setShowMaintConfirm(false)}>
-                            <div className="w-full max-w-sm max-h-[90vh] overflow-y-auto bg-proxmox-card border border-proxmox-border p-5" data-testid="maint-dialog" onClick={e => e.stopPropagation()}>
-                                <h3 className="text-[14px] font-semibold mb-2" style={{color: '#e9ecef'}}>{t('enterMaintenance') || 'Enter Maintenance Mode'}: {node}</h3>
-                                <p className="text-[13px] mb-4" style={{color: '#adbbc4'}}>{t('maintenanceWarning')}</p>
-                                <div className="mb-4">
-                                    <MaintenanceEvacOptions clusterId={clusterId} node={node} value={maintOptions} onChange={setMaintOptions} />
-                                </div>
-                                <div className="flex justify-end gap-2">
-                                    <button onClick={() => setShowMaintConfirm(false)} className="px-3 py-1.5 text-[13px] border border-proxmox-border hover:text-white" style={{color: '#adbbc4'}}>{t('cancel')}</button>
-                                    <button onClick={() => { setShowMaintConfirm(false); onMaintenanceToggle(node, true, maintOptions); }} className="px-3 py-1.5 text-[13px] text-white" style={{background: '#efc006', border: '1px solid #d4a905'}}>{t('startMaintenance')}</button>
-                                </div>
-                            </div>
-                        </div>
+                        <MaintenanceDialog clusterId={clusterId} node={node} options={maintOptions} onOptions={setMaintOptions}
+                            onCancel={() => setShowMaintConfirm(false)}
+                            onConfirm={() => { setShowMaintConfirm(false); onMaintenanceToggle(node, true, maintOptions); }} />
                     )}
                 </div>
             );

@@ -12,6 +12,7 @@ from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db
 from pegaprox.core import ha
+from pegaprox.models.tasks import balancer_cooldown
 
 from pegaprox.utils.auth import require_auth
 from pegaprox.utils.audit import log_audit
@@ -32,11 +33,38 @@ def get_scheduled_tasks():
     # restricted bearer token was scoped as its OWNER. For an admin owner get_user_clusters
     # then answers None ("all clusters") and the filter below is skipped entirely, which is
     # how a viewer-capped token read every tenant's rows. acting_user applies the token floor.
-    from pegaprox.api.helpers import acting_user
-    _allowed = get_user_clusters(acting_user())
+    from pegaprox.api.helpers import acting_user, caller_is_scoped
+    from pegaprox.utils.rbac import acts_as_admin, user_can_access_vm
+    # MK Oct 2026 - the stored record carries no username, which the pool and ACL checks
+    # below key on
+    _who = dict(acting_user() or {})
+    _who.setdefault('username', request.session.get('user', ''))
+    _allowed = get_user_clusters(_who)
     if _allowed is not None:
         config = dict(config)
         config['tasks'] = [t for t in config.get('tasks', []) if t.get('cluster_id') in _allowed]
+    # MK Oct 2026 - a caller confined to a pool or to ACL'd guests got every task on the
+    # cluster, with the guest, node and schedule of each. They get the tasks of guests they
+    # may see; a task whose target is no guest number is left out for them.
+    if not acts_as_admin(_who):
+        _scoped, kept = {}, []
+        for t in config.get('tasks', []):
+            cid = t.get('cluster_id')
+            if cid not in _scoped:
+                _scoped[cid] = caller_is_scoped(_who, cid)
+            if not _scoped[cid]:
+                kept.append(t)
+                continue
+            try:
+                vmid = int(t.get('target_id'))
+            except (TypeError, ValueError):
+                continue
+            # legacy rows say 'vm'; the pool lookup then tries both guest types
+            vt = t.get('target_type')
+            if user_can_access_vm(_who, cid, vmid, 'vm.view', vt if vt in ('qemu', 'lxc') else None):
+                kept.append(t)
+        config = dict(config)
+        config['tasks'] = kept
     return jsonify(config)
 
 @bp.route('/api/scheduled-tasks', methods=['POST'])
@@ -157,6 +185,7 @@ def load_migration_history():
                 'status': row['status'],
                 'duration': row['duration_seconds'],
                 'timestamp': row['timestamp'],
+                'trigger': row['trigger_kind'] if 'trigger_kind' in row.keys() else None,
             })
         
         return {'migrations': migrations}
@@ -184,45 +213,19 @@ def save_migration_history(config):
 
 def log_migration(cluster_id: str, vmid: int, vm_name: str, vm_type: str, 
                   source_node: str, target_node: str, migration_type: str,
-                  status: str, user: str = 'system', duration: float = 0):
+                  status: str, user: str = 'system', duration: float = 0,
+                  reason: str = None, trigger: str = None, details: dict = None):
     """Log a VM migration event to SQLite database
     
     MK: Called from migrate_vm and HA failover functions
-    writes to db now
+    writes to db now. Oct 2026 - the balancer passes its own reason and trigger,
+    and the table keeps the newest rows per cluster (db.add_migration_event)
     """
     try:
-        db = get_db()
-        cursor = db.conn.cursor()
-        
-        cursor.execute('''
-            INSERT INTO migration_history
-            (cluster_id, vmid, vm_name, source_node, target_node, 
-             reason, status, duration_seconds, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            cluster_id,
-            vmid,
-            vm_name,
-            source_node,
-            target_node,
-            f"{migration_type} by {user}",
-            status,
-            duration,
-            datetime.now().isoformat()
-        ))
-        
-        db.conn.commit()
-        
-        # Cleanup old entries (keep last 1000)
-        cursor.execute('''
-            DELETE FROM migration_history 
-            WHERE id NOT IN (
-                SELECT id FROM migration_history 
-                ORDER BY timestamp DESC LIMIT 1000
-            )
-        ''')
-        db.conn.commit()
-        
+        get_db().add_migration_event(
+            cluster_id, vmid, vm_name, source_node, target_node, status,
+            reason=reason or f"{migration_type} by {user}", trigger=trigger,
+            details=details, duration=duration)
     except Exception as e:
         logging.error(f"Error logging migration: {e}")
     
@@ -278,7 +281,7 @@ def get_migration_history():
     migrations = [m for m in migrations
                   if user_can_access_vm(_u, m.get('cluster_id'), m.get('vmid'), 'vm.view')]
 
-    return jsonify(migrations[:limit])
+    return jsonify(_balancer_rows_without_why(migrations[:limit], _u))
 
 @bp.route('/api/clusters/<cluster_id>/vms/<int:vmid>/migration-history', methods=['GET'])
 @require_auth(perms=['vm.view'])
@@ -303,7 +306,76 @@ def get_vm_migration_history(cluster_id, vmid):
     migrations = [m for m in config.get('migrations', []) 
                   if m.get('cluster_id') == cluster_id and m.get('vmid') == vmid]
     
-    return jsonify(migrations)
+    return jsonify(_balancer_rows_without_why(migrations, _u))
+
+
+def _balancer_rows_without_why(rows, user):
+    """A caller confined to some guests of a cluster gets the balancer's moves of their
+    guests without why: the reason quotes the load of every node and the names of rules
+    over guests they cannot see."""
+    from pegaprox.api.helpers import caller_is_scoped
+    scoped, out = {}, []
+    for m in rows:
+        if m.get('trigger'):
+            cid = m.get('cluster_id')
+            if cid not in scoped:
+                scoped[cid] = caller_is_scoped(user, cid)
+            if scoped[cid]:
+                m = dict(m, reason='')
+        out.append(m)
+    return out
+
+
+# MK Oct 2026 - what the balancer of one cluster moved and why, newest first, a page at a
+# time (?before=<id of the last row>). Only the instance whose balancer runs fills the
+# table, so a standby reads this from its active (ha.LEADER_ONLY_READS).
+BALANCE_HISTORY_STATUSES = ('success', 'failed', 'dry_run')
+
+
+@bp.route('/api/clusters/<cluster_id>/balance-history', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_balance_history(cluster_id):
+    """Balancer moves of one cluster with why. ?trigger=balance,predictive,affinity,pin
+    ?status=success|failed|dry_run ?before=<row id> ?limit=1..200"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    mgr = cluster_managers.get(cluster_id)
+    if mgr is None:
+        return jsonify({'error': 'Cluster not found'}), 404
+
+    db = get_db()
+    raw = request.args.get('trigger', '')
+    triggers = [t for t in raw.split(',') if t] if raw else None
+    if triggers is not None and (len(triggers) > len(db.BALANCER_TRIGGERS)
+                                 or any(t not in db.BALANCER_TRIGGERS for t in triggers)):
+        return jsonify({'error': f"trigger must be one or more of {', '.join(db.BALANCER_TRIGGERS)}"}), 400
+    status = request.args.get('status') or None
+    if status is not None and status not in BALANCE_HISTORY_STATUSES:
+        return jsonify({'error': f"status must be one of {', '.join(BALANCE_HISTORY_STATUSES)}"}), 400
+    before = request.args.get('before') or None
+    if before is not None:
+        if not before.isdigit() or len(before) > 18:
+            return jsonify({'error': 'before must be the id of a row'}), 400
+        before = int(before)
+    from pegaprox.api.helpers import bounded_limit, caller_is_scoped, scope_vm_rows
+    limit = bounded_limit(request.args.get('limit'), 50, 200)
+
+    from pegaprox.utils.auth import build_authz_user
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    if caller_is_scoped(user, cluster_id):
+        # their own guests only, and not why: the reason quotes the load of every node
+        # and the names of rules over guests they cannot see
+        rows = scope_vm_rows(cluster_id, db.list_balancer_moves(cluster_id, triggers, status, before))
+        rows = [dict(r, reason='', details={}) for r in rows[:limit + 1]]
+    else:
+        rows = db.list_balancer_moves(cluster_id, triggers, status, before, limit + 1)
+    page = rows[:limit]
+    return jsonify({
+        'entries': page,
+        'next_before': page[-1]['id'] if len(rows) > limit and page else None,
+        'cooldown': balancer_cooldown(getattr(getattr(mgr, 'config', None), 'migration_cooldown', None)),
+    })
 
 
 # =====================================================
@@ -361,25 +433,31 @@ def save_affinity_rules(config):
         logging.error(f"Error saving affinity rules: {e}")
         return False
 
-def check_affinity_violation(cluster_id: str, vmid: int, target_node: str) -> dict:
+def check_affinity_violation(cluster_id: str, vmid: int, target_node: str, vm_nodes: dict = None,
+                             config: dict = None) -> dict:
     """Check if moving a VM/CT to a node would violate affinity rules
 
     NS: Feb 2026 - returns enforce flag so callers can block or just warn.
     Works for both QEMU and LXC now (Issue #73).
+    MK Oct 2026 - vm_nodes ({'vmid': node}) and config (the rules) from a caller that asks for
+    many guests at once: the migration preflight hands in where each guest will be once the
+    whole set moved, and reads the rules once.
     """
-    config = load_affinity_rules()
-    
+    if config is None:
+        config = load_affinity_rules()
+
     if cluster_id not in cluster_managers:
         return {'violation': False}
-    
-    manager = cluster_managers[cluster_id]
-    resources = manager.get_vm_resources()
-    
-    # Build map of VM -> current node
-    vm_nodes = {}
-    for res in resources:
-        if res.get('type') in ['qemu', 'lxc']:
-            vm_nodes[str(res.get('vmid'))] = res.get('node')
+
+    if vm_nodes is None:
+        manager = cluster_managers[cluster_id]
+        resources = manager.get_vm_resources()
+
+        # Build map of VM -> current node
+        vm_nodes = {}
+        for res in resources:
+            if res.get('type') in ['qemu', 'lxc']:
+                vm_nodes[str(res.get('vmid'))] = res.get('node')
     
     for rule in config.get('rules', []):
         if rule.get('cluster_id') != cluster_id or not rule.get('enabled', True):

@@ -13,6 +13,17 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 
+
+def _smtp_tls_context(verify):
+    # MK Oct 2026 - smtplib without a context checks neither the certificate nor the name
+    if not verify:
+        return ssl._create_unverified_context()
+    ctx = ssl.create_default_context()
+    # 3.13 turns on strict X.509 checks, which turn down many internal CA certs (no AKI)
+    ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    return ctx
+
+
 def send_email(to_addresses: list, subject: str, body: str, html_body: str = None,
                smtp_settings: dict = None) -> tuple:
     """send email via smtp"""
@@ -55,6 +66,8 @@ def send_email(to_addresses: list, subject: str, body: str, html_body: str = Non
     from_name = settings.get('smtp_from_name', '') or 'PegaProx'
     use_tls = settings.get('smtp_tls', True)
     use_ssl = settings.get('smtp_ssl', False)
+    # only an explicit False skips the certificate check
+    verify_tls = settings.get('smtp_verify_tls', True) is not False
     
     if not smtp_host:
         return False, "SMTP host not configured"
@@ -83,9 +96,10 @@ def send_email(to_addresses: list, subject: str, body: str, html_body: str = Non
             msg.attach(MIMEText(html_body, 'html', 'utf-8'))
         
         # Connect and send
+        tls_ctx = _smtp_tls_context(verify_tls)
         if use_ssl:
             logging.debug(f"[SMTP] Connecting with SSL to {smtp_host}:{smtp_port}")
-            server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=15)
+            server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=15, context=tls_ctx)
         else:
             logging.debug(f"[SMTP] Connecting to {smtp_host}:{smtp_port}")
             server = smtplib.SMTP(smtp_host, smtp_port, timeout=15)
@@ -98,7 +112,7 @@ def send_email(to_addresses: list, subject: str, body: str, html_body: str = Non
         
         if not use_ssl and use_tls:
             logging.debug("[SMTP] Starting TLS")
-            server.starttls()
+            server.starttls(context=tls_ctx)
             server.ehlo()  # Re-identify after TLS
         
         # Authenticate if credentials provided
@@ -153,6 +167,11 @@ def send_email(to_addresses: list, subject: str, body: str, html_body: str = Non
         return False, error
     except ConnectionRefusedError:
         error = f"Connection refused by {smtp_host}:{smtp_port}"
+        logging.error(f"[SMTP] {error}")
+        return False, error
+    except ssl.SSLCertVerificationError as e:
+        error = (f"Certificate of {smtp_host} not trusted ({e.verify_message or e.reason}). "
+                 "For a self-signed relay turn off the certificate check in the SMTP settings")
         logging.error(f"[SMTP] {error}")
         return False, error
     except Exception as e:

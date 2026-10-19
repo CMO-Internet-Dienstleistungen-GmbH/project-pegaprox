@@ -18,7 +18,7 @@
             const [storageContent, setStorageContent] = useState([]);
             const [contentLoading, setContentLoading] = useState(false);
             const [expandedNodes, setExpandedNodes] = useState({});
-            const [activeTab, setActiveTab] = useState('browse'); // browse, balancing, sync, sla
+            const [activeTab, setActiveTab] = useState('browse'); // browse, balancing, sync, sla, recovery
             const [syncStatus, setSyncStatus] = useState(null);
             const [syncLoading, setSyncLoading] = useState(false);
             const [syncContentType, setSyncContentType] = useState('iso');
@@ -147,6 +147,7 @@
             const [uploadProgress, setUploadProgress] = useState(0);
             const [uploadSpeed, setUploadSpeed] = useState(0);
             const [deleteConfirm, setDeleteConfirm] = useState(null);
+            const [batchRestore, setBatchRestore] = useState(null);  // 'pick' or 'runs' while the dialog is open
             const [isRefreshing, setIsRefreshing] = useState(false);  // not used
             const lastFetchTime = useRef(0);  // for rate limiting, not implemented
             
@@ -1064,6 +1065,11 @@
                                 <Icons.Shield style={{width: 14, height: 14, flexShrink: 0}} />
                                 <span>{t('backupSla') || 'Backup SLA'}</span>
                             </button>
+                            {/* LW Oct 2026 - restore tests: the weekly run and how recoverable each guest is */}
+                            <button onClick={() => setActiveTab('recovery')} className={activeTab === 'recovery' ? 'active' : ''} style={{display:'flex',alignItems:'center',gap:6}} data-rtest-tab>
+                                <Icons.LifeBuoy style={{width: 14, height: 14, flexShrink: 0}} />
+                                <span>{t('rtestTab')}</span>
+                            </button>
                         </div>
                     ) : (
                     <div className="flex gap-2">
@@ -1104,6 +1110,15 @@
                         >
                             <Icons.Shield className="inline mr-2" />
                             {t('backupSla') || 'Backup SLA'}
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('recovery')} data-rtest-tab
+                            className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                                activeTab === 'recovery' ? 'bg-proxmox-orange text-white' : 'bg-proxmox-card text-gray-400 hover:text-white'
+                            }`}
+                        >
+                            <Icons.LifeBuoy className="inline mr-2" />
+                            {t('rtestTab')}
                         </button>
                     </div>
                     )}
@@ -1327,6 +1342,8 @@
                                 </div>
                             )}
                         </div>
+                    ) : activeTab === 'recovery' ? (
+                        <RestoreTestsPanel clusterId={clusterId} addToast={addToast} />
                     ) : activeTab === 'browse' ? (
                         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                             {/* Storage Tree */}
@@ -1591,6 +1608,19 @@
                                                             title={t('rescanStorageTooltip') || 'Rescan storage to detect new LUNs/volumes'}
                                                         >
                                                             <Icons.RefreshCw className="w-4 h-4" /> {t('rescan') || 'Rescan'}
+                                                        </button>
+                                                    )}
+                                                    {/* LW Oct 2026 - several of its backups in one go, and the batches before */}
+                                                    {hasPerm('vm.backup') && storageContent.some(i => i.content === 'backup' && i.vmid) && (
+                                                        <button onClick={() => setBatchRestore('pick')} data-br-open
+                                                            className="flex items-center gap-1 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm">
+                                                            <Icons.RotateCcw /> {t('batchRestoreButton')}
+                                                        </button>
+                                                    )}
+                                                    {hasPerm('backup.view') && storageContent.some(i => i.content === 'backup') && (
+                                                        <button onClick={() => setBatchRestore('runs')} data-br-recent-open title={t('batchRestoreRecent')}
+                                                            className="p-1.5 hover:bg-proxmox-hover rounded-lg text-gray-400 hover:text-white">
+                                                            <Icons.ClipboardList />
                                                         </button>
                                                     )}
                                                     <button
@@ -2464,6 +2494,14 @@
                         </div>
                     )}
                     
+                    {batchRestore && selectedStorage && (
+                        <BatchRestoreModal clusterId={clusterId} storage={selectedStorage.name}
+                            items={batchRestore === 'pick' ? storageContent.filter(i => i.content === 'backup') : null}
+                            nodes={datastores.nodes || []} datastores={datastores}
+                            defaultNode={selectedStorage.node || (storageContent.find(i => i.content === 'backup') || {}).node}
+                            onClose={() => setBatchRestore(null)} />
+                    )}
+
                     {/* Delete Confirm Modal */}
                     {deleteConfirm && (
                         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">

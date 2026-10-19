@@ -148,6 +148,7 @@ def save_config():
                     'ssl_verification': getattr(manager.config, 'ssl_verification', False),
                     'migration_threshold': getattr(manager.config, 'migration_threshold', 30),
                     'migration_tolerance': getattr(manager.config, 'migration_tolerance', 10),
+                    'migration_cooldown': getattr(manager.config, 'migration_cooldown', 900),
                     'check_interval': getattr(manager.config, 'check_interval', 300),
                     'auto_migrate': getattr(manager.config, 'auto_migrate', False),
                     'balance_containers': getattr(manager.config, 'balance_containers', False),
@@ -170,6 +171,7 @@ def save_config():
                     'vnc_tunnel': bool(getattr(manager.config, 'vnc_tunnel', False)),  # MK Apr 2026
                     'ssh_disabled': bool(getattr(manager.config, 'ssh_disabled', False)),  # MK Sep 2026 (#941)
                     'node_ui_suffix': getattr(manager.config, 'node_ui_suffix', '') or '',  # MK Aug 2026 (#689)
+                    'transfer_network': getattr(manager.config, 'transfer_network', '') or '',
                     # NS May 2026 (#364) — load-balancer settings used to be set
                     # on the in-memory config object but never made it into the
                     # save dict, so they reverted on the next reload.

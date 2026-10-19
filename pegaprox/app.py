@@ -102,6 +102,11 @@ def create_app():
     _default_max = int(os.environ.get('PEGAPROX_MAX_REQUEST_SIZE', 10 * 1024 * 1024))  # 10 MB default for API
     _upload_max = int(os.environ.get('PEGAPROX_MAX_UPLOAD_SIZE', 100 * 1024 * 1024 * 1024))  # MK: 100 GB for uploads (#116)
     app.config['MAX_CONTENT_LENGTH'] = _upload_max  # set high, we check per-route below
+    # NS Oct 2026 - a flight recorder bundle is checked by sending it back whole, and at its
+    # caps it is larger than an API call may be: that route takes what a standby may hand
+    # to the active (ha.FORWARD_MAX_BODY)
+    from pegaprox.core.ha import FORWARD_MAX_BODY as _bundle_max
+    _BUNDLE_PATHS = ('/api/timeline/evidence/verify',)
 
     # Request validation & rate limiting
     # LW: Mar 2026 - ACME HTTP-01 challenge route, must be unauthenticated (#96)
@@ -127,6 +132,8 @@ def create_app():
         # MK: Mar 2026 - removed global config mutation, was causing 413s on subsequent uploads (#119)
         is_upload = request.path.endswith('/upload')
         max_size = _upload_max if is_upload else _default_max
+        if request.path in _BUNDLE_PATHS:
+            max_size = max(_default_max, _bundle_max)
         if request.content_length and request.content_length > max_size:
             return jsonify({'error': f'Request too large. Max {max_size // (1024*1024)} MB'}), 413
         # H-6 (security audit): a chunked Transfer-Encoding request carries NO
@@ -435,6 +442,13 @@ def create_app():
         ('POST', '/api/sse/subscribe'),
         # a read that takes its filter in the body; the GET beside it is open anyway
         ('POST', '/api/snapshots/overview'),
+        # the migration preflights read the clusters and change nothing (core/preflight.py);
+        # a dry run of the migrations themselves goes to the active like any write
+        ('POST', '/api/clusters/<cluster_id>/migration-preflight'),
+        ('POST', '/api/cross-cluster-migrate/preflight'),
+        # the what-if simulator reads the cluster and takes its scenario in the body
+        ('POST', '/api/clusters/<cluster_id>/whatif'),
+        ('POST', '/api/clusters/<cluster_id>/whatif/ranking'),
         # the ESXi VM detail watch: which VMs the live stream pushes details for, a dict
         # in this process like the SSE subscription (vmware.vm.view, the per-server
         # check still applies). The push only reads the VM, its guest info and its
@@ -532,22 +546,23 @@ def create_app():
         if not ha.is_standby():
             # MK Oct 2026 (#625) - the leader hands its lead on: writes wait until the
             # member it goes to caught up (design 7.1)
-            active = ha.is_active()
+            active = ha.takes_writes()
             pausing = active and ha.handing_over()
             if active and not pausing:
                 return None
             # MK Oct 2026 (#625) - automatic failover: this instance leads and holds no
-            # lease right now (it ran out, or the takeover wait is on). A change taken now
-            # might be one the next leader never sees. The consoles stay: they are the
-            # user's, on the instance the browser is on.
+            # lease right now (it ran out, or the takeover wait is on), or less of it than
+            # a write may take (Q16). A change taken now might be one the next leader never
+            # sees. The consoles stay: they are the user's, on the instance the browser is on.
             if (request.method, rule) in _STANDBY_CONSOLES or (
                     plugin_call and view_args.get('subpath') in _PLUGIN_CONSOLE_PATHS):
                 return None
             if pausing:
                 from pegaprox.api.ha import transfer_refusal
                 return transfer_refusal()
-            # never None: is_active() said no, and a second look at the state may find a
-            # standby by now, which would wave the write through
+            # never None: takes_writes() said no, and a second look at the state may find
+            # a standby by now, or a lease that a renewal just extended. Either would wave
+            # the write through
             from pegaprox.api.ha import write_gate_refusal
             return write_gate_refusal()
         if plugin_call and view_args.get('subpath') in _PLUGIN_CONSOLE_PATHS:
@@ -1280,7 +1295,10 @@ def _write_atomic(path, data, mode):
     tmp = path + '.tmp'
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     try:
-        os.write(fd, data)
+        # a short write (disk filling up) must not get renamed over the target
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -1706,6 +1724,11 @@ def main(debug_mode=False):
 
     start_cross_cluster_replication_thread()
     print("Started cross-cluster replication scheduler thread")
+
+    # the weekly restore tests of the auto-verify policy; they run on the active only
+    from pegaprox.background.restore_tests import start_restore_test_thread
+    start_restore_test_thread()
+    print("Started restore test schedule thread")
 
     # MAC addresses, notes and configured IPs for the search; the loop itself only reads
     # where users are served

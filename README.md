@@ -22,7 +22,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.3.0-blue" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-1.4.0-blue" alt="Version"/>
   <img src="https://img.shields.io/badge/python-3.8+-green" alt="Python"/>
   <img src="https://img.shields.io/badge/license-AGPL--3.0--License-orange" alt="License"/>
 </p>
@@ -122,6 +122,7 @@ The name **PegaProx** is inspired by *Pegasus*, the winged horse of Greek mythol
 - 📊 **Live Metrics** - Real-time CPU, RAM, and storage monitoring via SSE
 - 🔄 **Live Migration** - Migrate VMs between nodes with one click
 - ⚖️ **Cross-Cluster Load Balancing** - Distribute workloads across clusters
+- 🛣️ **Transfer Network** - A dedicated network per cluster for the disk data of cross-cluster migrations, replications and Site Recovery runs, off the management network ([docs](docs/transfer-network.md))
 - 🔄 **Cross-Hypervisor Migration** - Migrate VMs between ESXi, Proxmox VE, and XCP-ng 
 
 ### VM & Container Management
@@ -190,7 +191,7 @@ The name **PegaProx** is inspired by *Pegasus*, the winged horse of Greek mythol
 - 🚑 **Site Recovery** - Configure DR plans (boot order, dependencies, replication mappings) and execute controlled failover with audit trail.
 - 📦 **Backup SLA Tracking** - SLA dashboard per cluster + datastore: last-backup age vs configured RPO, integrated with the Alert pipeline.
 - 🔁 **ZFS / Cross-Cluster Replication** - Native PVE replication monitor + cross-cluster replication for clusters without shared storage.
-- 🪽 **PegaProx High Availability** - Pair up to 4 PegaProx instances: standbys keep a copy of the configuration, show a live view and pass changes on to the leader; failover is a confirmed, manual promote
+- 🪽 **PegaProx High Availability** - Pair up to 4 PegaProx instances: standbys keep a copy of the configuration, show a live view and pass changes on to the leader; failover is a confirmed, manual promote, or (beta, switched on per group) automatic by majority vote, with an optional witness as the third vote
 - 🧩 **Automated PVE Installations** - Serve answer files for the Proxmox VE auto-installer from profiles (guided setup or editor) and follow every installation run
 - 🛠️ **V2P / ESXi Migration** - Pyvmomi + SSHFS-based, with VirtIO driver pre-staging via MSI bulk-install (Windows guests).
 

@@ -8,7 +8,8 @@ push, SIEM forwarding, VMware host base URL.
 What this module enforces:
   * scheme allowlist (default https; admins can permit http for localhost-only)
   * blocks raw IP literals that resolve into private / loopback / link-local /
-    multicast space (RFC1918, 127/8, 169.254/16, ::1, fc00::/7, fe80::/10)
+    multicast space (RFC1918, 100.64/10 shared address space, 127/8, 169.254/16,
+    ::1, fc00::/7, fe80::/10)
   * blocks the cloud metadata addresses (169.254.169.254, fd00:ec2::254)
   * CR/LF / NUL rejection (defeats header smuggling tricks)
   * resolves the hostname *before* the request and re-checks every returned IP,
@@ -92,6 +93,10 @@ def _embedded_ipv4(ip: ipaddress._BaseAddress):
 
 _NAT64_LOCAL_USE = ipaddress.IPv6Network('64:ff9b:1::/48')
 
+# RFC 6598 shared address space (carrier-grade NAT, tailnets). The stdlib calls it neither
+# private nor reserved, so it needs its own line - it is no more public than RFC1918.
+_SHARED_ADDRESS_SPACE = ipaddress.IPv4Network('100.64.0.0/10')
+
 
 def _in_nat64_local_use(ip) -> bool:
     return isinstance(ip, ipaddress.IPv6Address) and ip in _NAT64_LOCAL_USE
@@ -129,6 +134,7 @@ def _is_private_or_special(ip: ipaddress._BaseAddress) -> bool:
         or ip.is_multicast
         or ip.is_reserved
         or ip.is_unspecified
+        or (ip.version == 4 and ip in _SHARED_ADDRESS_SPACE)
     )
 
 
@@ -359,3 +365,38 @@ def resolve_and_pin_url(
         userinfo = netloc.rsplit('@', 1)[0] + '@'
     portpart = f':{parsed.port}' if parsed.port else ''
     return urlunparse(parsed._replace(netloc=f'{userinfo}{hostpart}{portpart}'))
+
+
+def infra_target_refusal(host: str, allow_loopback: bool = True, label: str = 'host') -> str:
+    """Why PegaProx will not dial an infrastructure host somebody typed in (a PBS, an ESXi
+    server), or '' when it may. Takes a bare name or address, no URL.
+
+    These hosts sit on the LAN, so private ranges stay open. Link-local, where the cloud
+    metadata services answer, has none of them, and the errors of a connection attempt tell
+    whether anything listens there. Loopback only when the caller says so (a global admin
+    may run PegaProx on that host itself). A name that does not resolve is left to the
+    connection, which reports it anyway.
+    MK Oct 2026 - moved here from core/pbs.py so the ESXi routes use the same rule.
+    """
+    host = (host or '').strip()
+    if host.startswith('[') and host.endswith(']'):
+        host = host[1:-1]
+    try:
+        found = socket.getaddrinfo(host, None)
+    except (OSError, UnicodeError):
+        return ''
+    for info in found:
+        try:
+            ip = ipaddress.ip_address(str(info[4][0]).split('%', 1)[0])
+        except ValueError:
+            continue
+        # the address itself and an IPv4 one carried inside it (mapped, 6to4, NAT64)
+        inner = [ip, _embedded_ipv4(ip)]
+        if _in_nat64_local_use(ip):
+            inner += _nat64_local_use_readings(ip)
+        for addr in inner:
+            if addr is not None and (addr.is_link_local or str(addr) in _METADATA_HOSTS):
+                return f'The {label} is a link-local or cloud metadata address'
+        if not allow_loopback and _is_loopback(ip):
+            return f'The {label} is a loopback address of this server'
+    return ''

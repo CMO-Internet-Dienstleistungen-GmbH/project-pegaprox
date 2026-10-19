@@ -791,6 +791,60 @@
         }
 
         // Compliance & Key Management Section (HIPAA/ISO 27001)
+        // LW Oct 2026 - what the hash chain found, in sentences. Edited, missing and out of
+        // order entries are the findings; pruning and the entries since the last checkpoint
+        // are context; the entries from before the chain are reported on their own.
+        function AuditChainFindings({ result }) {
+            const { t } = useTranslation();
+            const ch = result.chain || {};
+            const lg = result.legacy;
+            const fmt = (key, fb, vals) => Object.entries(vals).reduce(
+                (str, [k, v]) => str.split(`{${k}}`).join(String(v)), t(key) || fb);
+            const when = (iso) => { try { return iso ? new Date(iso).toLocaleString() : ''; } catch (_) { return iso || ''; } };
+            const named = (list) => (list || []).reduce((n, x) => n + (Array.isArray(x) ? x[1] - x[0] + 1 : 1), 0);
+            const seqs = (list, total) => (list || []).map(x => Array.isArray(x) ? (x[0] === x[1] ? `${x[0]}` : `${x[0]}-${x[1]}`) : `${x}`).join(', ')
+                + (total > named(list) ? ', ...' : '');
+            const bad = [];
+            if (ch.edited > 0) bad.push(fmt('auditChainEdited', '{n} entries were changed after they were written (entries {list}).', { n: ch.edited, list: seqs(ch.edited_seqs, ch.edited) }));
+            if (ch.missing > 0) bad.push(fmt('auditChainMissing', '{n} entries are missing, deleted from the log (entries {list}).', { n: ch.missing, list: seqs(ch.missing_ranges, ch.missing) }));
+            if (ch.broken_links > 0) bad.push(fmt('auditChainBroken', '{n} entries do not follow the entry before them (entries {list}).', { n: ch.broken_links, list: seqs(ch.broken_link_seqs, ch.broken_links) }));
+            if (ch.truncated) bad.push(t('auditChainTruncated') || 'The log ends before its last signed checkpoint: the newest entries were removed.');
+            if (ch.bad_checkpoints > 0) bad.push(fmt('auditChainBadCheckpoints', '{n} checkpoints fail their signature and were not trusted.', { n: ch.bad_checkpoints }));
+            // LW Oct 2026 - the checkpoints are a chain of their own, and the newest one is kept
+            // beside the key as well; a hole there or a chain started over are findings too
+            if (ch.checkpoints_missing > 0) bad.push(fmt('auditChainCheckpointsMissing', '{n} signed checkpoints are missing from the database.', { n: ch.checkpoints_missing }));
+            if (ch.checkpoints_broken > 0) bad.push(fmt('auditChainCheckpointsBroken', '{n} signed checkpoints do not follow the one before them.', { n: ch.checkpoints_broken }));
+            if (ch.no_start) bad.push(t('auditChainNoStart') || 'The signed start of the chain is missing: the oldest entries and those from before the chain cannot be vouched for.');
+            if (ch.restarted) bad.push(fmt('auditChainRestarted', 'The chain was started over. The one this server kept a copy of reached entry {n} and is no longer in the database.', { n: ch.restarted_after || 0 }));
+            if (ch.anchor === 'bad') bad.push(t('auditChainAnchorBad') || 'The copy of the last checkpoint kept beside the encryption key fails its signature.');
+            if (lg && lg.changed_since_chain_start) bad.push(t('auditLegacyChanged') || 'Entries from before the chain were removed or changed since it started.');
+            const info = [];
+            if (ch.anchor === 'missing') info.push(t('auditChainAnchorMissing') || 'No copy of the last checkpoint is kept beside the encryption key yet, so an end removed together with its checkpoints would not show.');
+            if (ch.pruned_through > 0) info.push(fmt('auditChainPruned', 'Retention removed entries up to number {n} ({time}). That is recorded and signed, not counted as missing.', { n: ch.pruned_through, time: when(ch.pruned_at) }));
+            if (ch.after_checkpoint > 0) info.push(fmt('auditChainAfterCheckpoint', '{n} entries were written since the last signed checkpoint ({time}). Checkpoints are signed hourly.', { n: ch.after_checkpoint, time: when(ch.last_checkpoint && ch.last_checkpoint.created_at) }));
+            return (
+                <div className="mt-4 space-y-3" data-testid="audit-chain-findings">
+                    <div className={`p-3 rounded-lg border ${bad.length ? 'bg-red-500/10 border-red-500/30' : 'bg-green-500/10 border-green-500/30'}`}>
+                        <div className="text-sm font-medium text-white mb-1">{t('auditChainTitle') || 'Hash chain'}</div>
+                        {bad.length ? (
+                            <ul className="text-sm text-red-300 space-y-1">{bad.map((b, i) => <li key={i}>{b}</li>)}</ul>
+                        ) : (
+                            <p className="text-sm text-green-300">{t('auditChainIntact') || 'Nothing was changed, removed or reordered since the chain started.'}</p>
+                        )}
+                        {info.length > 0 && (
+                            <ul className="text-xs text-gray-400 space-y-1 mt-2">{info.map((b, i) => <li key={i}>{b}</li>)}</ul>
+                        )}
+                    </div>
+                    {lg && lg.rows > 0 && (
+                        <div className="p-3 rounded-lg border bg-proxmox-card border-proxmox-border text-xs text-gray-400" data-testid="audit-legacy">
+                            {fmt('auditLegacyRows', '{n} entries are from before the chain: {verified} signed, {unsigned} unsigned, {tampered} changed.', { n: lg.rows, verified: lg.verified, unsigned: lg.unsigned, tampered: lg.tampered })}
+                            {lg.changed_since_chain_start === false && <> {t('auditLegacyUnchanged') || 'None of them was removed or changed since the chain started.'}</>}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         function ComplianceSection({ addToast }) {
             const { t } = useTranslation();
             const { getAuthHeaders, isAdmin, haStandby } = useAuth();
@@ -873,8 +927,11 @@
                     if (res.ok) {
                         const data = await res.json();
                         setAuditIntegrity(data);
-                        if (data.potentially_tampered > 0) {
-                            addToast(`⚠️ WARNING: ${data.potentially_tampered} audit entries may have been tampered!`, 'error');
+                        // LW Oct 2026 - a deleted entry leaves every other one verifying, so the
+                        // chain findings decide the toast too, not only the edited count
+                        const chain = data.chain || {};
+                        if (data.potentially_tampered > 0 || chain.missing > 0 || chain.broken_links > 0 || data.intact === false) {
+                            addToast(`⚠️ WARNING: ${data.potentially_tampered} changed, ${chain.missing || 0} missing, ${chain.broken_links || 0} out of order`, 'error');
                         } else {
                             addToast(`✓ Audit log integrity verified: ${data.verified}/${data.total_entries} entries`, 'success');
                         }
@@ -1001,8 +1058,16 @@
                                 <Icons.Check /> {t('securitySelfCheck') || 'Security Self-Check'}
                             </h3>
                             {compliance && (
-                                <div className={`text-3xl font-bold ${getScoreColor(compliance.compliance_score)}`}>
-                                    {compliance.compliance_score}%
+                                <div className="text-right">
+                                    <div className={`text-3xl font-bold ${compliance.compliance_score == null ? 'text-gray-500' : getScoreColor(compliance.compliance_score)}`}>
+                                        {compliance.compliance_score == null ? '-' : `${compliance.compliance_score}%`}
+                                    </div>
+                                    {compliance.total != null && (
+                                        <div className="text-xs text-gray-400" data-testid="compliance-checked-of">
+                                            {(t('complianceCheckedOf') || '{checked} of {total} controls checked')
+                                                .replace('{checked}', compliance.checked).replace('{total}', compliance.total)}
+                                        </div>
+                                    )}
                                 </div>
                             )}
                         </div>
@@ -1013,12 +1078,20 @@
 
                         {compliance && (
                             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4">
-                                {Object.entries(compliance.checks || {}).map(([key, value]) => (
-                                    <div key={key} className={`p-3 rounded-lg ${value ? 'bg-green-500/10 border border-green-500/30' : 'bg-red-500/10 border border-red-500/30'}`}>
+                                {/* LW Oct 2026 - a control that could not be judged here says so and why,
+                                    and stays out of the score; older servers only send `checks` */}
+                                {(compliance.controls || Object.entries(compliance.checks || {}).map(([id, v]) => ({ id, status: v ? 'passed' : 'failed' }))).map(c => (
+                                    <div key={c.id} title={c.reason || c.detail || ''} data-testid={`compliance-control-${c.id}`}
+                                        className={`p-3 rounded-lg border ${c.status === 'passed' ? 'bg-green-500/10 border-green-500/30' : c.status === 'failed' ? 'bg-red-500/10 border-red-500/30' : 'bg-proxmox-card border-proxmox-border'}`}>
                                         <div className="flex items-center gap-2">
-                                            {value ? <span className="text-green-400">✓</span> : <span className="text-red-400">✗</span>}
-                                            <span className="text-sm text-gray-300">{key.replace(/_/g, ' ')}</span>
+                                            {c.status === 'passed' ? <span className="text-green-400">✓</span> : c.status === 'failed' ? <span className="text-red-400">✗</span> : <span className="text-gray-500">-</span>}
+                                            <span className="text-sm text-gray-300">{c.id.replace(/_/g, ' ')}</span>
                                         </div>
+                                        {c.status === 'not_checked' ? (
+                                            <p className="text-xs text-gray-500 mt-1">{t('complianceNotChecked') || 'Not checked'}{c.reason ? `: ${c.reason}` : ''}</p>
+                                        ) : c.detail ? (
+                                            <p className="text-xs text-gray-500 mt-1">{c.detail}</p>
+                                        ) : null}
                                     </div>
                                 ))}
                             </div>
@@ -1071,6 +1144,7 @@
                                 </div>
                             </div>
                         )}
+                        {auditIntegrity && auditIntegrity.chain && <AuditChainFindings result={auditIntegrity} />}
                     </div>
 
                     {/* Encryption Key Management */}
@@ -2088,6 +2162,200 @@
             );
         }
 
+        // NS Oct 2026 - "1 guests": a wording about a count of one has its own key, <key>_one,
+        // in every language (where a language has no singular form it says the same)
+        function countKey(t, key, n) {
+            return String(n) === '1' && t(key + '_one') !== key + '_one' ? key + '_one' : key;
+        }
+
+        // NS Oct 2026 - what a reason of the server says in the user's language. The preflight
+        // (prefix 'pf_') and the what-if verdict ('wiv_') send {code, args, text}: the wording of
+        // the code comes from t(prefix + code) with {name} filled from args. The English text of
+        // the server stands in when the key is missing, and when the wording asks for a value
+        // the server did not send (a caller confined to some guests gets fewer figures).
+        // A reason with a variant has its own key, pf_<code>_<variant>.
+        function sayReason(t, prefix, r) {
+            const args = r.args || {};
+            const key = countKey(t, prefix + r.code + (r.variant ? '_' + r.variant : ''), args.count);
+            const wording = t(key);
+            if (!wording || wording === key) return r.text || '';
+            const need = (wording.match(/\{\w+\}/g) || []).map(m => m.slice(1, -1));
+            if (need.some(k => !(k in args))) return r.text || '';
+            return wording.replace(/\{(\w+)\}/g, (m, k) => (Array.isArray(args[k]) ? args[k].join(', ') : String(args[k])));
+        }
+
+        // the one line on top of a what-if report: ready, warning or blocked and why
+        function WhatIfVerdictLine({ verdict }) {
+            const { t } = useTranslation();
+            if (!verdict || !verdict.level) return null;
+            const look = {
+                ready: 'bg-green-500/10 text-green-400 border-green-500/30',
+                warning: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30',
+                blocked: 'bg-red-500/10 text-red-400 border-red-500/30',
+            };
+            const reasons = verdict.reasons || [];
+            return (
+                <div data-testid="whatif-verdict" data-verdict={verdict.level}
+                    className={`border rounded-xl p-3 text-sm ${look[verdict.level] || look.warning}`}>
+                    <div className="font-semibold">{t('wiv_level_' + verdict.level)}</div>
+                    {reasons.length > 0 && (
+                        <ul className="list-disc pl-5 mt-1 space-y-0.5 text-xs">
+                            {reasons.map(r => (
+                                <li key={r.code} data-verdict-reason={r.code}>{sayReason(t, 'wiv_', r)}</li>
+                            ))}
+                        </ul>
+                    )}
+                </div>
+            );
+        }
+
+        // the old RAM-only check of the maintenance preview as one line, '' when it has nothing to say
+        function maintPreviewText(t, p) {
+            if (!p) return '';
+            if (p.reason === 'no_target_nodes' && p.guest_count > 0)
+                return t('maintPreviewNoTargets');
+            const proceed = ' ' + t('maintPreviewProceed');
+            if (!p.headroom_sufficient)
+                return t('maintPreviewNoHeadroom') + proceed;
+            if (p.over_threshold && p.over_threshold.length)
+                return t('maintPreviewOverThreshold') + p.over_threshold.join(', ') + proceed;
+            return '';
+        }
+
+        // NS Oct 2026 - the dialog every way into a node's maintenance goes through: it runs the
+        // 'maintenance' what-if for the node once when it opens and says what the evacuation
+        // would do, next to the evacuation options. The server action is never held back by
+        // the check: a refused or failed what-if falls back to the old capacity pre-check, and
+        // only a blocked verdict asks for a tick first.
+        function MaintenanceDialog({ clusterId, node, options, onOptions, onCancel, onConfirm }) {
+            const { t } = useTranslation();
+            const { getAuthHeaders } = useAuth();
+            const { isCorporate } = useLayout();
+            const [check, setCheck] = useState({ state: 'loading' });
+            const [ack, setAck] = useState(false);
+            const MAX_NAMED = 8;
+            useEffect(() => {
+                let gone = false;
+                const base = `${API_URL}/clusters/${encodeURIComponent(clusterId)}`;
+                (async () => {
+                    try {
+                        const r = await fetch(`${base}/whatif`, {
+                            method: 'POST', credentials: 'include',
+                            headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
+                            body: JSON.stringify({ type: 'maintenance', nodes: [node] }),
+                        });
+                        const d = r.ok ? await r.json() : null;
+                        if (d && d.verdict && d.verdict.level) { if (!gone) setCheck({ state: 'ok', report: d }); return; }
+                    } catch (_) { /* the old pre-check below */ }
+                    let text = '';
+                    try {
+                        const pv = await fetch(`${base}/nodes/${encodeURIComponent(node)}/maintenance-preview?threshold=90`,
+                            { credentials: 'include', headers: getAuthHeaders() });
+                        if (pv.ok) text = maintPreviewText(t, await pv.json());
+                    } catch (_) { /* nothing to add */ }
+                    if (!gone) setCheck({ state: 'fallback', text });
+                })();
+                return () => { gone = true; };
+            }, [clusterId, node]);
+
+            const report = check.state === 'ok' ? check.report : null;
+            const blocked = report?.verdict?.level === 'blocked';
+            const rows = report?.guests || [];
+            const fill = (s, vars) => String(s).replace(/\{(\w+)\}/g, (m, k) => (vars[k] != null ? vars[k] : m));
+            const named = (list) => {
+                const names = list.slice(0, MAX_NAMED).map(g => `${g.name || g.vmid} (${g.vmid})`);
+                return names.join(', ') + (list.length > MAX_NAMED ? ', ' + fill(t('maintDlgMore'), { n: list.length - MAX_NAMED }) : '');
+            };
+            const crit = rows.filter(g => g.critical);
+            const unproven = rows.filter(g => g.restore && (g.restore.state === 'not_proven' || g.restore.state === 'failing'));
+            const down = rows.filter(g => g.outcome === 'down');
+            const moving = (report?.summary?.moved || 0) + (report?.summary?.restarted || 0);
+            const tenants = (report?.risk?.tenants?.items || []).filter(x => x.affected > 0);
+            const hot = (report?.nodes || []).filter(n => n.over_cpu || n.over_mem || n.overcommitted).map(n => n.node);
+
+            const overlay = isCorporate
+                ? 'fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60'
+                : 'fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/60';
+            const panel = isCorporate
+                ? 'w-full max-w-md max-h-[90vh] overflow-y-auto bg-proxmox-card border border-proxmox-border p-5'
+                : 'w-full max-w-md max-h-[90vh] overflow-y-auto bg-proxmox-card border border-proxmox-border rounded-2xl shadow-2xl p-6';
+            const cancelCls = isCorporate
+                ? 'px-3 py-1.5 text-[13px] border border-proxmox-border hover:text-white'
+                : 'flex-1 px-4 py-2.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-gray-300 font-medium hover:bg-proxmox-hover transition-colors';
+            const enableCls = isCorporate
+                ? 'px-3 py-1.5 text-[13px] text-white disabled:opacity-50'
+                : 'flex-1 px-4 py-2.5 bg-yellow-500 hover:bg-yellow-600 rounded-lg text-black font-medium transition-colors disabled:opacity-50';
+            const enableStyle = isCorporate ? { background: '#efc006', border: '1px solid #d4a905' } : undefined;
+            const line = 'text-xs text-gray-300';
+
+            return (
+                <div className={overlay} onClick={onCancel}>
+                    <div className={panel} data-testid="maint-dialog" onClick={e => e.stopPropagation()}>
+                        <div className="flex items-center gap-3 mb-3">
+                            <div className="p-2 bg-yellow-500/10 rounded-lg"><Icons.Wrench /></div>
+                            <div>
+                                <h3 className="text-base font-semibold text-white">{t('enterMaintenance') || 'Enter Maintenance Mode'}</h3>
+                                <p className="text-sm text-gray-400">{node}</p>
+                            </div>
+                        </div>
+
+                        <p className="text-xs text-gray-400 mb-3">{t('maintenanceDesc')}</p>
+
+                        <div className="space-y-2 mb-4" data-testid="maint-check" data-state={check.state}>
+                            {check.state === 'loading' && <p className="text-xs text-gray-500">{t('maintDlgChecking')}</p>}
+                            {check.state === 'fallback' && (
+                                <div data-testid="maint-fallback" className="text-xs text-gray-300 space-y-1">
+                                    <p className="text-gray-500">{t('maintDlgFallback')}</p>
+                                    <p className={check.text ? 'text-yellow-400' : 'text-gray-400'}>{check.text || t('maintDlgFallbackNone')}</p>
+                                </div>
+                            )}
+                            {report && (<>
+                                <WhatIfVerdictLine verdict={report.verdict} />
+                                <p className={line} data-testid="maint-moves">{fill(t(countKey(t, 'maintDlgMoves', moving)), { n: moving })}</p>
+                                {down.length > 0 && <p className="text-xs text-red-400" data-testid="maint-down">{fill(t(countKey(t, 'maintDlgStay', down.length)), { n: down.length })}: {named(down)}</p>}
+                                {crit.length > 0 && (
+                                    <p className={line} data-testid="maint-critical">
+                                        <span className="text-white">{t('maintDlgCritical')}:</span> {named(crit)}
+                                    </p>
+                                )}
+                                {unproven.length > 0 && (
+                                    <p className={line} data-testid="maint-unproven">
+                                        <span className="text-white">{fill(t(countKey(t, 'maintDlgUnproven', unproven.length)), { n: unproven.length })}:</span> {named(unproven)}
+                                    </p>
+                                )}
+                                {tenants.length > 0 && (
+                                    <p className={line} data-testid="maint-tenants">
+                                        <span className="text-white">{t('maintDlgTenants')}:</span> {tenants.map(x => x.name).join(', ')}
+                                        {' '}<span data-whatif-basis="assumed" className="px-1.5 py-0.5 rounded text-[10px] whitespace-nowrap bg-yellow-500/10 text-yellow-400">{t('whatifAssumed')}</span>
+                                    </p>
+                                )}
+                                {hot.length > 0 && <p className="text-xs text-yellow-400" data-testid="maint-over">{fill(t('maintDlgOver'), { nodes: hot.join(', ') })}</p>}
+                                {options.relax_anti_affinity && <p className="text-xs text-gray-500">{t('maintDlgRelaxNote')}</p>}
+                            </>)}
+                        </div>
+
+                        <div className="mb-4">
+                            <MaintenanceEvacOptions clusterId={clusterId} node={node} value={options} onChange={onOptions} />
+                        </div>
+
+                        {blocked && (
+                            <label className="flex items-start gap-2 cursor-pointer mb-4 text-sm text-red-300">
+                                <input type="checkbox" data-testid="maint-ack" checked={ack} onChange={e => setAck(e.target.checked)}
+                                    className="mt-0.5 w-4 h-4 flex-shrink-0 rounded border-proxmox-border bg-proxmox-dark" />
+                                <span>{t('maintDlgAck')}</span>
+                            </label>
+                        )}
+                        <div className={isCorporate ? 'flex justify-end gap-2' : 'flex gap-3'}>
+                            <button type="button" data-testid="maint-cancel" onClick={onCancel} className={cancelCls}
+                                style={isCorporate ? { color: '#adbbc4' } : undefined}>{t('cancel')}</button>
+                            <button type="button" data-testid="maint-enable" disabled={blocked && !ack} onClick={onConfirm}
+                                className={enableCls} style={enableStyle}>{t('maintDlgEnable')}</button>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
         // LW Oct 2026 (#763, #954) - the two evacuation options and what ticking each would change,
         // read from the plan. The rolling update dialog, its schedule and the maintenance dialog
         // of a node use them; the plan is read once each time the dialog opens
@@ -2274,6 +2542,9 @@
             const [checking, setChecking] = useState(false);
             const [updateStatus, setUpdateStatus] = useState(null);
             const [rollingUpdate, setRollingUpdate] = useState(null);
+            // LW Oct 2026 - the last runs of the cluster, read when the list is opened
+            const [rollHistory, setRollHistory] = useState(null);
+            const [showRollHistory, setShowRollHistory] = useState(false);
             const [includeReboot, setIncludeReboot] = useState(true);
             const [skipUpToDate, setSkipUpToDate] = useState(true);  // NS: Skip nodes without updates
             // MK Sep 2026 (#716) - which alert channels hear about this run,
@@ -2654,24 +2925,69 @@
                     const data = await response.json();
                     if (data.success) {
                         addToast(t('cancelRollingUpdate') + ' ✓', 'info');
-                        setRollingUpdate(null);
+                        // LW Oct 2026 - the cancelled run stays on screen with what it could not undo
+                        if (Array.isArray(data.not_undone) && data.not_undone.length > 0) {
+                            addToast(t('rollRunNotUndoneToast'), 'warning');
+                        }
+                        getRollingStatus();
+                    } else {
+                        addToast(data.error || t('connectionError'), 'error');
                     }
                 } catch (error) {
                     addToast(t('connectionError'), 'error');
                 }
             };
 
+            // LW Oct 2026 - one line per item a cancel could not undo
+            const rollReportText = (item) => {
+                if (item.kind === 'maintenance') return t('rollRunUndoneMaint').replace('{node}', item.node || '-');
+                if (item.kind === 'ha_rules') return t('rollRunUndoneRules').replace('{rules}', (item.rules || []).join(', '));
+                if (item.kind === 'guests_stay') return t('rollRunUndoneGuests').replace('{count}', item.count || 0).replace('{node}', item.node || '-');
+                return t('rollRunUndoneError');
+            };
+            // why a run waits for its quorum, from the votes the server counted
+            const rollQuorumText = (d) => {
+                const node = d.node || rollingUpdate?.current_node || '-';
+                if (d.reason === 'status_unreadable') return t('rollQuorumUnread').replace('{node}', node);
+                if (d.reason === 'status_incomplete') return t('rollQuorumIncomplete').replace('{node}', node);
+                if (d.reason === 'not_quorate') return t('rollQuorumNotQuorate').replace('{node}', node);
+                return t('rollQuorumHeld').replace('{node}', node).replace('{after}', String(d.after ?? '-'))
+                    .replace('{expected}', String(d.expected ?? '-')).replace('{needed}', String(d.needed ?? '-'));
+            };
+
+            const loadRollHistory = async () => {
+                setRollHistory(null);
+                try {
+                    const r = await fetch(`${API_URL}/clusters/${clusterId}/updates/rolling/history`, {
+                        credentials: 'include',
+                        headers: getAuthHeaders()
+                    });
+                    const d = r.ok ? await r.json() : null;
+                    setRollHistory(d && Array.isArray(d.runs) ? d.runs : 'error');
+                } catch (e) {
+                    setRollHistory('error');
+                }
+            };
+            const rollStatusLabel = { completed: 'rollRunStatusCompleted', failed: 'rollRunStatusFailed',
+                cancelled: 'rollRunStatusCancelled', running: 'rollRunStatusRunning', paused: 'rollRunStatusPaused' };
+            const rollStatusColor = { completed: 'bg-green-500/20 text-green-400', failed: 'bg-red-500/20 text-red-400',
+                cancelled: 'bg-gray-500/20 text-gray-400', running: 'bg-blue-500/20 text-blue-400',
+                paused: 'bg-yellow-500/20 text-yellow-400' };
+
             // NS: GitHub #40 - Resume a paused rolling update
-            const resumeRollingUpdate = async () => {
+            // LW Oct 2026 - acceptRisk: Continue anyway on a run held for its quorum (true only,
+            // the click event of the plain Continue is no yes)
+            const resumeRollingUpdate = async (acceptRisk) => {
                 try {
                     const response = await fetch(`${API_URL}/clusters/${clusterId}/updates/rolling/resume`, {
                         method: 'POST',
                         credentials: 'include',
-                        headers: getAuthHeaders()
+                        headers: acceptRisk === true ? { ...getAuthHeaders(), 'Content-Type': 'application/json' } : getAuthHeaders(),
+                        ...(acceptRisk === true ? { body: JSON.stringify({ accept_quorum_risk: true }) } : {}),
                     });
                     const data = await response.json();
                     if (data.success) {
-                        addToast('Rolling Update resumed', 'success');
+                        addToast(t('rollRunResumed'), 'success');
                         setTimeout(() => getRollingStatus(), 500);
                     } else {
                         addToast(data.error || 'Failed to resume', 'error');
@@ -2686,6 +3002,8 @@
                 // Reset state when cluster changes
                 setUpdateStatus(null);
                 setRollingUpdate(null);
+                setRollHistory(null);
+                setShowRollHistory(false);
                 setSelectedNode(null);
                 setUpdatingNode(null);
                 setExpanded(false);
@@ -2733,6 +3051,13 @@
                     checkUpdates();
                 }
             }, [rollingUpdate?.status]);
+
+            // LW Oct 2026 - a run that waits for Continue or Cancel (one a restart interrupted
+            // included) opens the section by itself
+            const rollPausedRun = rollingUpdate?.status === 'paused' ? (rollingUpdate.run_id || 'paused') : null;
+            useEffect(() => {
+                if (rollPausedRun) setExpanded(true);
+            }, [rollPausedRun]);
 
             const totalUpdates = updateStatus?.summary?.total_updates || 0;
             const nodesWithUpdates = updateStatus?.summary?.nodes_with_updates || 0;
@@ -2785,6 +3110,11 @@
                             </div>
                         </div>
                         <div className="flex items-center gap-2">
+                            {rollingUpdate && rollingUpdate.status === 'paused' && (
+                                <span className="px-2 py-1 bg-yellow-500/20 text-yellow-400 rounded-full text-xs font-medium" data-testid="rolling-paused-pill">
+                                    {t('rollRunStatusPaused')}
+                                </span>
+                            )}
                             {totalUpdates > 0 && (
                                 <span className="px-2 py-1 bg-yellow-500/20 text-yellow-400 rounded-full text-xs font-medium">
                                     {totalUpdates}
@@ -3223,6 +3553,18 @@
                                             {rollingUpdate.skipped_nodes?.length > 0 && `, ${rollingUpdate.skipped_nodes.length} skipped`}
                                         </p>
                                     )}
+                                    {/* LW Oct 2026 - what a cancel could not undo */}
+                                    {rollingUpdate.status === 'cancelled' && Array.isArray(rollingUpdate.cancel_report) && rollingUpdate.cancel_report.length > 0 && (
+                                        <div className="mt-2 space-y-1" data-testid="rolling-cancel-report">
+                                            <p className="text-xs text-yellow-400 font-medium">{t('rollRunNotUndone')}</p>
+                                            {rollingUpdate.cancel_report.map((item, i) => (
+                                                <div key={i} className="flex items-start gap-2 text-xs text-yellow-200/80" data-kind={item.kind}>
+                                                    <Icons.AlertTriangle className="w-3 h-3 mt-0.5 shrink-0" />
+                                                    <span>{rollReportText(item)}</span>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
                                 </div>
                             )}
 
@@ -3231,12 +3573,35 @@
                                 <div className={`p-4 ${rollingUpdate.status === 'paused' ? 'bg-yellow-500/10 border border-yellow-500/30' : 'bg-blue-500/10 border border-blue-500/30'} rounded-lg space-y-4`}>
                                     {/* NS: GitHub #40 - Paused Banner */}
                                     {rollingUpdate.status === 'paused' && (
-                                        <div className="bg-yellow-900/30 border border-yellow-600/50 rounded-lg p-4 space-y-3">
+                                        <div className="bg-yellow-900/30 border border-yellow-600/50 rounded-lg p-4 space-y-3" data-testid="rolling-paused" data-reason={rollingUpdate.paused_reason || ''}>
                                             <div className="flex items-center gap-2">
                                                 <Icons.AlertTriangle className="w-5 h-5 text-yellow-400" />
-                                                <span className="text-yellow-400 font-semibold text-lg">Rolling Update Paused</span>
+                                                <span className="text-yellow-400 font-semibold text-lg">{t('rollRunPausedTitle')}</span>
                                             </div>
-                                            {rollingUpdate.paused_details && (
+                                            {/* LW Oct 2026 - PegaProx stopped mid-run: where it was, and that nothing goes on by itself */}
+                                            {rollingUpdate.paused_reason === 'interrupted' ? (
+                                                <div className="text-sm text-yellow-200/80 space-y-1" data-testid="rolling-interrupted">
+                                                    <p>{t('rollRunInterrupted')
+                                                        .replace('{node}', rollingUpdate.paused_details?.node || rollingUpdate.current_node || '-')
+                                                        .replace('{phase}', rollingUpdate.paused_details?.phase || rollingUpdate.resume_at?.phase || '-')}</p>
+                                                    <p className="text-xs text-gray-400">{t('rollRunInterruptedHint').replace('{node}', rollingUpdate.paused_details?.node || rollingUpdate.current_node || '-')}</p>
+                                                </div>
+                                            ) : rollingUpdate.paused_reason === 'quorum' ? (
+                                                // LW Oct 2026 - the node would cost the cluster its quorum: the votes, and what Continue does
+                                                <div className="text-sm text-yellow-200/80 space-y-1" data-testid="rolling-quorum">
+                                                    <p>{rollQuorumText(rollingUpdate.paused_details || {})}</p>
+                                                    {(rollingUpdate.paused_details?.offline || []).length > 0 && (
+                                                        <p className="text-xs">{t('rollQuorumOffline').replace('{nodes}', rollingUpdate.paused_details.offline.join(', '))}</p>
+                                                    )}
+                                                    {rollingUpdate.paused_details?.qdevice?.present && !rollingUpdate.paused_details.qdevice.connected && (
+                                                        // LW Oct 2026 - the nodes that stay up without the vote, where the server named them
+                                                        <p className="text-xs" data-testid="rolling-quorum-qdevice">{(rollingUpdate.paused_details.qdevice.not_connected || []).length > 0
+                                                            ? t('rollQuorumQdeviceNodes').replace('{nodes}', rollingUpdate.paused_details.qdevice.not_connected.join(', '))
+                                                            : t('rollQuorumQdevice')}</p>
+                                                    )}
+                                                    <p className="text-xs text-gray-400">{t('rollQuorumHint').replace('{node}', rollingUpdate.paused_details?.node || rollingUpdate.current_node || '-')}</p>
+                                                </div>
+                                            ) : rollingUpdate.paused_details && (
                                                 <div className="text-sm text-yellow-200/80">
                                                     {rollingUpdate.paused_details.message}
                                                 </div>
@@ -3254,22 +3619,44 @@
                                                     ))}
                                                 </div>
                                             )}
-                                            <div className="flex gap-3 mt-3">
-                                                <button
-                                                    onClick={resumeRollingUpdate}
-                                                    className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg text-sm font-medium flex items-center gap-2 transition-colors"
-                                                >
-                                                    <Icons.Play className="w-4 h-4" />
-                                                    Continue Update
-                                                </button>
-                                                <button
-                                                    onClick={cancelRollingUpdate}
-                                                    className="px-4 py-2 bg-red-600/30 hover:bg-red-600/50 text-red-400 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors"
-                                                >
-                                                    <Icons.X className="w-4 h-4" />
-                                                    Cancel Update
-                                                </button>
-                                            </div>
+                                            {rollingUpdate.current_step === 'cancelling' ? (
+                                                <div className="flex items-center gap-2 text-sm text-yellow-300" data-testid="rolling-cancelling">
+                                                    <div className="animate-spin w-4 h-4 border-2 border-proxmox-orange border-t-transparent rounded-full"></div>
+                                                    {t('rollRunCancelling')}
+                                                </div>
+                                            ) : hasPerm('node.update') && (
+                                                <div className="flex gap-3 mt-3">
+                                                    <button
+                                                        onClick={resumeRollingUpdate}
+                                                        data-testid="rolling-continue"
+                                                        className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg text-sm font-medium flex items-center gap-2 transition-colors"
+                                                    >
+                                                        <Icons.Play className="w-4 h-4" />
+                                                        {t('rollRunContinue')}
+                                                    </button>
+                                                    {rollingUpdate.paused_reason === 'quorum' && (
+                                                        <button
+                                                            onClick={() => {
+                                                                const node = rollingUpdate.paused_details?.node || rollingUpdate.current_node || '-';
+                                                                if (window.confirm(t('rollQuorumContinueConfirm').replace('{node}', node))) resumeRollingUpdate(true);
+                                                            }}
+                                                            data-testid="rolling-continue-anyway"
+                                                            className="px-4 py-2 bg-yellow-500/20 hover:bg-yellow-500/30 text-yellow-300 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors"
+                                                        >
+                                                            <Icons.AlertTriangle className="w-4 h-4" />
+                                                            {t('rollQuorumContinueAnyway')}
+                                                        </button>
+                                                    )}
+                                                    <button
+                                                        onClick={cancelRollingUpdate}
+                                                        data-testid="rolling-cancel"
+                                                        className="px-4 py-2 bg-red-600/30 hover:bg-red-600/50 text-red-400 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors"
+                                                    >
+                                                        <Icons.X className="w-4 h-4" />
+                                                        {t('rollRunCancel')}
+                                                    </button>
+                                                </div>
+                                            )}
                                         </div>
                                     )}
                                     
@@ -3285,7 +3672,7 @@
                                                 {rollingUpdate.status === 'paused' ? 'Update Paused' : t('rollingUpdateInProgress')}
                                             </span>
                                         </div>
-                                        {rollingUpdate.status === 'running' && (
+                                        {rollingUpdate.status === 'running' && hasPerm('node.update') && (
                                             <button
                                                 onClick={cancelRollingUpdate}
                                                 className="px-3 py-1.5 text-sm bg-red-500/20 text-red-400 rounded-lg hover:bg-red-500/30 transition-colors flex items-center gap-1"
@@ -3502,6 +3889,58 @@
                                                 ))}
                                             </div>
                                         </details>
+                                    )}
+                                </div>
+                            )}
+
+                            {/* LW Oct 2026 - the last rolling updates, how each ended; read when opened */}
+                            {hasPerm('node.view') && (
+                                <div className="border-t border-proxmox-border pt-3" data-testid="rolling-history">
+                                    <button
+                                        onClick={(e) => { e.stopPropagation(); const open = !showRollHistory; setShowRollHistory(open); if (open) loadRollHistory(); }}
+                                        className="text-sm text-gray-400 hover:text-white flex items-center gap-2 transition-colors"
+                                    >
+                                        <Icons.ChevronDown className={`w-4 h-4 transition-transform ${showRollHistory ? 'rotate-180' : ''}`} />
+                                        {t('rollRunHistory')}
+                                    </button>
+                                    {showRollHistory && (
+                                        rollHistory === null ? (
+                                            <div className="mt-2 animate-spin w-4 h-4 border-2 border-proxmox-orange border-t-transparent rounded-full"></div>
+                                        ) : rollHistory === 'error' ? (
+                                            <p className="mt-2 text-xs text-red-400">{t('rollRunHistoryLoadFailed')}</p>
+                                        ) : rollHistory.length === 0 ? (
+                                            <p className="mt-2 text-xs text-gray-500">{t('rollRunHistoryEmpty')}</p>
+                                        ) : (
+                                            <div className="mt-2 space-y-1 max-h-64 overflow-y-auto">
+                                                {rollHistory.map(run => (
+                                                    <details key={run.run_id} className="bg-proxmox-dark rounded-lg" data-run={run.run_id} data-status={run.status}>
+                                                        <summary className="px-3 py-2 cursor-pointer text-xs flex flex-wrap items-center gap-2">
+                                                            <span className={`px-2 py-0.5 rounded-full font-medium ${rollStatusColor[run.status] || 'bg-gray-500/20 text-gray-400'}`}>
+                                                                {rollStatusLabel[run.status] ? t(rollStatusLabel[run.status]) : run.status}
+                                                            </span>
+                                                            <span className="text-gray-300 font-mono">{run.started_at || '-'}</span>
+                                                            <span className="text-gray-400">
+                                                                {t('rollRunHistoryCounts').replace('{updated}', run.completed || 0)
+                                                                    .replace('{skipped}', run.skipped || 0).replace('{failed}', run.failed || 0)}
+                                                            </span>
+                                                            <span className="text-gray-500">
+                                                                {run.scheduled ? t('rollRunHistoryScheduled') : t('rollRunHistoryBy').replace('{user}', run.started_by || '-')}
+                                                            </span>
+                                                        </summary>
+                                                        {Array.isArray(run.cancel_report) && run.cancel_report.length > 0 && (
+                                                            <div className="px-3 pb-1 space-y-0.5">
+                                                                {run.cancel_report.map((item, i) => (
+                                                                    <div key={i} className="text-xs text-yellow-200/80">{rollReportText(item)}</div>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                        <div className="max-h-40 overflow-y-auto px-3 pb-2 font-mono text-xs text-gray-400 space-y-0.5">
+                                                            {(run.logs || []).map((line, i) => <div key={i}>{line}</div>)}
+                                                        </div>
+                                                    </details>
+                                                ))}
+                                            </div>
+                                        )
                                     )}
                                 </div>
                             )}

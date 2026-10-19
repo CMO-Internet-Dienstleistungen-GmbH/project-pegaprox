@@ -11,6 +11,7 @@ import base64
 import re
 import requests
 import secrets
+import ssl
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa, padding, utils
@@ -28,6 +29,37 @@ _pending_challenges = {}
 
 # DNS-01 requests waiting for the admin to publish the TXT record.
 _pending_dns_challenges = {}
+
+
+def _acme_ssl_context():
+    """Trust the full system store as well as Requests' usual public CAs."""
+    context = ssl.create_default_context()
+    context.load_verify_locations(cafile=requests.certs.where())
+    return context
+
+
+class _AcmeTrustAdapter(requests.adapters.HTTPAdapter):
+    """Use system trust unless Requests receives an explicit CA bundle path."""
+
+    def __init__(self):
+        """Build a certificate-verifying context for ACME HTTPS requests."""
+        self._acme_context = _acme_ssl_context()
+        super().__init__()
+
+    def build_connection_pool_key_attributes(self, request, verify, cert=None):
+        """Keep Requests' bundle overrides ahead of the system trust context."""
+        host, pool = super().build_connection_pool_key_attributes(request, verify, cert)
+        if verify is True or verify is None:
+            pool['ssl_context'] = self._acme_context
+        return host, pool
+
+
+def _acme_request(method, url, **kwargs):
+    """Send an ACME request with system trust and Requests' environment overrides."""
+    _guard_acme_url(url)
+    with requests.Session() as session:
+        session.mount('https://', _AcmeTrustAdapter())
+        return session.request(method, url, **kwargs)
 
 
 def _b64url(data):
@@ -108,7 +140,8 @@ def _signed_request(url, payload, account_key, nonce, kid=None):
         'signature': _b64url(signature),
     }
     _guard_acme_url(url)
-    resp = requests.post(url, json=body, headers={'Content-Type': 'application/jose+json'},
+    resp = _acme_request('POST', url, json=body,
+                         headers={'Content-Type': 'application/jose+json'},
                          timeout=30, allow_redirects=False)
     return resp
 
@@ -137,8 +170,10 @@ def _guard_acme_url(url):
 
 
 def _get_nonce(directory):
+    """Fetch a replay nonce from the ACME server using the configured CA trust."""
     _guard_acme_url(directory['newNonce'])
-    resp = requests.head(directory['newNonce'], timeout=10, allow_redirects=False)
+    resp = _acme_request('HEAD', directory['newNonce'], timeout=10,
+                         allow_redirects=False)
     return resp.headers['Replay-Nonce']
 
 
@@ -578,7 +613,8 @@ def _create_order(domain, email, ssl_dir, staging=False, directory_url=None):
         return {'success': False, 'message': f'ACME directory URL rejected: {guard_err} '
                 '(set "Allow private/internal ACME CA" in SSL settings if this is an internal CA)'}
 
-    dir_resp = requests.get(acme_url, timeout=15, allow_redirects=False)  # M-8: no redirect to internal
+    dir_resp = _acme_request('GET', acme_url, timeout=15,
+                             allow_redirects=False)  # M-8: no redirect to internal
     dir_resp.raise_for_status()
     directory = dir_resp.json()
 
@@ -790,6 +826,16 @@ def get_cert_info(ssl_dir):
                 subject_cn = attr.value
                 break
 
+        # MK Oct 2026 - a certificate may name its hosts in the SAN only (ACME CAs leave
+        # the CN out more and more): the subject is then the first of them
+        try:
+            domains = cert.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName).value.get_values_for_type(x509.DNSName)
+        except x509.ExtensionNotFound:
+            domains = []
+        if not subject_cn and domains:
+            subject_cn = domains[0]
+
         # check if it's a Let's Encrypt cert
         issuer_org = ''
         for attr in cert.issuer:
@@ -804,6 +850,7 @@ def get_cert_info(ssl_dir):
 
         return {
             'subject': subject_cn,
+            'domains': domains,
             'issuer': issuer_cn,
             'issuer_org': issuer_org,
             'expires': expires.isoformat(),

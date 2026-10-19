@@ -15,7 +15,8 @@ from pegaprox.constants import *
 from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.core.db import get_db
-from pegaprox.core import ha
+from pegaprox.core import ha, rolling_runs
+from pegaprox.background.scheduler import _first_minute, _minute
 
 from pegaprox.utils.auth import require_auth, load_users, build_authz_user
 from pegaprox.utils.rbac import has_permission
@@ -23,7 +24,8 @@ from pegaprox.utils.audit import log_audit
 from pegaprox.api.helpers import (check_cluster_access, safe_error, require_unconfined, evacuation_options,
                                   evacuation_options_said, rolling_log, rolling_options_intro,
                                   rolling_node_templates, rolling_moved_templates, rolling_rules_give_way,
-                                  rolling_rules_back_on)
+                                  rolling_rules_back_on, rolling_moved_guests, rolling_wind_down,
+                                  rolling_guests_left_moved)
 from pegaprox.api.nodes import cleanup_deleted_scripts, cleanup_orphaned_excluded_vms
 
 bp = Blueprint('schedules', __name__)
@@ -276,89 +278,109 @@ def check_schedules():
     This is deliberately simple - no cron expressions, just specific times
     """
     global _scheduler_running
-    
+    # what the pass before checked: (minute, wall time, seconds it took); None checks the
+    # current minute only
+    last = None
+
     while _scheduler_running:
         # a standby keeps ticking but fires nothing: VM actions, scheduled rolling
         # updates and the 03:00 cleanup all belong to the active instance (#625)
         if not ha.is_active():
+            # nothing to catch up once it acts: what fell due meanwhile was the other
+            # instance's (5.7 reports it in an automatic group)
+            last = None
             _wait_a_minute()
             continue
         try:
+            started = time.monotonic()
             schedules = load_schedules()
+            actions = schedules.get('actions', [])
             # the group's zone when this instance is in one, so a failover does not
             # shift a schedule; datetime.now() on an instance of its own (#625)
-            now = ha.schedule_now()
-            current_time = now.strftime('%H:%M')
-            current_day = now.strftime('%A').lower()
-            current_date = now.strftime('%Y-%m-%d')
+            now = _minute(ha.schedule_now())
+            wall = time.time()
             # automatic failover (design 5.7): what fell due without a leader is said, and
             # a new leader fires nothing in a minute the former one may have fired. Neither
             # does anything anywhere else
-            _report_missed(schedules.get('actions', []))
+            _report_missed(actions)
             if ha.schedule_held():
+                last = (now, wall, 0.0)
                 _wait_a_minute()
                 continue
 
-            for action in schedules.get('actions', []):
+            # MK Oct 2026 - every minute since the pass before, not just the one it woke
+            # in: a minute the loop slept over never ran its actions. A long gap (clock
+            # step forward, suspended host) is reported instead of run late, as in
+            # background/scheduler.py
+            first, skipped = _first_minute(last, now, wall)
+            if skipped:
+                # in an automatic group the gap is the group's mark first (5.7)
+                if not ha.report_settled('scheduled actions', wall - 60,
+                                         'the report of the minutes the scheduled actions stepped over'):
+                    last = (now, wall, 0.0)
+                    _wait_a_minute()
+                    continue
+                _report_skipped(actions, *skipped)
+            minutes = []
+            at = first
+            while at <= now:
+                minutes.append(at)
+                at += timedelta(minutes=1)
+
+            lost, through = [], True
+            for action in actions:
                 if not action.get('enabled', True):
                     continue
+                slot = next((m for m in reversed(minutes) if _due_minute(action, m)), None)
+                if slot is None:
+                    continue
+                stamp = slot.strftime('%Y-%m-%d %H:%M')
+                # ran in this minute or later already (prevent double execution; a clock
+                # step back must not run a minute twice)
+                if _stamp(action.get('last_run')) >= stamp:
+                    continue
+                # a minute caught up that a new leader still holds (5.7)
+                if slot < now and ha.schedule_held(slot):
+                    continue
+                if action.get('schedule_type') == 'once':
+                    action['enabled'] = False  # Disable after running
 
-                should_run = False
-                schedule_type = action.get('schedule_type', 'daily')
-                schedule_time = action.get('time', '')
-                
-                # Check if it's time to run
-                if schedule_time == current_time:
-                    if schedule_type == 'once':
-                        # One-time schedule - check date
-                        if action.get('date') == current_date:
-                            should_run = True
-                            action['enabled'] = False  # Disable after running
-                    
-                    elif schedule_type == 'daily':
-                        should_run = True
-                    
-                    elif schedule_type == 'weekly':
-                        # Check if today is in the selected days
-                        days = action.get('days', [])
-                        if current_day in days:
-                            should_run = True
-                    
-                    elif schedule_type == 'weekdays':
-                        if current_day not in ['saturday', 'sunday']:
-                            should_run = True
-                    
-                    elif schedule_type == 'weekends':
-                        if current_day in ['saturday', 'sunday']:
-                            should_run = True
-                
-                if should_run:
-                    # Check if we already ran this minute (prevent double execution)
-                    last_run = action.get('last_run', '')
-                    if last_run == f"{current_date} {current_time}":
-                        continue
-
-                    if ha.schedule_fire_first():
-                        # at most once: written and on its way to the members before it acts
-                        _record_action_run(action.get('id'), f"{current_date} {current_time}",
-                                           disable=not action.get('enabled', True))
-                        ha.schedule_fired()
-                    if not ha.confirm_step(f"scheduled {action.get('action')} of {action.get('vmid')}"):
+                first_run = ha.schedule_fire_first()
+                if first_run:
+                    if not ha.is_active():
+                        # the lease went during this pass: the rest is the next leader's
+                        through = False
                         break
-                    # Execute the action
-                    execute_scheduled_action(action)
-                    action['last_run'] = f"{current_date} {current_time}"
-                    _record_action_run(action.get('id'), action['last_run'],
+                    # at most once: written and on its way to the members before it acts
+                    _record_action_run(action.get('id'), stamp,
                                        disable=not action.get('enabled', True))
-            
+                    ha.schedule_fired()
+                if not ha.confirm_step(f"scheduled {action.get('action')} of {action.get('vmid')}"):
+                    if not first_run:
+                        through = False
+                        break
+                    # used up and reported (lab E6b_2), the ones after it try again
+                    lost.append((action, slot))
+                    continue
+                # Execute the action
+                execute_scheduled_action(action)
+                action['last_run'] = stamp
+                _record_action_run(action.get('id'), action['last_run'],
+                                   disable=not action.get('enabled', True))
+            if lost:
+                _report_lost(lost)
+            if through:
+                # the group's mark for the report of the next leader (5.7)
+                ha.schedules_checked('scheduled actions', wall)
+
             # MK: Check for scheduled rolling updates
             try:
-                check_scheduled_updates()
+                check_scheduled_updates(minutes)
             except Exception as e:
                 logging.error(f"[SCHEDULER] Scheduled updates check error: {e}")
             
             # Daily cleanup tasks at 03:00
-            if current_time == '03:00':
+            if any(m.hour == 3 and m.minute == 0 for m in minutes):
                 try:
                     # Cleanup soft-deleted scripts after 20 days
                     cleanup_deleted_scripts()
@@ -367,6 +389,7 @@ def check_schedules():
                     logging.info("[SCHEDULER] Daily cleanup completed")
                 except Exception as e:
                     logging.error(f"[SCHEDULER] Daily cleanup error: {e}")
+            last = (now, wall, time.monotonic() - started)
         
         except Exception as e:
             logging.error(f"Scheduler error: {e}")
@@ -374,9 +397,13 @@ def check_schedules():
         _wait_a_minute()
 
 
+def _stamp(value):
+    """A last run as 'YYYY-MM-DD HH:MM', the form the tick writes ('' for none)."""
+    return str(value or '').replace('T', ' ')[:16]
+
+
 def _due_minute(action, at):
-    """Whether `action` falls due in the minute `at`, its last run aside. For the report
-    of what a change of leader missed (5.7); check_schedules decides as it always did."""
+    """Whether `action` falls due in the minute `at`, its last run aside."""
     if action.get('time', '') != at.strftime('%H:%M'):
         return False
     kind, day = action.get('schedule_type', 'daily'), at.strftime('%A').lower()
@@ -387,29 +414,91 @@ def _due_minute(action, at):
             or (kind == 'weekends' and day in ('saturday', 'sunday')))
 
 
+# a week of minutes at most is looked through for the report of a gap
+_REPORT_SPAN = 7 * 24 * 60
+
+
+def _report_skipped(actions, first, last):
+    """Say and audit the actions that fell due in the minutes from `first` to `last`,
+    which the loop stepped over, and did not run."""
+    names = set()
+    at, n = first, 0
+    while at <= last and n < _REPORT_SPAN:
+        stamp = at.strftime('%Y-%m-%d %H:%M')
+        names.update(str(a.get('name') or f"{a.get('action')} {a.get('vmid')}") for a in actions
+                     if a.get('enabled', True) and _due_minute(a, at)
+                     and _stamp(a.get('last_run')) < stamp)
+        at += timedelta(minutes=1)
+        n += 1
+    why = ('while the scheduler stood still (a clock step forward, a suspended host '
+           'or a stalled process)')
+    window = (first, last + timedelta(seconds=59))
+    if ha.guard_on():
+        ha.missed_schedules('scheduled actions', sorted(names), window, why)
+        return
+    if not names:
+        return
+    a, b = window
+    text = (f"{len(names)} scheduled actions fell due between {a:%Y-%m-%d %H:%M:%S} and "
+            f"{b:%Y-%m-%d %H:%M:%S} {why} and did not run: {', '.join(sorted(names)[:20])}")
+    logging.warning(f"[SCHEDULER] {text}")
+    log_audit('system', 'scheduled_action.missed', text)
+
+
 def _report_missed(actions):
     """Once a new leader of an automatic group acts: the actions that fell due in the gap."""
     window = ha.missed_schedule_window('scheduled actions')
     if not window:
         return
+    first, last = (ha.schedule_at(w).replace(second=0, microsecond=0) for w in window)
     missed = set()
-    at = window[0] - window[0] % 60
-    while at <= window[1]:
-        when = ha.schedule_at(at)
-        stamp = when.strftime('%Y-%m-%d %H:%M')
+    for a in actions:
+        slot = _latest_due(a, first, last) if a.get('enabled', True) else None
         # a last run in that minute or later: the former leader got to it
-        missed.update(str(a.get('name') or f"{a.get('action')} {a.get('vmid')}") for a in actions
-                      if a.get('enabled', True) and _due_minute(a, when)
-                      and str(a.get('last_run') or '') < stamp)
-        at += 60
+        if slot is not None and _stamp(a.get('last_run')) < slot.strftime('%Y-%m-%d %H:%M'):
+            missed.add(_action_name(a))
+    # the end of the gap is the group's mark before the report goes out: the next leader
+    # starts after it. A no leaves it to the next pass
+    if missed and not ha.missed_settled('scheduled actions', window):
+        return
     ha.missed_schedules('scheduled actions', sorted(missed), window)
 
 
+def _action_name(action):
+    return str(action.get('name') or f"{action.get('action')} {action.get('vmid')}")
+
+
+def _latest_due(action, first, last):
+    """The latest minute from `first` to `last` at which `action` falls due, its last run
+    aside; None for none. A day at a time: the marks of 5.7 let the gap reach back days."""
+    try:
+        hour, minute = map(int, str(action.get('time', '')).split(':'))
+        day = last.replace(hour=hour, minute=minute)
+    except (TypeError, ValueError):
+        return None
+    if day > last:
+        day -= timedelta(days=1)
+    while day >= first:
+        if _due_minute(action, day):
+            return day
+        day -= timedelta(days=1)
+    return None
+
+
+def _report_lost(lost):
+    """Actions whose last run went out and whose lease confirm then failed: no leader runs
+    them now, so they are reported as missed (5.7), not run late."""
+    slots = [slot for _action, slot in lost]
+    ha.missed_schedules('scheduled actions', sorted({_action_name(a) for a, _slot in lost}),
+                        (min(slots), max(slots) + timedelta(seconds=59)),
+                        'while the lease of this instance could not be confirmed')
+
+
 def _wait_a_minute():
-    # Sleep for 60 seconds (check every minute), in 1s steps so a stop is quick
-    for _ in range(60):
-        if not _scheduler_running:
-            break
+    # to just after the start of the next minute, in 1 s steps so a stop is quick. A flat
+    # 60 s after the work let the pass creep through the minute until it stepped over one
+    until = time.time() + 60 - time.time() % 60 + 0.5
+    while _scheduler_running and time.time() < until:
         time.sleep(1)
 
 
@@ -511,6 +600,10 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
     """Execute a scheduled rolling update on a cluster
     
     MK: This runs the same rolling update logic but triggered by scheduler
+
+    MK Oct 2026 - kept in rolling_update_runs like a run started by hand: not started while
+    one of the cluster is running or paused, and a run a restart interrupted is paused there
+    and goes on (or is cancelled) through the routes of settings.py.
     """
     try:
         # Get update config from action
@@ -526,6 +619,12 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
         except (TypeError, ValueError):
             reboot_timeout = 600
         wait_for_reboot = config.get('wait_for_reboot', True)
+        # NS #630 - scheduled updates run unattended, so default local-disk
+        # evacuation ON: a run that pauses at 3am waiting for a human because one
+        # local-disk VM couldn't live-migrate is the worst possible outcome for an
+        # automatic update. On shared-storage clusters it's a no-op anyway. Honour a
+        # per-schedule override if one is ever stored, else evacuate everything.
+        allow_local_disks = action.get('allow_local_disks', True) is not False
         # MK Oct 2026 (#763, #954) - the two evacuation options of the schedule, off on one
         # saved before they existed and on XCP-ng, as for a run started by hand
         migrate_templates, relax_anti_affinity = evacuation_options(mgr, config)
@@ -533,9 +632,10 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
         logging.info(f"[SCHEDULER] Starting scheduled rolling update for cluster {cluster_id}")
         logging.info(f"[SCHEDULER] Config: reboot={include_reboot}, skip_evacuation={skip_evacuation}")
         
-        # Check if already running
-        if hasattr(mgr, '_rolling_update') and mgr._rolling_update and mgr._rolling_update.get('status') == 'running':
-            logging.warning(f"[SCHEDULER] Rolling update already in progress, skipping")
+        # Check if already running - or paused, which waits for an admin
+        why = rolling_runs.busy(mgr, cluster_id)
+        if why:
+            logging.warning(f"[SCHEDULER] Rolling update not started on {cluster_id}: {why}")
             return
         
         # Get nodes
@@ -546,69 +646,102 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
             logging.warning(f"[SCHEDULER] No nodes available for update")
             return
         
-        # Initialize rolling update state
-        mgr._rolling_update = {
+        # Initialize rolling update state, in the table before the first step
+        state = rolling_runs.begin(mgr, cluster_id, {
             'status': 'running', 'started_at': time.strftime('%Y-%m-%d %H:%M:%S'),
             'include_reboot': include_reboot, 'skip_up_to_date': skip_up_to_date,
             'skip_evacuation': skip_evacuation, 'wait_for_reboot': wait_for_reboot,
-            'pause_on_evacuation_error': False, 'force_all': False,
+            'pause_on_evacuation_error': False, 'force_all': False, 'allow_local_disks': allow_local_disks,
             'migrate_templates': migrate_templates, 'relax_anti_affinity': relax_anti_affinity,
             'evacuation_timeout': evacuation_timeout, 'update_timeout': 900, 'reboot_timeout': reboot_timeout,
             'nodes': nodes_to_update, 'current_index': 0, 'current_node': nodes_to_update[0],
             'current_step': 'starting', 'completed_nodes': [], 'skipped_nodes': [],
             'failed_nodes': [], 'rebooting_nodes': [], 'paused_reason': None, 'paused_details': None,
             'logs': [f"[{time.strftime('%H:%M:%S')}] Scheduled rolling update started"], 'scheduled': True
-        }
+        }, 'scheduler')
+        if state is None:
+            logging.warning(f"[SCHEDULER] Rolling update not started on {cluster_id}: another run came first")
+            return
         log_audit('scheduler', 'node.rolling_update_started',
                   f"Scheduled rolling update of {len(nodes_to_update)} node(s) started"
                   + evacuation_options_said(migrate_templates, relax_anti_affinity),
                   cluster=getattr(mgr.config, 'name', cluster_id))
 
         def run_scheduled_update():
+            def _set(**kw):
+                return rolling_runs.change(mgr, **kw)
+
+            def _status():
+                return (rolling_runs.current(mgr) or {}).get('status')
+
+            def _quorum_stop(idx, node_name, phase):
+                """MK Oct 2026 - the quorum gate of settings.run_rolling_update. This worker waits
+                for nobody: a node that would cost the cluster its quorum pauses the run (reason
+                'quorum') and this worker ends - a Continue hands the run to the worker of a run
+                started by hand, which looks again. 'paused', 'cancelled' or None to go on."""
+                verdict = rolling_runs.quorum_gate(mgr, node_name, sleep=time.sleep,
+                                                   stop=lambda: _status() != 'running')
+                if verdict['ok']:
+                    if not verdict.get('skipped'):
+                        rolling_log(mgr, rolling_runs.quorum_said(verdict))
+                    return None
+                if _status() != 'running':
+                    return 'cancelled'
+                details, line = rolling_runs.quorum_hold(verdict, phase)
+                logging.warning(f"[SCHEDULER] Rolling update of {cluster_id} paused before {node_name}: "
+                                f"quorum {verdict.get('reason')}")
+                _set(status='paused', current_step='paused_quorum', paused_reason=rolling_runs.QUORUM,
+                     paused_details=details, resume_at={'index': idx, 'phase': phase}, log=line)
+                return 'paused'
+
             rolling_log(mgr, f"Settings: skip_up_to_date={skip_up_to_date}, skip_evacuation={skip_evacuation}, "
                              f"evacuation_timeout={evacuation_timeout}s, reboot_timeout={reboot_timeout}s, "
                              f"migrate_templates={migrate_templates}, relax_anti_affinity={relax_anti_affinity}")
             rolling_options_intro(mgr)
             try:
                 for idx, node_name in enumerate(nodes_to_update):
-                    if not hasattr(mgr, '_rolling_update') or mgr._rolling_update.get('status') != 'running':
+                    if _status() != 'running':
                         break
-                    mgr._rolling_update['current_index'] = idx
-                    mgr._rolling_update['current_node'] = node_name
-                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Processing {node_name}")
+                    _set(current_index=idx, current_node=node_name, current_step='checking',
+                         node=(node_name, {'phase': 'checking'}), log=f"Processing {node_name}")
                     if skip_up_to_date:
                         try:
                             mgr.refresh_node_apt(node_name); time.sleep(3)
                             if not mgr.get_node_apt_updates(node_name):
-                                mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] {node_name} up-to-date, skipping")
-                                mgr._rolling_update['skipped_nodes'].append(node_name); continue
+                                _set(add={'skipped_nodes': node_name},
+                                     node=(node_name, {'phase': 'done', 'result': 'skipped'}),
+                                     log=f"{node_name} up-to-date, skipping")
+                                continue
                         except Exception as e:
                             logging.warning(f"[SCHEDULER] Check failed for {node_name}: {e}")
-                    mgr._rolling_update['current_step'] = 'maintenance'
-                    # NS #630 — scheduled updates run unattended, so default local-disk
-                    # evacuation ON: a run that pauses at 3am waiting for a human because one
-                    # local-disk VM couldn't live-migrate is the worst possible outcome for an
-                    # automatic update. On shared-storage clusters it's a no-op anyway. Honour a
-                    # per-schedule override if one is ever stored, else evacuate everything.
+                    _set(current_step='maintenance', node=(node_name, {'phase': 'maintenance'}))
+                    gate = _quorum_stop(idx, node_name, 'maintenance')
+                    if gate == 'paused':
+                        return
+                    if gate:
+                        break
+                    running = []
                     if not skip_evacuation:
                         try:
-                            rolling_node_templates(mgr, [r for r in (mgr.get_vm_resources() or [])
-                                                         if r.get('node') == node_name
-                                                         and r.get('type') in ('qemu', 'lxc')])
+                            here = [r for r in (mgr.get_vm_resources() or [])
+                                    if r.get('node') == node_name and r.get('type') in ('qemu', 'lxc')]
+                            running = [v for v in here if (v.get('status') or '').lower() == 'running']
+                            rolling_node_templates(mgr, here)
                         except Exception:
                             pass
                         rolling_rules_give_way(mgr, 'scheduler')   # #954, once, before the first evacuation
                     # before each node's evacuation and its update (design 5.2)
                     if not ha.confirm_step(f'rolling update of {node_name}'):
-                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] stopped: this instance does not hold the lease")
+                        rolling_log(mgr, "stopped: this instance does not hold the lease")
                         break
                     mgr.enter_maintenance_mode(node_name, skip_evacuation=skip_evacuation,
-                                               allow_local_disks=action.get('allow_local_disks', True),
+                                               allow_local_disks=allow_local_disks,
                                                **({'migrate_templates': True} if migrate_templates else {}))  # #763
+                    _set(node=(node_name, {'in_maintenance': True}))
                     if not skip_evacuation:
-                        mgr._rolling_update['current_step'] = 'evacuating'
-                        waited = 0; evacuation_ok = False
-                        while waited < evacuation_timeout:
+                        _set(current_step='evacuating', node=(node_name, {'phase': 'evacuating'}))
+                        waited = 0; evacuation_ok = False; task = None
+                        while waited < evacuation_timeout and _status() != 'cancelled':
                             if node_name in mgr.nodes_in_maintenance:
                                 task = mgr.nodes_in_maintenance[node_name]
                                 if task.status == 'completed':
@@ -617,17 +750,28 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
                                 elif task.status == 'completed_with_errors':
                                     rolling_moved_templates(mgr, task)
                                     fv = getattr(task, 'failed_vms', [])
-                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠️ Evacuation: {getattr(task,'migrated_vms',0)}/{getattr(task,'total_vms',0)} migrated, {len(fv)} failed - continuing")
+                                    rolling_log(mgr, f"⚠️ Evacuation: {getattr(task,'migrated_vms',0)}/{getattr(task,'total_vms',0)} migrated, {len(fv)} failed - continuing")
                                     evacuation_ok = True; break
                                 elif task.status == 'failed': break
                             time.sleep(5); waited += 5
+                        if _status() == 'cancelled':
+                            break
                         if not evacuation_ok:
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ Evacuation failed on {node_name}, skipping")
-                            mgr._rolling_update['failed_nodes'].append({'node': node_name, 'error': 'Evacuation failed'})
-                            mgr.exit_maintenance_mode(node_name); continue
-                    mgr._rolling_update['current_step'] = 'updating'
+                            _set(add={'failed_nodes': {'node': node_name, 'error': 'Evacuation failed'}},
+                                 node=(node_name, {'result': 'failed'}),
+                                 log=f"✗ Evacuation failed on {node_name}, skipping")
+                            if mgr.exit_maintenance_mode(node_name):
+                                _set(node=(node_name, {'in_maintenance': False}))
+                            continue
+                        rolling_moved_guests(mgr, node_name, running, task)
+                    _set(current_step='updating', node=(node_name, {'phase': 'updating'}))
+                    gate = _quorum_stop(idx, node_name, 'updating')
+                    if gate == 'paused':
+                        return
+                    if gate:
+                        break
                     if not ha.confirm_step(f'update of {node_name}'):
-                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] stopped: this instance does not hold the lease")
+                        rolling_log(mgr, "stopped: this instance does not hold the lease")
                         break
                     update_task = mgr.start_node_update(node_name, reboot=include_reboot, force=True)
                     if update_task:
@@ -636,13 +780,13 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
                             if update_task.status in ['completed', 'failed']: break
                             time.sleep(10); waited += 10
                         if update_task.status == 'completed':
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ {node_name} updated")
-                            mgr._rolling_update['completed_nodes'].append(node_name)
+                            _set(add={'completed_nodes': node_name}, node=(node_name, {'updated': True}),
+                                 log=f"✓ {node_name} updated")
                             if include_reboot:
-                                mgr._rolling_update['current_step'] = 'rebooting'
-                                mgr._rolling_update['rebooting_nodes'].append(node_name)
+                                _set(current_step='rebooting', add={'rebooting_nodes': node_name},
+                                     node=(node_name, {'phase': 'rebooting', 'rebooted': True}))
                                 if wait_for_reboot:
-                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Waiting for {node_name} to reboot...")
+                                    rolling_log(mgr, f"Waiting for {node_name} to reboot...")
                                     ow = 0
                                     while ow < 120:
                                         try:
@@ -652,13 +796,13 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
                                         time.sleep(5); ow += 5
                                     rw = 0
                                     came_back = False
-                                    while rw < 600:
+                                    # #630 - the schedule's own reboot timeout, it was a fixed 600 s here
+                                    while rw < reboot_timeout and _status() != 'cancelled':
                                         try:
                                             ns = mgr.get_node_status()
                                             if node_name in ns and ns[node_name].get('status') == 'online':
-                                                mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ {node_name} back online")
-                                                if node_name in mgr._rolling_update['rebooting_nodes']:
-                                                    mgr._rolling_update['rebooting_nodes'].remove(node_name)
+                                                _set(drop={'rebooting_nodes': node_name},
+                                                     log=f"✓ {node_name} back online")
                                                 came_back = True
                                                 # NS May 2026 — give HA services time to start
                                                 # before trying to disable maintenance. 10s was
@@ -669,60 +813,70 @@ def execute_scheduled_rolling_update(mgr, cluster_id: str, action: dict):
                                         except: pass
                                         time.sleep(10); rw += 10
                                     if not came_back:
-                                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠ {node_name} did not come back online within 600s")
+                                        rolling_log(mgr, f"⚠ {node_name} did not come back online within {reboot_timeout}s")
                                 else:
-                                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] {node_name} rebooting (wait_for_reboot=False)")
+                                    rolling_log(mgr, f"{node_name} rebooting (wait_for_reboot=False)")
                         else:
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ {node_name} update failed")
-                            mgr._rolling_update['failed_nodes'].append({'node': node_name, 'error': 'Update failed'})
+                            _set(add={'failed_nodes': {'node': node_name, 'error': 'Update failed'}},
+                                 node=(node_name, {'result': 'failed'}), log=f"✗ {node_name} update failed")
                     # NS May 2026 — exit_maintenance_mode now retries internally;
                     # if it still returns False the node is stuck and we log it
-                    # for the post-loop sweep below.
-                    if not mgr.exit_maintenance_mode(node_name):
-                        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ⚠ {node_name} maintenance exit failed — will retry at end")
+                    # for the post-loop sweep below. One the update took out itself is no failed exit.
+                    _set(current_step='finishing', node=(node_name, {'phase': 'finishing'}))
+                    if node_name not in mgr.nodes_in_maintenance or mgr.exit_maintenance_mode(node_name):
+                        _set(node=(node_name, {'in_maintenance': False}))
+                    else:
+                        rolling_log(mgr, f"⚠ {node_name} maintenance exit failed - will retry at end")
+                    if node_name in ((rolling_runs.current(mgr) or {}).get('completed_nodes') or []):
+                        _set(node=(node_name, {'phase': 'done', 'result': 'done', 'moved': []}))
                 
-                # NS May 2026 — final sweep: any node still flagged as in
-                # maintenance gets one more shot, after a longer settle time.
-                # Catches the case where the node took >600s to reboot or HA
-                # services were still starting when we tried to exit.
-                stuck_nodes = []
-                try:
-                    with mgr.maintenance_lock:
-                        stuck_nodes = list(mgr.nodes_in_maintenance.keys())
-                except Exception:
-                    pass
-                if stuck_nodes:
-                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Cleanup: {len(stuck_nodes)} node(s) still in maintenance, retrying...")
-                    time.sleep(15)
-                    for nn in stuck_nodes:
-                        if mgr.exit_maintenance_mode(nn):
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✓ {nn} maintenance cleared on retry")
-                        else:
-                            mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ✗ {nn} STILL in maintenance — manual intervention needed")
-                            mgr._rolling_update['failed_nodes'].append({'node': nn, 'error': 'Stuck in maintenance after rolling update'})
-
-                rolling_rules_back_on(mgr, 'scheduler')   # #954, every node is out of maintenance by now
+                # NS May 2026 - final sweep: every node this run put into maintenance that is
+                # still in it gets one more shot, after a longer settle time. Catches the case
+                # where the node took long to reboot or HA services were still starting when we
+                # tried to exit. And the negative affinity rules come back on (#954).
+                cancelled = _status() == 'cancelled'
+                if not cancelled:
+                    _set(current_step=rolling_runs.CLEANUP)
+                undone = rolling_wind_down(mgr, 'scheduler', settle=15, sleep=time.sleep)
 
                 # Finished
-                mgr._rolling_update['status'] = 'completed'
-                mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] Scheduled rolling update completed")
+                done = rolling_runs.current(mgr) or {}
+                counts = (f"{len(done.get('completed_nodes') or [])} updated, "
+                          f"{len(done.get('skipped_nodes') or [])} skipped, "
+                          f"{len(done.get('failed_nodes') or [])} failed")
+                if cancelled:
+                    _set(cancel_report=undone + rolling_guests_left_moved(mgr), rebooting_nodes=[],
+                         log="Scheduled rolling update cancelled")
+                else:
+                    _set(status='completed', rebooting_nodes=[], log="Scheduled rolling update completed")
                 
                 # Log audit
                 log_audit('scheduler', 'scheduled.rolling_update', 
-                         f"Scheduled rolling update completed: {len(mgr._rolling_update['completed_nodes'])} updated, "
-                         f"{len(mgr._rolling_update['skipped_nodes'])} skipped, "
-                         f"{len(mgr._rolling_update['failed_nodes'])} failed")
+                          f"Scheduled rolling update {'cancelled' if cancelled else 'completed'}: {counts}")
                 
             except Exception as e:
                 logging.error(f"[SCHEDULER] Rolling update error: {e}")
+                # MK Oct 2026 - the nodes this run put into maintenance come out again, as after a
+                # cancel; the manual run does the same in its own error path
+                try:
+                    rolling_wind_down(mgr, 'scheduler', settle=15, sleep=time.sleep)
+                except Exception as wd:
+                    logging.error(f"[SCHEDULER] Rolling update cleanup after the error failed: {wd}")
                 rolling_rules_back_on(mgr, 'scheduler')   # #954, before the status says the run is over
-                if hasattr(mgr, '_rolling_update'):
-                    mgr._rolling_update['status'] = 'failed'
-                    mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] ERROR: {e}")
+                _set(status='failed', error=str(e), rebooting_nodes=[], log=f"ERROR: {e}")
+
+        run_id = state.get('run_id')
+
+        def work():
+            try:
+                run_scheduled_update()
+            finally:
+                rolling_runs.detach(cluster_id, run_id)
         
         # the steps between the confirms (apt refresh, maintenance exit) ask at their exit (#625)
-        update_thread = threading.Thread(target=ha.as_job(run_scheduled_update, f'rolling update of {cluster_id}'),
+        update_thread = threading.Thread(target=ha.as_job(work, f'rolling update of {cluster_id}'),
                                          daemon=True)
+        rolling_runs.attach(mgr, cluster_id, update_thread)
         update_thread.start()
 
         logging.info(f"[SCHEDULER] Rolling update thread started for {cluster_id}")
@@ -775,10 +929,11 @@ def get_schedules():
     # schedules) when it was empty. get_user_clusters returns None only for a genuine admin/
     # default-tenant all-cluster user; otherwise it's the caller's reachable cluster set.
     from pegaprox.utils.rbac import get_user_clusters, user_can_access_vm
+    from pegaprox.api.helpers import caller_is_scoped
     _ud = dict(user_data)
     _ud['username'] = user
     allowed = get_user_clusters(_ud)
-    if is_admin or allowed is None:
+    if is_admin:
         return jsonify(schedules.get('actions', []))
 
     # sec (private disclosure Sep 2026 — audit M6): the cluster filter alone let a pool-/ACL-scoped
@@ -787,11 +942,22 @@ def get_schedules():
     # Plain operators keep every action on their clusters (user_can_access_vm returns True for them).
     authz = _ud
     out = []
+    _scoped = {}
     for a in schedules.get('actions', []):
-        if a.get('cluster_id') not in allowed:
+        if allowed is None:
+            # MK Oct 2026 - "all clusters" is a default-tenant account's reach, and such an
+            # account can still hold a pool grant or ACL'd guests. Then it is confined to
+            # those like anyone else; otherwise it keeps every action as before.
+            cid = a.get('cluster_id')
+            if cid not in _scoped:
+                _scoped[cid] = caller_is_scoped(authz, cid)
+            if not _scoped[cid]:
+                out.append(a)
+                continue
+        elif a.get('cluster_id') not in allowed:
             continue
         try:
-            if user_can_access_vm(authz, a['cluster_id'], int(a.get('vmid')), 'vm.view', a.get('vm_type')):
+            if user_can_access_vm(authz, a.get('cluster_id'), int(a.get('vmid')), 'vm.view', a.get('vm_type')):
                 out.append(a)
         except (TypeError, ValueError):
             continue   # malformed / non-VM action → drop from a scoped listing (fail closed)
@@ -1366,11 +1532,16 @@ def calculate_next_update_run(day: str, time_str: str) -> str:
         return None
 
 
-def check_scheduled_updates():
-    """Check if any scheduled updates should run - called by scheduler"""
+def check_scheduled_updates(minutes=None):
+    """Check if any scheduled updates should run - called by scheduler with the minutes its
+    pass covers (the current one alone when None)"""
     try:
         schedules = load_all_update_schedules()
         now = ha.schedule_now()
+        # MK Oct 2026 - the minutes of the pass, as the actions have them since 3f86cb2: a
+        # pass that took past the minute, or caught up after a stall, looked at the clock
+        # again and stepped over the update without a word
+        slots = list(minutes) if minutes else [now]
         
         for cluster_id, schedule in schedules.items():
             if not schedule.get('enabled'):
@@ -1402,25 +1573,31 @@ def check_scheduled_updates():
                 'friday': 4, 'saturday': 5, 'sunday': 6
             }
             
-            is_correct_day = (day == 'daily' or now.weekday() == day_map.get(day.lower(), -1))
-            is_correct_time = now.hour == hour and now.minute == minute
-            
-            if is_correct_day and is_correct_time:
-                # Check if already ran today (for recurring)
+            slot = next((m for m in reversed(slots)
+                         if (day == 'daily' or m.weekday() == day_map.get(day.lower(), -1))
+                         and m.hour == hour and m.minute == minute), None)
+
+            if slot is not None:
+                # a minute caught up that a new leader still holds (5.7)
+                if slot < _minute(now) and ha.schedule_held(slot):
+                    continue
+                # Check if already ran that day (for recurring)
                 if schedule_type == 'recurring':
                     last_run = schedule.get('last_run')
                     if last_run:
                         try:
                             last_run_date = datetime.fromisoformat(last_run).date()
-                            if last_run_date == now.date():
+                            if last_run_date >= slot.date():
                                 continue  # Already ran today
                         except:
                             pass
                 
-                # Check if rolling update already running
-                if hasattr(mgr, '_rolling_update') and mgr._rolling_update:
-                    if mgr._rolling_update.get('status') == 'running':
-                        continue
+                # Check if rolling update already running, or paused (one a restart interrupted
+                # waits for an admin, across restarts)
+                why = rolling_runs.busy(mgr, cluster_id)
+                if why:
+                    logging.info(f"[SCHEDULER] Scheduled update of {cluster_id} not started: {why}")
+                    continue
 
                 if not _creator_may_update(cluster_id, schedule):
                     logging.warning(f"[SCHEDULER] Not starting the scheduled update of {cluster_id}: "
@@ -1436,10 +1613,10 @@ def check_scheduled_updates():
                 if ha.schedule_fire_first():
                     # automatic failover, at most once (5.7): written and on its way to the
                     # members before the update starts; a one-time one switches itself off
-                    update_schedule_last_run(cluster_id, now.isoformat(), calculate_next_update_run(
+                    update_schedule_last_run(cluster_id, slot.isoformat(), calculate_next_update_run(
                         day, time_str) if schedule_type == 'recurring' else None)
                     if schedule_type == 'once':
-                        save_update_schedule(cluster_id, dict(schedule, enabled=False, last_run=now.isoformat()))
+                        save_update_schedule(cluster_id, dict(schedule, enabled=False, last_run=slot.isoformat()))
                     ha.schedule_fired()
 
                 # Execute the scheduled rolling update
@@ -1462,7 +1639,9 @@ def check_scheduled_updates():
                 execute_scheduled_rolling_update(mgr, cluster_id, action)
                 
                 # Update last run time
-                last_run_str = now.isoformat()
+                # the minute it was due for, not the clock now: a pass that caught up 23:59
+                # after midnight stored the next day, and that day's run was then skipped
+                last_run_str = slot.isoformat()
                 next_run_str = calculate_next_update_run(day, time_str) if schedule_type == 'recurring' else None
                 update_schedule_last_run(cluster_id, last_run_str, next_run_str)
                 

@@ -8,6 +8,129 @@
         // backups) deliberately don't pass a timeout and are therefore unaffected.
         const POLL_TIMEOUT_MS = 12000;
 
+        /**
+         * Combine a datastore's GC schedule with only the PBS jobs targeting that store.
+         * All inputs come from the PBS datastore and jobs reads already used by this view.
+         * @param {string} store - The selected datastore name.
+         * @param {Object|undefined} datastore - Its PBS configuration and status.
+         * @param {Object|undefined} jobs - PBS sync, verify and prune job lists.
+         * @returns {Array<{kind: string, id: string, schedule: string, lastRun: number|null, disabled: boolean}>}
+         */
+        function pbsDatastoreScheduleRows(store, datastore, jobs) {
+            if (!store || !datastore) return [];
+            const gcJob = datastore['gc-job'] || {};
+            const rows = [{
+                kind: 'gc', id: '', schedule: gcJob.schedule ?? datastore['gc-schedule'] ?? '',
+                lastRun: gcJob['last-run-endtime'] ?? null, disabled: false,
+                state: gcJob['last-run-state'] ?? '', nextRun: gcJob['next-run'] ?? null,
+            }];
+            for (const kind of ['sync', 'verify', 'prune']) {
+                const list = Array.isArray(jobs?.[kind]) ? jobs[kind] : [];
+                for (const job of list) {
+                    if (!job || job.store !== store) continue;
+                    rows.push({
+                        kind, id: job.id || '', schedule: job.schedule || '',
+                        lastRun: job['last-run-endtime'] ?? null,
+                        disabled: Boolean(job.disable),
+                        state: job['last-run-state'] ?? '', nextRun: job['next-run'] ?? null,
+                    });
+                }
+            }
+            return rows;
+        }
+
+        // LW Oct 2026 - what PBS wrote for the last run of a job: "OK", "WARNINGS: n", or the error
+        // itself. A failed sync read like a good one while only its end time was shown
+        function PbsRunState({ state }) {
+            const s = String(state || '');
+            if (!s) return <span className="text-gray-500">-</span>;
+            const ok = /^(TASK )?OK$/i.test(s);
+            const warn = /^(TASK )?WARNINGS/i.test(s);
+            return <span data-pbs-run-state={ok ? 'ok' : warn ? 'warning' : 'error'} title={s}
+                className={`${ok ? 'text-green-400' : warn ? 'text-yellow-400' : 'text-red-400'} break-all`}>{s}</span>;
+        }
+
+        function PbsJobReadError({ kind }) {
+            const { t } = useTranslation();
+            const labels = {
+                sync: t('pbsSyncJobs') || 'Sync Jobs',
+                verify: t('pbsVerifyJobs') || 'Verify Jobs',
+                prune: t('pbsPruneJobs') || 'Prune Jobs',
+            };
+            return <div role="alert" className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3 mb-3 text-sm text-yellow-300">
+                {t('pbsLoadAllDataError') || 'Could not load all data:'} {labels[kind]}
+            </div>;
+        }
+
+        /**
+         * Show the selected PBS datastore's configured schedules and last run times.
+         * @param {{store: string, datastore: Object|undefined, jobs: Object|undefined, error: boolean}} props
+         * @returns {JSX.Element|null}
+         */
+        function PbsDatastoreSchedules({ store, datastore, jobs, error }) {
+            const { t } = useTranslation();
+            const rows = pbsDatastoreScheduleRows(store, datastore, jobs);
+            if (!rows.length) return null;
+            const labels = {
+                gc: t('pbsGarbageCollection') || 'Garbage Collection',
+                sync: t('sync') || 'Sync',
+                verify: t('pbsVerify') || 'Verify',
+                prune: t('pbsPruneAction') || 'Prune',
+            };
+            return (
+                <div data-pbs-datastore-schedules={store}>
+                    <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">
+                        {t('pbsJobsTab') || 'Jobs'} - {store}
+                    </h3>
+                    {error && <div role="alert" className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3 mb-3 text-sm text-yellow-300">
+                        {t('pbsLoadAllDataError') || 'Could not load all data:'} {t('pbsJobsTab') || 'Jobs'}
+                    </div>}
+                    {['sync', 'verify', 'prune'].filter(kind => jobs?.errors?.[kind]).map(kind => (
+                        <PbsJobReadError key={kind} kind={kind} />
+                    ))}
+                    <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-auto">
+                        <table className="w-full text-sm">
+                            <thead><tr className="border-b border-proxmox-border text-gray-500 text-xs">
+                                <th scope="col" className="text-left p-3">{t('type') || 'Type'}</th>
+                                <th scope="col" className="text-left p-3">{t('id') || 'ID'}</th>
+                                <th scope="col" className="text-left p-3">{t('schedule') || 'Schedule'}</th>
+                                <th scope="col" className="text-left p-3">{t('lastRun') || 'Last Run'}</th>
+                                <th scope="col" className="text-left p-3">{t('status') || 'Status'}</th>
+                                <th scope="col" className="text-left p-3">{t('pbsNextRun') || 'Next Run'}</th>
+                            </tr></thead>
+                            <tbody>
+                                {rows.map((row, i) => (
+                                    <tr key={`${row.kind}:${row.id}:${i}`} data-pbs-schedule-kind={row.kind}
+                                        className="border-b border-proxmox-border/50">
+                                        <td className="p-3 text-white font-medium">{labels[row.kind]}</td>
+                                        <td className="p-3 text-gray-300">{row.id || '-'}</td>
+                                        <td className="p-3 text-gray-400">
+                                            {row.schedule || (t('manual') || 'Manual')}
+                                            {row.disabled && <> <span className="text-yellow-400">({t('disabled') || 'Disabled'})</span></>}
+                                        </td>
+                                        <td className="p-3 text-gray-500">{row.lastRun ? fmtDate(row.lastRun * 1000) : '-'}</td>
+                                        <td className="p-3"><PbsRunState state={row.state} /></td>
+                                        <td className="p-3 text-gray-500">{row.nextRun ? fmtDate(row.nextRun * 1000) : '-'}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            );
+        }
+
+        // LW Oct 2026 - PBS keeps a datastore's GC counters (gc-status, in the usage list) apart
+        // from when GC ran (gc-job, from /admin/gc). Neither has a dedup factor: PBS shows the
+        // index size over the bytes on disk, so we do the same
+        function pbsGcView(ds) {
+            const status = ds?.['gc-status'] || ds?.detail?.['gc-status'] || {};
+            const job = ds?.['gc-job'] || {};
+            const onDisk = Number(status['disk-bytes']) || 0;
+            const indexed = Number(status['index-data-bytes']) || 0;
+            return { status, job, dedup: onDisk > 0 && indexed > 0 ? indexed / onDisk : null };
+        }
+
         // Task Bar Component with Task Viewer
         function TaskBar({ tasks, onClear, onClose, onCancel, onRefresh, clusterId, autoExpandEnabled = true }) {
             const { t } = useTranslation();
@@ -317,7 +440,7 @@
                             </div>
                             
                             <div className="flex items-center gap-2">
-                                <span className={`transition-transform ${expanded ? 'rotate-180' : ''}`}>
+                                <span className={`transition-transform ${expanded ? '' : 'rotate-180'}`}>
                                     <Icons.ChevronDown />
                                 </span>
                             </div>
@@ -554,6 +677,102 @@
             return field;
         }
 
+        // LW Oct 2026 - the query language of the search (pegaprox/utils/search_query.py):
+        // examples to click into the box, and what the server says when it cannot read one
+        const SEARCH_SYNTAX_EXAMPLES = [
+            ['web', 'searchSyntaxFree'],
+            ['tag:prod node:pve1', 'searchSyntaxAnd'],
+            ['tag:web OR tag:api', 'searchSyntaxOr'],
+            ['-status:running', 'searchSyntaxNot'],
+            ['(tag:db OR tag:cache) AND NOT node:pve3', 'searchSyntaxGroup'],
+            ['name:"web 01"', 'searchSyntaxQuote'],
+            ['id:100-199', 'searchSyntaxRange'],
+        ];
+        const SEARCH_SYNTAX_PREFIXES = 'tag: node: name: id: ip: mac: notes: status: type: cluster: pool:';
+        const SEARCH_SYNTAX_ERRORS = {
+            unclosed_paren: 'searchErrUnclosedParen', unexpected_paren: 'searchErrUnexpectedParen',
+            empty_group: 'searchErrEmptyGroup', unclosed_quote: 'searchErrUnclosedQuote',
+            term_before: 'searchErrTermBefore', term_after: 'searchErrTermAfter', empty_value: 'searchErrEmptyValue',
+            bad_id: 'searchErrBadId', bad_type: 'searchErrBadType', too_long: 'searchErrTooLong',
+            too_many_terms: 'searchErrTooManyTerms', too_deep: 'searchErrTooDeep',
+        };
+        function searchSyntaxMessage(t, err) {
+            if (!err) return '';
+            const key = SEARCH_SYNTAX_ERRORS[err.reason];
+            const text = key ? t(key) : '';
+            if (!text || text === key) return err.error || '';
+            return text.replace('{at}', String((err.position || 0) + 1)).replace('{token}', err.token || '')
+                .replace('{limit}', String(err.limit || ''));
+        }
+        // a picked tag in place of the term it completes, the rest of the query kept
+        function searchWithTag(res, tag) {
+            const c = res && res.tag_complete;
+            if (!c || typeof res.query !== 'string') return `tag:${tag}`;
+            return res.query.slice(0, c.start) + c.prefix + tag + res.query.slice(c.end);
+        }
+        // the popover goes to the body: the search boxes it sits in clip what overflows them
+        function SearchSyntaxHelp({ t, onPick, align }) {
+            const { isCorporate } = useLayout();
+            const [pos, setPos] = useState(null);
+            const btnRef = useRef(null);
+            const popRef = useRef(null);
+            const toggle = () => {
+                if (pos || !btnRef.current) { setPos(null); return; }
+                const r = btnRef.current.getBoundingClientRect();
+                const width = Math.min(320, window.innerWidth - 32);
+                const left = Math.max(16, Math.min(align === 'left' ? r.left : r.right - width, window.innerWidth - width - 16));
+                setPos({ top: r.bottom + 8, left, width });
+            };
+            useEffect(() => {
+                if (!pos) return;
+                const away = (e) => {
+                    if (btnRef.current?.contains(e.target) || popRef.current?.contains(e.target)) return;
+                    setPos(null);
+                };
+                const esc = (e) => { if (e.key === 'Escape') setPos(null); };
+                const shut = () => setPos(null);
+                document.addEventListener('mousedown', away);
+                document.addEventListener('keydown', esc);
+                window.addEventListener('resize', shut);
+                return () => {
+                    document.removeEventListener('mousedown', away);
+                    document.removeEventListener('keydown', esc);
+                    window.removeEventListener('resize', shut);
+                };
+            }, [pos]);
+            return (
+                <>
+                    <button ref={btnRef} type="button" data-search-syntax onClick={toggle} aria-expanded={!!pos}
+                        title={t('searchSyntaxHelp')} aria-label={t('searchSyntaxHelp')}
+                        className="w-5 h-5 flex-shrink-0 rounded-full border border-proxmox-border text-[11px] leading-none text-gray-400 hover:text-white hover:border-proxmox-orange flex items-center justify-center">
+                        ?
+                    </button>
+                    {pos && ReactDOM.createPortal(
+                        <div ref={popRef} data-search-syntax-help className={`p-3 rounded-lg shadow-2xl text-left ${isCorporate ? 'border-2' : 'bg-proxmox-card border border-proxmox-border'}`}
+                             style={{position: 'fixed', top: pos.top, left: pos.left, width: pos.width, zIndex: 110,
+                                     ...(isCorporate ? {background: '#243542', borderColor: '#49afd9'} : {})}}>
+                            <div className="text-sm font-medium text-white mb-2">{t('searchSyntaxTitle')}</div>
+                            <div className="space-y-1">
+                                {SEARCH_SYNTAX_EXAMPLES.map(([example, key]) => (
+                                    <button key={example} type="button" data-search-syntax-example={example}
+                                        onClick={() => { setPos(null); if (onPick) onPick(example); }}
+                                        className="w-full flex flex-col items-start text-left px-2 py-1 rounded hover:bg-proxmox-hover">
+                                        <code className="text-xs font-mono text-proxmox-orange">{example}</code>
+                                        <span className="text-[11px] text-gray-400">{t(key)}</span>
+                                    </button>
+                                ))}
+                            </div>
+                            <div className="mt-2 pt-2 border-t border-proxmox-border text-[11px] text-gray-400">
+                                <div><span className="text-gray-300">{t('searchSyntaxPrefixes')}:</span> <code className="font-mono">{SEARCH_SYNTAX_PREFIXES}</code></div>
+                                <div className="mt-1">{t('searchSyntaxNote')}</div>
+                            </div>
+                        </div>,
+                        document.body
+                    )}
+                </>
+            );
+        }
+
         // LW Apr 2026 — Global command palette. Opens on Ctrl/Cmd+K.
         // Indexes: clusters, VMs, storage (from resources), and a curated action list.
         // Keyboard-first: ↑/↓ to move, enter to pick, esc to close.
@@ -582,12 +801,19 @@
                     const res = await authFetch(`${API_URL}/global/search?q=${encodeURIComponent(q)}&type=all`, { signal: ctrl.signal });
                     if (ctrl.signal.aborted) return;
                     let hits = [];
+                    let error = null;
                     if (res && res.ok) {
                         const data = await res.json().catch(() => null);
-                        hits = ((data && data.results) || []).filter(h => h.vmid != null && SEARCH_INDEX_FIELDS.includes(h.match_field));
+                        // an expression (tag:web OR node:pve2) means nothing to the fuzzy match
+                        // here: every guest the server found is listed then
+                        const expression = !!data && data.syntax === 'expression';
+                        hits = ((data && data.results) || []).filter(h => (expression && h.vmid != null) || (h.vmid != null && SEARCH_INDEX_FIELDS.includes(h.match_field)));
+                    } else if (res && res.status === 400) {
+                        const body = await res.json().catch(() => null);
+                        if (body && body.code === 'SEARCH_SYNTAX') error = body;
                     }
                     if (ctrl.signal.aborted) return;
-                    setRemote({ q, hits });
+                    setRemote({ q, hits, error });
                     setRemoteLoading(false);
                 }, 250);
                 return () => { clearTimeout(timer); ctrl.abort(); };
@@ -681,7 +907,7 @@
                             subtitle: [`VMID ${h.vmid}`, h.node, h.cluster_name || h.cluster_id].filter(Boolean).join(' · '),
                             icon: h.type === 'ct' ? 'Container' : 'VM',
                             score: 20,
-                            match: { field: h.match_field, value: h.match_value || '', net: h.match_net || '' },
+                            match: SEARCH_INDEX_FIELDS.includes(h.match_field) ? { field: h.match_field, value: h.match_value || '', net: h.match_net || '' } : null,
                             pick: () => onPickHit && onPickHit(h),
                         });
                     });
@@ -728,8 +954,14 @@
                                 placeholder={t('commandPalettePlaceholder') || 'Type to search clusters, VMs, actions…'}
                                 className="flex-1 bg-transparent text-white outline-none text-base placeholder:text-gray-500"
                             />
+                            <SearchSyntaxHelp t={t} onPick={(example) => { setQuery(example); inputRef.current?.focus(); }} />
                             <span className="text-xs text-gray-500">ESC</span>
                         </div>
+                        {remote.error && remote.q === query.trim() && (
+                            <div data-cmdpal-syntax-error className="px-4 py-1.5 text-xs text-red-400 border-b border-proxmox-border">
+                                {searchSyntaxMessage(t, remote.error)}
+                            </div>
+                        )}
                         <div className="flex-1 overflow-y-auto" style={{scrollbarWidth: 'thin'}}>
                             {results.length === 0 ? (
                                 <div className="text-center text-sm text-gray-500 py-10">
@@ -1341,6 +1573,228 @@
             );
         }
 
+        // LW Oct 2026 - the transfer network of a PVE cluster: the network remote migrations
+        // into it dial its nodes in (core/transfer_net.py). Each node's address comes from the
+        // server's cache, nodes it still reads come back pending and are asked for again.
+        const XFER_NET_V4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/;
+        function xferNetValid(value) {
+            const v = (value || '').trim();
+            if (!v) return true;
+            const m = v.match(XFER_NET_V4);
+            if (m) return m.slice(1, 5).every(o => Number(o) <= 255) && Number(m[5]) >= 1 && Number(m[5]) <= 32;
+            const six = v.match(/^([0-9a-fA-F:.]+)\/(\d{1,3})$/);
+            return !!six && six[1].includes(':') && Number(six[2]) >= 1 && Number(six[2]) <= 128;
+        }
+
+        function TransferNetworkSection({ cluster, clusters, authFetch, addToast, t, canEdit, haReadOnly, onSaved }) {
+            const saved = cluster.transfer_network || '';
+            const [draft, setDraft] = React.useState(saved);
+            const [view, setView] = React.useState(null);
+            const [failed, setFailed] = React.useState(false);
+            const [saving, setSaving] = React.useState(false);
+            const [srcCluster, setSrcCluster] = React.useState('');
+            const [srcNodes, setSrcNodes] = React.useState([]);
+            const [srcNode, setSrcNode] = React.useState('');
+            const [check, setCheck] = React.useState(null);
+            const [checkError, setCheckError] = React.useState('');
+            const [checking, setChecking] = React.useState(false);
+            const gen = React.useRef(0);
+
+            React.useEffect(() => { setDraft(saved); }, [saved]);
+
+            const value = draft.trim();
+            const valid = xferNetValid(value);
+            const dirty = value !== saved;
+            // what the list shows: the saved network, or the one typed when it differs
+            const query = !valid ? null : (dirty ? `?network=${encodeURIComponent(value)}` : '');
+
+            React.useEffect(() => {
+                if (query === null) return undefined;
+                const mine = ++gen.current;
+                let timer = null, tries = 0;
+                const load = async () => {
+                    const r = await authFetch(`${API_URL}/clusters/${cluster.id}/transfer-network${query}`);
+                    const d = r && r.ok ? await r.json().catch(() => null) : null;
+                    if (mine !== gen.current) return;
+                    setFailed(!d);
+                    if (!d) return;
+                    setView(d);
+                    if (d.pending && ++tries < 15) timer = setTimeout(load, 2000);
+                };
+                timer = setTimeout(load, query ? 500 : 0);
+                return () => { gen.current += 1; clearTimeout(timer); };
+            }, [cluster.id, query, authFetch]);
+
+            React.useEffect(() => {
+                setSrcNodes([]); setSrcNode('');
+                if (!srcCluster) return undefined;
+                let live = true;
+                (async () => {
+                    const r = await authFetch(`${API_URL}/clusters/${srcCluster}/nodes`);
+                    const d = r && r.ok ? await r.json().catch(() => null) : null;
+                    if (!live || !Array.isArray(d)) return;
+                    setSrcNodes(d.filter(n => n && n.node && (n.status || 'online') === 'online').map(n => n.node).sort());
+                })();
+                return () => { live = false; };
+            }, [srcCluster, authFetch]);
+
+            const save = async () => {
+                if (!valid || !dirty) return;
+                setSaving(true);
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${cluster.id}/config`, {
+                        method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ transfer_network: value }),
+                    });
+                    if (!r || !r.ok) {
+                        addToast(await PegaProxApiErrors.message(r, t('saveError')), 'error');
+                        return;
+                    }
+                    // the server stores the network address (10.20.0.5/24 is 10.20.0.0/24)
+                    const g = await authFetch(`${API_URL}/clusters/${cluster.id}/transfer-network`);
+                    const d = g && g.ok ? await g.json().catch(() => null) : null;
+                    const stored = d && typeof d.saved === 'string' ? d.saved : value;
+                    setCheck(null);
+                    onSaved(stored);
+                    setDraft(stored);
+                    addToast(t('xferNetSaved'));
+                } finally {
+                    setSaving(false);
+                }
+            };
+
+            const runCheck = async () => {
+                setChecking(true); setCheck(null); setCheckError('');
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${cluster.id}/transfer-network/check`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ source_cluster: srcCluster, source_node: srcNode }),
+                    });
+                    if (!r || !r.ok) {
+                        setCheckError(await PegaProxApiErrors.message(r, t('xferNetCheckFailed')));
+                        return;
+                    }
+                    const d = await r.json().catch(() => null);
+                    if (d) setCheck(d); else setCheckError(t('xferNetCheckFailed'));
+                } finally {
+                    setChecking(false);
+                }
+            };
+
+            const probe = {};
+            (check?.nodes || []).forEach(n => { probe[n.node] = n; });
+            const tested = (check?.nodes || []).filter(n => n.status === 'ok' || n.status === 'fail');
+            const sources = (clusters || []).filter(c => (c.cluster_type || 'proxmox') === 'proxmox')
+                .sort((a, b) => (a.id === cluster.id) - (b.id === cluster.id));
+            const inputCls = 'bg-proxmox-dark border border-proxmox-border rounded-lg px-3 py-1.5 text-sm';
+            const selectCls = 'bg-proxmox-dark border border-proxmox-border rounded-lg px-2 py-1 text-xs text-gray-300 disabled:opacity-50';
+            const nodeState = (n) => {
+                if (n.state === 'ok') return <span className="font-mono text-green-400">{n.address} <span className="text-gray-500">({n.iface})</span></span>;
+                if (n.state === 'none') return <span className="text-yellow-400">{t('xferNetNoAddress')}</span>;
+                if (n.state === 'unreadable') return <span className="text-red-400" title={n.error || ''}>{t('xferNetUnreadable')}</span>;
+                if (n.state === 'offline') return <span className="text-gray-500">{t('xferNetNodeOffline')}</span>;
+                return <span className="text-gray-500">{t('xferNetResolving')}</span>;
+            };
+
+            return (
+                <div className="space-y-3 min-w-0" data-transfer-network>
+                    <div>
+                        <h4 className="text-sm font-medium text-gray-400 mb-1 flex items-center gap-2">
+                            <Icons.Network className="w-4 h-4" />
+                            {t('xferNetTitle')}
+                        </h4>
+                        <p className="text-xs text-gray-500">{t('xferNetDesc')}</p>
+                    </div>
+                    <fieldset disabled={haReadOnly || !canEdit} className="min-w-0 space-y-3"
+                        data-ha-locked={haReadOnly ? '' : undefined} data-xfer-edit>
+                        <div className="flex flex-wrap items-center gap-2">
+                            <input id="xfer-net-input" type="text" value={draft} maxLength={64}
+                                onChange={e => setDraft(e.target.value)} placeholder={t('xferNetPlaceholder')}
+                                aria-label={t('xferNetTitle')} spellCheck={false}
+                                className={`${inputCls} font-mono flex-1 min-w-0 disabled:opacity-50 ${valid ? '' : 'border-red-500'}`} />
+                            <button type="button" onClick={save} disabled={!valid || !dirty || saving} data-xfer-save
+                                className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm text-white disabled:opacity-50 disabled:cursor-not-allowed">
+                                {t('save')}
+                            </button>
+                        </div>
+                        {!valid && <div className="text-xs text-red-400" data-xfer-invalid>{t('xferNetInvalid')}</div>}
+                    </fieldset>
+
+                    {failed && <div className="text-xs text-red-400" data-xfer-failed>{t('xferNetLoadError')}</div>}
+                    {view && (
+                        <div className="text-xs text-gray-500 p-2 bg-proxmox-dark rounded-lg space-y-1" data-xfer-dc>
+                            <div>
+                                {t('xferNetDcNet')}:{' '}
+                                <span className="font-mono text-gray-300" data-xfer-dc-value>
+                                    {view.migration_network === null ? t('xferNetDcNetUnread') : (view.migration_network || t('xferNetDcNetNone'))}
+                                </span>
+                            </div>
+                            <div>{t('xferNetDcNetHint')}</div>
+                        </div>
+                    )}
+                    {view && !view.network && <div className="text-xs text-gray-500" data-xfer-off>{t('xferNetOff')}</div>}
+                    {view && view.network && (
+                        <div className="space-y-1 min-w-0" data-xfer-nodes>
+                            <div className="text-xs text-gray-400" data-xfer-heading>{t('xferNetNodes').replace('{network}', view.network)}</div>
+                            {view.missing > 0 && (
+                                <div className="text-xs text-yellow-400" data-xfer-missing>
+                                    {t('xferNetMissing').replace('{count}', view.missing).replace('{total}', view.nodes.length)}
+                                </div>
+                            )}
+                            <div className="max-h-64 overflow-y-auto space-y-1">
+                                {view.nodes.map(n => {
+                                    const p = probe[n.node];
+                                    return (
+                                        <div key={n.node} data-xfer-node={n.node} data-xfer-state={n.state}
+                                            className="flex flex-wrap items-center justify-between gap-2 bg-proxmox-dark rounded px-2 py-1 text-xs min-w-0">
+                                            <span className="font-mono text-gray-300 truncate">{n.node}</span>
+                                            <span className="flex items-center gap-3">
+                                                {nodeState(n)}
+                                                {p && p.status === 'ok' && <span className="text-green-400" data-xfer-probe="ok">{t('xferNetAnswers')}{p.ms != null ? ` (${p.ms} ms)` : ''}</span>}
+                                                {p && p.status === 'fail' && <span className="text-red-400" data-xfer-probe="fail">{t('xferNetNoAnswer')}</span>}
+                                            </span>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </div>
+                    )}
+
+                    {saved && (
+                        <fieldset disabled={haReadOnly || !canEdit} className="min-w-0 space-y-2 pt-2 border-t border-gray-700/50"
+                            data-ha-locked={haReadOnly ? '' : undefined} data-xfer-check>
+                            <div className="text-xs text-gray-500">{t('xferNetCheckDesc')}</div>
+                            <div className="flex flex-wrap items-center gap-2">
+                                <select value={srcCluster} onChange={e => setSrcCluster(e.target.value)} className={selectCls}
+                                    aria-label={t('xferNetCheckCluster')} data-xfer-src-cluster>
+                                    <option value="">{t('xferNetCheckCluster')}</option>
+                                    {sources.map(c => <option key={c.id} value={c.id}>{c.display_name || c.name}</option>)}
+                                </select>
+                                <select value={srcNode} onChange={e => setSrcNode(e.target.value)} disabled={!srcNodes.length}
+                                    className={selectCls} aria-label={t('xferNetCheckNode')} data-xfer-src-node>
+                                    <option value="">{t('xferNetCheckNode')}</option>
+                                    {srcNodes.map(n => <option key={n} value={n}>{n}</option>)}
+                                </select>
+                                <button type="button" onClick={runCheck} disabled={!srcNode || checking || dirty} data-xfer-run
+                                    className="px-3 py-1 bg-proxmox-dark hover:bg-proxmox-border border border-proxmox-border rounded text-xs text-gray-300 flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed">
+                                    {checking ? <Icons.RotateCw className="w-3 h-3" /> : <Icons.Activity className="w-3 h-3" />}
+                                    {t('xferNetCheckRun')}
+                                </button>
+                            </div>
+                            {dirty && <div className="text-xs text-gray-500" data-xfer-save-first>{t('xferNetCheckSaveFirst')}</div>}
+                            {checkError && <div className="text-xs text-red-400" data-xfer-check-error>{checkError}</div>}
+                            {check && (
+                                <div className="text-xs text-gray-400" data-xfer-check-done>
+                                    {t('xferNetCheckDone').replace('{ok}', tested.filter(n => n.status === 'ok').length)
+                                        .replace('{total}', tested.length).replace('{node}', check.source_node)}
+                                </div>
+                            )}
+                        </fieldset>
+                    )}
+                </div>
+            );
+        }
+
         // LW Oct 2026 - the connection check of one PVE cluster: read-only probes on the
         // server (core/conncheck.py), started here by the admin and never on a timer. The
         // server answers with codes; the words and the fix for each come from translations.
@@ -1370,6 +1824,9 @@
             hardware: 'connCheckFeatHardware', agent: 'connCheckFeatAgent', storage: 'connCheckFeatStorage',
             disks: 'connCheckFeatDisks', uploads: 'connCheckFeatUploads', nodePower: 'connCheckFeatNodePower',
             nodeConfig: 'connCheckFeatNodeConfig', syslog: 'connCheckFeatSyslog', sdn: 'connCheckFeatSdn',
+            networks: 'connCheckFeatNetworks', pools: 'connCheckFeatPools', mappings: 'connCheckFeatMappings',
+            replication: 'connCheckFeatReplication', haConfig: 'connCheckFeatHaConfig',
+            remoteMigration: 'connCheckFeatRemoteMigration',
         };
         const CONN_CHECK_SECTIONS = [
             ['credentials', 'connCheckSecCredentials', ['credentials']],
@@ -1392,6 +1849,9 @@
             const [running, setRunning] = React.useState(false);
             const [report, setReport] = React.useState(null);
             const [error, setError] = React.useState('');
+            // LW Oct 2026 - what works with this connection, and the role that needs no more
+            const [showCaps, setShowCaps] = React.useState(true);
+            const [showRole, setShowRole] = React.useState(false);
 
             const run = async () => {
                 setRunning(true); setError('');
@@ -1481,7 +1941,7 @@
                                 {it.code && <span className="text-xs px-1.5 py-0.5 rounded bg-proxmox-dark border border-proxmox-border font-mono">{it.code}</span>}
                                 {it.status === 'ok' && <span className="text-xs text-gray-400">{t('connCheckSshOk')}</span>}
                             </div>
-                            {it.user && it.ip && <div className="text-xs text-gray-400">{mono(`${it.user}@${it.ip}`)} - {it.method === 'key' ? t('connCheckSshKey') : t('connCheckSshPassword')}</div>}
+                            {it.user && it.ip && <div className="text-xs text-gray-400">{mono(`${it.user}@${it.ip}`)} - {it.method === 'key' ? t('connCheckSshKey') : t('connCheckSshPassword')}{it.credential === 'node' ? ` (${t('nodeCredsViaOwn')})` : it.credential === 'cluster' ? ` (${t('nodeCredsViaCluster')})` : ''}</div>}
                         </div>);
                     default:
                         return null;
@@ -1549,9 +2009,31 @@
                                             </div>
                                         );
                                     })}
+                                    {(report.refused || []).length > 0 && (
+                                        // LW Oct 2026 (#1136) - where a node's own root password goes
+                                        <div data-check-refused className="mt-4 p-3 rounded-lg bg-red-500/10 border border-red-500/30 text-sm text-red-300">
+                                            {t('nodeCredsRefusedHint').replace('{nodes}', report.refused.join(', '))}
+                                        </div>
+                                    )}
                                     <div className="text-xs text-gray-500 mt-4">{t('connCheckCheckedAt').replace('{time}', new Date(report.checked_at).toLocaleString()).replace('{s}', (report.duration_ms / 1000).toFixed(1))}</div>
                                 </div>
                             )}
+                            <div className="mt-4 pt-4 border-t border-proxmox-border">
+                                <button type="button" data-check-toggle="capabilities" onClick={() => setShowCaps(!showCaps)}
+                                    className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-gray-500 hover:text-white">
+                                    <Icons.ChevronRight className={`w-3 h-3 transform transition-transform ${showCaps ? 'rotate-90' : ''}`} />
+                                    {t('capabTitle')}
+                                </button>
+                                {showCaps && <div className="mt-2"><ClusterCapabilities clusterId={cluster.id} refreshKey={report ? report.checked_at : ''} /></div>}
+                            </div>
+                            <div className="mt-4 pt-4 border-t border-proxmox-border">
+                                <button type="button" data-check-toggle="role" onClick={() => setShowRole(!showRole)}
+                                    className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-gray-500 hover:text-white">
+                                    <Icons.ChevronRight className={`w-3 h-3 transform transition-transform ${showRole ? 'rotate-90' : ''}`} />
+                                    {t('pveRoleTitle')}
+                                </button>
+                                {showRole && <div className="mt-2"><PveRoleRecipe /></div>}
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -4491,6 +4973,48 @@
             );
         }
 
+        // NS Oct 2026 - power, costs and right-sizing come from a kept result, worked out off
+        // the server's main loop (helpers.history_report): say how old it is, and fetch again
+        // while a newer one is being worked out
+        function ReportStamp({ report, t }) {
+            if (!report?.computed_at) return null;
+            const at = new Date(report.computed_at);
+            if (isNaN(at.getTime())) return null;
+            const opts = { hour: '2-digit', minute: '2-digit', hour12: localStorage.getItem('pegaprox-time-format') === '12h' };
+            // a page left open overnight: the day too, or yesterday's figures read as today's
+            const time = at.toDateString() === new Date().toDateString()
+                ? at.toLocaleTimeString(undefined, opts)
+                : at.toLocaleString(undefined, { ...opts, day: '2-digit', month: '2-digit' });
+            return (
+                <div className="text-xs text-gray-500 mt-0.5" data-report-stamp>
+                    {(t('reportAsOf') || 'As of {time}').replace('{time}', () => time)}
+                    {report.refreshing && <span className="text-gray-400">{' · '}{t('reportUpdating') || 'updating'}</span>}
+                </div>
+            );
+        }
+
+        // `asking`: what the page shows (cluster, window); a new one starts with four tries again
+        function useReportFollowUp(report, refresh, asking) {
+            const latest = React.useRef(refresh);
+            latest.current = refresh;
+            const tries = React.useRef(0);
+            const seenAt = React.useRef(null);
+            const alive = React.useRef(true);
+            // one more round after every fetch, also one that failed and left `report` as it was
+            const [round, setRound] = React.useState(0);
+            React.useEffect(() => () => { alive.current = false; }, []);
+            React.useEffect(() => { tries.current = 0; }, asking);
+            React.useEffect(() => {
+                if (report?.computed_at !== seenAt.current) { seenAt.current = report?.computed_at; tries.current = 0; }
+                if (!report?.refreshing || tries.current >= 4) return;
+                const id = setTimeout(async () => {
+                    tries.current += 1;
+                    try { await latest.current(); } finally { if (alive.current) setRound(n => n + 1); }
+                }, 15000);
+                return () => clearTimeout(id);
+            }, [report, round]);
+        }
+
         // MK May 2026 — Power & Carbon Tracking. Same shape as Cost Dashboard
         // (rates editor + summary + per-VM table) but in kWh / kg CO₂.
         function PowerCarbonTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin }) {
@@ -4504,20 +5028,29 @@
             const [showRates, setShowRates] = React.useState(false);
             const [rateForm, setRateForm] = React.useState(null);
             const [savingRates, setSavingRates] = React.useState(false);
+            // #965 - a power profile per host (whole-system idle / full-load watts)
+            const [hostForm, setHostForm] = React.useState(null);
+            const [savingHosts, setSavingHosts] = React.useState(false);
 
+            // NS Oct 2026 - only the newest request writes: a late answer for another window
+            // (a follow-up, a quick switch) must not land over the one now selected
+            const asked = React.useRef(0);
             const refresh = async () => {
                 if (!clusterId) return;
+                const mine = ++asked.current;
                 setLoading(true);
                 try {
                     const [s, p] = await Promise.all([
                         authFetch(`${API_URL}/clusters/${clusterId}/power/summary?days=${days}`).then(r => r?.json()).catch(() => null),
                         authFetch(`${API_URL}/clusters/${clusterId}/power/per-vm?days=${days}`).then(r => r?.json()).catch(() => null),
                     ]);
+                    if (mine !== asked.current) return;
                     if (s && !s.error) setSummary(s);
                     if (p && p.rows) setRows(p.rows);
-                } finally { setLoading(false); }
+                } finally { if (mine === asked.current) setLoading(false); }
             };
             React.useEffect(() => { refresh(); /* eslint-disable-line */ }, [clusterId, days]);
+            useReportFollowUp(summary, refresh, [clusterId, days]);
 
             const openRates = async () => {
                 const r = await authFetch(`${API_URL}/power/rates/${clusterId}`).then(x => x?.json()).catch(() => null);
@@ -4545,15 +5078,74 @@
                         addToast(t('powerRatesSaved') || 'Power rates saved', 'success');
                         setShowRates(false);
                         await refresh();
+                    } else if (r) {
+                        // LW Oct 2026 - the server refuses rates it cannot count with (a PUE under 1,
+                        // a negative price); the dialog stayed open and said nothing
+                        const body = await r.json().catch(() => ({}));
+                        addToast(body?.error || t('saveFailed') || 'Save failed', 'error');
                     }
                 } finally { setSavingRates(false); }
             };
+
+            const openHosts = async () => {
+                const r = await authFetch(`${API_URL}/clusters/${clusterId}/power/hosts`).then(x => x?.json()).catch(() => null);
+                if (!r || !Array.isArray(r.hosts)) {
+                    addToast(t('powerHostLoadFailed') || 'Could not load the hosts', 'error');
+                    return;
+                }
+                setHostForm(r.hosts.map(h => ({
+                    ...h, own: h.profile === 'host', wasOwn: h.profile === 'host',
+                    idle: String(h.idle_w), max: String(h.max_w),
+                    was: `${h.idle_w}|${h.max_w}|${h.notes || ''}`,
+                })));
+            };
+            const saveHosts = async () => {
+                setSavingHosts(true);
+                let failed = 0;
+                try {
+                    for (const h of hostForm) {
+                        let r = null;
+                        if (h.own && h.wasOwn && h.was === `${parseFloat(h.idle)}|${parseFloat(h.max)}|${h.notes || ''}`) {
+                            continue;  // unchanged - keep who set it and when
+                        } else if (h.own) {
+                            if (!Number.isFinite(parseFloat(h.idle)) || !Number.isFinite(parseFloat(h.max))) {
+                                failed++;
+                                addToast(`${h.node}: ${t('powerHostWattsMissing') || 'Enter idle and full-load watts'}`, 'error');
+                                continue;
+                            }
+                            r = await authFetch(`${API_URL}/clusters/${clusterId}/power/hosts/${encodeURIComponent(h.node)}`, {
+                                method: 'PUT',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ idle_w: parseFloat(h.idle), max_w: parseFloat(h.max), notes: h.notes || '' }),
+                            });
+                        } else if (h.wasOwn) {
+                            r = await authFetch(`${API_URL}/clusters/${clusterId}/power/hosts/${encodeURIComponent(h.node)}`, { method: 'DELETE' });
+                        } else {
+                            continue;
+                        }
+                        if (!r?.ok) {
+                            failed++;
+                            const body = await r?.json().catch(() => null);
+                            addToast(`${h.node}: ${body?.error || t('powerHostSaveFailed') || 'Could not save the host profile'}`, 'error');
+                        }
+                    }
+                    if (!failed) {
+                        addToast(t('powerHostsSaved') || 'Host profiles saved', 'success');
+                        setHostForm(null);
+                    }
+                    await refresh();
+                } finally { setSavingHosts(false); }
+            };
+            const setHost = (node, patch) => setHostForm(hostForm.map(h => h.node === node ? { ...h, ...patch } : h));
 
             const cur = summary?.rates?.currency || 'EUR';
             const sym = ({ EUR: '€', USD: '$', GBP: '£' }[cur] || cur);
             const fmtCost = (n) => `${sym} ${(n || 0).toFixed(2)}`;
             const fmtKwh = (n) => `${(n || 0).toFixed(1)} kWh`;
             const fmtCo2 = (n) => `${(n || 0).toFixed(1)} kg`;
+            const coverageText = () => (t('powerCoverage') || 'Estimate from {covered} of {window} h of history. Monthly figures are extrapolated from the covered hours.')
+                .replace('{covered}', () => summary?.coverage?.covered_h ?? 0)
+                .replace('{window}', () => summary?.coverage?.window_h ?? 0);
 
             // ── Export helpers (same WinAnsi-safe pattern as Cost / Insights) ──
             const safe = (s) => {
@@ -4575,7 +5167,7 @@
                     'avg_cpu_pct', 'avg_mem_pct', 'cores', 'memory_gb', 'running_h',
                     'kwh', 'monthly_kwh',
                     `cost_${cur}`, `monthly_cost_${cur}`,
-                    'kg_co2', 'monthly_kg_co2',
+                    'kg_co2', 'monthly_kg_co2', 'kwh_by_host',
                 ];
                 const esc = (v) => {
                     const s = String(v ?? '');
@@ -4589,6 +5181,7 @@
                         r.kwh, r.monthly_kwh,
                         r.cost, r.monthly_cost,
                         r.kg_co2, r.monthly_co2,
+                        Object.entries(r.by_node || {}).map(([n, k]) => `${n}=${k}`).join(' '),
                     ].map(esc).join(','));
                 }
                 const blob = new Blob(['﻿' + lines.join('\n')], { type: 'text/csv;charset=utf-8' });
@@ -4634,8 +5227,35 @@
                                 + `${summary.rates.kwh_price.toFixed(2)} ${cur}/kWh, `
                                 + `${summary.rates.kg_co2_per_kwh.toFixed(2)} kg CO2/kWh`),
                 });
+                if (summary.coverage?.missing_h > 0) {
+                    blocks.push({ type: 'text', value: safe(coverageText()) });
+                }
 
-                if (summary.by_node && Object.keys(summary.by_node).length) {
+                if (summary.hosts?.length) {
+                    blocks.push({ type: 'spacer', height: 4 });
+                    blocks.push({
+                        type: 'table',
+                        title: safe(t('powerPerHost') || 'Per host'),
+                        columns: [
+                            safe(t('node') || 'Node'),
+                            safe(t('powerProfile') || 'Profile'),
+                            'W idle / max',
+                            safe(t('powerAvgW') || 'Avg W (est.)'),
+                            safe(t('powerMonthlyKwh') || 'Monthly kWh'),
+                            safe(t('powerMonthlyCost') || 'Monthly cost'),
+                            safe(t('powerUnallocated') || 'Unallocated'),
+                        ],
+                        rows: summary.hosts.map(h => [
+                            safe(h.node),
+                            safe(h.profile === 'host' ? (t('powerProfileHost') || 'Own profile') : (t('powerProfileCluster') || 'Cluster default')),
+                            `${h.idle_w} / ${h.max_w}`,
+                            String(h.avg_w),
+                            kwh(h.monthly.kwh),
+                            pf(h.monthly.cost),
+                            `${kwh(h.monthly_unallocated.kwh)} * ${pf(h.monthly_unallocated.cost)}`,
+                        ]),
+                    });
+                } else if (summary.by_node && Object.keys(summary.by_node).length) {
                     blocks.push({ type: 'spacer', height: 4 });
                     blocks.push({
                         type: 'table',
@@ -4706,6 +5326,7 @@
                             <p className="text-xs text-gray-500 mt-0.5">
                                 {t('powerDesc') || 'Estimated electricity + CO₂ per VM, based on metrics history × node-power profile × PUE × grid CO₂ intensity.'}
                             </p>
+                            <ReportStamp report={summary} t={t} />
                         </div>
                         <div className="flex gap-2">
                             <select value={days} onChange={e => setDays(parseInt(e.target.value, 10))}
@@ -4719,6 +5340,13 @@
                                     className="px-3 py-1.5 bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white rounded-lg text-sm flex items-center gap-1.5">
                                     <Icons.Settings className="w-3.5 h-3.5" />
                                     {t('powerRates') || 'Rates'}
+                                </button>
+                            )}
+                            {canAct && (
+                                <button onClick={openHosts}
+                                    className="px-3 py-1.5 bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white rounded-lg text-sm flex items-center gap-1.5">
+                                    <Icons.Server className="w-3.5 h-3.5" />
+                                    {t('powerHostProfiles') || 'Host profiles'}
                                 </button>
                             )}
                             <button onClick={exportCsv} disabled={!rows.length}
@@ -4766,7 +5394,66 @@
                                 </div>
                             </div>
 
-                            {summary.by_node && Object.keys(summary.by_node).length > 0 && (
+                            {/* #965 - what is an estimate, and what no guest accounts for */}
+                            {(summary.coverage?.missing_h > 0 || summary.coverage?.node_estimated_vms > 0 || summary.unallocated || summary.scoped) && (
+                                <div className="text-xs text-gray-400 bg-proxmox-card border border-proxmox-border rounded-xl p-3 space-y-1" data-power-notes>
+                                    {summary.unallocated && (
+                                        <div title={t('powerUnallocatedHint') || 'Host power no guest accounts for: the baseline of a host without running guests, and host CPU above what its guests use.'}>
+                                            {t('powerGuests') || 'Guests'}: <span className="text-white">{fmtKwh(summary.allocated?.monthly?.kwh)} · {fmtCost(summary.allocated?.monthly?.cost)}</span>
+                                            <span className="mx-2 text-gray-600">|</span>
+                                            {t('powerUnallocated') || 'Unallocated'}: <span className="text-yellow-400">{fmtKwh(summary.unallocated.monthly?.kwh)} · {fmtCost(summary.unallocated.monthly?.cost)}</span>
+                                        </div>
+                                    )}
+                                    {summary.coverage?.missing_h > 0 && <div className="text-yellow-400">{coverageText()}</div>}
+                                    {summary.coverage?.node_estimated_vms > 0 && (
+                                        <div>{(t('powerNodeEstimated') || 'For {count} guests the host is taken from where they run today, for history recorded before hosts were tracked.')
+                                            .replace('{count}', () => summary.coverage.node_estimated_vms)}</div>
+                                    )}
+                                    {summary.scoped && <div>{t('powerScopedNote') || 'Showing the share of your guests only.'}</div>}
+                                </div>
+                            )}
+
+                            {summary.hosts?.length > 0 && (
+                                <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 overflow-x-auto" data-power-hosts>
+                                    <h3 className="text-sm font-semibold text-white mb-2">{t('powerPerHost') || 'Per host'}</h3>
+                                    <table className="w-full text-xs">
+                                        <thead className="text-gray-400 uppercase text-[10px]">
+                                            <tr className="border-b border-proxmox-border">
+                                                <th className="text-left py-2">{t('node') || 'Node'}</th>
+                                                <th className="text-left">{t('powerProfile') || 'Profile'}</th>
+                                                <th className="text-right">W idle / max</th>
+                                                <th className="text-right">{t('powerOnlineH') || 'Online h'}</th>
+                                                <th className="text-right">{t('powerAvgW') || 'Avg W (est.)'}</th>
+                                                <th className="text-right">{t('powerMonthlyKwh') || 'Monthly kWh'}</th>
+                                                <th className="text-right">{t('powerMonthlyCost') || 'Monthly cost'}</th>
+                                                <th className="text-right">{t('powerMonthlyCo2') || 'Monthly CO₂'}</th>
+                                                <th className="text-right">{t('powerUnallocated') || 'Unallocated'}</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {summary.hosts.map(h => (
+                                                <tr key={h.node} className="border-b border-proxmox-border hover:bg-proxmox-dark">
+                                                    <td className="py-1.5 text-white">{h.node}{h.status !== 'online' && <span className="ml-1 text-gray-500">({h.status})</span>}</td>
+                                                    <td className={h.profile === 'host' ? 'text-green-400' : 'text-gray-500'}>
+                                                        {h.profile === 'host' ? (t('powerProfileHost') || 'Own profile') : (t('powerProfileCluster') || 'Cluster default')}
+                                                    </td>
+                                                    <td className="text-right text-gray-400">{h.idle_w} / {h.max_w}</td>
+                                                    <td className="text-right text-gray-400">{h.online_h}</td>
+                                                    <td className="text-right text-gray-300">{h.avg_w}</td>
+                                                    <td className="text-right text-yellow-400">{fmtKwh(h.monthly.kwh)}</td>
+                                                    <td className="text-right font-semibold text-green-400">{fmtCost(h.monthly.cost)}</td>
+                                                    <td className="text-right text-emerald-400">{fmtCo2(h.monthly.kg_co2)}</td>
+                                                    <td className="text-right text-gray-400" title={t('powerUnallocatedHint') || 'Host power no guest accounts for: the baseline of a host without running guests, and host CPU above what its guests use.'}>
+                                                        {fmtKwh(h.monthly_unallocated.kwh)} · {fmtCost(h.monthly_unallocated.cost)}
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            )}
+
+                            {!summary.hosts?.length && summary.by_node && Object.keys(summary.by_node).length > 0 && (
                                 <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
                                     <h3 className="text-sm font-semibold text-white mb-2">{t('powerByNode') || 'Per node'}</h3>
                                     <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
@@ -4803,9 +5490,20 @@
                                             <tr key={r.vmid} className="border-b border-proxmox-border/30 hover:bg-proxmox-dark/40">
                                                 <td className="py-1.5 text-white">{r.name}{r.low_data && <span className="ml-1 text-yellow-500" title={t('lowDataWarning') || 'limited samples'}>⚠</span>}</td>
                                                 <td className="text-gray-400">{r.vmid}</td>
-                                                <td className="text-gray-400">{r.node}</td>
+                                                <td className="text-gray-400">
+                                                    {/* LW Oct 2026 - a guest that is gone and ran before hosts were tracked
+                                                        has no host to charge: say so instead of an empty cell and a "~" */}
+                                                    {r.node ? r.node : <span data-power-no-host title={t('powerNoHost') || 'No host recorded: the guest is gone, and its history is from before hosts were tracked. Its share is in Unallocated.'}>-</span>}
+                                                    {Object.keys(r.by_node || {}).length > 1 && (
+                                                        <span className="ml-1 text-blue-400" title={`${t('powerMigrated') || 'Ran on several hosts in this window'}: ${Object.entries(r.by_node).map(([n, k]) => `${n} ${k} kWh`).join(', ')}`}>+{Object.keys(r.by_node).length - 1}</span>
+                                                    )}
+                                                    {r.node_estimated && r.node && <span className="ml-1 text-yellow-500" title={t('powerNodeGuessed') || 'Host partly taken from where it runs today'}>~</span>}
+                                                </td>
                                                 <td className="text-right text-gray-300">{r.avg_cpu_pct}%</td>
-                                                <td className="text-right text-gray-300">{r.avg_mem_pct}%</td>
+                                                <td className="text-right text-gray-300">
+                                                    {r.avg_mem_pct}%
+                                                    {r.avg_mem_pct > 100 && <span data-power-mem-over className="ml-1 text-yellow-500" title={t('powerMemOverAssigned') || 'More than assigned: Proxmox counts the QEMU process, which a guest without the balloon driver can push past its RAM. The host draws for it all the same.'}>ⓘ</span>}
+                                                </td>
                                                 <td className="text-right text-gray-400">{r.running_h}</td>
                                                 <td className="text-right text-yellow-400">{r.kwh}</td>
                                                 <td className="text-right text-yellow-400">{r.monthly_kwh}</td>
@@ -4868,6 +5566,70 @@
                             </div>
                         </div>
                     )}
+
+                    {hostForm && (
+                        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" onClick={() => !savingHosts && setHostForm(null)}>
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-5 w-full max-w-3xl max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()} data-power-host-profiles>
+                                <h3 className="text-base font-semibold text-white mb-1">{t('powerHostProfiles') || 'Host profiles'}</h3>
+                                <p className="text-xs text-gray-500 mb-3">
+                                    {t('powerHostProfilesHint') || 'Whole-system watts at the wall, idle and at full CPU load, ideally read off a power meter. A host without its own profile uses the cluster rates. RAM watts are not added on top of a host profile, they are part of it.'}
+                                </p>
+                                <table className="w-full text-xs">
+                                    <thead className="text-gray-400 uppercase text-[10px]">
+                                        <tr className="border-b border-proxmox-border">
+                                            <th className="text-left py-2">{t('node') || 'Node'}</th>
+                                            <th className="text-left">{t('powerProfileHost') || 'Own profile'}</th>
+                                            <th className="text-left">{t('powerHostIdleW') || 'Idle (W)'}</th>
+                                            <th className="text-left">{t('powerHostMaxW') || 'Full load (W)'}</th>
+                                            <th className="text-left">{t('notes') || 'Notes'}</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {hostForm.map(h => (
+                                            <tr key={h.node} className="border-b border-proxmox-border">
+                                                <td className="py-1.5 text-white">
+                                                    {h.node}
+                                                    <div className="text-[10px] text-gray-500">
+                                                        {h.in_cluster ? `${h.cores} CPU · ${h.memory_gb} GB · ${h.status}` : (t('powerHostGone') || 'no longer in the cluster')}
+                                                    </div>
+                                                </td>
+                                                <td>
+                                                    <input type="checkbox" checked={h.own} disabled={savingHosts || (!h.in_cluster && !h.own)}
+                                                        onChange={e => setHost(h.node, { own: e.target.checked })} />
+                                                </td>
+                                                <td className="pr-2">
+                                                    <input type="number" min="0" step="1" value={h.idle} disabled={savingHosts || !h.own || !h.in_cluster}
+                                                        onChange={e => setHost(h.node, { idle: e.target.value })}
+                                                        className="w-20 px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm disabled:opacity-50" />
+                                                </td>
+                                                <td className="pr-2">
+                                                    <input type="number" min="0" step="1" value={h.max} disabled={savingHosts || !h.own || !h.in_cluster}
+                                                        onChange={e => setHost(h.node, { max: e.target.value })}
+                                                        className="w-20 px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm disabled:opacity-50" />
+                                                </td>
+                                                <td>
+                                                    <input type="text" maxLength={500} value={h.notes || ''} disabled={savingHosts || !h.own || !h.in_cluster}
+                                                        onChange={e => setHost(h.node, { notes: e.target.value })}
+                                                        className="w-full px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm disabled:opacity-50" />
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                                <div className="flex justify-end gap-2 mt-4">
+                                    <button onClick={() => setHostForm(null)} disabled={savingHosts}
+                                        className="px-3 py-1.5 text-sm text-gray-400 hover:text-white">
+                                        {t('cancel') || 'Cancel'}
+                                    </button>
+                                    <button onClick={saveHosts} disabled={savingHosts}
+                                        className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 disabled:opacity-50 text-white text-sm rounded flex items-center gap-1.5">
+                                        {savingHosts ? <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" /> : <Icons.Check className="w-3.5 h-3.5" />}
+                                        {t('save') || 'Save'}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
                 </div>
             );
         }
@@ -4885,20 +5647,24 @@
             const [savingRates, setSavingRates] = React.useState(false);
             const [sortBy, setSortBy] = React.useState('cost_total');
 
+            const asked = React.useRef(0);  // only the newest request writes, as in PowerCarbonTab
             const refresh = async () => {
                 if (!clusterId) return;
+                const mine = ++asked.current;
                 setLoading(true);
                 try {
                     const [s, p] = await Promise.all([
                         authFetch(`${API_URL}/clusters/${clusterId}/costs/summary?days=${days}`).then(r => r?.json()).catch(() => null),
                         authFetch(`${API_URL}/clusters/${clusterId}/costs/per-vm?days=${days}`).then(r => r?.json()).catch(() => null),
                     ]);
+                    if (mine !== asked.current) return;
                     if (s && !s.error) setSummary(s);
                     if (p && p.rows) setRows(p.rows);
-                } finally { setLoading(false); }
+                } finally { if (mine === asked.current) setLoading(false); }
             };
 
             React.useEffect(() => { refresh(); /* eslint-disable-line */ }, [clusterId, days]);
+            useReportFollowUp(summary, refresh, [clusterId, days]);
 
             const openRates = async () => {
                 const r = await authFetch(`${API_URL}/cost/rates/${clusterId}`).then(r => r?.json()).catch(() => null);
@@ -5095,6 +5861,7 @@
                             <p className="text-xs text-gray-500 mt-0.5">
                                 {t('costDashboardDesc') || 'Estimated chargeback per VM/CT based on metrics history × configured rates.'}
                             </p>
+                            <ReportStamp report={summary} t={t} />
                         </div>
                         <div className="flex gap-2">
                             <select value={days} onChange={e => setDays(parseInt(e.target.value, 10))}
@@ -5439,9 +6206,158 @@
             );
         }
 
+        // LW Oct 2026 - what the balancer moved on this cluster and why. The server keeps it in
+        // the migration history, so it outlives a restart; read when the settings open and on
+        // demand, a page at a time, never polled. The reason is worded here from the numbers the
+        // server stored; a caller confined to some guests gets their rows without them.
+        // BAL_HIST_TRIGGERS sits beside MigrationHistory (vm_modals.js)
+        const BAL_HIST_PAGE = 50;
+        const BAL_HIST_STATUS = {
+            success: ['balHistStatusSuccess', 'text-green-400'],
+            failed: ['balHistStatusFailed', 'text-red-400'],
+            dry_run: ['balHistStatusDryRun', 'text-yellow-400'],
+        };
+        function balHistReason(e, t) {
+            const d = e.details || {};
+            const fill = (key, vals) => Object.keys(vals).reduce(
+                (s, k) => s.split(`{${k}}`).join(String(vals[k] ?? '?')), t(key));
+            const load = (l) => l || {};
+            let text = '';
+            if (e.trigger === 'balance' && d.source_load) {
+                const s = load(d.source_load), g = load(d.target_load);
+                text = fill('balHistWhyBalance', { src: d.source, srcScore: s.score, srcCpu: s.cpu, srcMem: s.mem,
+                    tgt: d.target, tgtScore: g.score, tgtCpu: g.cpu, tgtMem: g.mem, diff: d.diff,
+                    threshold: d.threshold, tolerance: d.tolerance });
+            } else if (e.trigger === 'predictive' && d.forecast !== undefined) {
+                text = fill('balHistWhyPredictive', { src: d.source, forecast: d.forecast, threshold: d.threshold,
+                    confidence: d.confidence, tgt: d.target, tgtScore: load(d.target_load).score });
+            } else if (e.trigger === 'affinity' && d.rule !== undefined) {
+                text = fill('balHistWhyAffinity', { rule: d.rule, src: d.source, tgt: d.target });
+            } else if (e.trigger === 'pin' && d.pinned) {
+                text = fill('balHistWhyPin', { nodes: d.pinned.join(', '), src: d.source, tgt: d.target });
+            } else {
+                return e.reason || '';
+            }
+            if (d.manual) text += ' ' + t('balHistManual');
+            if (d.requested_target) text += ' ' + fill('balHistRerouted', { node: e.target_node, requested: d.requested_target });
+            if (d.error) text += ' ' + fill('balHistFailedWith', { error: d.error });
+            return text;
+        }
+
+        function BalancerHistory({ clusterId, authFetch, t }) {
+            const [rows, setRows] = React.useState([]);
+            const [next, setNext] = React.useState(null);
+            const [loaded, setLoaded] = React.useState(false);
+            const [failed, setFailed] = React.useState(false);
+            const [loading, setLoading] = React.useState(false);
+            const [trigger, setTrigger] = React.useState('');
+            const [status, setStatus] = React.useState('');
+            const [leaderAway, setLeaderAway] = React.useState(false);
+            const gen = React.useRef(0);
+
+            const load = React.useCallback(async (before) => {
+                const mine = before ? gen.current : ++gen.current;
+                setLoading(true);
+                try {
+                    const q = new URLSearchParams({ limit: String(BAL_HIST_PAGE) });
+                    if (trigger) q.set('trigger', trigger);
+                    if (status) q.set('status', status);
+                    if (before) q.set('before', String(before));
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/balance-history?${q.toString()}`);
+                    // only the instance whose balancer runs keeps these rows (#625)
+                    const away = await haLeaderAway(r);
+                    const d = r && r.ok ? await r.json().catch(() => null) : null;
+                    if (mine !== gen.current) return;
+                    setLeaderAway(away);
+                    setFailed(!d && !away);
+                    if (!d) return;
+                    setRows(prev => before ? prev.concat(d.entries || []) : (d.entries || []));
+                    setNext(d.next_before || null);
+                    setLoaded(true);
+                } finally {
+                    if (mine === gen.current) setLoading(false);
+                }
+            }, [clusterId, authFetch, trigger, status]);
+
+            React.useEffect(() => {
+                setRows([]); setNext(null); setLoaded(false);
+                load(null);
+                return () => { gen.current += 1; };
+            }, [load]);
+
+            const selectCls = 'bg-proxmox-dark border border-proxmox-border rounded-lg px-2 py-1 text-xs text-gray-300';
+            const when = (ts) => { const d = new Date(ts); return isNaN(d) ? (ts || '') : d.toLocaleString(); };
+
+            return (
+                <div className="space-y-3 min-w-0" data-balancer-history>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="min-w-0">
+                            <h3 className="font-semibold flex items-center gap-2">
+                                <span className="text-blue-400 flex-shrink-0"><Icons.Activity /></span>
+                                {t('balHistTitle')}
+                            </h3>
+                            <p className="text-xs text-gray-500 mt-1">{t('balHistDesc')}</p>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                            <select value={trigger} onChange={e => setTrigger(e.target.value)} className={selectCls} data-bal-filter-trigger aria-label={t('balHistFilterTrigger')}>
+                                <option value="">{t('balHistAllTriggers')}</option>
+                                {Object.keys(BAL_HIST_TRIGGERS).map(k => <option key={k} value={k}>{t(BAL_HIST_TRIGGERS[k][0])}</option>)}
+                            </select>
+                            <select value={status} onChange={e => setStatus(e.target.value)} className={selectCls} data-bal-filter-status aria-label={t('balHistFilterStatus')}>
+                                <option value="">{t('balHistAllOutcomes')}</option>
+                                {Object.keys(BAL_HIST_STATUS).map(k => <option key={k} value={k}>{t(BAL_HIST_STATUS[k][0])}</option>)}
+                            </select>
+                            <button type="button" onClick={() => load(null)} disabled={loading} title={t('refresh')}
+                                className="p-1 text-gray-400 hover:text-white disabled:opacity-40" data-bal-refresh>
+                                {loading ? <Icons.RotateCw /> : <Icons.RefreshCw />}
+                            </button>
+                        </div>
+                    </div>
+                    {leaderAway && <div className="text-xs text-yellow-400" data-bal-leader-away>{t('pgHaLeaderAwayView')}</div>}
+                    {failed && <div className="text-xs text-red-400">{t('balHistLoadError')}</div>}
+                    {!loaded && !failed && !leaderAway && <div className="text-xs text-gray-500">{t('loading')}...</div>}
+                    {loaded && rows.length === 0 && (
+                        <div className="text-xs text-gray-500 p-2 bg-proxmox-dark rounded-lg" data-bal-empty>
+                            {t(trigger || status ? 'balHistNoMatch' : 'balHistNone')}
+                        </div>
+                    )}
+                    {rows.length > 0 && (
+                        <div className="space-y-2 max-h-96 overflow-y-auto">
+                            {rows.map(e => {
+                                const [tKey, tTone] = BAL_HIST_TRIGGERS[e.trigger] || ['', 'bg-gray-500/20 text-gray-400'];
+                                const [sKey, sTone] = BAL_HIST_STATUS[e.status] || ['', 'text-gray-400'];
+                                const why = balHistReason(e, t);
+                                return (
+                                    <div key={e.id} data-bal-row={e.id}
+                                        className="flex flex-col gap-1 bg-proxmox-dark rounded-lg px-3 py-2 text-xs min-w-0">
+                                        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 min-w-0">
+                                            <span className="text-gray-500 whitespace-nowrap">{when(e.timestamp)}</span>
+                                            <span className="text-sm text-gray-200 truncate">{e.vm_name || `VM ${e.vmid}`} <span className="text-gray-500">({e.vmid})</span></span>
+                                            <span className="flex items-center gap-1 font-mono text-gray-300">{e.source_node}<Icons.ArrowRight />{e.target_node}</span>
+                                            <span className={`px-1.5 py-0.5 rounded ${tTone}`} data-bal-trigger={e.trigger}>{tKey ? t(tKey) : e.trigger}</span>
+                                            <span className={sTone} data-bal-status={e.status}>{sKey ? t(sKey) : e.status}</span>
+                                        </div>
+                                        {why && <div className="text-gray-400 leading-relaxed" data-bal-why>{why}</div>}
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+                    {next && (
+                        <button type="button" onClick={() => load(next)} disabled={loading} data-bal-more
+                            className="text-xs text-blue-400 hover:text-blue-300 disabled:opacity-40">
+                            {t('balHistLoadMore')}
+                        </button>
+                    )}
+                </div>
+            );
+        }
+
         // NS May 2026 — Config Drift Detection.
-        // Tracks open events grouped by kind (vm_config, storage, network, cluster_options).
+        // Tracks open events grouped by kind (vm_config, storage, network, cluster_options,
+        // firewall, ha_rules, backup_jobs, access).
         // Admin can rescan, set baseline, acknowledge/promote events.
+        const DRIFT_KINDS = ['vm_config', 'storage', 'network', 'cluster_options', 'firewall', 'ha_rules', 'backup_jobs', 'access'];
         function DriftTab({ clusterId, clusterName, authFetch, addToast, t, isAdmin }) {
             // the admin buttons here change things: a standby hands them to the active (#625)
             const { haReadOnly } = useAuth();
@@ -5455,27 +6371,77 @@
             // #625: only the leader keeps the drift rows; a member says so while it is away
             // and drops what it showed, an ack must never name a row from elsewhere
             const [leaderAway, setLeaderAway] = React.useState(false);
+            // LW Oct 2026 - filters by kind and category, the policy checks and their allow list drafts
+            const [kindFilter, setKindFilter] = React.useState('');
+            const [catFilter, setCatFilter] = React.useState('');
+            const [policy, setPolicy] = React.useState([]);
+            const [allowDraft, setAllowDraft] = React.useState({});
 
             const refresh = async () => {
                 if (!clusterId) return;
                 setBusy(true);
                 try {
-                    const [sr, er] = await Promise.all([
+                    const q = `status=${filter}&limit=200` + (kindFilter ? `&kind=${kindFilter}` : '') + (catFilter ? `&category=${catFilter}` : '');
+                    const [sr, er, pr] = await Promise.all([
                         authFetch(`${API_URL}/clusters/${clusterId}/drift/status`),
-                        authFetch(`${API_URL}/clusters/${clusterId}/drift/events?status=${filter}&limit=200`),
+                        authFetch(`${API_URL}/clusters/${clusterId}/drift/events?${q}`),
+                        authFetch(`${API_URL}/clusters/${clusterId}/drift/policy`),
                     ]);
                     const away = (await haLeaderAway(sr)) || (await haLeaderAway(er));
                     setLeaderAway(away);
-                    if (away) { setStatus(null); setEvents([]); return; }
+                    if (away) { setStatus(null); setEvents([]); setPolicy([]); return; }
                     const s = await sr?.json().catch(() => null);
                     const e = await er?.json().catch(() => null);
+                    const pj = await pr?.json().catch(() => null);
                     if (s && !s.error) setStatus(s);
                     if (e && e.events) setEvents(e.events);
+                    if (pj && pj.checks) {
+                        setPolicy(pj.checks);
+                        setAllowDraft(d => {
+                            const next = { ...d };
+                            pj.checks.forEach(c => { if (c.allow && next[c.id] === undefined) next[c.id] = c.allow.join(', '); });
+                            return next;
+                        });
+                    }
                 } finally { setBusy(false); }
             };
 
             // again when forwarding comes or goes: the list is the leader's then, or not
-            React.useEffect(() => { refresh(); /* eslint-disable-line */ }, [clusterId, filter, haReadOnly]);
+            React.useEffect(() => { refresh(); /* eslint-disable-line */ }, [clusterId, filter, kindFilter, catFilter, haReadOnly]);
+
+            const savePolicy = async (id, patch) => {
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/drift/policy`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ checks: { [id]: patch } }),
+                    });
+                    if (r?.ok) {
+                        addToast(t('driftPolicySaved') || 'Policy saved', 'success');
+                        setAllowDraft(d => { const n = { ...d }; delete n[id]; return n; });
+                        await refresh();
+                    } else {
+                        addToast(t('driftPolicySaveFailed') || 'Policy not saved', 'error');
+                    }
+                } catch (e) { addToast(t('driftPolicySaveFailed') || 'Policy not saved', 'error'); }
+            };
+
+            const markIncident = async (ev, flag) => {
+                if (flag && !confirm(t('driftIncidentAsk') || 'Confirm this event as an incident?')) return;
+                try {
+                    const r = await authFetch(`${API_URL}/drift/events/${ev.id}/incident`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ incident: flag }),
+                    });
+                    if (r?.ok) {
+                        addToast(flag ? (t('driftIncidentConfirmed') || 'Confirmed as incident') : (t('driftIncidentWithdrawn') || 'Incident withdrawn'), 'success');
+                        await refresh();
+                    } else {
+                        addToast(t('driftIncidentFailed') || 'Could not change the event', 'error');
+                    }
+                } catch (e) { addToast(t('driftIncidentFailed') || 'Could not change the event', 'error'); }
+            };
 
             const scan = async () => {
                 setScanning(true);
@@ -5542,7 +6508,32 @@
                 'storage': t('driftKindStorage') || 'Storage',
                 'network': t('driftKindNetwork') || 'Network',
                 'cluster_options': t('driftKindCluster') || 'Cluster Options',
+                'firewall': t('driftKindFirewall') || 'Firewall',
+                'ha_rules': t('driftKindHa') || 'HA Rules',
+                'backup_jobs': t('driftKindBackup') || 'Backup Jobs',
+                'access': t('driftKindAccess') || 'Access',
             }[k] || k);
+
+            const catLabel = (c) => ({
+                'deviation': t('driftCatDeviation') || 'Deviation',
+                'policy_violation': t('driftCatPolicy') || 'Policy violation',
+                'incident': t('driftCatIncident') || 'Incident',
+            }[c] || c);
+            const catColor = (c) => ({
+                'policy_violation': 'bg-purple-500/15 text-purple-400',
+                'incident': 'bg-red-500/15 text-red-400',
+            }[c] || 'bg-gray-500/15 text-gray-400');
+            const policyColor = (st) => ({
+                'pass': 'bg-green-500/15 text-green-400',
+                'fail': 'bg-red-500/15 text-red-400',
+                'not_checked': 'bg-yellow-500/15 text-yellow-400',
+            }[st] || 'bg-gray-500/15 text-gray-400');
+            const policyStatus = (st) => ({
+                'pass': t('driftPolicyPass') || 'Passed',
+                'fail': t('driftPolicyFail') || 'Violated',
+                'not_checked': t('driftNotChecked') || 'Not checked',
+                'disabled': t('driftPolicyDisabled') || 'Off',
+            }[st] || st);
 
             // LW Oct 2026 - 'unknown' is a scope on a node that did not answer (#968):
             // not checked, so the old value is not struck through
@@ -5551,6 +6542,7 @@
                 'removed': t('driftOpRemoved') || 'removed',
                 'changed': t('driftOpChanged') || 'changed',
                 'unknown': t('nodeOffline') || 'Node offline',
+                'violation': t('driftOpViolation') || 'violation',
             }[op] || op);
 
             const fmtVal = (v) => {
@@ -5577,6 +6569,16 @@
                                 <option value="open">{t('driftOpen') || 'open'}</option>
                                 <option value="acknowledged">{t('driftAcknowledged2') || 'acknowledged'}</option>
                                 <option value="all">{t('all') || 'all'}</option>
+                            </select>
+                            <select value={kindFilter} onChange={e => setKindFilter(e.target.value)} data-drift-filter="kind"
+                                className="px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm">
+                                <option value="">{t('driftAllKinds') || 'All kinds'}</option>
+                                {DRIFT_KINDS.map(k => <option key={k} value={k}>{kindLabel(k)}</option>)}
+                            </select>
+                            <select value={catFilter} onChange={e => setCatFilter(e.target.value)} data-drift-filter="category"
+                                className="px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm">
+                                <option value="">{t('driftAllCategories') || 'All categories'}</option>
+                                {['deviation', 'policy_violation', 'incident'].map(c => <option key={c} value={c}>{catLabel(c)}</option>)}
                             </select>
                             {canAct && (
                                 <>
@@ -5613,22 +6615,86 @@
                                 { k: 'storage', l: kindLabel('storage'), c: 'border-purple-500/30' },
                                 { k: 'network', l: kindLabel('network'), c: 'border-red-500/30' },
                                 { k: 'cluster_options', l: kindLabel('cluster_options'), c: 'border-orange-500/30' },
+                                { k: 'firewall', l: kindLabel('firewall'), c: 'border-red-500/30' },
+                                { k: 'ha_rules', l: kindLabel('ha_rules'), c: 'border-blue-500/30' },
+                                { k: 'backup_jobs', l: kindLabel('backup_jobs'), c: 'border-purple-500/30' },
+                                { k: 'access', l: kindLabel('access'), c: 'border-orange-500/30' },
                             ].map(it => {
                                 const counts = (status.by_kind || {})[it.k] || {};
                                 const total = (counts.critical || 0) + (counts.warning || 0) + (counts.info || 0);
+                                // LW Oct 2026 - a kind the last scan could not read is not "0 drift",
+                                // and neither is one it read but had no baseline to compare with
+                                const read = (status.kinds || {})[it.k];
                                 return (
-                                    <div key={it.k} className={`bg-proxmox-card border ${it.c} rounded-xl p-3`}>
+                                    <div key={it.k} data-drift-kind={it.k} onClick={() => setKindFilter(kindFilter === it.k ? '' : it.k)}
+                                        className={`bg-proxmox-card border ${it.c} rounded-xl p-3 cursor-pointer`}>
                                         <div className="text-xs text-gray-500">{it.l}</div>
                                         <div className="text-2xl font-bold text-white mt-1">{total}</div>
                                         <div className="text-[10px] text-gray-500 mt-1">
                                             {counts.critical ? <span className="text-red-400">{counts.critical} crit · </span> : null}
                                             {counts.warning ? <span className="text-yellow-400">{counts.warning} warn · </span> : null}
                                             {counts.info ? <span className="text-blue-400">{counts.info} info</span> : null}
-                                            {!total && <span>—</span>}
+                                            {!total && <span>-</span>}
                                         </div>
+                                        {(read === 'not_checked' || read === 'partial' || read === 'no_baseline') && (
+                                            <div data-drift-unread={read} className="text-[10px] text-yellow-400 mt-1">
+                                                {read === 'no_baseline' ? (t('driftNoBaselineYet') || 'No baseline yet')
+                                                    : read === 'partial' ? (t('driftPartlyChecked') || 'Partly checked')
+                                                    : (t('driftNotChecked') || 'Not checked')}
+                                            </div>
+                                        )}
                                     </div>
                                 );
                             })}
+                        </div>
+                    )}
+
+                    {status && status.planned > 0 && (
+                        <div data-drift-planned-count className="text-xs text-green-400">
+                            {chgFill(t, 'driftPlannedCount', { n: status.planned })}
+                        </div>
+                    )}
+
+                    {!leaderAway && policy.length > 0 && (
+                        <div data-drift-policy className="bg-proxmox-card border border-proxmox-border rounded-xl p-3 space-y-2">
+                            <div>
+                                <div className="text-sm font-semibold text-white">{t('driftPolicyTitle') || 'Policy checks'}</div>
+                                <div className="text-xs text-gray-500">{t('driftPolicyDesc') || 'Forbidden states, judged on every scan. A check that could not read its data says so and never passes.'}</div>
+                            </div>
+                            <div className="divide-y divide-proxmox-border/40">
+                                {policy.map(c => (
+                                    <div key={c.id} data-drift-check={c.id} className="py-2 flex items-start justify-between gap-3 flex-wrap">
+                                        <div className="min-w-0">
+                                            <div className="flex items-center gap-2 flex-wrap">
+                                                <span className="text-xs text-gray-300">{t('driftCheck_' + c.id) || c.id}</span>
+                                                <span className="text-[10px] text-gray-500">{kindLabel(c.kind)}</span>
+                                                <span className={`px-1.5 py-0.5 text-[10px] rounded ${policyColor(c.status)}`}>{policyStatus(c.status)}</span>
+                                            </div>
+                                            {(c.violations || []).slice(0, 5).map((v, i) => (
+                                                <div key={i} className="text-[11px] text-gray-400 font-mono break-all">{v.path}: {v.detail}</div>
+                                            ))}
+                                            {c.allow && canAct && (
+                                                <div className="flex items-center gap-2 mt-1">
+                                                    <input value={allowDraft[c.id] !== undefined ? allowDraft[c.id] : c.allow.join(', ')}
+                                                        onChange={e => setAllowDraft({ ...allowDraft, [c.id]: e.target.value })}
+                                                        placeholder={t('driftPolicyAllow') || 'Allowed names, comma separated'}
+                                                        className="px-2 py-1 bg-proxmox-dark border border-proxmox-border rounded text-white text-xs w-64 max-w-full" />
+                                                    <button onClick={() => savePolicy(c.id, { allow: (allowDraft[c.id] !== undefined ? allowDraft[c.id] : c.allow.join(',')).split(',').map(x => x.trim()).filter(Boolean) })}
+                                                        className="text-[11px] px-2 py-0.5 bg-proxmox-darker border border-proxmox-border rounded text-gray-300 hover:text-white">
+                                                        {t('save') || 'Save'}
+                                                    </button>
+                                                </div>
+                                            )}
+                                        </div>
+                                        {canAct && (
+                                            <label className="flex items-center gap-1.5 text-xs text-gray-300 cursor-pointer flex-shrink-0">
+                                                <input type="checkbox" checked={!!c.enabled} onChange={e => savePolicy(c.id, { enabled: e.target.checked })} />
+                                                {t('driftPolicyEnabled') || 'Check on every scan'}
+                                            </label>
+                                        )}
+                                    </div>
+                                ))}
+                            </div>
                         </div>
                     )}
 
@@ -5651,6 +6717,15 @@
                                              onClick={() => setExpanded({ ...expanded, [ev.id]: !open })}>
                                             <div className="flex items-center gap-2 min-w-0">
                                                 <span className={`px-1.5 py-0.5 text-[10px] rounded ${sevColor(ev.severity)} flex-shrink-0`}>{ev.severity}</span>
+                                                {ev.category && ev.category !== 'deviation' && (
+                                                    <span data-drift-category={ev.category} className={`px-1.5 py-0.5 text-[10px] rounded ${catColor(ev.category)} flex-shrink-0`}>{catLabel(ev.category)}</span>
+                                                )}
+                                                {ev.change_id && (
+                                                    <span data-drift-planned={ev.change_id} title={ev.change_title}
+                                                        className="px-1.5 py-0.5 text-[10px] rounded bg-green-500/15 text-green-400 flex-shrink-0 max-w-xs truncate">
+                                                        {chgFill(t, 'driftPlanned', { title: ev.change_title || '' })}
+                                                    </span>
+                                                )}
                                                 <span className="text-xs text-gray-300 truncate">
                                                     <span className="text-gray-400">{kindLabel(ev.kind)}:</span> {ev.scope}
                                                 </span>
@@ -5665,11 +6740,25 @@
                                                             className="text-[11px] px-2 py-0.5 bg-proxmox-darker border border-proxmox-border rounded text-gray-300 hover:text-white">
                                                             {t('driftAck') || 'Ack'}
                                                         </button>
-                                                        <button onClick={e => { e.stopPropagation(); ack(ev.id, true); }}
-                                                            className="text-[11px] px-2 py-0.5 bg-orange-500/80 hover:bg-orange-600 rounded text-white">
-                                                            {t('driftPromote') || 'Promote'}
-                                                        </button>
+                                                        {ev.category !== 'policy_violation' && ev.category !== 'incident' && (
+                                                            <button onClick={e => { e.stopPropagation(); ack(ev.id, true); }}
+                                                                className="text-[11px] px-2 py-0.5 bg-orange-500/80 hover:bg-orange-600 rounded text-white">
+                                                                {t('driftPromote') || 'Promote'}
+                                                            </button>
+                                                        )}
                                                     </>
+                                                )}
+                                                {canAct && ev.category !== 'incident' && (
+                                                    <button data-drift-incident={ev.id} onClick={e => { e.stopPropagation(); markIncident(ev, true); }}
+                                                        className="text-[11px] px-2 py-0.5 bg-red-500/20 border border-red-500/30 rounded text-red-300 hover:text-white">
+                                                        {t('driftConfirmIncident') || 'Confirm as incident'}
+                                                    </button>
+                                                )}
+                                                {canAct && ev.category === 'incident' && (
+                                                    <button onClick={e => { e.stopPropagation(); markIncident(ev, false); }}
+                                                        className="text-[11px] px-2 py-0.5 bg-proxmox-darker border border-proxmox-border rounded text-gray-300 hover:text-white">
+                                                        {t('driftWithdrawIncident') || 'Withdraw incident'}
+                                                    </button>
                                                 )}
                                                 <Icons.ChevronDown className={`w-3.5 h-3.5 text-gray-500 transition-transform ${open ? 'rotate-180' : ''}`} />
                                             </div>
@@ -5684,6 +6773,11 @@
                                                         <div className="col-span-4 text-green-400 font-mono break-all">{fmtVal(d.after)}</div>
                                                     </div>
                                                 ))}
+                                                {ev.confirmed_at && (
+                                                    <div className="text-gray-500 mt-2">
+                                                        {t('driftConfirmedBy') || 'Confirmed as incident by'} {ev.confirmed_by} {t('at') || 'at'} {(ev.confirmed_at || '').replace('T', ' ').slice(0, 16)}
+                                                    </div>
+                                                )}
                                                 {ev.acknowledged_at && (
                                                     <div className="text-gray-500 mt-2">
                                                         {t('driftAcknowledgedBy') || 'Acknowledged by'} {ev.acknowledged_by} {t('at') || 'at'} {(ev.acknowledged_at || '').replace('T', ' ').slice(0, 16)}
@@ -5695,6 +6789,620 @@
                                 );
                             })}
                         </div>
+                    )}
+                </div>
+            );
+        }
+
+        // NS Oct 2026 - the evidence bundle of the cluster timeline: download what the page shows
+        // (window and filters) as a signed file, or hand such a file back and see whether this
+        // instance signed it unchanged. Shown on the cluster timeline only; a node or a guest
+        // view has no bundle of its own.
+        function TimelineEvidence({ clusterId, authFetch, t, getQuery }) {
+            const [busy, setBusy] = React.useState(false);
+            const [verdict, setVerdict] = React.useState(null);
+            const fetchRef = React.useRef(authFetch);
+            fetchRef.current = authFetch;
+
+            const download = async () => {
+                setBusy(true); setVerdict(null);
+                try {
+                    const q = new URLSearchParams({ clusters: clusterId });
+                    const want = getQuery();
+                    if (want.from) q.set('from', want.from);
+                    if (want.kinds) q.set('kinds', want.kinds);
+                    if (want.severity) q.set('severity', want.severity);
+                    const r = await fetchRef.current(`${API_URL}/timeline/evidence?${q.toString()}`);
+                    if (!r || !r.ok) { setVerdict({ bad: true, text: t('flrExportFailed') }); return; }
+                    const blob = await r.blob();
+                    const named = /filename="([^"]+)"/.exec(r.headers.get('Content-Disposition') || '');
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = named ? named[1] : 'flight-recorder.json';
+                    document.body.appendChild(a);
+                    a.click();
+                    setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(a.href); }, 150);
+                } catch (e) {
+                    setVerdict({ bad: true, text: t('flrExportFailed') });
+                } finally {
+                    setBusy(false);
+                }
+            };
+
+            const check = async (file) => {
+                setVerdict(null);
+                if (!file) return;
+                try {
+                    const r = await fetchRef.current(`${API_URL}/timeline/evidence/verify`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: await file.text() });
+                    const v = r && r.ok ? await r.json().catch(() => null) : null;
+                    if (!v) { setVerdict({ bad: true, text: t('flrVerifyFailed') }); return; }
+                    setVerdict(v.valid ? { bad: false, text: t('flrVerifyValid') }
+                        : { bad: true, text: tlFill(t, 'flrVerifyInvalid', { reason: v.reason || '' }) });
+                } catch (e) {
+                    setVerdict({ bad: true, text: t('flrVerifyFailed') });
+                }
+            };
+
+            const btn = 'flex items-center gap-1 px-2 py-1 text-xs text-gray-300 hover:text-white border border-proxmox-border rounded';
+            return (
+                <div className="flex flex-wrap items-center gap-2" data-tl-evidence>
+                    <button type="button" onClick={download} disabled={busy} title={t('flrExportTitle')}
+                        className={`${btn} disabled:opacity-40`} data-tl-export>
+                        <Icons.Download />{t('flrExport')}
+                    </button>
+                    <label className={`${btn} cursor-pointer`}>
+                        <Icons.Check />{t('flrVerify')}
+                        <input type="file" accept="application/json,.json" className="hidden" data-tl-verify
+                            onChange={e => { check(e.target.files && e.target.files[0]); e.target.value = ''; }} />
+                    </label>
+                    {verdict && (
+                        <span className={`text-xs ${verdict.bad ? 'text-red-400' : 'text-green-400'}`}
+                            data-tl-verdict={verdict.bad ? 'bad' : 'ok'}>{verdict.text}</span>
+                    )}
+                </div>
+            );
+        }
+
+        // NS Oct 2026 - change plans (GET/POST /api/changes): a planned change with a scope and a
+        // window, approved by a second administrator. Nothing here runs a change. Which buttons a
+        // plan gets, and why Approve is off, is the server's answer (`can`, `approve_blocked`),
+        // not a guess made from the role. Writes ask for the active, like the other tabs (#625).
+        const CHG_KINDS = ['guests', 'nodes', 'storage', 'network', 'firewall', 'ha', 'backup', 'access', 'cluster'];
+        const CHG_KIND_KEYS = {
+            guests: 'chgKindGuests', nodes: 'chgKindNodes', storage: 'chgKindStorage', network: 'chgKindNetwork',
+            firewall: 'chgKindFirewall', ha: 'chgKindHa', backup: 'chgKindBackup', access: 'chgKindAccess',
+            cluster: 'chgKindCluster',
+        };
+        const CHG_STATES = ['draft', 'submitted', 'approved', 'rejected', 'cancelled', 'done', 'expired'];
+        const CHG_STATE_KEYS = {
+            draft: 'chgStDraft', submitted: 'chgStSubmitted', approved: 'chgStApproved', rejected: 'chgStRejected',
+            cancelled: 'chgStCancelled', done: 'chgStDone', expired: 'chgStExpired',
+        };
+        const CHG_STATE_COLORS = {
+            draft: 'bg-gray-500/15 text-gray-300', submitted: 'bg-yellow-500/15 text-yellow-400',
+            approved: 'bg-green-500/15 text-green-400', rejected: 'bg-red-500/15 text-red-400',
+            cancelled: 'bg-gray-500/15 text-gray-400', done: 'bg-blue-500/15 text-blue-400',
+            expired: 'bg-orange-500/15 text-orange-400',
+        };
+
+        function chgFill(t, key, vals) {
+            return Object.keys(vals).reduce((s, k) => s.split(`{${k}}`).join(String(vals[k] ?? '')), t(key));
+        }
+
+        // the window is typed in local time and travels as UTC
+        function chgToIso(local) {
+            if (!local) return null;
+            const d = new Date(local);
+            return isNaN(d.getTime()) ? null : d.toISOString().replace(/\.\d+Z$/, 'Z');
+        }
+
+        function chgToLocal(iso) {
+            if (!iso) return '';
+            const d = new Date(iso);
+            if (isNaN(d.getTime())) return '';
+            const p = (n) => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+        }
+
+        function chgShow(iso) {
+            if (!iso) return '';
+            const d = new Date(iso);
+            return isNaN(d.getTime()) ? iso : d.toLocaleString();
+        }
+
+        const CHG_EMPTY_FORM = { id: null, title: '', description: '', kind: 'guests', targets: '', start: '', end: '' };
+
+        function ChangesTab({ clusterId, authFetch, addToast, t, canRequest }) {
+            const { haReadOnly } = useAuth();
+            const [plans, setPlans] = React.useState([]);
+            const [filter, setFilter] = React.useState('');
+            const [busy, setBusy] = React.useState(false);
+            const [form, setForm] = React.useState(null);
+            const [rejecting, setRejecting] = React.useState(null);
+            const [reason, setReason] = React.useState('');
+
+            const refresh = async () => {
+                if (!clusterId) { setPlans([]); return; }
+                setBusy(true);
+                try {
+                    const q = `cluster=${encodeURIComponent(clusterId)}` + (filter ? `&status=${filter}` : '');
+                    const r = await authFetch(`${API_URL}/changes?${q}`);
+                    const j = await r?.json().catch(() => null);
+                    if (j && j.changes) setPlans(j.changes);
+                } finally { setBusy(false); }
+            };
+            React.useEffect(() => { setForm(null); setRejecting(null); }, [clusterId]);
+            React.useEffect(() => { refresh(); /* eslint-disable-line */ }, [clusterId, filter]);
+
+            const send = async (path, method, body) => {
+                const r = await authFetch(`${API_URL}/changes${path}`, {
+                    method, headers: { 'Content-Type': 'application/json' },
+                    body: body ? JSON.stringify(body) : undefined,
+                });
+                const j = await r?.json().catch(() => null);
+                if (!r?.ok) {
+                    addToast((j && j.error) || t('chgFailed'), 'error');
+                    return null;
+                }
+                return j;
+            };
+
+            const act = async (p, action, body) => {
+                if (action === 'cancel' && !confirm(t('chgCancelAsk'))) return;
+                const j = await send(`/${p.id}/${action}`, 'POST', body);
+                if (j) { addToast(t('chgMoved'), 'success'); setRejecting(null); setReason(''); await refresh(); }
+            };
+
+            const targetsOf = (f) => {
+                const parts = f.targets.split(',').map(x => x.trim()).filter(Boolean);
+                return f.kind === 'guests' ? parts.map(x => (/^\d+$/.test(x) ? parseInt(x, 10) : x)) : parts;
+            };
+
+            const save = async (andSubmit) => {
+                const body = {
+                    title: form.title, description: form.description,
+                    scope: { kind: form.kind, targets: form.kind === 'cluster' ? [] : targetsOf(form) },
+                    window_start: chgToIso(form.start), window_end: chgToIso(form.end),
+                };
+                const j = form.id ? await send(`/${form.id}`, 'PUT', body)
+                                  : await send('', 'POST', Object.assign({ cluster_id: clusterId }, body));
+                if (!j) return;
+                if (andSubmit) {
+                    const s = await send(`/${j.id}/submit`, 'POST');
+                    if (!s) { await refresh(); return; }
+                }
+                addToast(t('chgSaved'), 'success');
+                setForm(null);
+                await refresh();
+            };
+
+            const edit = (p) => setForm({
+                id: p.id, title: p.title, description: p.description || '',
+                kind: (p.scope || {}).kind || 'guests', targets: ((p.scope || {}).targets || []).join(', '),
+                start: chgToLocal(p.window_start), end: chgToLocal(p.window_end),
+            });
+
+            const kindText = (k) => t(CHG_KIND_KEYS[k] || 'chgKindGuests');
+            const blockedText = (p) => {
+                const key = 'chgBlocked' + (p.approve_blocked || '').replace(/^./, c => c.toUpperCase());
+                const txt = t(key);
+                return txt !== key ? txt : (p.approve_blocked_reason || '');
+            };
+            const input = 'w-full px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm';
+            const writable = !haReadOnly;
+
+            return (
+                <div className="space-y-4" data-changes-tab>
+                    <div className="flex items-center justify-between flex-wrap gap-2">
+                        <div>
+                            <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+                                <Icons.ClipboardList className="w-5 h-5 text-orange-400" />
+                                {t('chgTitle')}
+                            </h2>
+                            <p className="text-xs text-gray-500 mt-0.5">{t('chgDesc')}</p>
+                        </div>
+                        <div className="flex gap-2">
+                            <select value={filter} onChange={e => setFilter(e.target.value)} data-change-filter
+                                className="px-3 py-1.5 bg-proxmox-dark border border-proxmox-border rounded text-white text-sm">
+                                <option value="">{t('chgAllStatus')}</option>
+                                {CHG_STATES.map(s => <option key={s} value={s}>{t(CHG_STATE_KEYS[s])}</option>)}
+                            </select>
+                            {canRequest && writable && (
+                                <button data-change-new onClick={() => setForm(Object.assign({}, CHG_EMPTY_FORM))} disabled={!clusterId}
+                                    className="px-3 py-1.5 bg-orange-500 hover:bg-orange-600 rounded-lg text-sm text-white flex items-center gap-1.5 disabled:opacity-50">
+                                    <Icons.Plus className="w-3.5 h-3.5" />
+                                    {t('chgNew')}
+                                </button>
+                            )}
+                            <button onClick={refresh} disabled={busy}
+                                className="px-3 py-1.5 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm text-white flex items-center gap-1.5 disabled:opacity-50">
+                                {busy ? <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" /> : <Icons.RefreshCw className="w-3.5 h-3.5" />}
+                                {t('refresh')}
+                            </button>
+                        </div>
+                    </div>
+
+                    {!clusterId && (
+                        <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-6 text-center text-sm text-gray-500">{t('chgNeedCluster')}</div>
+                    )}
+
+                    {form && (
+                        <div data-change-form className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 space-y-3">
+                            <div className="text-sm font-semibold text-white">{form.id ? t('chgFormEdit') : t('chgFormNew')}</div>
+                            <div>
+                                <label className="text-xs text-gray-400">{t('chgFieldTitle')}</label>
+                                <input data-change-field="title" value={form.title} maxLength={200} className={input}
+                                    onChange={e => setForm({ ...form, title: e.target.value })} />
+                            </div>
+                            <div>
+                                <label className="text-xs text-gray-400">{t('chgFieldDesc')}</label>
+                                <textarea data-change-field="description" value={form.description} rows={3} className={input}
+                                    onChange={e => setForm({ ...form, description: e.target.value })} />
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div>
+                                    <label className="text-xs text-gray-400">{t('chgFieldKind')}</label>
+                                    <select data-change-field="kind" value={form.kind} className={input}
+                                        onChange={e => setForm({ ...form, kind: e.target.value })}>
+                                        {CHG_KINDS.map(k => <option key={k} value={k}>{kindText(k)}</option>)}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="text-xs text-gray-400">{t('chgFieldTargets')}</label>
+                                    {form.kind === 'cluster' ? (
+                                        <div className="text-xs text-gray-500 py-2">{t('chgTargetsCluster')}</div>
+                                    ) : (
+                                        <input data-change-field="targets" value={form.targets} className={input}
+                                            placeholder={form.kind === 'guests' ? t('chgTargetsGuests') : t('chgTargetsNames')}
+                                            onChange={e => setForm({ ...form, targets: e.target.value })} />
+                                    )}
+                                </div>
+                                <div>
+                                    <label className="text-xs text-gray-400">{t('chgFieldStart')}</label>
+                                    <input type="datetime-local" data-change-field="start" value={form.start} className={input}
+                                        onChange={e => setForm({ ...form, start: e.target.value })} />
+                                </div>
+                                <div>
+                                    <label className="text-xs text-gray-400">{t('chgFieldEnd')}</label>
+                                    <input type="datetime-local" data-change-field="end" value={form.end} className={input}
+                                        onChange={e => setForm({ ...form, end: e.target.value })} />
+                                </div>
+                            </div>
+                            <div className="text-[11px] text-gray-500">{t('chgWindowHint')}</div>
+                            <div className="flex gap-2 justify-end flex-wrap">
+                                <button data-change-close onClick={() => setForm(null)}
+                                    className="px-3 py-1.5 bg-proxmox-darker border border-proxmox-border rounded-lg text-sm text-gray-300 hover:text-white">
+                                    {t('chgClose')}
+                                </button>
+                                <button data-change-save onClick={() => save(false)} disabled={!form.title.trim()}
+                                    className="px-3 py-1.5 bg-proxmox-darker border border-proxmox-border rounded-lg text-sm text-gray-300 hover:text-white disabled:opacity-50">
+                                    {t('chgSaveDraft')}
+                                </button>
+                                <button data-change-save-submit onClick={() => save(true)} disabled={!form.title.trim()}
+                                    className="px-3 py-1.5 bg-orange-500 hover:bg-orange-600 rounded-lg text-sm text-white disabled:opacity-50">
+                                    {t('chgSaveSubmit')}
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {clusterId && plans.length === 0 ? (
+                        <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-6 text-center text-sm text-gray-500">{t('chgNone')}</div>
+                    ) : (
+                        <div className="space-y-3">
+                            {plans.map(p => {
+                                const can = p.can || {};
+                                const sc = p.scope || {};
+                                const showApprove = p.status === 'submitted' && (can.approve || (p.approve_blocked && p.approve_blocked !== 'no_permission'));
+                                return (
+                                    <div key={p.id} data-change={p.id} data-change-state={p.display_status}
+                                         className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 space-y-2">
+                                        <div className="flex items-start justify-between gap-2 flex-wrap">
+                                            <div className="flex items-center gap-2 min-w-0 flex-wrap">
+                                                <span className="text-sm font-semibold text-white break-words">{p.title}</span>
+                                                <span data-change-badge className={`px-1.5 py-0.5 text-[10px] rounded ${CHG_STATE_COLORS[p.display_status] || CHG_STATE_COLORS.draft}`}>
+                                                    {t(CHG_STATE_KEYS[p.display_status] || 'chgStDraft')}
+                                                </span>
+                                                <span className="px-1.5 py-0.5 text-[10px] rounded bg-blue-500/15 text-blue-400">{kindText(sc.kind)}</span>
+                                                {(sc.targets || []).length > 0 && (
+                                                    <span className="text-[11px] text-gray-400 font-mono break-all">{(sc.targets || []).join(', ')}</span>
+                                                )}
+                                            </div>
+                                            <div className="flex items-center gap-2 flex-wrap">
+                                                {writable && can.edit && (
+                                                    <button data-change-action="edit" onClick={() => edit(p)}
+                                                        className="text-[11px] px-2 py-0.5 bg-proxmox-darker border border-proxmox-border rounded text-gray-300 hover:text-white">{t('chgEdit')}</button>
+                                                )}
+                                                {writable && can.submit && (
+                                                    <button data-change-action="submit" onClick={() => act(p, 'submit')}
+                                                        className="text-[11px] px-2 py-0.5 bg-orange-500/80 hover:bg-orange-600 rounded text-white">{t('chgSubmit')}</button>
+                                                )}
+                                                {writable && showApprove && (
+                                                    <button data-change-action="approve" disabled={!can.approve}
+                                                        title={can.approve ? undefined : blockedText(p)} onClick={() => act(p, 'approve')}
+                                                        className="text-[11px] px-2 py-0.5 bg-green-600/80 hover:bg-green-600 rounded text-white disabled:opacity-40 disabled:cursor-not-allowed">{t('chgApprove')}</button>
+                                                )}
+                                                {writable && showApprove && (
+                                                    <button data-change-action="reject" disabled={!can.reject}
+                                                        title={can.reject ? undefined : blockedText(p)} onClick={() => { setRejecting(p.id); setReason(''); }}
+                                                        className="text-[11px] px-2 py-0.5 bg-red-500/20 border border-red-500/30 rounded text-red-300 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed">{t('chgReject')}</button>
+                                                )}
+                                                {writable && can.done && (
+                                                    <button data-change-action="done" onClick={() => act(p, 'done')}
+                                                        className="text-[11px] px-2 py-0.5 bg-blue-500/20 border border-blue-500/30 rounded text-blue-300 hover:text-white">{t('chgDone')}</button>
+                                                )}
+                                                {writable && can.cancel && (
+                                                    <button data-change-action="cancel" onClick={() => act(p, 'cancel')}
+                                                        className="text-[11px] px-2 py-0.5 bg-proxmox-darker border border-proxmox-border rounded text-gray-300 hover:text-white">{t('chgCancel')}</button>
+                                                )}
+                                            </div>
+                                        </div>
+                                        {p.description && <div className="text-xs text-gray-400 whitespace-pre-wrap break-words">{p.description}</div>}
+                                        <div className="text-[11px] text-gray-500 flex flex-wrap gap-x-4 gap-y-1">
+                                            <span data-change-window>{p.window_start && p.window_end
+                                                ? chgFill(t, 'chgWindowText', { start: chgShow(p.window_start), end: chgShow(p.window_end) })
+                                                : t('chgNoWindow')}</span>
+                                            <span>{chgFill(t, 'chgBy', { name: p.requested_by })}</span>
+                                            {p.approved_by && <span>{chgFill(t, 'chgApprovedBy', { name: p.approved_by })}</span>}
+                                            {p.rejected_by && <span>{chgFill(t, 'chgRejectedBy', { name: p.rejected_by, reason: p.reject_reason })}</span>}
+                                        </div>
+                                        {p.status === 'submitted' && !can.approve && p.approve_blocked && p.approve_blocked !== 'no_permission' && (
+                                            <div data-change-blocked={p.approve_blocked} className="text-[11px] text-yellow-400">{blockedText(p)}</div>
+                                        )}
+                                        {rejecting === p.id && (
+                                            <div data-change-reject-form className="flex items-center gap-2 flex-wrap">
+                                                <input data-change-reason value={reason} maxLength={500} onChange={e => setReason(e.target.value)}
+                                                    placeholder={t('chgRejectReason')} className={input + ' md:w-96'} />
+                                                <button data-change-reject-confirm disabled={!reason.trim()} onClick={() => act(p, 'reject', { reason })}
+                                                    className="text-[11px] px-2 py-1 bg-red-500/80 hover:bg-red-600 rounded text-white disabled:opacity-50">{t('chgReject')}</button>
+                                                <button onClick={() => setRejecting(null)}
+                                                    className="text-[11px] px-2 py-1 bg-proxmox-darker border border-proxmox-border rounded text-gray-300 hover:text-white">{t('chgClose')}</button>
+                                            </div>
+                                        )}
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // LW Oct 2026 - the flight recorder: what happened on a cluster, a node or a guest in one
+        // list, newest first (GET /api/timeline). What hangs under an event is correlation, the
+        // same guest or node shortly before, and the page says so. Only reads, so a standby
+        // shows it too; only the leader keeps these rows (#625).
+        const TL_PAGE = 50;
+        const TL_FOLLOW = 4;
+        const TL_KINDS = {
+            audit: ['tlKindAudit', Icons.FileText], alert: ['tlKindAlert', Icons.Bell],
+            migration: ['tlKindMigration', Icons.ArrowRight], balancer: ['tlKindBalancer', Icons.Activity],
+            drift: ['tlKindDrift', Icons.Shield], task: ['tlKindTask', Icons.Play], backup: ['tlKindBackup', Icons.Database],
+            backup_verify: ['tlKindBackupVerify', Icons.CheckCircle], node: ['tlKindNode', Icons.Server],
+            site_recovery: ['tlKindSiteRecovery', Icons.Globe], rolling_update: ['tlKindRollingUpdate', Icons.RefreshCw],
+            syslog: ['tlKindSyslog', Icons.Terminal], incident: ['tlKindIncident', Icons.AlertTriangle],
+        };
+        const TL_SEVERITY = {
+            critical: ['tlSevCritical', 'bg-red-500', 'text-red-400'],
+            warning: ['tlSevWarning', 'bg-yellow-500', 'text-yellow-400'],
+            info: ['tlSevInfo', 'bg-gray-500', 'text-gray-200'],
+        };
+        const TL_RANGES = [['tlRange1h', 1], ['tlRange24h', 24], ['tlRange7d', 168], ['tlRange30d', 720]];
+        const TL_NODE_TEXT = {
+            offline: 'tlNodeOffline', online: 'tlNodeOnline', unknown: 'tlNodeUnknown', maintenance: 'tlNodeMaintenance',
+            maintenance_end: 'tlNodeMaintenanceEnd', no_quorum: 'tlNodeNoQuorum', quorate: 'tlNodeQuorate',
+        };
+        // where a kind has a view of its own in the cluster
+        const TL_VIEWS = { drift: 'compliance', site_recovery: 'site-recovery', balancer: 'settings', rolling_update: 'settings' };
+
+        function tlFill(t, key, vals) {
+            return Object.keys(vals).reduce((s, k) => s.split(`{${k}}`).join(String(vals[k] ?? '')), t(key));
+        }
+
+        function tlText(e, t) {
+            const p = e.params || {};
+            const guest = e.guest_name ? `${e.guest_name} (${e.guest})` : (e.guest != null ? String(e.guest) : '');
+            const nodeKey = (e.what || '').startsWith('node.') && TL_NODE_TEXT[e.what.slice(5)];
+            if (nodeKey) {
+                return tlFill(t, nodeKey, { node: p.node || e.node || '' }) + (p.detail === 'in maintenance' ? ' ' + t('tlInMaintenance') : '');
+            }
+            switch (e.what) {
+                case 'alert.fired': return tlFill(t, 'tlAlertFired', { text: e.title });
+                case 'alert.resolved': return tlFill(t, 'tlAlertResolved', { text: e.title });
+                case 'migration': {
+                    const vals = { guest, source: p.source || '', target: p.target || '' };
+                    if (p.status === 'failed') return tlFill(t, 'tlMigrationFailed', vals);
+                    if (p.status === 'dry_run') return tlFill(t, 'tlBalancerDryRun', vals);
+                    return tlFill(t, e.kind === 'balancer' ? 'tlBalancerMoved' : 'tlMigrated', vals);
+                }
+                case 'backup_verify':
+                    return tlFill(t, p.status === 'passed' ? 'tlVerifyPassed'
+                        : (p.status === 'failed' || p.status === 'error') ? 'tlVerifyFailed' : 'tlVerifyRunning', { guest });
+                case 'rolling.started': return tlFill(t, 'tlRollingStarted', { nodes: p.nodes });
+                case 'rolling.ended': return tlFill(t, 'tlRollingEnded', { status: p.status || '' });
+                case 'site_recovery': return tlFill(t, 'tlSiteRecovery', { plan: p.plan || '', type: p.event_type || '', status: p.status || '' });
+                default: return e.title || e.kind;
+            }
+        }
+
+        function TimelineView({ clusterId, node, vmid, authFetch, t, compact, onOpenGuest, onOpenNode, onOpenTab }) {
+            const [hours, setHours] = React.useState(24);
+            const [kind, setKind] = React.useState('');
+            const [severity, setSeverity] = React.useState('');
+            const [rows, setRows] = React.useState([]);
+            const [next, setNext] = React.useState(null);
+            const [sources, setSources] = React.useState({});
+            const [linkWindow, setLinkWindow] = React.useState(10);
+            const [loaded, setLoaded] = React.useState(false);
+            const [failed, setFailed] = React.useState(false);
+            const [loading, setLoading] = React.useState(false);
+            const [leaderAway, setLeaderAway] = React.useState(false);
+            const [open, setOpen] = React.useState({});
+            const gen = React.useRef(0);
+            const from = React.useRef(null);
+            // the detail views build their fetch on every render; the list loads on what it asks, not on that
+            const fetchRef = React.useRef(authFetch);
+            fetchRef.current = authFetch;
+
+            const load = React.useCallback(async (before, hops = 0) => {
+                if (!clusterId) return;
+                const mine = before ? gen.current : ++gen.current;
+                if (!before) from.current = new Date(Date.now() - hours * 3600 * 1000).toISOString();
+                setLoading(true);
+                try {
+                    const q = new URLSearchParams({ cluster: clusterId, limit: String(TL_PAGE), from: from.current });
+                    if (node) q.set('node', node);
+                    if (vmid != null) q.set('vmid', String(vmid));
+                    if (kind) q.set('kinds', kind);
+                    if (severity) q.set('severity', severity);
+                    if (before) q.set('before', before);
+                    const r = await fetchRef.current(`${API_URL}/timeline?${q.toString()}`);
+                    const away = await haLeaderAway(r);
+                    const d = r && r.ok ? await r.json().catch(() => null) : null;
+                    if (mine !== gen.current) return;
+                    setLeaderAway(away);
+                    setFailed(!d && !away);
+                    if (!d) return;
+                    const got = d.events || [];
+                    setRows(prev => before ? prev.concat(got) : got);
+                    setSources(d.sources || {});
+                    setLinkWindow((d.correlation || {}).window_minutes ?? 10);
+                    // LW Oct 2026 - a filter can empty a page with more below it: go on by itself, a few pages at most
+                    if (!got.length && d.next_before && hops < TL_FOLLOW) return await load(d.next_before, hops + 1);
+                    setNext(d.next_before || null);
+                    setLoaded(true);
+                } finally {
+                    if (mine === gen.current) setLoading(false);
+                }
+            }, [clusterId, node, vmid, hours, kind, severity]);
+
+            React.useEffect(() => {
+                setRows([]); setNext(null); setLoaded(false); setOpen({});
+                load(null);
+                return () => { gen.current += 1; };
+            }, [load]);
+
+            if (!clusterId) return null;
+            const selectCls = 'bg-proxmox-dark border border-proxmox-border rounded-lg px-2 py-1 text-xs text-gray-300';
+            const when = (ts) => { const d = new Date(ts); return isNaN(d) ? (ts || '') : d.toLocaleString(); };
+            const before = (s) => s >= 60 ? tlFill(t, 'tlMinBefore', { m: Math.round(s / 60) }) : tlFill(t, 'tlSecBefore', { s });
+            const hidden = Object.keys(sources).filter(k => TL_KINDS[k] && sources[k] && sources[k].shown === false);
+            const badge = (k) => {
+                const [key, Icon] = TL_KINDS[k] || [null, null];
+                return (
+                    <span className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-gray-500/20 text-gray-300 whitespace-nowrap" data-tl-badge={k}>
+                        {Icon && <Icon />}{key ? t(key) : k}
+                    </span>
+                );
+            };
+            const guestLabel = (e) => e.guest_name ? `${e.guest_name} (${e.guest})` : String(e.guest);
+
+            return (
+                <div className="space-y-3 min-w-0" data-timeline={vmid != null ? 'guest' : node ? 'node' : 'cluster'}>
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="min-w-0">
+                            <h3 className="font-semibold flex items-center gap-2">
+                                <span className="text-blue-400 flex-shrink-0"><Icons.Clock /></span>
+                                {t('tlTitle')}
+                            </h3>
+                            <p className="text-xs text-gray-500 mt-1">{t(vmid != null ? 'tlDescGuest' : node ? 'tlDescNode' : 'tlDesc')}</p>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                            <select value={hours} onChange={e => setHours(Number(e.target.value))} className={selectCls} data-tl-range aria-label={t('tlFilterRange')}>
+                                {TL_RANGES.map(([key, h]) => <option key={h} value={h}>{t(key)}</option>)}
+                            </select>
+                            <select value={kind} onChange={e => setKind(e.target.value)} className={selectCls} data-tl-filter-kind aria-label={t('tlFilterKind')}>
+                                <option value="">{t('tlAllKinds')}</option>
+                                {Object.keys(TL_KINDS).map(k => <option key={k} value={k}>{t(TL_KINDS[k][0])}</option>)}
+                            </select>
+                            <select value={severity} onChange={e => setSeverity(e.target.value)} className={selectCls} data-tl-filter-severity aria-label={t('tlFilterSeverity')}>
+                                <option value="">{t('tlAllSeverities')}</option>
+                                {['critical', 'warning', 'info'].map(s => <option key={s} value={s}>{t(TL_SEVERITY[s][0])}</option>)}
+                            </select>
+                            <button type="button" onClick={() => load(null)} disabled={loading} title={t('refresh')}
+                                className="p-1 text-gray-400 hover:text-white disabled:opacity-40" data-tl-refresh>
+                                {loading ? <Icons.RotateCw /> : <Icons.RefreshCw />}
+                            </button>
+                        </div>
+                    </div>
+                    {!node && vmid == null && (
+                        <TimelineEvidence clusterId={clusterId} authFetch={authFetch} t={t}
+                            getQuery={() => ({ from: from.current || new Date(Date.now() - hours * 3600 * 1000).toISOString(), kinds: kind, severity })} />
+                    )}
+                    {leaderAway && <div className="text-xs text-yellow-400" data-tl-leader-away>{t('pgHaLeaderAwayView')}</div>}
+                    {failed && <div className="text-xs text-red-400" data-tl-error>{t('tlLoadError')}</div>}
+                    {!loaded && !failed && !leaderAway && <div className="text-xs text-gray-500">{t('loading')}...</div>}
+                    {loaded && hidden.length > 0 && (
+                        <div className="text-xs text-gray-500" data-tl-hidden>
+                            {tlFill(t, 'tlHidden', { kinds: hidden.map(k => t(TL_KINDS[k][0])).join(', ') })}
+                        </div>
+                    )}
+                    {loaded && rows.length === 0 && (
+                        <div className="text-xs text-gray-500 p-2 bg-proxmox-dark rounded-lg" data-tl-empty>
+                            {t(kind || severity ? 'tlNoMatch' : 'tlNone')}
+                        </div>
+                    )}
+                    {rows.length > 0 && (
+                        <div className={compact ? 'space-y-2 max-h-96 overflow-y-auto' : 'space-y-2'}>
+                            {rows.map(e => {
+                                const sev = TL_SEVERITY[e.severity] || TL_SEVERITY.info;
+                                const links = e.shortly_before || [];
+                                const view = onOpenTab && TL_VIEWS[e.kind];
+                                return (
+                                    <div key={e.id} data-tl-row={e.id} data-tl-row-kind={e.kind}
+                                        className="flex flex-col gap-1 bg-proxmox-dark rounded-lg px-3 py-2 text-xs min-w-0">
+                                        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 min-w-0">
+                                            <span className={`w-2 h-2 rounded-full flex-shrink-0 ${sev[1]}`} title={t(sev[0])} data-tl-sev={e.severity}></span>
+                                            <span className="text-gray-500 whitespace-nowrap">{when(e.time)}</span>
+                                            {badge(e.kind)}
+                                            <span className={`text-sm min-w-0 ${sev[2]}`} data-tl-text>{tlText(e, t)}</span>
+                                            {e.node && e.node !== node && (onOpenNode ? (
+                                                <button type="button" onClick={() => onOpenNode(e.node)} data-tl-open-node={e.node}
+                                                    className="flex items-center gap-1 text-blue-400 hover:text-blue-300"><Icons.Server />{e.node}</button>
+                                            ) : <span className="flex items-center gap-1 text-gray-400"><Icons.Server />{e.node}</span>)}
+                                            {e.guest != null && vmid == null && (onOpenGuest ? (
+                                                <button type="button" onClick={() => onOpenGuest(e.guest)} data-tl-open-guest={e.guest}
+                                                    className="flex items-center gap-1 text-blue-400 hover:text-blue-300"><Icons.Monitor />{guestLabel(e)}</button>
+                                            ) : <span className="flex items-center gap-1 text-gray-400"><Icons.Monitor />{guestLabel(e)}</span>)}
+                                            {view && (
+                                                <button type="button" onClick={() => onOpenTab(view)} data-tl-open-view={view}
+                                                    className="flex items-center gap-1 text-blue-400 hover:text-blue-300"><Icons.ExternalLink />{t('tlOpenView')}</button>
+                                            )}
+                                        </div>
+                                        {e.details && <div className="text-gray-400 leading-relaxed break-all" data-tl-details>{e.details}</div>}
+                                        {links.length > 0 && (
+                                            <div>
+                                                <button type="button" onClick={() => setOpen(o => ({ ...o, [e.id]: !o[e.id] }))} data-tl-links-toggle
+                                                    className="flex items-center gap-1 text-blue-400 hover:text-blue-300">
+                                                    {open[e.id] ? <Icons.ChevronDown /> : <Icons.ChevronRight />}
+                                                    {tlFill(t, 'tlShortlyBefore', { n: links.length })}
+                                                </button>
+                                                {open[e.id] && (
+                                                    <div className="mt-1 pl-3 border-l border-proxmox-border space-y-1" data-tl-links>
+                                                        <div className="text-gray-500" data-tl-links-note>{tlFill(t, 'tlShortlyBeforeNote', { min: linkWindow })}</div>
+                                                        {links.map(x => (
+                                                            <div key={x.id} className="flex flex-wrap items-center gap-x-4 gap-y-1 min-w-0" data-tl-link={x.id}>
+                                                                <span className="text-gray-500 whitespace-nowrap">{before(x.seconds_before)}</span>
+                                                                {badge(x.kind)}
+                                                                <span className="text-gray-300 min-w-0">{tlText(x, t)}</span>
+                                                                {x.node && <span className="flex items-center gap-1 text-gray-400"><Icons.Server />{x.node}</span>}
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+                    {next && (
+                        <button type="button" onClick={() => load(next)} disabled={loading} data-tl-more
+                            className="text-xs text-blue-400 hover:text-blue-300 disabled:opacity-40">
+                            {t('tlLoadMore')}
+                        </button>
                     )}
                 </div>
             );
@@ -6824,6 +8532,802 @@
             );
         }
 
+        // LW Oct 2026 - What-if simulator of a cluster (Reports > What-if, the cloud Reports
+        // group). Picks a scenario, POSTs it to /whatif and shows the report: what becomes of
+        // each guest, the nodes before and after against the thresholds, the HA limits hit,
+        // the reserve and the assumptions. It only reads, so a standby runs it as well.
+        const WHATIF_SCENARIOS = [
+            { id: 'node_failure', label: 'whatifNodeFailure', desc: 'whatifNodeFailureDesc' },
+            { id: 'maintenance', label: 'whatifMaintenance', desc: 'whatifMaintenanceDesc' },
+            { id: 'headroom', label: 'whatifHeadroom', desc: 'whatifHeadroomDesc' },
+            { id: 'storage_failure', label: 'whatifStorageFailure', desc: 'whatifStorageFailureDesc' },
+            { id: 'network_failure', label: 'whatifNetworkFailure', desc: 'whatifNetworkFailureDesc' },
+            { id: 'pbs_failure', label: 'whatifPbsFailure', desc: 'whatifPbsFailureDesc' },
+        ];
+        // LW Oct 2026 - risk view: restore status badges, the kinds the ranking lists
+        const WHATIF_RESTORE = {
+            proven: ['whatifRestoreProven', 'bg-green-500/10 text-green-400 border-green-500/30'],
+            not_proven: ['whatifRestoreNotProven', 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30'],
+            failing: ['whatifRestoreFailing', 'bg-red-500/10 text-red-400 border-red-500/30'],
+            unknown: ['whatifRestoreUnknown', 'bg-gray-500/20 text-gray-300 border-proxmox-border'],
+        };
+        const WHATIF_KINDS = { node: 'whatifKindNode', storage: 'whatifKindStorage', pbs: 'whatifKindPbs', bridge: 'whatifKindBridge' };
+        const WHATIF_REASONS = {
+            not_ha: 'whatifRsnNotHa', ha_state: 'whatifRsnHaState', ha_unreadable: 'whatifRsnHaUnreadable',
+            local_disks: 'whatifRsnLocalDisks', storage_unknown: 'whatifRsnStorageUnknown',
+            passthrough: 'whatifRsnPassthrough', ha_restart: 'whatifRsnHaRestart',
+            pegaprox_restart: 'whatifRsnPegaproxRestart', no_node_rule: 'whatifRsnNoNodeRule',
+            no_node_storage: 'whatifRsnNoNodeStorage', no_node_apart: 'whatifRsnNoNodeApart',
+            apart_refused: 'whatifRsnApartRefused', no_target: 'whatifRsnNoTarget',
+            quorum_lost: 'whatifRsnQuorumLost', fence_reset: 'whatifRsnFenceReset',
+            overcommitted: 'whatifRsnOvercommitted', moved_live: 'whatifRsnMovedLive',
+            ct_restart: 'whatifRsnCtRestart', local_disks_copied: 'whatifRsnLocalCopied',
+            local_disks_stay: 'whatifRsnLocalStay', pin_strict: 'whatifRsnPinStrict', off_pin: 'whatifRsnOffPin',
+            disk_on_storage: 'whatifRsnDiskOnStorage', data_disk_on_storage: 'whatifRsnDataDisk',
+            cdrom_on_storage: 'whatifRsnCdrom', volumes_on_storage: 'whatifRsnVolumes',
+            copy_on_storage: 'whatifRsnCopy', all_nics: 'whatifRsnAllNics', some_nics: 'whatifRsnSomeNics',
+            config_unread: 'whatifRsnConfigUnread', pbs_only_copy: 'whatifRsnPbsOnlyCopy',
+            pbs_some_copy: 'whatifRsnPbsSomeCopy', pbs_job_only: 'whatifRsnPbsJobOnly',
+        };
+        const WHATIF_LIMITS = {
+            quorum_lost: 'whatifLimQuorumLost', fence_reset: 'whatifLimFenceReset', not_ha: 'whatifLimNotHa',
+            local_disks: 'whatifLimLocalDisks', passthrough: 'whatifLimPassthrough',
+            storage_unknown: 'whatifLimStorageUnknown', no_node_rule: 'whatifLimNoNodeRule',
+            no_node_storage: 'whatifLimNoNodeStorage', no_node_apart: 'whatifLimNoNodeApart',
+            apart_refused: 'whatifLimApartRefused', pin_strict: 'whatifLimPinStrict', no_target: 'whatifLimNoTarget',
+            local_disks_stay: 'whatifLimLocalStay', over_threshold: 'whatifLimOverThreshold',
+            overcommitted: 'whatifLimOvercommitted', ha_unreadable: 'whatifLimHaUnreadable',
+            configs_unread: 'whatifLimConfigsUnread', no_ha_reaction: 'whatifLimNoHaReaction',
+            pbs_only_copy: 'whatifLimPbsOnlyCopy', pbs_tests_lost: 'whatifLimPbsTestsLost',
+            pbs_points_unread: 'whatifLimPbsPointsUnread', pbs_jobs_unread: 'whatifLimPbsJobsUnread',
+            pbs_inactive: 'whatifLimPbsInactive',
+        };
+        const WHATIF_ASSUMPTIONS = {
+            mem_configured: 'whatifAsmMemConfigured', mem_current: 'whatifAsmMemCurrent', cpu_now: 'whatifAsmCpuNow',
+            votes: 'whatifAsmVotes', votes_qdevice: 'whatifAsmVotesQdevice', ha_choice: 'whatifAsmHaChoice',
+            pegaprox_choice: 'whatifAsmPegaproxChoice', restart_order: 'whatifAsmRestartOrder',
+            fence_delay: 'whatifAsmFenceDelay', passthrough_local: 'whatifAsmPassthrough',
+            configs_unread: 'whatifAsmConfigsUnread', no_service_model: 'whatifAsmNoServiceModel',
+            headroom_all: 'whatifAsmHeadroomAll', headroom_ha: 'whatifAsmHeadroomHa',
+            headroom_no_storage: 'whatifAsmHeadroomNoStorage', headroom_pairs: 'whatifAsmHeadroomPairs',
+            storage_disks: 'whatifAsmStorageDisks', storage_content: 'whatifAsmStorageContent',
+            net_underlay: 'whatifAsmNetUnderlay', net_down: 'whatifAsmNetDown',
+            maint_evacuator: 'whatifAsmMaintEvacuator', maint_apart: 'whatifAsmMaintApart',
+            critical_tags: 'whatifAsmCriticalTags', tenant_by_cluster: 'whatifAsmTenantByCluster',
+            restore_marks: 'whatifAsmRestoreMarks', pbs_listing: 'whatifAsmPbsListing', pbs_jobs: 'whatifAsmPbsJobs',
+            rank_weighting: 'whatifAsmRankWeighting', rank_cheap: 'whatifAsmRankCheap',
+            stopped_guests: 'whatifAsmStoppedGuests', stopped_backups: 'whatifAsmStoppedBackups',
+            rank_stopped: 'whatifAsmRankStopped', rank_shared_only: 'whatifAsmRankSharedOnly',
+        };
+        // LW Oct 2026 - assumptions the report states next to its counts, not only in the list below
+        const WHATIF_STOPPED_NOTES = ['stopped_guests', 'stopped_backups'];
+        const WHATIF_RANK_NOTES = ['rank_stopped', 'rank_shared_only'];
+        const WHATIF_OUTCOMES = [
+            { id: 'down', label: 'whatifDown', cls: 'bg-red-500/10 text-red-400 border-red-500/30' },
+            { id: 'degraded', label: 'whatifDegraded', cls: 'bg-yellow-500/10 text-yellow-400 border-yellow-500/30' },
+            { id: 'restarted', label: 'whatifRestarted', cls: 'bg-blue-500/10 text-blue-400 border-blue-500/30' },
+            { id: 'moved', label: 'whatifMoved', cls: 'bg-green-500/10 text-green-400 border-green-500/30' },
+            { id: 'unknown', label: 'whatifUnknown', cls: 'bg-gray-500/20 text-gray-300 border-proxmox-border' },
+            { id: 'unaffected', label: 'whatifUnaffected', cls: 'bg-gray-500/10 text-gray-400 border-proxmox-border' },
+        ];
+        const WHATIF_STATES = { up: 'whatifStateUp', failed: 'whatifStateFailed', maintenance: 'whatifStateMaintenance',
+                                reset: 'whatifStateReset', offline: 'whatifStateOffline' };
+        const WHATIF_PAGE = 200;
+
+        function WhatIfTab({ clusterId, authFetch }) {
+            const { t } = useTranslation();
+            const [opts, setOpts] = React.useState(null);
+            const [optsError, setOptsError] = React.useState('');
+            const [kind, setKind] = React.useState('node_failure');
+            const [nodes, setNodes] = React.useState([]);
+            const [allowLocal, setAllowLocal] = React.useState(false);
+            const [relax, setRelax] = React.useState(false);
+            const [depth, setDepth] = React.useState(1);
+            const [guestsMode, setGuestsMode] = React.useState('all');
+            const [storage, setStorage] = React.useState('');
+            const [where, setWhere] = React.useState('');
+            const [netKind, setNetKind] = React.useState('bridge');
+            const [bridge, setBridge] = React.useState('');
+            const [vnet, setVnet] = React.useState('');
+            const [vlan, setVlan] = React.useState('');
+            const [memory, setMemory] = React.useState('configured');
+            const [cpuThr, setCpuThr] = React.useState('');
+            const [memThr, setMemThr] = React.useState('');
+            const [running, setRunning] = React.useState(false);
+            const [report, setReport] = React.useState(null);
+            const [error, setError] = React.useState('');
+            const [filter, setFilter] = React.useState('all');
+            const [shown, setShown] = React.useState(WHATIF_PAGE);
+            const [view, setView] = React.useState('scenario');
+            const [pbsStorage, setPbsStorage] = React.useState('');
+            const [tagsText, setTagsText] = React.useState('');
+            const [rank, setRank] = React.useState(null);
+            const [ranking, setRanking] = React.useState(false);
+            const [rankError, setRankError] = React.useState('');
+
+            // t() hands back the key on a miss: the server's English stands in then
+            const say = (key, args, fallback) => {
+                const raw = key ? t(key) : '';
+                let text = raw && raw !== key ? raw : (fallback || key || '');
+                Object.entries(args || {}).forEach(([k, v]) => {
+                    const val = Array.isArray(v) ? v.join(', ') : String(v);
+                    text = text.split(`{${k}}`).join(val);
+                });
+                return text;
+            };
+            const gib = (b) => b == null ? '-' : `${(b / 1073741824).toFixed(1)} GiB`;
+            const pct = (v) => v == null ? '-' : `${Number(v).toFixed(1)}%`;
+
+            React.useEffect(() => {
+                let gone = false;
+                setOpts(null); setReport(null); setError(''); setOptsError('');
+                setNodes([]); setStorage(''); setWhere(''); setBridge(''); setVnet('');
+                setPbsStorage(''); setRank(null); setRankError(''); setTagsText('');
+                if (!clusterId) return;
+                (async () => {
+                    try {
+                        const r = await authFetch(`${API_URL}/clusters/${clusterId}/whatif/options`);
+                        const d = r ? await r.json().catch(() => null) : null;
+                        if (gone) return;
+                        if (!r || !r.ok || !d) { setOptsError((d && d.error) || t('whatifOptionsFailed')); return; }
+                        setOpts(d);
+                        setTagsText(((d.critical_tags && d.critical_tags.tags) || []).join(', '));
+                        if (d.thresholds) {
+                            setCpuThr(String(d.thresholds.cpu ?? ''));
+                            setMemThr(String(d.thresholds.memory ?? ''));
+                        }
+                    } catch (e) {
+                        if (!gone) setOptsError(t('whatifOptionsFailed'));
+                    }
+                })();
+                return () => { gone = true; };
+            }, [clusterId]);
+
+            const onlineNodes = (opts?.nodes || []).filter(n => n.status === 'online');
+            const toggleNode = (name) => setNodes(prev => prev.includes(name) ? prev.filter(n => n !== name) : [...prev, name]);
+            const pickedStorage = (opts?.storages || []).find(s => s.storage === storage);
+            const pickedBridge = (opts?.bridges || []).find(b => b.name === bridge);
+
+            // the critical tags typed in, sent only where they differ from what the cluster uses
+            const tagList = () => [...new Set(tagsText.split(/[\s,;]+/).map(x => x.trim().toLowerCase()).filter(Boolean))];
+            const tagsChanged = () => {
+                const now = tagList().sort().join(','), was = [...((opts?.critical_tags?.tags) || [])].sort().join(',');
+                return now !== was;
+            };
+            const tagSource = (src) => src === 'request' ? t('whatifTagsRequest') : src === 'recovery' ? t('whatifTagsRecovery') : t('whatifTagsDefault');
+
+            const body = () => {
+                const out = { type: kind, memory };
+                if (tagsChanged()) out.critical_tags = tagList();
+                const thr = {};
+                const c = parseFloat(cpuThr), m = parseFloat(memThr);
+                if (!isNaN(c) && opts?.thresholds && c !== opts.thresholds.cpu) thr.cpu = c;
+                if (!isNaN(m) && opts?.thresholds && m !== opts.thresholds.memory) thr.memory = m;
+                if (Object.keys(thr).length) out.thresholds = thr;
+                if (kind === 'node_failure' || kind === 'maintenance') out.nodes = nodes;
+                if (kind === 'maintenance') { out.allow_local_disks = allowLocal; out.relax_anti_affinity = relax; }
+                if (kind === 'headroom') { out.depth = depth; out.guests = guestsMode; }
+                if (kind === 'storage_failure') { out.storage = storage; if (where) out.node = where; }
+                if (kind === 'pbs_failure') out.storage = pbsStorage;
+                if (kind === 'network_failure') {
+                    if (netKind === 'bridge') out.bridge = bridge; else out.vnet = vnet;
+                    if (vlan !== '' && !isNaN(parseInt(vlan, 10))) out.vlan = parseInt(vlan, 10);
+                    if (where) out.node = where;
+                }
+                return out;
+            };
+            const missing = (kind === 'node_failure' || kind === 'maintenance') && !nodes.length ? 'whatifPickNode'
+                : kind === 'storage_failure' && !storage ? 'whatifPickStorage'
+                : kind === 'pbs_failure' && !pbsStorage ? 'whatifPickPbs'
+                : kind === 'network_failure' && !(netKind === 'bridge' ? bridge : vnet) ? 'whatifPickNetwork' : '';
+
+            const simulate = async () => {
+                if (missing || running) return;
+                setRunning(true); setError('');
+                try {
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/whatif`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body()),
+                    });
+                    const d = r ? await r.json().catch(() => null) : null;
+                    if (!r || !r.ok || !d || d.error) { setError((d && d.error) || t('whatifRunFailed')); return; }
+                    setReport(d); setFilter('all'); setShown(WHATIF_PAGE);
+                } catch (e) {
+                    setError(t('whatifRunFailed'));
+                } finally { setRunning(false); }
+            };
+
+            const runRanking = async () => {
+                if (ranking) return;
+                setRanking(true); setRankError('');
+                try {
+                    const payload = tagsChanged() ? { critical_tags: tagList() } : {};
+                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/whatif/ranking`, {
+                        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+                    });
+                    const d = r ? await r.json().catch(() => null) : null;
+                    if (!r || !r.ok || !d || d.error) { setRankError((d && d.error) || t('whatifRunFailed')); return; }
+                    setRank(d);
+                } catch (e) {
+                    setRankError(t('whatifRunFailed'));
+                } finally { setRanking(false); }
+            };
+
+            const Basis = ({ b }) => {
+                const map = { known: ['whatifKnown', 'bg-blue-500/10 text-blue-400'],
+                              calculated: ['whatifCalculated', 'bg-purple-500/10 text-purple-400'],
+                              assumed: ['whatifAssumed', 'bg-yellow-500/10 text-yellow-400'] };
+                const [key, cls] = map[b] || map.assumed;
+                return <span data-whatif-basis={b} className={`px-1.5 py-0.5 rounded text-[10px] whitespace-nowrap ${cls}`}>{t(key)}</span>;
+            };
+            const field = 'bg-proxmox-dark border border-proxmox-border rounded-lg px-2 py-1.5 text-sm text-white focus:outline-none focus:border-proxmox-orange';
+            const label = 'block text-xs text-gray-400 mb-1';
+            const tagsField = (
+                <div>
+                    <div className={label}>{t('whatifCriticalTags')} <span className="text-gray-500">({tagSource(opts?.critical_tags?.source)})</span></div>
+                    <input type="text" value={tagsText} onChange={e => setTagsText(e.target.value)} className={`${field} w-full`} data-whatif-field="tags" />
+                    <div className="text-[10px] text-gray-500 mt-1">{t('whatifCriticalTagsHint')}</div>
+                </div>
+            );
+
+            if (opts && opts.supported === false) {
+                return <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 text-sm text-gray-400">{t('whatifNotSupported')}</div>;
+            }
+
+            const rows = (report?.guests || []).filter(g => filter === 'all' || g.outcome === filter);
+            const stoppedNote = (report?.assumptions || []).find(a => WHATIF_STOPPED_NOTES.includes(a.code));
+            const rankNotes = (rank?.assumptions || []).filter(a => WHATIF_RANK_NOTES.includes(a.code));
+            const tenantName = {};
+            ((report?.risk?.tenants?.items) || []).forEach(x => { tenantName[x.id] = x.name; });
+            const outcomeOf = (id) => WHATIF_OUTCOMES.find(o => o.id === id) || WHATIF_OUTCOMES[4];
+            const thrSource = (src) => src === 'alert_rule' ? t('whatifThrFromRule') : src === 'request' ? t('whatifThrFromRun') : t('whatifThrDefault');
+
+            return (
+                <div className="space-y-4" data-whatif="view">
+                    <div>
+                        <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+                            <Icons.Scale className="w-5 h-5 text-proxmox-orange" />
+                            {t('whatifTitle')}
+                        </h2>
+                        <p className="text-xs text-gray-500 mt-1">{t('whatifDesc')}</p>
+                    </div>
+
+                    <div className="flex gap-2">
+                        {['scenario', 'ranking'].map(v => (
+                            <button key={v} type="button" data-whatif-view={v} onClick={() => setView(v)}
+                                className={`px-3 py-1.5 rounded-lg text-sm border ${view === v
+                                    ? 'border-proxmox-orange bg-proxmox-orange/10 text-white'
+                                    : 'border-proxmox-border text-gray-400 hover:text-white hover:bg-proxmox-hover'}`}>
+                                {t(v === 'scenario' ? 'whatifViewScenario' : 'whatifViewRanking')}
+                            </button>
+                        ))}
+                    </div>
+
+                    {view === 'ranking' && (
+                        <div className="space-y-4" data-whatif="ranking-view">
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 space-y-3" data-whatif="rank-picker">
+                                <p className="text-xs text-gray-500">{t('whatifRankIntro')}</p>
+                                {optsError && <div className="text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg p-3">{optsError}</div>}
+                                {!opts && !optsError && <div className="text-sm text-gray-500">{t('whatifLoading')}</div>}
+                                {opts && <div className="grid grid-cols-1 md:grid-cols-2 gap-3">{tagsField}</div>}
+                                <button type="button" onClick={runRanking} disabled={!opts || ranking} data-whatif="rank-run"
+                                    className="px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm text-white flex items-center gap-2 disabled:opacity-50">
+                                    {ranking ? <Icons.RotateCw className="w-4 h-4 animate-spin" /> : <Icons.Play className="w-4 h-4" />}
+                                    {ranking ? t('whatifRankRunning') : t('whatifRankRun')}
+                                </button>
+                            </div>
+                            {rankError && <div className="text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg p-3" data-whatif="rank-error">{rankError}</div>}
+                            {rank && (
+                                <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 space-y-3" data-whatif="rank">
+                                    <div className="text-xs text-gray-400 flex flex-wrap items-center gap-2" data-whatif="rank-weighting">
+                                        <span>{say('whatifRankWeighting', Object.assign({ factor: rank.weighting.critical_factor }, rank.weighting.outcomes))}</span>
+                                        <Basis b={rank.weighting.basis} />
+                                    </div>
+                                    <div className="text-xs text-gray-500">{say('whatifRiskTagsFrom', { tags: (rank.critical_tags || []).join(', ') || '-', source: tagSource(rank.critical_tags_source) })}</div>
+                                    {rankNotes.map(a => (
+                                        <div key={a.code} data-whatif-rank-note={a.code} className="text-xs text-gray-400 flex flex-wrap items-center gap-2">
+                                            <span>{say(WHATIF_ASSUMPTIONS[a.code], a.args, a.text)}</span>
+                                            <Basis b="assumed" />
+                                        </div>
+                                    ))}
+                                    {(rank.capped || []).map(c => (
+                                        <div key={c.kind} data-whatif-rank-capped={c.kind} className="text-xs text-yellow-400">{say('whatifRankCapped', { kind: t(WHATIF_KINDS[c.kind]), cap: c.cap, total: c.total })}</div>
+                                    ))}
+                                    {(rank.skipped || []).length > 0 && (
+                                        <div data-whatif="rank-skipped" className="text-xs text-yellow-400">{say('whatifRankSkipped', { names: rank.skipped.map(x => `${x.name} (${x.code})`) })}</div>
+                                    )}
+                                    {rank.stopped && <div data-whatif="rank-stopped" className="text-xs text-yellow-400">{say('whatifRankStopped', rank.stopped)}</div>}
+                                    {rank.configs_unread > 0 && <div className="text-xs text-yellow-400">{say('whatifRankUnread', { n: rank.configs_unread })}</div>}
+                                    {!(rank.ranking || []).length && <div className="text-sm text-gray-500">{t('whatifRankEmpty')}</div>}
+                                    {(rank.ranking || []).length > 0 && (
+                                        <div className="overflow-x-auto">
+                                            <table className="w-full text-sm">
+                                                <thead className="text-xs text-gray-400">
+                                                    <tr>
+                                                        <th className="text-left p-2">{t('whatifRankKind')}</th>
+                                                        <th className="text-left p-2">{t('whatifRankName')}</th>
+                                                        <th className="text-right p-2">{t('whatifRankAffected')}</th>
+                                                        <th className="text-right p-2">{t('whatifDown')}</th>
+                                                        <th className="text-right p-2">{t('whatifDegraded')} / {t('whatifUnknown')}</th>
+                                                        <th className="text-right p-2">{t('whatifRestarted')}</th>
+                                                        <th className="text-right p-2">{t('whatifRankCritical')}</th>
+                                                        <th className="text-right p-2">{t('whatifRankWeight')}</th>
+                                                        <th className="text-left p-2">{t('whatifBasis')}</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {rank.ranking.map(r => (
+                                                        <tr key={`${r.kind}:${r.name}`} data-whatif-rank-row={`${r.kind}:${r.name}`} className="border-t border-proxmox-border">
+                                                            <td className="p-2 text-gray-400">{t(WHATIF_KINDS[r.kind] || 'whatifRankKind')}</td>
+                                                            <td className="p-2 text-white font-mono">{r.name}</td>
+                                                            <td className="p-2 text-right font-mono text-gray-300">{r.affected}</td>
+                                                            <td className="p-2 text-right font-mono text-gray-300">{r.down}</td>
+                                                            <td className="p-2 text-right font-mono text-gray-300">{r.degraded + r.unknown}</td>
+                                                            <td className="p-2 text-right font-mono text-gray-300">{r.restarted}</td>
+                                                            <td className={`p-2 text-right font-mono ${r.critical_affected ? 'text-red-400' : 'text-gray-500'}`}>{r.critical_affected}</td>
+                                                            <td className="p-2 text-right font-mono text-white" data-whatif-rank-weight>{r.weight}</td>
+                                                            <td className="p-2"><Basis b={r.basis} /></td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    )}
+                                    <ul className="list-disc pl-5 space-y-1 text-sm text-gray-300" data-whatif="rank-assumptions">
+                                        {(rank.assumptions || []).filter(a => !WHATIF_RANK_NOTES.includes(a.code)).map(a => (
+                                            <li key={a.code} data-whatif-assumption={a.code}>{say(WHATIF_ASSUMPTIONS[a.code], a.args, a.text)}</li>
+                                        ))}
+                                    </ul>
+                                    <div className="flex items-center gap-1 text-xs text-gray-500"><Basis b="assumed" /> {t('whatifBasisHelp')}</div>
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {view === 'scenario' && (<>
+                    <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 space-y-4" data-whatif="picker">
+                        <div>
+                            <div className={label}>{t('whatifScenario')}</div>
+                            <div className="flex flex-wrap gap-2">
+                                {WHATIF_SCENARIOS.map(s => (
+                                    <button key={s.id} type="button" data-whatif-scenario={s.id}
+                                        onClick={() => { setKind(s.id); setWhere(''); }}
+                                        className={`px-3 py-1.5 rounded-lg text-sm border ${kind === s.id
+                                            ? 'border-proxmox-orange bg-proxmox-orange/10 text-white'
+                                            : 'border-proxmox-border text-gray-400 hover:text-white hover:bg-proxmox-hover'}`}>
+                                        {t(s.label)}
+                                    </button>
+                                ))}
+                            </div>
+                            <p className="text-xs text-gray-500 mt-2">{t((WHATIF_SCENARIOS.find(s => s.id === kind) || WHATIF_SCENARIOS[0]).desc)}</p>
+                        </div>
+
+                        {optsError && <div className="text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg p-3">{optsError}</div>}
+                        {!opts && !optsError && <div className="text-sm text-gray-500">{t('whatifLoading')}</div>}
+
+                        {opts && (kind === 'node_failure' || kind === 'maintenance') && (
+                            <div>
+                                <div className={label}>{t('whatifNodes')}</div>
+                                <div className="flex flex-wrap gap-2">
+                                    {onlineNodes.map(n => (
+                                        <label key={n.name} className={`px-2.5 py-1 rounded-lg border text-sm cursor-pointer flex items-center gap-1.5 ${nodes.includes(n.name)
+                                            ? 'border-proxmox-orange bg-proxmox-orange/10 text-white' : 'border-proxmox-border text-gray-300'}`}>
+                                            <input type="checkbox" data-whatif-node={n.name} checked={nodes.includes(n.name)} onChange={() => toggleNode(n.name)} />
+                                            {n.name}
+                                            {n.maintenance && <span className="text-[10px] text-yellow-400">({t('whatifStateMaintenance')})</span>}
+                                        </label>
+                                    ))}
+                                </div>
+                                {kind === 'maintenance' && (
+                                    <div className="flex flex-wrap gap-4 mt-3 text-sm text-gray-300">
+                                        <label className="flex items-center gap-2 cursor-pointer">
+                                            <input type="checkbox" checked={allowLocal} onChange={e => setAllowLocal(e.target.checked)} />
+                                            {t('whatifAllowLocal')}
+                                        </label>
+                                        <label className="flex items-center gap-2 cursor-pointer">
+                                            <input type="checkbox" checked={relax} onChange={e => setRelax(e.target.checked)} />
+                                            {t('whatifRelaxApart')}
+                                        </label>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
+                        {opts && kind === 'headroom' && (
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div>
+                                    <div className={label}>{t('whatifDepth')}</div>
+                                    <select value={depth} onChange={e => setDepth(parseInt(e.target.value, 10))} className={`${field} w-full`} data-whatif-field="depth">
+                                        <option value={1}>{t('whatifN1')}</option>
+                                        <option value={2}>{t('whatifN2')}</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <div className={label}>{t('whatifGuestsLabel')}</div>
+                                    <select value={guestsMode} onChange={e => setGuestsMode(e.target.value)} className={`${field} w-full`}>
+                                        <option value="all">{t('whatifGuestsAll')}</option>
+                                        <option value="ha">{t('whatifGuestsHa')}</option>
+                                    </select>
+                                </div>
+                            </div>
+                        )}
+
+                        {opts && kind === 'storage_failure' && (
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                <div>
+                                    <div className={label}>{t('whatifStorage')}</div>
+                                    <select value={storage} onChange={e => { setStorage(e.target.value); setWhere(''); }} className={`${field} w-full`} data-whatif-field="storage">
+                                        <option value="">-</option>
+                                        {(opts.storages || []).map(s => (
+                                            <option key={s.storage} value={s.storage}>{s.storage} ({s.shared ? t('whatifShared') : t('whatifLocal')})</option>
+                                        ))}
+                                    </select>
+                                </div>
+                                <div>
+                                    <div className={label}>{t('whatifWhere')}</div>
+                                    <select value={where} onChange={e => setWhere(e.target.value)} className={`${field} w-full`} data-whatif-field="where">
+                                        <option value="">{t('whatifEverywhere')}</option>
+                                        {(pickedStorage?.nodes || []).map(n => <option key={n} value={n}>{n}</option>)}
+                                    </select>
+                                </div>
+                            </div>
+                        )}
+
+                        {opts && kind === 'pbs_failure' && (
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3"><div>
+                                <div className={label}>{t('whatifPbsStorage')}</div>
+                                <select value={pbsStorage} onChange={e => setPbsStorage(e.target.value)} className={`${field} w-full`} data-whatif-field="pbs">
+                                    <option value="">-</option>
+                                    {(opts.pbs || []).map(p => <option key={p.storage} value={p.storage}>{p.storage}</option>)}
+                                </select>
+                            </div></div>
+                        )}
+
+                        {opts && kind === 'network_failure' && (
+                            <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                                <div>
+                                    <div className={label}>{t('whatifNetKind')}</div>
+                                    <select value={netKind} onChange={e => setNetKind(e.target.value)} className={`${field} w-full`} data-whatif-field="netkind">
+                                        <option value="bridge">{t('whatifBridge')}</option>
+                                        <option value="vnet" disabled={!(opts.vnets || []).length}>{t('whatifVnet')}</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <div className={label}>{netKind === 'bridge' ? t('whatifBridge') : t('whatifVnet')}</div>
+                                    {netKind === 'bridge' ? (
+                                        <select value={bridge} onChange={e => { setBridge(e.target.value); setWhere(''); }} className={`${field} w-full`} data-whatif-field="bridge">
+                                            <option value="">-</option>
+                                            {(opts.bridges || []).map(b => <option key={b.name} value={b.name}>{b.name}</option>)}
+                                        </select>
+                                    ) : (
+                                        <select value={vnet} onChange={e => setVnet(e.target.value)} className={`${field} w-full`} data-whatif-field="vnet">
+                                            <option value="">-</option>
+                                            {(opts.vnets || []).map(v => <option key={v.vnet} value={v.vnet}>{v.vnet}{v.tag ? ` (${v.tag})` : ''}</option>)}
+                                        </select>
+                                    )}
+                                </div>
+                                <div>
+                                    <div className={label}>{t('whatifVlan')}</div>
+                                    <input type="number" min="1" max="4094" value={vlan} onChange={e => setVlan(e.target.value)} className={`${field} w-full`} data-whatif-field="vlan" />
+                                </div>
+                                <div>
+                                    <div className={label}>{t('whatifWhere')}</div>
+                                    <select value={where} onChange={e => setWhere(e.target.value)} className={`${field} w-full`} data-whatif-field="where">
+                                        <option value="">{t('whatifEverywhere')}</option>
+                                        {(netKind === 'bridge' && pickedBridge ? pickedBridge.nodes : onlineNodes.map(n => n.name)).map(n => <option key={n} value={n}>{n}</option>)}
+                                    </select>
+                                </div>
+                            </div>
+                        )}
+
+                        {opts && (
+                            <div className="grid grid-cols-1 md:grid-cols-4 gap-3 border-t border-proxmox-border pt-3">
+                                <div>
+                                    <div className={label}>{t('whatifMemoryBasis')}</div>
+                                    <select value={memory} onChange={e => setMemory(e.target.value)} className={`${field} w-full`}>
+                                        <option value="configured">{t('whatifMemConfigured')}</option>
+                                        <option value="current">{t('whatifMemCurrent')}</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <div className={label}>{t('whatifCpuThreshold')} <span className="text-gray-500">({thrSource(opts.thresholds?.cpu_source)})</span></div>
+                                    <input type="number" min="1" max="100" value={cpuThr} onChange={e => setCpuThr(e.target.value)} className={`${field} w-full`} data-whatif-field="cpu" />
+                                </div>
+                                <div>
+                                    <div className={label}>{t('whatifMemThreshold')} <span className="text-gray-500">({thrSource(opts.thresholds?.memory_source)})</span></div>
+                                    <input type="number" min="1" max="100" value={memThr} onChange={e => setMemThr(e.target.value)} className={`${field} w-full`} data-whatif-field="memory" />
+                                </div>
+                                {tagsField}
+                            </div>
+                        )}
+
+                        <div className="flex items-center gap-3">
+                            <button type="button" onClick={simulate} disabled={!opts || !!missing || running} data-whatif="run"
+                                className="px-4 py-2 bg-proxmox-orange hover:bg-orange-600 rounded-lg text-sm text-white flex items-center gap-2 disabled:opacity-50">
+                                {running ? <Icons.RotateCw className="w-4 h-4 animate-spin" /> : <Icons.Play className="w-4 h-4" />}
+                                {running ? t('whatifRunning') : t('whatifRun')}
+                            </button>
+                            {opts && missing && <span className="text-xs text-gray-500">{t(missing)}</span>}
+                        </div>
+                    </div>
+
+                    {error && <div className="text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg p-3" data-whatif="error">{error}</div>}
+
+                    {report && (
+                        <div className="space-y-4" data-whatif="report">
+                            <WhatIfVerdictLine verdict={report.verdict} />
+                            {/* a headroom check moves no guest of its own: its table is the answer */}
+                            {!report.headroom && <div className="grid grid-cols-2 md:grid-cols-6 gap-3">
+                                {WHATIF_OUTCOMES.map(o => (
+                                    <button key={o.id} type="button" data-whatif-count={o.id}
+                                        onClick={() => o.id !== 'unaffected' && setFilter(filter === o.id ? 'all' : o.id)}
+                                        className={`border rounded-xl p-3 text-left ${o.cls} ${filter === o.id ? 'border-proxmox-orange' : ''}`}>
+                                        <div className="text-2xl font-bold">{report.summary?.[o.id] ?? 0}</div>
+                                        <div className="text-xs">{t(o.label)}</div>
+                                    </button>
+                                ))}
+                            </div>}
+                            {stoppedNote && !report.headroom && (
+                                <div data-whatif="stopped-note" className="text-xs text-gray-400 flex flex-wrap items-center gap-2">
+                                    <span>{say(WHATIF_ASSUMPTIONS[stoppedNote.code], stoppedNote.args, stoppedNote.text)}</span>
+                                    <Basis b="assumed" />
+                                </div>
+                            )}
+                            {report.stopped_affected > 0 && (
+                                <div className="text-xs text-gray-400">{say('whatifStoppedAffected', { n: report.stopped_affected })}</div>
+                            )}
+
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4" data-whatif="limits">
+                                <h3 className="text-sm font-semibold text-white mb-3 flex items-center gap-2">
+                                    <Icons.AlertTriangle />
+                                    {/* LW Oct 2026 - a backup storage failure hits no HA limit, its heading says what it does list */}
+                                    {t(report.scenario?.type === 'pbs_failure' ? 'whatifLimitsPbs' : 'whatifLimits')}
+                                </h3>
+                                {!(report.limits || []).length && <div className="text-sm text-green-400">{t('whatifNoLimits')}</div>}
+                                <ul className="space-y-2">
+                                    {(report.limits || []).map(l => (
+                                        <li key={l.code} data-whatif-limit={l.code} className="flex items-start justify-between gap-3 text-sm text-gray-300">
+                                            <span className="min-w-0">{say(WHATIF_LIMITS[l.code], l.args, l.text)}</span>
+                                            <Basis b={l.basis} />
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+
+                            {report.risk && (
+                                <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 space-y-3" data-whatif="risk">
+                                    <h3 className="text-sm font-semibold text-white">{t('whatifRiskTitle')}</h3>
+                                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                                        <div className="bg-proxmox-dark border border-proxmox-border rounded-lg p-3 text-sm" data-whatif-risk="critical">
+                                            <div className="text-xs text-gray-400 flex items-center justify-between gap-2">{t('whatifColCritical')} <Basis b={report.risk.critical.basis} /></div>
+                                            <div className="text-white mt-1">{say('whatifRiskCritical', { n: report.risk.critical.affected, total: report.risk.critical.in_cluster, down: report.risk.critical.down })}</div>
+                                            <div className="text-[10px] text-gray-500 mt-1 flex items-center gap-1">
+                                                {say('whatifRiskTagsFrom', { tags: (report.risk.critical.tags || []).join(', ') || '-', source: tagSource(report.risk.critical.source) })}
+                                                <Basis b={report.risk.critical.tags_basis} />
+                                            </div>
+                                        </div>
+                                        <div className="bg-proxmox-dark border border-proxmox-border rounded-lg p-3 text-sm" data-whatif-risk="restore">
+                                            <div className="text-xs text-gray-400 flex items-center justify-between gap-2">{t('whatifRiskRestore')} <Basis b={report.risk.restore.basis} /></div>
+                                            <div className="flex flex-wrap gap-2 mt-2">
+                                                {Object.keys(WHATIF_RESTORE).map(k => (
+                                                    <span key={k} data-whatif-restore-count={k} className={`px-1.5 py-0.5 rounded border text-xs ${WHATIF_RESTORE[k][1]}`}>{t(WHATIF_RESTORE[k][0])}: {report.risk.restore[k] ?? 0}</span>
+                                                ))}
+                                            </div>
+                                        </div>
+                                        <div className="bg-proxmox-dark border border-proxmox-border rounded-lg p-3 text-sm" data-whatif-risk="weight">
+                                            <div className="text-xs text-gray-400 flex items-center justify-between gap-2">{t('whatifRankWeight')} <Basis b={report.risk.weight.basis} /></div>
+                                            <div className="text-white font-mono mt-1">{say('whatifRiskWeight', { value: report.risk.weight.value })}</div>
+                                            <div className="text-[10px] text-gray-500 mt-1">{say('whatifRankWeighting', Object.assign({ factor: report.risk.weight.critical_factor }, report.risk.weight.outcomes))}</div>
+                                        </div>
+                                    </div>
+                                    <div className="bg-proxmox-dark border border-proxmox-border rounded-lg p-3 text-sm" data-whatif-risk="tenants">
+                                        <div className="text-xs text-gray-400 flex items-center justify-between gap-2">{t('whatifRiskTenants')} <Basis b={report.risk.tenants.basis} /></div>
+                                        {!(report.risk.tenants.items || []).length && <div className="text-gray-500 mt-1">{t('whatifRiskNoTenants')}</div>}
+                                        <ul className="mt-1 space-y-1">
+                                            {(report.risk.tenants.items || []).map(x => (
+                                                <li key={x.id} data-whatif-tenant={x.id} className="text-gray-300">
+                                                    <span className="text-white">{x.name}</span>: {say('whatifRiskTenantRow', { n: x.affected, down: x.down, critical: x.critical })}
+                                                </li>
+                                            ))}
+                                        </ul>
+                                    </div>
+                                </div>
+                            )}
+
+                            {report.pbs && (
+                                <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 space-y-2" data-whatif="pbs">
+                                    <h3 className="text-sm font-semibold text-white flex items-center gap-2">{say('whatifPbsTitle', { storage: report.pbs.storage })} <Basis b={report.pbs.basis} /></h3>
+                                    {report.pbs.jobs_read && !report.pbs.jobs.length && <div className="text-sm text-gray-400">{t('whatifPbsNoJobs')}</div>}
+                                    <ul className="text-sm text-gray-300 space-y-1">
+                                        {report.pbs.jobs.map(j => <li key={j.id} data-whatif-pbs-job={j.id}>{say('whatifPbsJobRow', { id: j.id, schedule: j.schedule || '-', n: j.guests })}</li>)}
+                                    </ul>
+                                    <div className="text-sm text-gray-300" data-whatif-pbs="counts">{say('whatifPbsCounts', { all: report.pbs.guests_all_lost, some: report.pbs.guests_some_lost, job: report.pbs.guests_job_only })}</div>
+                                    <div className="text-sm text-gray-300" data-whatif-pbs="tests">{say('whatifPbsTests', { n: report.pbs.tests_lost, unmatched: report.pbs.tests_unmatched })}</div>
+                                </div>
+                            )}
+
+                            {report.headroom && (
+                                <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4" data-whatif="headroom">
+                                    <h3 className="text-sm font-semibold text-white mb-1">{t('whatifHeadroomTitle')}</h3>
+                                    <p className={`text-sm mb-3 ${report.headroom.ok ? 'text-green-400' : 'text-red-400'}`}>
+                                        {report.headroom.ok ? t('whatifHeadroomOk')
+                                            : say('whatifHeadroomFailing', { n: report.headroom.failing, total: report.headroom.checked })}
+                                    </p>
+                                    <div className="overflow-x-auto max-h-80 overflow-y-auto">
+                                        <table className="w-full text-sm">
+                                            <thead className="text-xs text-gray-400">
+                                                <tr>
+                                                    <th className="text-left p-2">{t('whatifFailedNodes')}</th>
+                                                    <th className="text-left p-2">{t('whatifQuorum')}</th>
+                                                    <th className="text-right p-2">{t('whatifWorstMem')}</th>
+                                                    <th className="text-right p-2">{t('whatifWorstCpu')}</th>
+                                                    <th className="text-left p-2">{t('whatifOverloaded')}</th>
+                                                    <th className="text-right p-2">{t('whatifUnplaced')}</th>
+                                                    <th className="text-right p-2">{t('whatifReserveMem')}</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {report.headroom.combinations.map(c => (
+                                                    <tr key={c.failed.join('+')} className={`border-t border-proxmox-border ${c.ok ? '' : 'text-red-400'}`}>
+                                                        <td className="p-2 font-mono">{c.failed.join(' + ')}</td>
+                                                        <td className="p-2">{c.quorate ? t('whatifQuorumOk') : t('whatifNoQuorum')}</td>
+                                                        <td className="p-2 text-right font-mono">{c.checked === 'totals' ? t('whatifByTotals') : pct(c.worst_mem_pct)}</td>
+                                                        <td className="p-2 text-right font-mono">{c.checked === 'totals' ? '-' : pct(c.worst_cpu_pct)}</td>
+                                                        <td className="p-2">{[...new Set([...(c.over_mem || []), ...(c.over_cpu || [])])].join(', ') || '-'}</td>
+                                                        <td className="p-2 text-right font-mono">{c.unplaced == null ? '-' : c.unplaced}</td>
+                                                        <td className="p-2 text-right font-mono">{gib(c.mem_reserve)}</td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+                            )}
+
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4" data-whatif="nodes">
+                                <div className="flex items-center justify-between mb-3 gap-2">
+                                    <h3 className="text-sm font-semibold text-white">{t('whatifNodesTitle')}</h3>
+                                    <span className="flex items-center gap-1 text-xs text-gray-500">
+                                        {t('whatifBefore')} <Basis b="known" /> {t('whatifAfter')} <Basis b="calculated" />
+                                    </span>
+                                </div>
+                                <div className="overflow-x-auto">
+                                    <table className="w-full text-sm">
+                                        <thead className="text-xs text-gray-400">
+                                            <tr>
+                                                <th className="text-left p-2">{t('whatifNode')}</th>
+                                                <th className="text-left p-2">{t('whatifState')}</th>
+                                                <th className="text-right p-2">{t('whatifCpu')} {t('whatifBefore')}</th>
+                                                <th className="text-right p-2">{t('whatifCpu')} {t('whatifAfter')}</th>
+                                                <th className="text-right p-2">{t('whatifMem')} {t('whatifBefore')}</th>
+                                                <th className="text-right p-2">{t('whatifMem')} {t('whatifAfter')}</th>
+                                                <th className="text-right p-2">{t('whatifThresholds')}</th>
+                                                <th className="text-right p-2">{t('whatifGuestsMoved')}</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {(report.nodes || []).map(n => (
+                                                <tr key={n.node} data-whatif-node-row={n.node} className="border-t border-proxmox-border">
+                                                    <td className="p-2 text-white">
+                                                        {n.node}
+                                                        {n.worst_when && <div className="text-[10px] text-gray-500">{say('whatifWorstWhen', { nodes: n.worst_when })}</div>}
+                                                    </td>
+                                                    <td className="p-2 text-gray-400">{t(WHATIF_STATES[n.state] || 'whatifStateUp')}</td>
+                                                    <td className="p-2 text-right font-mono text-gray-400">{pct(n.cpu_before)}</td>
+                                                    <td className={`p-2 text-right font-mono ${n.over_cpu ? 'text-red-400' : 'text-gray-300'}`}>{pct(n.cpu_after)}</td>
+                                                    <td className="p-2 text-right font-mono text-gray-400">{pct(n.mem_before)}</td>
+                                                    <td className={`p-2 text-right font-mono ${n.over_mem ? 'text-red-400' : 'text-gray-300'}`}>{pct(n.mem_after)}</td>
+                                                    <td className="p-2 text-right font-mono text-gray-500">{n.cpu_threshold}% / {n.mem_threshold}%</td>
+                                                    <td className="p-2 text-right font-mono text-gray-400">+{n.guests_in} / -{n.guests_out}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                                {report.reserve && (
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3" data-whatif="reserve">
+                                        <div className="bg-proxmox-dark border border-proxmox-border rounded-lg p-3 text-sm">
+                                            <div className="text-xs text-gray-400 flex items-center justify-between gap-2">{t('whatifReserveMem')} <Basis b={report.reserve.basis} /></div>
+                                            <div className="text-white font-mono mt-1">{gib(report.reserve.mem_to_threshold)} / {gib(report.reserve.mem_to_full)}</div>
+                                        </div>
+                                        <div className="bg-proxmox-dark border border-proxmox-border rounded-lg p-3 text-sm">
+                                            <div className="text-xs text-gray-400 flex items-center justify-between gap-2">{t('whatifReserveCpu')} <Basis b={report.reserve.basis} /></div>
+                                            <div className="text-white font-mono mt-1">{report.reserve.cpu_to_threshold} / {report.reserve.cpu_to_full}</div>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+
+                            {!report.headroom && (
+                                <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4" data-whatif="guests">
+                                    <div className="flex items-center justify-between mb-3 gap-2">
+                                        <h3 className="text-sm font-semibold text-white">{t('whatifGuestsTitle')}</h3>
+                                        <select value={filter} onChange={e => { setFilter(e.target.value); setShown(WHATIF_PAGE); }} className={field}>
+                                            <option value="all">{t('whatifAllOutcomes')}</option>
+                                            {WHATIF_OUTCOMES.filter(o => o.id !== 'unaffected').map(o => <option key={o.id} value={o.id}>{t(o.label)}</option>)}
+                                        </select>
+                                    </div>
+                                    {!rows.length && <div className="text-sm text-gray-500">{t('whatifNoGuests')}</div>}
+                                    {rows.length > 0 && (
+                                        <div className="overflow-x-auto">
+                                            <table className="w-full text-sm">
+                                                <thead className="text-xs text-gray-400">
+                                                    <tr>
+                                                        <th className="text-left p-2">{t('whatifGuest')}</th>
+                                                        <th className="text-left p-2">{t('whatifNode')}</th>
+                                                        <th className="text-left p-2">{t('whatifOutcome')}</th>
+                                                        <th className="text-left p-2">{t('whatifTarget')}</th>
+                                                        <th className="text-left p-2">{t('whatifReason')}</th>
+                                                        <th className="text-left p-2">{t('whatifColRestore')}</th>
+                                                        <th className="text-left p-2">{t('whatifColTenant')}</th>
+                                                        <th className="text-left p-2">{t('whatifBasis')}</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {rows.slice(0, shown).map(g => (
+                                                        <tr key={g.vmid} data-whatif-guest={g.vmid} className="border-t border-proxmox-border">
+                                                            <td className="p-2">
+                                                                <span className="text-white">{g.name || g.vmid}</span>
+                                                                <span className="text-xs text-gray-500 ml-2 font-mono">{g.vmid}</span>
+                                                                {g.critical && <span data-whatif-critical className="ml-2 px-1.5 py-0.5 rounded border text-[10px] bg-red-500/10 text-red-400 border-red-500/30">{t('whatifCriticalBadge')}</span>}
+                                                            </td>
+                                                            <td className="p-2 text-gray-400">{g.node}</td>
+                                                            <td className="p-2">
+                                                                <span className={`px-1.5 py-0.5 rounded border text-xs ${outcomeOf(g.outcome).cls}`}>{t(outcomeOf(g.outcome).label)}</span>
+                                                            </td>
+                                                            <td className="p-2 text-gray-300">
+                                                                {g.target || '-'}
+                                                                {g.target && g.target_basis && <span className="ml-1"><Basis b={g.target_basis} /></span>}
+                                                                {g.risk === 'overcommitted' && <div className="text-[10px] text-red-400">{t('whatifRiskOvercommitted')}</div>}
+                                                            </td>
+                                                            <td className="p-2 text-gray-300">
+                                                                {say(WHATIF_REASONS[g.reason?.code], g.reason?.args, g.text)}
+                                                                {g.restore_test_lost && <div className="text-[10px] text-yellow-400">{t('whatifRestoreTestLost')}</div>}
+                                                            </td>
+                                                            <td className="p-2">
+                                                                {g.restore ? (
+                                                                    <span className="flex items-center gap-1">
+                                                                        <span data-whatif-restore={g.restore.state} className={`px-1.5 py-0.5 rounded border text-xs ${(WHATIF_RESTORE[g.restore.state] || WHATIF_RESTORE.unknown)[1]}`}>{t((WHATIF_RESTORE[g.restore.state] || WHATIF_RESTORE.unknown)[0])}</span>
+                                                                        <Basis b={g.restore.basis} />
+                                                                    </span>
+                                                                ) : '-'}
+                                                            </td>
+                                                            <td className="p-2 text-gray-400 text-xs" data-whatif-tenants>{(g.tenants || []).map(id => tenantName[id] || id).join(', ') || '-'}</td>
+                                                            <td className="p-2"><Basis b={g.basis} /></td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    )}
+                                    {rows.length > shown && (
+                                        <button type="button" onClick={() => setShown(shown + WHATIF_PAGE)} className="mt-2 text-xs text-proxmox-orange hover:text-white">
+                                            {t('whatifShowMore')} ({rows.length - shown})
+                                        </button>
+                                    )}
+                                    {report.guests_hidden > 0 && <div className="text-xs text-gray-500 mt-2">{say('whatifHidden', { n: report.guests_hidden })}</div>}
+                                    {report.guests_truncated > 0 && <div className="text-xs text-gray-500 mt-2">{say('whatifTruncated', { n: report.guests_truncated })}</div>}
+                                </div>
+                            )}
+
+                            <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4" data-whatif="assumptions">
+                                <h3 className="text-sm font-semibold text-white mb-2 flex items-center gap-2">{t('whatifAssumptions')} <Basis b="assumed" /></h3>
+                                <ul className="list-disc pl-5 space-y-1 text-sm text-gray-300">
+                                    {(report.assumptions || []).map(a => (
+                                        <li key={a.code} data-whatif-assumption={a.code}>{say(WHATIF_ASSUMPTIONS[a.code], a.args, a.text)}</li>
+                                    ))}
+                                </ul>
+                                <p className="text-xs text-gray-500 mt-3">{t('whatifBasisHelp')}</p>
+                                {report.reads && (
+                                    <p className="text-xs text-gray-500 mt-1">{say('whatifReads', { read: report.reads.configs_read, cached: report.reads.configs_cached, unread: report.reads.configs_unread })}</p>
+                                )}
+                            </div>
+                        </div>
+                    )}
+                    </>)}
+                </div>
+            );
+        }
+
         // NS Apr 2026 — Compliance Dashboard (top-level read-only audit view).
         // Aggregates per-cluster hardening scores, BSI/ISO/NIS2 mapping, audit activity.
         // Available to ops/Compliance Officers without admin rights (admin.audit or
@@ -6847,18 +9351,22 @@
             const [forcing, setForcing] = React.useState(false);
             const [exporting, setExporting] = React.useState(false);
 
+            const asked = React.useRef(0);  // only the newest request writes, as in PowerCarbonTab
             const refresh = async () => {
                 if (!clusterId) return;
+                const mine = ++asked.current;
                 setLoading(true);
                 try {
                     const [r1, r2] = await Promise.all([
                         authFetch(`${API_URL}/clusters/${clusterId}/insights/right-sizing`).then(r => r?.json()).catch(() => null),
                         authFetch(`${API_URL}/clusters/${clusterId}/insights/forecast`).then(r => r?.json()).catch(() => null),
                     ]);
+                    if (mine !== asked.current) return;
                     if (r1 && !r1.error) setRs(r1);
                     if (r2 && !r2.error) setFc(r2);
-                } finally { setLoading(false); }
+                } finally { if (mine === asked.current) setLoading(false); }
             };
+            useReportFollowUp(rs, refresh, [clusterId]);
 
             const refreshTop = async (metric) => {
                 if (!clusterId) return;
@@ -7174,6 +9682,7 @@
                             <p className="text-xs text-gray-500 mt-0.5">
                                 {t('insightsDesc') || 'Right-sizing recommendations + capacity forecasts based on 30 days of historical metrics.'}
                             </p>
+                            <ReportStamp report={rs} t={t} />
                         </div>
                         <div className="flex gap-2">
                             {canAct && (
@@ -7454,6 +9963,11 @@
             // #717 — the server answers with a machine code; the sentence the operator reads
             // is chosen here, so it lands in their language. The English error/hint the API
             // also returns stay the fallback for a code we do not know yet.
+            // LW Oct 2026 - a control whose output did not come back is null (verbose: status
+            // null): not checked. It is neither passed nor failed and no score divides by it.
+            const verdictOf = (v) => (v === true || v === false) ? v
+                : (v && typeof v === 'object' && typeof v.status === 'boolean') ? v.status : null;
+
             const sshReason = (info) => ({
                 SSH_NO_CREDENTIALS: [t('sshNoCredentials'), t('sshNoCredentialsHint')],
                 NODE_BACKOFF:       [t('sshNodeBackoff'),   t('sshNodeBackoffHint')],
@@ -7493,9 +10007,11 @@
                             }
                             const d = await r.json();
                             const ctrls = d.controls || {};
-                            const total = Object.keys(ctrls).length;
-                            const passed = Object.values(ctrls).filter(v => v === true || v?.status === true).length;
-                            perNode[n] = { controls: ctrls, total, passed, score: total ? Math.round(passed * 100 / total) : 0 };
+                            const verdicts = Object.values(ctrls).map(verdictOf);
+                            const total = verdicts.filter(v => v !== null).length;
+                            const passed = verdicts.filter(v => v === true).length;
+                            perNode[n] = { controls: ctrls, total, passed, notChecked: verdicts.length - total,
+                                           score: total ? Math.round(passed * 100 / total) : null };
                         } catch (e) {
                             perNode[n] = { error: String(e) };
                         }
@@ -7577,19 +10093,20 @@
                 { id: 'fips', name: 'FIPS 140-3', region: 'US', controls: ['vsnfd_kernel_lockdown'], informational: true, note: 'Requires FIPS-validated crypto module (RHEL/Ubuntu Pro). Not satisfiable on stock Proxmox.' },
             ];
             const frameworkScore = (fw) => {
-                let total = 0, passed = 0;
+                let total = 0, passed = 0, notChecked = 0;
                 Object.values(scopedResults).forEach(perNode => {
                     Object.values(perNode).forEach(n => {
                         if (!n.controls) return;
                         fw.controls.forEach(cid => {
-                            if (cid in n.controls) {
-                                total++;
-                                if (n.controls[cid] === true || n.controls[cid]?.status === true) passed++;
-                            }
+                            if (!(cid in n.controls)) return;
+                            const v = verdictOf(n.controls[cid]);
+                            if (v === null) { notChecked++; return; }
+                            total++;
+                            if (v) passed++;
                         });
                     });
                 });
-                return { total, passed, score: total ? Math.round(passed * 100 / total) : null };
+                return { total, passed, notChecked, score: total ? Math.round(passed * 100 / total) : null };
             };
 
             // MK Apr 2026 — per-framework PDF download. Restructured to use real framework
@@ -7713,11 +10230,8 @@
                 // ── Per-node coverage stats ──
                 const nodeStats = nodes.map(node => {
                     const info = perNode[node] || {};
-                    const checked = fw.controls.filter(cid => info?.controls?.[cid] !== undefined);
-                    const passed = checked.filter(cid => {
-                        const v = info.controls[cid];
-                        return v === true || v?.status === true;
-                    });
+                    const checked = fw.controls.filter(cid => verdictOf(info?.controls?.[cid]) !== null);
+                    const passed = checked.filter(cid => verdictOf(info.controls[cid]) === true);
                     return {
                         node,
                         checked: checked.length,
@@ -7740,10 +10254,10 @@
                 fw.controls.forEach(cid => {
                     const sev = severityMap[cid] || 'medium';
                     nodes.forEach(node => {
-                        const v = perNode[node]?.controls?.[cid];
-                        if (v === undefined) return;
+                        const v = verdictOf(perNode[node]?.controls?.[cid]);
+                        if (v === null) return;
                         sevBuckets[sev].checked += 1;
-                        if (v === true || v?.status === true) sevBuckets[sev].passed += 1;
+                        if (v) sevBuckets[sev].passed += 1;
                     });
                 });
                 const highPct = sevBuckets.high.checked
@@ -7767,11 +10281,11 @@
                     if (!byFamily[familyKey]) byFamily[familyKey] = [];
                     const ctrlResults = {};
                     nodes.forEach(node => {
-                        const v = perNode[node]?.controls?.[cid];
-                        if (v === undefined) {
+                        const v = verdictOf(perNode[node]?.controls?.[cid]);
+                        if (v === null) {
                             ctrlResults[node] = '—';
                         } else {
-                            ctrlResults[node] = (v === true || v?.status === true) ? 'PASS' : 'FAIL';
+                            ctrlResults[node] = v ? 'PASS' : 'FAIL';
                         }
                     });
                     const evaluated = Object.values(ctrlResults).filter(s => s !== '—');
@@ -8244,6 +10758,11 @@
                                             </div>
                                             <p className={`text-3xl font-bold ${scoreColor(s.score)}`}>{s.score == null ? '—' : `${s.score}%`}</p>
                                             <p className="text-xs text-gray-500">{s.passed}/{s.total} {t('controls') || 'controls'}</p>
+                                            {s.notChecked > 0 && (
+                                                <p className="text-[11px] text-gray-400" title={t('hardenNotCheckedHint') || 'The check did not return a result, so it is neither passed nor failed and the score leaves it out'}>
+                                                    {s.notChecked} {t('hardenNotChecked') || 'not checked'}
+                                                </p>
+                                            )}
                                             {fw.note && (
                                                 <p className="text-[10px] text-yellow-400/80 leading-tight" title={fw.note}>⚠ {fw.note.slice(0, 80)}{fw.note.length > 80 ? '…' : ''}</p>
                                             )}
@@ -8316,13 +10835,20 @@
                                                     {info.error ? (
                                                         <span className="text-xs text-amber-400">{t('unavailable') || 'unavailable'}</span>
                                                     ) : (
-                                                        <span className={`text-sm font-medium ${scoreColor(info.score)}`}>{info.score}%</span>
+                                                        <span className={`text-sm font-medium ${scoreColor(info.score)}`}>{info.score == null ? '-' : `${info.score}%`}</span>
                                                     )}
                                                 </div>
                                                 {info.error ? (
                                                     <p className="text-xs text-gray-500 mt-1">{sshReason(info)[0] || `HTTP ${info.error}`}</p>
                                                 ) : (
-                                                    <p className="text-xs text-gray-500 mt-1">{info.passed}/{info.total} {t('passed') || 'passed'}</p>
+                                                    <p className="text-xs text-gray-500 mt-1">
+                                                        {info.passed}/{info.total} {t('passed') || 'passed'}
+                                                        {info.notChecked > 0 && (
+                                                            <span className="text-gray-400" title={t('hardenNotCheckedHint') || 'The check did not return a result, so it is neither passed nor failed and the score leaves it out'}>
+                                                                {' · '}{info.notChecked} {t('hardenNotChecked') || 'not checked'}
+                                                            </span>
+                                                        )}
+                                                    </p>
                                                 )}
                                             </div>
                                         ))}
@@ -8500,6 +11026,7 @@
             const [drDrillData, setDrDrillData] = useState(null);
             const [drDrillPolling, setDrDrillPolling] = useState(false);
             const [expandedEvent, setExpandedEvent] = useState(null);
+            const [guestPick, setGuestPick] = useState(null);
             const [sourceVms, setSourceVms] = useState([]);
             const [replJobs, setReplJobs] = useState([]);
             const [sourceBridges, setSourceBridges] = useState([]);
@@ -8516,7 +11043,12 @@
                 ready: 'bg-green-500/20 text-green-400', running: 'bg-blue-500/20 text-blue-400',
                 testing: 'bg-yellow-500/20 text-yellow-400', failed: 'bg-red-500/20 text-red-400',
                 completed: 'bg-purple-500/20 text-purple-400',
+                cancelling: 'bg-orange-500/20 text-orange-400', cancelled: 'bg-gray-500/20 text-gray-400',
             };
+            // LW Oct 2026 - a cancelled run finishes the guest it is on first: until then the plan
+            // reads 'cancelling', nothing starts on it and deleting it needs force, as while it runs
+            const srBusy = (status) => status === 'running' || status === 'cancelling';
+            const srActive = (status) => srBusy(status) || status === 'testing';
             const getClusterName = (id) => clusterLabel(clusters.find(cl => cl.id === id)) || id;
             const rpoColor = (vm) => {
                 if (!vm.last_replication) return 'text-gray-500';
@@ -8539,6 +11071,10 @@
             useEffect(() => { fetchPlans(); }, []);
             useEffect(() => { if (selectedPlan) { fetchPlanDetail(selectedPlan); setSrSubTab('overview'); } else setPlanDetail(null); }, [selectedPlan]);
             useEffect(() => { if (selectedPlan && srSubTab === 'events') fetchEvents(selectedPlan); }, [srSubTab, selectedPlan]);
+            // a finished run moved guests: read where they are now
+            useEffect(() => {
+                if (selectedPlan && srProgress?.plan_id === selectedPlan && srProgress.progress >= 100) { fetchPlanDetail(selectedPlan); fetchPlans(); }
+            }, [srProgress?.plan_id, srProgress?.progress]);
             // a test's boot screenshots arrive after its event completed: while one of the
             // listed tests still takes them, read the list again every few seconds
             const shotsPending = srSubTab === 'events' && events.some(ev => ev.details?.screenshots?.state === 'capturing');
@@ -8645,15 +11181,23 @@
                 if (r && r.ok) { addToast('Plan deleted'); setSelectedPlan(null); fetchPlans(); }
                 else { const e = r ? await r.json().catch(() => ({})) : {}; addToast(e.error || 'Delete failed', 'error'); }
             };
-            const handleAction = async (planId, action, confirmMsg) => {
+            const handleAction = async (planId, action, confirmMsg, body) => {
                 if (confirmMsg && !confirm(confirmMsg)) return;
                 setActionRunning(true);
                 try {
-                    const r = await authFetch(`${API_URL}/site-recovery/plans/${planId}/${action}`, { method: 'POST' });
+                    const opts = body ? { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) } : { method: 'POST' };
+                    const r = await authFetch(`${API_URL}/site-recovery/plans/${planId}/${action}`, opts);
                     if (r && r.ok) { const d = await r.json(); addToast(d.message || 'Action started'); fetchPlanDetail(planId); fetchPlans(); }
                     else { const e = r ? await r.json().catch(() => ({})) : {}; addToast(e.error || 'Action failed', 'error'); }
                 } catch(e) { addToast('Action failed', 'error'); }
                 finally { setTimeout(() => setActionRunning(false), 2000); }
+            };
+            // LW Oct 2026 - emergency failover and failback of single guests. The picker hands
+            // over the guests ticked; all of them is the whole plan, sent without a list as before
+            const startPicked = (planId, action, vmids, all) => {
+                if (!confirm(action === 'failback' ? t('srConfirmFailback') : t('confirmEmergency'))) return;
+                setGuestPick(null);
+                handleAction(planId, action, null, all ? null : { vmids });
             };
             // readiness check with modal
             const handleReadiness = async (planId) => {
@@ -8919,14 +11463,15 @@
                                 <button onClick={() => setSelectedPlan(null)} className="text-gray-400 hover:text-white"><Icons.ChevronLeft className="w-5 h-5" /></button>
                                 <h2 className="text-lg font-semibold flex items-center gap-2"><Icons.Shield className="w-5 h-5 text-proxmox-orange" />{pd.name}</h2>
                                 <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${statusColors[pd.status] || 'bg-gray-500/20 text-gray-400'}`}>{pd.status}</span>
+                                <SrFailoverBadge plan={pd} total={(pd.vms || []).length} t={t} />
                             </div>
                             <div className="flex items-center gap-2 flex-wrap">
                                 {canFailover && <button onClick={() => handleReadiness(pd.id)} disabled={actionRunning} className="px-3 py-1.5 text-xs rounded-lg bg-gray-600/50 text-gray-300 hover:bg-gray-600 disabled:opacity-40">{t('readinessCheck')}</button>}
                                 {canFailover && <button onClick={() => startDrDrill(pd)} disabled={actionRunning} className="px-3 py-1.5 text-xs rounded-lg bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 disabled:opacity-40">{t('drDrillRun') || 'DR Drill'}</button>}
-                                {canFailover && <button onClick={() => handleAction(pd.id, 'test', t('confirmFailover'))} disabled={actionRunning || pd.status === 'running'} className="px-3 py-1.5 text-xs rounded-lg bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500/30 disabled:opacity-40">{t('testFailover')}</button>}
-                                {canFailover && <button onClick={() => handleAction(pd.id, 'failover', t('confirmFailover'))} disabled={actionRunning || pd.status === 'running'} className="px-3 py-1.5 text-xs rounded-lg bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 disabled:opacity-40">{t('plannedFailover')}</button>}
-                                {canFailover && <button onClick={() => handleAction(pd.id, 'emergency', t('confirmEmergency'))} disabled={actionRunning || pd.status === 'running'} className="px-3 py-1.5 text-xs rounded-lg bg-red-500/20 text-red-400 hover:bg-red-500/30 disabled:opacity-40">{t('emergencyFailover')}</button>}
-                                {canFailover && pd.status === 'completed' && <button onClick={() => handleAction(pd.id, 'failback', t('confirmFailover'))} disabled={actionRunning} className="px-3 py-1.5 text-xs rounded-lg bg-purple-500/20 text-purple-400 hover:bg-purple-500/30 disabled:opacity-40">{t('failback')}</button>}
+                                {canFailover && <button onClick={() => handleAction(pd.id, 'test', t('confirmFailover'))} disabled={actionRunning || srBusy(pd.status)} className="px-3 py-1.5 text-xs rounded-lg bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500/30 disabled:opacity-40">{t('testFailover')}</button>}
+                                {canFailover && <button onClick={() => handleAction(pd.id, 'failover', t('confirmFailover'))} disabled={actionRunning || srBusy(pd.status)} className="px-3 py-1.5 text-xs rounded-lg bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 disabled:opacity-40">{t('plannedFailover')}</button>}
+                                {canFailover && <button data-sr-action="emergency" onClick={() => setGuestPick('emergency')} disabled={actionRunning || srBusy(pd.status) || pd.failover_state === 'all'} className="px-3 py-1.5 text-xs rounded-lg bg-red-500/20 text-red-400 hover:bg-red-500/30 disabled:opacity-40">{t('emergencyFailover')}</button>}
+                                {canFailover && pd.failed_over_count > 0 && <button data-sr-action="failback" onClick={() => setGuestPick('failback')} disabled={actionRunning || srBusy(pd.status)} className="px-3 py-1.5 text-xs rounded-lg bg-purple-500/20 text-purple-400 hover:bg-purple-500/30 disabled:opacity-40">{t('failback')}</button>}
                                 {canFailover && pd.status === 'testing' && <button onClick={() => handleAction(pd.id, 'test/cleanup', t('confirmTestCleanup'))} disabled={actionRunning} className="px-3 py-1.5 text-xs rounded-lg bg-orange-500/20 text-orange-400 hover:bg-orange-500/30 disabled:opacity-40">{t('testCleanup')}</button>}
                             </div>
                         </div>
@@ -8980,12 +11525,13 @@
                                             {gIdx > 0 && <span className="text-xs text-gray-500 flex items-center gap-1"><Icons.Clock className="w-3 h-3" />{t('bootDelay')}: {groupVms[0]?.boot_delay || 30}s</span>}
                                         </div>
                                         <table className="w-full text-sm">
-                                            <thead><tr className="text-left text-gray-500 text-xs"><th className="px-4 py-2">VMID</th><th className="py-2">{t('name')||'Name'}</th><th className="py-2">{t('bootGroup')}</th><th className="py-2">{t('bootDelay')}</th><th className="py-2">{t('rpo')}</th><th className="py-2 w-10"></th></tr></thead>
+                                            <thead><tr className="text-left text-gray-500 text-xs"><th className="px-4 py-2">VMID</th><th className="py-2">{t('name')||'Name'}</th><th className="py-2">{t('srGuestLocation')}</th><th className="py-2">{t('bootGroup')}</th><th className="py-2">{t('bootDelay')}</th><th className="py-2">{t('rpo')}</th><th className="py-2 w-10"></th></tr></thead>
                                             <tbody>
                                                 {groupVms.map(vm => (
                                                     <tr key={vm.id} className="border-t border-proxmox-border/30 hover:bg-proxmox-hover/30">
                                                         <td className="px-4 py-2 font-mono text-xs">{vm.vmid}</td>
                                                         <td className="py-2">{vm.vm_name || '-'}</td>
+                                                        <td className="py-2" data-sr-guest-location={vm.vmid}><SrGuestPlace vm={vm} t={t} /></td>
                                                         <td className="py-2">{editingVm?.id === vm.id && editingVm?.field === 'boot_group'
                                                             ? <input type="number" className="w-16 bg-proxmox-dark border border-proxmox-border rounded px-1 py-0.5 text-xs" defaultValue={vm.boot_group} autoFocus onBlur={e => handleUpdateVm(vm.id, 'boot_group', parseInt(e.target.value))} onKeyDown={e => e.key === 'Enter' && handleUpdateVm(vm.id, 'boot_group', parseInt(e.target.value))} />
                                                             : <span className="cursor-pointer hover:text-proxmox-orange" onClick={() => canManage && setEditingVm({id: vm.id, field: 'boot_group'})}>{vm.boot_group}</span>
@@ -8994,7 +11540,9 @@
                                                             ? <input type="number" className="w-16 bg-proxmox-dark border border-proxmox-border rounded px-1 py-0.5 text-xs" defaultValue={vm.boot_delay} autoFocus onBlur={e => handleUpdateVm(vm.id, 'boot_delay', parseInt(e.target.value))} onKeyDown={e => e.key === 'Enter' && handleUpdateVm(vm.id, 'boot_delay', parseInt(e.target.value))} />
                                                             : <span className="cursor-pointer hover:text-proxmox-orange" onClick={() => canManage && setEditingVm({id: vm.id, field: 'boot_delay'})}>{vm.boot_delay}s</span>
                                                         }</td>
-                                                        <td className="py-2"><span className={rpoColor(vm)}>{vm.last_replication ? fmtDate(vm.last_replication) : '-'}</span></td>
+                                                        <td className="py-2">{vm.failed_over
+                                                            ? <span className="text-xs text-gray-500">{t('srReplicationHeld')}</span>
+                                                            : <span className={rpoColor(vm)}>{vm.last_replication ? fmtDate(vm.last_replication) : '-'}</span>}</td>
                                                         {canManage && <td className="py-2"><button onClick={() => handleRemoveVm(vm.id)} className="text-red-400 hover:text-red-300"><Icons.Trash2 className="w-3.5 h-3.5" /></button></td>}
                                                     </tr>
                                                 ))}
@@ -9078,10 +11626,10 @@
                                                     <table className="w-full text-xs">
                                                         <thead><tr className="text-gray-500"><th className="text-left pb-1">VMID</th><th className="text-left pb-1">{t('name')||'Name'}</th><th className="text-left pb-1">Status</th><th className="text-left pb-1">Error</th></tr></thead>
                                                         <tbody>{Object.entries(results).map(([vmid, r]) => (
-                                                            <tr key={vmid} className="border-t border-proxmox-border/30">
+                                                            <tr key={vmid} className="border-t border-proxmox-border/30" data-sr-result={vmid}>
                                                                 <td className="py-1 font-mono">{vmid}</td><td className="py-1">{r.vm_name || '-'}</td>
-                                                                <td className="py-1">{r.success ? <span className="text-green-400">OK</span> : <span className="text-red-400">Failed</span>}</td>
-                                                                <td className="py-1 text-gray-500">{r.error || '-'}</td>
+                                                                <td className="py-1">{r.skipped ? <span className="text-gray-400">{t('skipped')}</span> : r.success ? <span className="text-green-400">OK</span> : <span className="text-red-400">Failed</span>}</td>
+                                                                <td className="py-1 text-gray-500">{r.skipped ? (r.reason === 'not failed over' ? t('srSkipNotFailedOver') : t('srSkipFailedOver')) : (r.error || '-')}</td>
                                                             </tr>
                                                         ))}</tbody>
                                                     </table>
@@ -9115,8 +11663,8 @@
                                 </div>
                                 {canManage && <div className="bg-red-500/5 border border-red-500/20 rounded-xl p-4">
                                     <h4 className="text-sm font-medium text-red-400 mb-2">{t('dangerZone') || 'Danger Zone'}</h4>
-                                    <button onClick={() => handleDeletePlan(pd.id, pd.status === 'running' || pd.status === 'testing')} className="px-3 py-1.5 text-xs rounded-lg bg-red-500/20 text-red-400 hover:bg-red-500/30">
-                                        {(pd.status === 'running' || pd.status === 'testing') ? (t('forceDeletePlan') || 'Force Delete (stuck)') : t('deletePlan')}
+                                    <button onClick={() => handleDeletePlan(pd.id, srActive(pd.status))} className="px-3 py-1.5 text-xs rounded-lg bg-red-500/20 text-red-400 hover:bg-red-500/30">
+                                        {(srActive(pd.status)) ? (t('forceDeletePlan') || 'Force Delete (stuck)') : t('deletePlan')}
                                     </button>
                                 </div>}
                             </div>
@@ -9137,7 +11685,7 @@
                                     </div>
                                     <select value={addVmForm.replication_job_id} onChange={e => setAddVmForm(f => ({...f, replication_job_id: e.target.value}))} className="w-full bg-proxmox-card border border-proxmox-border rounded-lg p-2 text-sm">
                                         <option value="">{t('linkReplication') || 'Link Replication Job (optional)'}</option>
-                                        {replJobs.filter(j => j.vmid == addVmForm.vmid).map(j => <option key={j.id} value={j.id}>{j.schedule} → {getClusterName(j.target_cluster)}</option>)}
+                                        {replJobs.filter(j => j.vmid == addVmForm.vmid && j.source_cluster === planDetail.source_cluster && j.target_cluster === planDetail.target_cluster).map(j => <option key={j.id} value={j.id}>{j.schedule} → {getClusterName(j.target_cluster)}</option>)}
                                     </select>
                                     <div className="flex justify-end gap-2">
                                         <button onClick={() => setShowAddVmModal(false)} className="px-3 py-1.5 text-sm text-gray-400 hover:text-white">{t('cancel') || 'Cancel'}</button>
@@ -9145,6 +11693,11 @@
                                     </div>
                                 </div>
                             </div>
+                        )}
+
+                        {guestPick && canFailover && (
+                            <SrGuestPicker plan={pd} action={guestPick} t={t} onCancel={() => setGuestPick(null)}
+                                onStart={(vmids, all) => startPicked(pd.id, guestPick, vmids, all)} />
                         )}
 
                         {/* ---- Readiness check results modal ---- */}
@@ -9298,7 +11851,8 @@
                                 <div key={plan.id} onClick={() => setSelectedPlan(plan.id)} className="bg-proxmox-card border border-proxmox-border rounded-xl p-4 cursor-pointer hover:border-proxmox-orange/50 transition-colors">
                                     <div className="flex items-center justify-between mb-3"><h3 className="font-medium text-sm">{plan.name}</h3><span className={`px-2 py-0.5 rounded-full text-xs ${statusColors[plan.status] || 'bg-gray-500/20 text-gray-400'}`}>{plan.status}</span></div>
                                     <div className="text-xs text-gray-500 space-y-1"><p>{getClusterName(plan.source_cluster)} → {getClusterName(plan.target_cluster)}</p><p>{plan.vm_count} {t('protectedVMs')}</p>{plan.last_failover && <p>Last failover: {fmtDate(plan.last_failover)}</p>}</div>
-                                    {canManage && <div className="mt-3 flex justify-end"><button onClick={(e) => { e.stopPropagation(); handleDeletePlan(plan.id, plan.status === 'running' || plan.status === 'testing'); }} className="text-red-400 hover:text-red-300 text-xs"><Icons.Trash2 className="w-3.5 h-3.5" /></button></div>}
+                                    {plan.failed_over_count > 0 && <div className="mt-2"><SrFailoverBadge plan={plan} total={plan.vm_count} t={t} /></div>}
+                                    {canManage && <div className="mt-3 flex justify-end"><button onClick={(e) => { e.stopPropagation(); handleDeletePlan(plan.id, srActive(plan.status)); }} className="text-red-400 hover:text-red-300 text-xs"><Icons.Trash2 className="w-3.5 h-3.5" /></button></div>}
                                 </div>
                             ))}
                         </div>
@@ -9314,6 +11868,110 @@
                             </div>
                         </div>
                     )}
+                </div>
+            );
+        }
+
+        // LW Oct 2026 - a recovery plan can be failed over guest by guest: how much of it is
+        // on the target now ('partial' or 'all', nothing while every guest is at the source)
+        function SrFailoverBadge({ plan, total, t }) {
+            const n = plan.failed_over_count || 0;
+            if (!n) return null;
+            const all = plan.failover_state === 'all';
+            return (
+                <span data-sr-failover-state={plan.failover_state}
+                    className={`px-2 py-0.5 rounded-full text-xs font-medium ${all ? 'bg-purple-500/20 text-purple-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                    {all ? t('srFailoverAll') : fillText(t('srFailoverPartial'), { n, total })}
+                </span>
+            );
+        }
+
+        function SrGuestPlace({ vm, t }) {
+            if (!vm.failed_over) return <span className="text-xs text-gray-500">{t('srGuestAtSource')}</span>;
+            return (
+                <span className="px-2 py-0.5 rounded text-xs bg-purple-500/20 text-purple-400"
+                    title={`${vm.failed_over}${vm.failed_over_at ? ', ' + fmtDate(vm.failed_over_at) : ''}`}>
+                    {t('srGuestFailedOver')}
+                </span>
+            );
+        }
+
+        // the guests an emergency failover or a failback takes. Every guest it can take is
+        // ticked to begin with; the others are listed with where they are. A plan of thousands
+        // renders the first SR_PICK_SHOWN rows of the filter, and "all" ticks what it matches
+        const SR_PICK_SHOWN = 200;
+        function SrGuestPicker({ plan, action, t, onCancel, onStart }) {
+            const back = action === 'failback';
+            const guests = plan.vms || [];
+            const takes = (vm) => !!vm.failed_over === back;
+            const eligible = useMemo(() => guests.filter(takes), [guests, back]);
+            const [picked, setPicked] = useState(() => new Set(eligible.map(v => v.vmid)));
+            const [filter, setFilter] = useState('');
+            const q = filter.trim().toLowerCase();
+            const rows = useMemo(() => q ? guests.filter(v => String(v.vmid).includes(q) || (v.vm_name || '').toLowerCase().includes(q)) : guests, [guests, q]);
+            const matching = rows.filter(takes);
+            const allOn = matching.length > 0 && matching.every(v => picked.has(v.vmid));
+            const flip = (vmids, on) => setPicked(prev => {
+                const next = new Set(prev);
+                vmids.forEach(id => on ? next.add(id) : next.delete(id));
+                return next;
+            });
+            const count = eligible.filter(v => picked.has(v.vmid)).length;
+            return (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onCancel}>
+                    <div data-sr-pick={action} className="bg-proxmox-dark border border-proxmox-border rounded-xl p-6 w-full max-w-lg space-y-4" onClick={e => e.stopPropagation()}>
+                        <h3 className={`font-semibold flex items-center gap-2 ${back ? 'text-purple-400' : 'text-red-400'}`}>
+                            {back ? <Icons.RotateCcw className="w-5 h-5" /> : <Icons.Zap className="w-5 h-5" />}
+                            {back ? t('failback') : t('emergencyFailover')}<span className="text-gray-400 font-normal">- {plan.name}</span>
+                        </h3>
+                        <p className="text-xs text-gray-400">{back ? t('srPickFailbackHint') : t('srPickEmergencyHint')}</p>
+                        <div className="flex items-center gap-3">
+                            <label className="flex items-center gap-2 text-xs text-gray-300 cursor-pointer shrink-0">
+                                <input type="checkbox" className="rounded" data-sr-pick-all checked={allOn} disabled={!matching.length}
+                                    onChange={() => flip(matching.map(v => v.vmid), !allOn)} />
+                                {t('selectAll')}
+                            </label>
+                            <div className="flex items-center gap-1.5 flex-1 min-w-0 bg-proxmox-card border border-proxmox-border rounded-lg px-2">
+                                <Icons.Search className="w-3.5 h-3.5 text-gray-500 shrink-0" />
+                                <input value={filter} onChange={e => setFilter(e.target.value)} placeholder={t('search')}
+                                    className="flex-1 min-w-0 bg-transparent py-1 text-sm focus:outline-none" />
+                            </div>
+                        </div>
+                        <div className="max-h-80 overflow-y-auto border border-proxmox-border rounded-lg">
+                            <table className="w-full text-sm">
+                                <thead><tr className="text-left text-gray-500 text-xs"><th className="px-3 py-2 w-8"></th><th className="py-2">VMID</th><th className="py-2">{t('name')}</th><th className="py-2">{t('bootGroup')}</th><th className="py-2 pr-4">{t('srGuestLocation')}</th></tr></thead>
+                                <tbody>
+                                    {rows.slice(0, SR_PICK_SHOWN).map(vm => {
+                                        const can = takes(vm);
+                                        return (
+                                            <tr key={vm.vmid} data-sr-pick-row={vm.vmid} className={`border-t border-proxmox-border/50 ${can ? 'hover:bg-proxmox-hover/30 cursor-pointer' : 'opacity-50'}`}
+                                                onClick={() => can && flip([vm.vmid], !picked.has(vm.vmid))}>
+                                                <td className="px-3 py-1.5"><input type="checkbox" className="rounded" disabled={!can} checked={can && picked.has(vm.vmid)} onChange={() => {}} /></td>
+                                                <td className="py-1.5 font-mono text-xs">{vm.vmid}</td>
+                                                <td className="py-1.5">{vm.vm_name || '-'}</td>
+                                                <td className="py-1.5 text-xs text-gray-400">{vm.boot_group ?? 0}</td>
+                                                <td className="py-1.5 pr-4"><SrGuestPlace vm={vm} t={t} /></td>
+                                            </tr>
+                                        );
+                                    })}
+                                </tbody>
+                            </table>
+                            {rows.length > SR_PICK_SHOWN && (
+                                <p className="text-xs text-gray-500 px-3 py-2 border-t border-proxmox-border/50" data-sr-pick-more>{fillText(t('srPickMore'), { n: rows.length - SR_PICK_SHOWN })}</p>
+                            )}
+                        </div>
+                        <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs text-gray-400" data-sr-pick-count>{fillText(t('srPickCount'), { n: count, total: eligible.length })}</span>
+                            <div className="flex gap-2">
+                                <button onClick={onCancel} className="px-3 py-1.5 text-sm text-gray-400 hover:text-white">{t('cancel')}</button>
+                                <button data-sr-pick-start disabled={!count}
+                                    onClick={() => onStart(eligible.filter(v => picked.has(v.vmid)).map(v => v.vmid), count === eligible.length)}
+                                    className={`px-4 py-1.5 text-sm rounded-lg text-white disabled:opacity-40 ${back ? 'bg-purple-600 hover:bg-purple-700' : 'bg-red-600 hover:bg-red-700'}`}>
+                                    {fillText(back ? t('srPickStartFailback') : t('srPickStartEmergency'), { n: count })}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             );
         }
@@ -9453,10 +12111,15 @@
         // the server dedup) lets us keep the SAME array reference on a no-op frame, so
         // ResourceTable's filter/sort useMemos + the whole grid stay idle instead of
         // re-rendering every second.
+        // LW Oct 2026 - the agent column of the list redraws when the agent comes or goes; the
+        // disk rates are fed from every frame through pegaprox-resources-frame instead
         function _resSig(r) {
             return r.vmid + '|' + (r.status || '') + '|' + (r.node || '') + '|' + (r.name || '') +
                    '|' + Math.floor((r.cpu_percent || 0) / 5) + '|' + Math.floor((r.mem_percent || 0) / 2) +
-                   '|' + (r.ip || '') + '|' + (r.tags || '');
+                   '|' + (r.ip || '') + '|' + (r.tags || '') + '|' + (r.agent_running === undefined ? '' : r.agent_running);
+        }
+        function announceResourcesFrame(clusterId, rows) {
+            try { window.dispatchEvent(new CustomEvent('pegaprox-resources-frame', { detail: { cluster_id: clusterId, rows } })); } catch (e) {}
         }
         function areResourcesEqual(a, b) {
             if (a === b) return true;
@@ -10417,6 +13080,8 @@
             const [error, setError] = useState(null);
             const [toasts, setToasts] = useState([]);
             const [activeTab, setActiveTab] = useState('overview');
+            // LW Oct 2026 - the datacenter section an overview link opens (the Ceph one), once
+            const [datacenterSection, setDatacenterSection] = useState(null);
             const [resourcesSubTab, setResourcesSubTab] = useState('management');
             const [sidebarTopology, setSidebarTopology] = useState(false);
             // MK May 2026 — Worldmap top-level sidebar entry (offline cluster geo-view)
@@ -10482,7 +13147,12 @@
             const [pbsSnapshots, setPbsSnapshots] = useState([]);
             const [pbsGroups, setPbsGroups] = useState([]);
             const [pbsTasks, setPbsTasks] = useState([]);
-            const [pbsJobs, setPbsJobs] = useState({});
+            const [pbsJobsResult, setPbsJobsResult] = useState({ id: null, data: {}, error: false });
+            const pbsJobsSeq = React.useRef(0);
+            const selectedPBSIdRef = React.useRef(null);
+            selectedPBSIdRef.current = selectedPBS?.id ?? null;
+            const pbsJobs = pbsJobsResult.id === selectedPBS?.id ? pbsJobsResult.data : {};
+            const pbsJobsError = pbsJobsResult.id === selectedPBS?.id && pbsJobsResult.error;
             const [pbsActiveTab, setPbsActiveTab] = useState('dashboard');
             // NS May 2026 — VM backup status map (vmid -> {status, last_age, ...})
             const [vmsBackupStatus, setVmsBackupStatus] = useState({});
@@ -10612,6 +13282,8 @@
             const [vmwareDsDetail, setVmwareDsDetail] = useState(null);
             const [vmwareClusters, setVmwareClusters] = useState([]);
             const [vmwareConnectionOk, setVmwareConnectionOk] = useState(true);
+            // what the VM list of the server answered when it failed: {code, message} (#1142)
+            const [vmwareError, setVmwareError] = useState(null);
             const [vmwareSelectedMigration, setVmwareSelectedMigration] = useState(null);
             const [vmwareMigrationDetail, setVmwareMigrationDetail] = useState(null);
             const [showVmwareRename, setShowVmwareRename] = useState(false);
@@ -10624,6 +13296,7 @@
             const [sidebarXHM, setSidebarXHM] = useState(false);
             const [sidebarMultiSdn, setSidebarMultiSdn] = useState(false); // #612 — Multi-Cluster EVPN view
             const [sidebarAutoInstall, setSidebarAutoInstall] = useState(false);
+            const [sidebarGuests, setSidebarGuests] = useState(false);  // All Guests, every guest in one table
             const [autoInstallIntent, setAutoInstallIntent] = useState(null); // {wizard, target_cluster_id} handed to the panel once
             const [xhmMigrations, setXhmMigrations] = useState([]);
             const [xhmSelectedMigration, setXhmSelectedMigration] = useState(null);
@@ -10691,21 +13364,23 @@
             };
 
             // NS: auto-clear topology/xhm sidebar when navigating to something else
-            useEffect(() => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup) { setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); } }, [selectedCluster, selectedPBS, selectedVMware, selectedGroup]);
+            useEffect(() => { if (selectedCluster || selectedPBS || selectedVMware || selectedGroup) { setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); setSidebarGuests(false); } }, [selectedCluster, selectedPBS, selectedVMware, selectedGroup]);
 
             // All Clusters used to check only XHM, so it stayed lit next to World Map / EVPN
-            const onGlobalView = sidebarTopology || sidebarWorldmap || sidebarXHM || sidebarMultiSdn || sidebarAutoInstall;
+            const onGlobalView = sidebarTopology || sidebarWorldmap || sidebarXHM || sidebarMultiSdn || sidebarAutoInstall || sidebarGuests;
             // one way in for every auto-install shortcut, intent opens the wizard on arrival
             const openAutoInstall = (intent = null) => {
-                setSidebarAutoInstall(true); setSidebarTopology(false); setSidebarWorldmap(false); setSidebarXHM(false); setSidebarMultiSdn(false);
+                setSidebarAutoInstall(true); setSidebarTopology(false); setSidebarWorldmap(false); setSidebarXHM(false); setSidebarMultiSdn(false); setSidebarGuests(false);
                 setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null);
                 setAutoInstallIntent(intent);
             };
             // the other global views, one place for the Modern rows and the corporate Tools section
-            const openTopology = () => { setSidebarTopology(true); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarWorldmap(false); setSidebarXHM(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); };
-            const openWorldmap = () => { setSidebarWorldmap(true); setSidebarTopology(false); setSidebarXHM(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); };
-            const openXhm = () => { setSidebarXHM(true); setSidebarTopology(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); };
-            const openMultiSdn = () => { setSidebarMultiSdn(true); setSidebarXHM(false); setSidebarTopology(false); setSidebarWorldmap(false); setSidebarAutoInstall(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); };
+            const openTopology = () => { setSidebarTopology(true); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarWorldmap(false); setSidebarXHM(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); setSidebarGuests(false); };
+            const openWorldmap = () => { setSidebarWorldmap(true); setSidebarTopology(false); setSidebarXHM(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); setSidebarGuests(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); };
+            const openXhm = () => { setSidebarXHM(true); setSidebarTopology(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); setSidebarGuests(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); };
+            const openMultiSdn = () => { setSidebarMultiSdn(true); setSidebarXHM(false); setSidebarTopology(false); setSidebarWorldmap(false); setSidebarAutoInstall(false); setSidebarGuests(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); };
+            // LW Oct 2026 - All Guests, the guest table of every cluster
+            const openGuests = () => { setSidebarGuests(true); setSidebarTopology(false); setSidebarWorldmap(false); setSidebarXHM(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); };
             // XHM needs a cluster on each side
             const hasXhmPair = clusters.some(c => c.type === 'xcpng' || c.cluster_type === 'xcpng') && clusters.some(c => c.type !== 'xcpng' && c.cluster_type !== 'xcpng');
 
@@ -10731,6 +13406,11 @@
             const [expandedSidebarNodes, setExpandedSidebarNodes] = useState({});
             const [selectedSidebarVm, setSelectedSidebarVm] = useState(null);
             const [selectedSidebarNode, setSelectedSidebarNode] = useState(null); // LW: Feb 2026 - corporate node detail
+            // LW Oct 2026 (#1137) - the QDevice next to the nodes: what /qdevice said per cluster, the
+            // cluster whose QDevice the corporate view shows, the one in the modern dialog
+            const [qdeviceByCluster, setQdeviceByCluster] = useState({});
+            const [selectedSidebarQdevice, setSelectedSidebarQdevice] = useState(null);
+            const [qdeviceOpen, setQdeviceOpen] = useState(null);
             // NS: Mar 2026 - recent items for corporate sidebar
             const [recentItems, setRecentItems] = useState(() => {
                 try { return JSON.parse(localStorage.getItem('corp-recent') || '[]'); } catch { return []; }
@@ -10766,6 +13446,11 @@
             const [reconfigurePassword, setReconfigurePassword] = useState('');
             const [reconfigureConfig, setReconfigureConfig] = useState(null);
             const [reconfigureLoading, setReconfigureLoading] = useState(false);
+            // LW Oct 2026 (#1136) - nodes of a new cluster that refused the login, and which part
+            // of the re-configure dialog to open on
+            const [nodeCredsNotice, setNodeCredsNotice] = useState(null);
+            const [nodeLoginsAfterAdd, setNodeLoginsAfterAdd] = useState(null);  // LW Oct 2026 (#1136)
+            const reconfigureFocusRef = useRef(null);
             // NS: Mar 2026 - pool/folder view for corporate sidebar
             const [sidebarViewMode, setSidebarViewMode] = useState(() => localStorage.getItem('pegaprox-sidebar-view') || 'tree');
             const [sidebarSearch, setSidebarSearch] = useState('');
@@ -10798,9 +13483,13 @@
                 setSelectedSidebarVm(prev => prev && prev._clusterId === selectedCluster?.id ? prev : null);
                 setSelectedSidebarNode(prev => prev && prev.clusterId === selectedCluster?.id ? prev : null);
                 setSelectedSidebarDatastore(prev => prev && prev.clusterId === selectedCluster?.id ? prev : null);
+                setSelectedSidebarQdevice(prev => prev === selectedCluster?.id ? prev : null);
+                setQdeviceOpen(null);
                 if (selectedCluster && isCorporate) setExpandedSidebarClusters(prev => ({ ...prev, [selectedCluster.id]: true }));
             }, [selectedCluster?.id]);
-            useEffect(() => { if (activeTab !== 'resources') setSelectedSidebarVm(null); if (activeTab !== 'overview') setSelectedSidebarNode(null); if (activeTab !== 'datastore') setSelectedSidebarDatastore(null); }, [activeTab]);
+            useEffect(() => { if (activeTab !== 'resources') setSelectedSidebarVm(null); if (activeTab !== 'overview') { setSelectedSidebarNode(null); setSelectedSidebarQdevice(null); } if (activeTab !== 'datastore') setSelectedSidebarDatastore(null); }, [activeTab]);
+            // whatever else the tree opens takes the place of the QDevice view
+            useEffect(() => { if (selectedSidebarNode || selectedSidebarVm || selectedSidebarDatastore) setSelectedSidebarQdevice(null); }, [selectedSidebarNode, selectedSidebarVm, selectedSidebarDatastore]);
             useEffect(() => { localStorage.setItem('pegaprox-sidebar-view', sidebarViewMode); }, [sidebarViewMode]);
 
             // NS: track recent items for corporate sidebar
@@ -10854,9 +13543,9 @@
             // handlers and patching each one would rot the moment somebody adds another.
             useEffect(() => { setMobileSidebarOpen(false); }, [
                 selectedGroup, selectedCluster, selectedPBS, selectedVMware,
-                selectedSidebarVm, selectedSidebarNode, selectedSidebarDatastore, activeTab,
+                selectedSidebarVm, selectedSidebarNode, selectedSidebarDatastore, selectedSidebarQdevice, activeTab,
                 // the global views set no selection, so they never closed the drawer
-                sidebarTopology, sidebarWorldmap, sidebarXHM, sidebarMultiSdn, sidebarAutoInstall,
+                sidebarTopology, sidebarWorldmap, sidebarXHM, sidebarMultiSdn, sidebarAutoInstall, sidebarGuests,
             ]);
             const sidebarResizing = useRef(false);
             const wsRef = useRef(null);
@@ -10914,6 +13603,8 @@
             // #625: the last agent check of the open HA settings, and what HA disable left behind
             const [haAgentCheck, setHaAgentCheck] = useState(null);
             const [haDisableReport, setHaDisableReport] = useState(null);
+            // NS Oct 2026 - the maintenance dialog of the cloud menus and the sidebar: {clusterId, node, options}
+            const [maintDialog, setMaintDialog] = useState(null);
             
             // NS: Global Search state - Jan 2026
             const [globalSearchQuery, setGlobalSearchQuery] = useState('');
@@ -10992,8 +13683,10 @@
             const [alertMutes, setAlertMutes] = useState([]);
             const [muteMenu, setMuteMenu] = useState(null);
             const [muteWholeObject, setMuteWholeObject] = useState(false);
-            const EVENT_ALERT_METRICS = ['task_failed', 'ceph_health', 'replication', 'snapshot_age', 'backup_coverage', 'zfs_health'];
-            const [sessionExpired, setSessionExpired] = useState(false);  // any 401 -> clear "session expired" overlay instead of silent failure
+            const EVENT_ALERT_METRICS = ['task_failed', 'ceph_health', 'ceph_osd_latency', 'replication', 'replication_rpo', 'snapshot_age', 'backup_coverage', 'zfs_health', 'clock_drift', 'restart_loop', 'qdevice'];
+            // LW Oct 2026 - a guest without a restore test that passed within so many days
+            EVENT_ALERT_METRICS.push('restore_test_age');
+            const [sessionExpired, setSessionExpired] = useState(false);  // our own 401 -> clear "session expired" overlay instead of silent failure
             const [clusterAffinityRules, setClusterAffinityRules] = useState([]);
             const [showAffinityModal, setShowAffinityModal] = useState(false);
             
@@ -11046,6 +13739,17 @@
             const [topVms, setTopVms] = useState([]);
             const [reportSubTab, setReportSubTab] = useState('summary');
             const [complianceSubTab, setComplianceSubTab] = useState('hardening');
+            // NS Oct 2026 - hardening and drift read with admin.audit or node.maintenance, the change
+            // plans with changes.view; each account gets the sub tabs it can read
+            const complianceSubs = [
+                ...((holds('admin.audit') || holds('node.maintenance')) ? [
+                    { id: 'hardening', label: t('compliance') || 'Compliance', icon: Icons.Lock },
+                    { id: 'drift', label: t('driftDetection') || 'Drift Detection', icon: Icons.Shield },
+                ] : []),
+                ...(holds('changes.view') ? [{ id: 'changes', label: t('chgTab'), icon: Icons.ClipboardList }] : []),
+            ];
+            const complianceSub = complianceSubs.some(x => x.id === complianceSubTab)
+                ? complianceSubTab : ((complianceSubs[0] || {}).id || '');
 
             // MK: CVE Scanner state
             const [cveResults, setCveResults] = useState(null);
@@ -11074,6 +13778,8 @@
             // addToast and t exist. A ref, because authFetch keeps one identity for good.
             // And with the 503 HA_ACTIVE_UNREACHABLE of a forwarding standby
             const haRefusedRef = useRef(null);
+            // when a 401 without one of our codes last made us ask /auth/check (#1142)
+            const sessionProbeRef = useRef(0);
             const authFetch = React.useCallback(async (url, opts = {}) => {
                 const { timeout, quiet, ...rest } = opts;
                 let ctrl, timer;
@@ -11090,11 +13796,24 @@
                     });
                     // #144: detect session loss early — don't auto-logout on auth/check or SSE
                     if (res.status === 401 && !url.includes('/auth/') && !url.includes('/sse')) {
-                        console.warn('[authFetch] 401 on', url.split('?')[0]);
-                        // Session invalid/expired (server restart, timeout, revoked token) — surface a
-                        // clear overlay instead of letting every poll fail silently. Idempotent, so
-                        // a burst of concurrent 401s only shows the prompt once.
-                        setSessionExpired(true);
+                        // LW Oct 2026 (#1142) - only a 401 with one of PegaProx's own codes means the
+                        // session is gone. Any other one (an ESXi server refusing its stored password,
+                        // a proxy) is the caller's error: the overlay threw the user out at every click
+                        // on such a server. /auth/check is asked once whether the session is still there.
+                        const body = await res.clone().json().catch(() => null);
+                        if (PegaProxApiErrors.sessionLost(body)) {
+                            console.warn('[authFetch] 401 on', url.split('?')[0]);
+                            // Session invalid/expired (server restart, timeout, revoked token) - surface a
+                            // clear overlay instead of letting every poll fail silently. Idempotent, so
+                            // a burst of concurrent 401s only shows the prompt once.
+                            setSessionExpired(true);
+                        } else if (Date.now() - sessionProbeRef.current > 15000) {
+                            sessionProbeRef.current = Date.now();
+                            fetch(`${API_URL}/auth/check?t=${Date.now()}`, { credentials: 'include', headers: getAuthHeaders() })
+                                .then(r => r.status === 401 ? { authenticated: false } : r.json())
+                                .then(d => { if (d && d.authenticated === false) setSessionExpired(true); })
+                                .catch(() => {});
+                        }
                     }
                     setConnectionError(null);
                     // #625 v2 - a standby refuses what acts. One translated toast here, and the
@@ -11475,6 +14194,32 @@
                                 </div>
                             );
                         })}
+                        {/* LW Oct 2026 (#1137) - the QDevice right after the nodes, only where the cluster has one */}
+                        {showNodes && qdeviceByCluster[clusterId]?.present && (!searchLower || 'qdevice'.includes(searchLower)) && (() => {
+                            const isQSelected = selectedSidebarQdevice === clusterId;
+                            const openQ = () => { if (!selectedCluster || selectedCluster.id !== clusterId) setSelectedCluster(clusters.find(c => c.id === clusterId)); setSelectedSidebarNode(null); setSelectedSidebarVm(null); setSelectedSidebarDatastore(null); setSelectedSidebarQdevice(clusterId); setActiveTab('overview'); };
+                            return (
+                                <div
+                                    key={`qdevice-${clusterId}`}
+                                    data-qdevice-entry={clusterId}
+                                    className="corp-tree-child flex items-center gap-1.5 pl-1 pr-2 py-0.5 text-[13px] leading-5 cursor-pointer"
+                                    tabIndex={0}
+                                    onClick={openQ}
+                                    onKeyDown={(e) => {
+                                        if (e.key === 'Enter') { e.preventDefault(); openQ(); }
+                                        else if (e.key === 'ArrowDown') treeNavDown(e);
+                                        else if (e.key === 'ArrowUp') treeNavUp(e);
+                                    }}
+                                    style={isQSelected ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}}
+                                    onMouseEnter={(e) => { if (!isQSelected) { e.currentTarget.style.background = 'var(--color-hover)'; e.currentTarget.style.color = 'var(--color-text)'; } }}
+                                    onMouseLeave={(e) => { if (!isQSelected) { e.currentTarget.style.background = ''; e.currentTarget.style.color = 'var(--corp-text-secondary)'; } }}
+                                >
+                                    <span className="flex flex-shrink-0" style={{color: 'var(--corp-accent)'}}><Icons.Scale className="w-4 h-4" /></span>
+                                    <span className="truncate flex-1">{t('qdeviceTitle')}</span>
+                                    <QdeviceDot q={qdeviceByCluster[clusterId]} />
+                                </div>
+                            );
+                        })()}
                         {/* Then VMs/CTs at same level */}
                         {filteredVms.map(vm => {
                             const vmRunning = vm.status === 'running';
@@ -12079,6 +14824,13 @@
                         const data = await response.json();
                         setGlobalSearchResults(data);
                         setGlobalSearchIndex(0);
+                    } else if (response && response.status === 400) {
+                        // LW Oct 2026 - a query the server cannot read: the dropdown says where
+                        const body = await response.json().catch(() => null);
+                        if (body && body.code === 'SEARCH_SYNTAX') {
+                            setGlobalSearchResults({ query, count: 0, results: [], tag_suggestions: [], syntaxError: body });
+                            setGlobalSearchIndex(0);
+                        }
                     }
                 } catch (err) {
                     console.error('Global search error:', err);
@@ -12898,6 +15650,15 @@
                     return t('backupCoverageSummary').replace('{n}', n) + (tags.length ? ` - ${t('backupCoverageExcept').replace('{tags}', tags.join(', '))}` : '');
                 }
                 if (alert.metric === 'zfs_health') return `${t('zfsAlertTitle')}: ${Number(n) >= 1 ? t('zfsAlertStateOnly') : t('zfsAlertAny')}`;
+                if (alert.metric === 'clock_drift') return t('clockDriftSummary').replace('{n}', n);
+                if (alert.metric === 'restart_loop') return t('restartLoopSummary').replace('{n}', n).replace('{m}', alert.restart_window_minutes || 15);
+                if (alert.metric === 'qdevice') return t('qdeviceAlertSummary');
+                if (alert.metric === 'ceph_osd_latency') return t('cephOsdLatencySummary').replace('{n}', n);
+                if (alert.metric === 'replication_rpo') return Number(n) > 0 ? t('replicationRpoSummary').replace('{n}', n) : t('replicationRpoSummaryAuto');
+                if (alert.metric === 'restore_test_age') {
+                    const tags = alert.backup_exclude_tags || [];
+                    return t('restoreTestAgeSummary').replace('{n}', n) + (tags.length ? ` - ${t('backupCoverageExcept').replace('{tags}', tags.join(', '))}` : '');
+                }
                 return `${alert.metric?.toUpperCase()} ${alert.operator} ${alert.threshold}%`;
             };
 
@@ -12978,6 +15739,20 @@
                 setReportLoading(false);
             };
             
+            // LW Oct 2026 - the CPU and memory charts of the report zoom together. The report is
+            // PegaProx's own history already, so a range with few points in it (the week keeps
+            // every third snapshot) is read again at full resolution with from/to
+            const reportToSeries = d => (d && Array.isArray(d.timestamps)) ? {
+                timestamps: d.timestamps.map(x => { const ms = new Date(x).getTime(); return isNaN(ms) ? 0 : Math.floor(ms / 1000); }),
+                metrics: { cpu: d.cpu?.samples || [], memory: d.memory?.samples || [] },
+            } : null;
+            const reportSeries = React.useMemo(() => reportToSeries(reportData), [reportData]);
+            const reportZoom = useChartZoom({
+                preset: reportPeriod, loaded: reportSeries, resetKey: selectedCluster?.id,
+                loadRange: (from, to) => authFetch(`${API_URL}/clusters/${selectedCluster?.id}/reports/summary?from=${Math.floor(from)}&to=${Math.ceil(to)}`)
+                    .then(r => r && r.ok ? r.json() : null).then(reportToSeries),
+            });
+
             const loadTopVms = async (metric = 'cpu', limit = 10, clusterId = null) => {
                 const clId = clusterId || selectedCluster?.id;
                 if (!clId) return;
@@ -13069,9 +15844,11 @@
                         // pre-select all controls that are NOT yet applied
                         const sel = {};
                         Object.entries(data.controls || {}).forEach(([id, v]) => {
-                            // verbose: v is {status, evidence}, non-verbose: v is bool
-                            const applied = typeof v === 'object' ? v.status : v;
-                            if (!applied) sel[id] = true;
+                            // verbose: v is {status, evidence}, non-verbose: v is bool. LW Oct 2026 -
+                            // null is a control that was not checked: its state is unknown, so it
+                            // is not ticked for an apply on its own
+                            const applied = (v && typeof v === 'object') ? v.status : v;
+                            if (applied === false) sel[id] = true;
                         });
                         setHardenSelected(sel);
                     } else {
@@ -13707,6 +16484,7 @@
                                     // NS Jul 2026 (render-perf): skip the array swap on a no-op/
                                     // keepalive frame so the VM grid doesn't re-filter/re-render
                                     // every second (window.pegaproxVmList is the last-applied list)
+                                    announceResourcesFrame(data.cluster_id, data.data);
                                     if (!areResourcesEqual(window.pegaproxVmList, data.data)) {
                                         setClusterResources(data.data);
                                         window.pegaproxVmList = data.data;
@@ -14077,11 +16855,29 @@
                 } catch (e) { console.warn('PBS tasks error:', e); }
             };
             
+            /**
+             * Read PBS jobs with status, keeping late replies from a previous server out of view.
+             * @param {string} pbsId - The PBS server whose jobs are requested.
+             * @returns {Promise<void>}
+             */
             const fetchPBSJobs = async (pbsId) => {
+                const seq = ++pbsJobsSeq.current;
                 try {
                     const resp = await authFetch(`${API_URL}/pbs/${pbsId}/jobs`);
-                    if (resp && resp.ok) setPbsJobs(await resp.json());
-                } catch (e) { console.warn('PBS jobs error:', e); }
+                    if (resp && resp.ok) {
+                        const jobs = await resp.json();
+                        if (seq === pbsJobsSeq.current) {
+                            setPbsJobsResult({ id: pbsId, data: jobs, error: false });
+                        }
+                    } else if (seq === pbsJobsSeq.current) {
+                        setPbsJobsResult({ id: pbsId, data: {}, error: true });
+                    }
+                } catch (e) {
+                    console.warn('PBS jobs error:', e);
+                    if (seq === pbsJobsSeq.current) {
+                        setPbsJobsResult({ id: pbsId, data: {}, error: true });
+                    }
+                }
             };
 
             // MK Apr 2026: #273 — PBS Reports fetchers
@@ -14315,6 +17111,12 @@
                 } catch (e) { addToast('Error: ' + e.message, 'error'); }
             };
             
+            // LW Oct 2026 - opening the Jobs or Datastores tab reads the jobs again instead of
+            // showing what the last 30 s poll had
+            useEffect(() => {
+                if (selectedPBS && (pbsActiveTab === 'jobs' || pbsActiveTab === 'datastores')) fetchPBSJobs(selectedPBS.id);
+            }, [pbsActiveTab]);
+
             // Load PBS when selected
             useEffect(() => {
                 if (selectedPBS) {
@@ -14329,6 +17131,7 @@
                     const interval = setInterval(() => {
                         fetchPBSStatus(selectedPBS.id);
                         fetchPBSDatastores(selectedPBS.id);
+                        fetchPBSJobs(selectedPBS.id);
                     }, 30000);
                     return () => clearInterval(interval);
                 }
@@ -14482,15 +17285,26 @@
                 } catch (e) { addToast(`${action} error: ${e.message}`, 'error'); }
             };
             
+            /**
+             * Start a PBS job and refresh its server's tasks and last-run status.
+             * @param {'sync'|'verify'|'prune'} jobType - PBS job kind.
+             * @param {string} jobId - Job to run.
+             * @returns {Promise<void>}
+             */
             const pbsRunJob = async (jobType, jobId) => {
                 if (!selectedPBS) return;
+                const pbsId = selectedPBS.id;
                 try {
-                    const resp = await authFetch(`${API_URL}/pbs/${selectedPBS.id}/jobs/${jobType}/${jobId}/run`, {
+                    const resp = await authFetch(`${API_URL}/pbs/${pbsId}/jobs/${jobType}/${jobId}/run`, {
                         method: 'POST',
                     });
                     if (resp && resp.ok) {
                         addToast(`${jobType} job '${jobId}' started`, 'success');
-                        setTimeout(() => fetchPBSTasks(selectedPBS.id), 1000);
+                        setTimeout(() => {
+                            if (selectedPBSIdRef.current !== pbsId) return;
+                            fetchPBSTasks(pbsId);
+                            fetchPBSJobs(pbsId);
+                        }, 1000);
                     } else {
                         const err = resp ? await resp.json().catch(() => ({})) : {};
                         addToast(`Job failed: ${err.error || 'unknown'}`, 'error');
@@ -14510,7 +17324,7 @@
             };
             
             
-            // PBS prune dialog  
+            // PBS prune dialog
             const [showPbsPrune, setShowPbsPrune] = useState(null);
             
             // ============================================================
@@ -14531,11 +17345,18 @@
                 setVmwareLoading(true);
                 try {
                     const resp = await authFetch(`${API_URL}/vmware/${vmwId}/vms`);
-                    if (resp && resp.ok) {
+                    // a slow answer for the server shown before says nothing about this one
+                    const current = !selectedVMwareRef.current || selectedVMwareRef.current.id === vmwId;
+                    if (current && resp && resp.ok) {
                         const data = await resp.json();
                         setVmwareVms(Array.isArray(data) ? data : data.data || []);
                         setVmwareConnectionOk(true);
-                    } else {
+                        setVmwareError(null);
+                    } else if (current) {
+                        // the server's own words, so a refused password is told apart from a
+                        // server that is down (#1142)
+                        const body = resp ? await resp.json().catch(() => ({})) : {};
+                        setVmwareError(resp ? { code: body.code || '', message: body.error || `HTTP ${resp.status}` } : null);
                         setVmwareConnectionOk(false);
                     }
                 } catch (e) { console.warn('VMware VMs error:', e); setVmwareConnectionOk(false); }
@@ -14715,6 +17536,17 @@
                         setShowAddVMware(false);
                         setEditingVMware(null);
                         fetchVMwareServers();
+                        // the server on screen is read again at once, with the password just set (#1142).
+                        // All of it: networks have no poll, hosts and datastores wait a minute for theirs
+                        if (selectedVMware?.id === vmwId) {
+                            const saved = await resp.json().catch(() => null);
+                            if (saved) setSelectedVMware(prev => ({ ...prev, ...saved }));
+                            fetchVMwareVms(vmwId);
+                            fetchVMwareHosts(vmwId);
+                            fetchVMwareDatastores(vmwId);
+                            fetchVMwareNetworks(vmwId);
+                            fetchVMwareClusters(vmwId);
+                        }
                     } else {
                         const err = resp ? await resp.json().catch(() => ({})) : {};
                         addToast(`${t('updateFailed')}: ${err.error || t('unknown')}`, 'error');
@@ -14722,6 +17554,12 @@
                 } catch (e) { addToast(t('error') + ': ' + e.message, 'error'); }
             };
             
+            const openVmwareEdit = (vmw) => {
+                setEditingVMware(vmw);
+                setVmwareForm({ name: vmw.name || '', host: vmw.host, port: vmw.port || 443, username: vmw.username || 'root', password: '', ssl_verify: vmw.ssl_verify || false, notes: vmw.notes || '' });
+                setShowAddVMware(true);
+            };
+
             const handleDeleteVMware = async (vmwId) => {
                 if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
                 if (!confirm(t('deleteEsxiServerConfirm'))) return;
@@ -14761,6 +17599,10 @@
             // Fetch VMs when a VMware server is selected
             useEffect(() => {
                 if (selectedVMware?.id) {
+                    // nothing of the server shown before stays under this one's name, not when
+                    // this one cannot be read either (#1142)
+                    setVmwareVms([]); setVmwareHosts([]); setVmwareDatastores([]); setVmwareNetworks([]); setVmwareClusters([]);
+                    setVmwareError(null); setVmwareConnectionOk(true);
                     fetchVMwareVms(selectedVMware.id);
                     fetchVMwareHosts(selectedVMware.id);
                     fetchVMwareDatastores(selectedVMware.id);
@@ -15311,7 +18153,8 @@
                         }
                         
                         // fetch status for all clusters (overview)
-                        const connectedClusters = data.filter(c => c.connected);
+                        // LW Oct 2026 - an ESXi connection has no datacenter status to poll
+                        const connectedClusters = data.filter(c => c.connected && c.cluster_type !== 'esxi');
                         const allGuests = [];
                         
                         // NS #594 — this used to be a serial await-loop: one slow cluster
@@ -15471,6 +18314,7 @@
                             return { ...prev, [clusterId]: { ...cur, resources: data } };
                         });
                         if (selectedClusterRef.current?.id !== clusterId) return;
+                        announceResourcesFrame(clusterId, data);
                         // NS Jul 2026 (render-perf): only swap + re-render on a real change
                         if (!areResourcesEqual(window.pegaproxVmList, data)) {
                             setClusterResources(data);
@@ -15578,6 +18422,41 @@
                 return () => clearInterval(iv);
             }, []);
 
+            // LW Oct 2026 (#1137) - the QDevice of the clusters someone looks at: the selected one and
+            // those open in the corporate tree, every 30 s. The server reads a cluster at most that
+            // often whoever asks. A refusal (a confined account) is not asked again
+            const qdeviceClustersRef = useRef([]);
+            qdeviceClustersRef.current = clusters;
+            const fetchQdevice = async (clusterId) => {
+                const c = (qdeviceClustersRef.current || []).find(x => x.id === clusterId);
+                if (!c || c.cluster_type === 'xcpng' || c.connected === false || !can('node.view')) return;
+                const res = await authFetch(`${API_URL}/clusters/${clusterId}/qdevice`, { timeout: POLL_TIMEOUT_MS, quiet: true });
+                if (res && res.ok) {
+                    const data = await res.json().catch(() => null);
+                    if (data) { setQdeviceByCluster(prev => ({ ...prev, [clusterId]: data })); return; }
+                } else if (res && (res.status === 403 || res.status === 404)) {
+                    setQdeviceByCluster(prev => ({ ...prev, [clusterId]: { present: false, refused: true } }));
+                    return;
+                }
+                // no answer (timeout, 503): the last one stays, marked as old, so its dot does not
+                // keep saying connected while nothing can be read
+                setQdeviceByCluster(prev => prev[clusterId]?.present && !prev[clusterId].stale
+                    ? { ...prev, [clusterId]: { ...prev[clusterId], stale: true } } : prev);
+            };
+            const qdeviceSeenRef = useRef({});
+            qdeviceSeenRef.current = qdeviceByCluster;
+            useEffect(() => {
+                const round = () => {
+                    const ids = new Set();
+                    if (selectedClusterRef.current?.id) ids.add(selectedClusterRef.current.id);
+                    if (isCorporate) Object.entries(expandedSidebarClustersRef.current || {}).forEach(([cid, open]) => { if (open) ids.add(cid); });
+                    ids.forEach(cid => { if (!(qdeviceSeenRef.current[cid] || {}).refused) fetchQdevice(cid); });
+                };
+                round();
+                const iv = setInterval(round, 30000);
+                return () => clearInterval(iv);
+            }, [selectedCluster?.id, expandedSidebarClusters, isCorporate, clusters.length]);
+
             const fetchClusterNetworks = async (clusterId) => {
                 setLoadingNetworks(true);
                 try {
@@ -15660,20 +18539,22 @@
                         await fetchClusters();
                         setShowAddModal(false);
                         addToast(t('clusterAdded') || 'Cluster added successfully');
+                        if (data.node_check && data.id) setNodeLoginsAfterAdd({ id: data.id, name: config.name });
                         // LW: show extra toast when API token was auto-created (#110)
                         if (data.api_token_created) {
                             addToast(t('apiTokenCreated') || 'API token created on PVE', 'success');
                             setTimeout(() => addToast(t('sshPasswordStillNeeded') || 'SSH still uses the password', 'info'), 800);
                         }
-                    } else if (response && response.status === 401) {
-                        // #144: session expired or lost — re-login needed
-                        setError(t('sessionExpired') || 'Session expired — please log in again');
-                        setTimeout(() => logout(), 2000);
                     } else {
-                        const err = await response.json().catch(() => ({}));
-                        // #683 — a 2FA-enabled PVE account can't be added by password; show the
+                        const err = response ? await response.json().catch(() => ({})) : {};
+                        if (response?.status === 401 && PegaProxApiErrors.sessionLost(err)) {
+                            // #144: session expired or lost - re-login needed. Only our own 401 says
+                            // so; Proxmox refusing the login typed here is an error of this form (#1142)
+                            setError(t('sessionExpired') || 'Session expired - please log in again');
+                            setTimeout(() => logout(), 2000);
+                        // #683 - a 2FA-enabled PVE account can't be added by password; show the
                         // localized hint (API token OR temporarily disable 2FA) instead of the raw text.
-                        if (err.error_code === 'NEEDS_2FA') {
+                        } else if (err.error_code === 'NEEDS_2FA') {
                             setError(t('cluster2FAHint') || err.error);
                         } else {
                             setError(err.error || t('connectionFailed'));
@@ -15683,6 +18564,12 @@
                     setError(t('connectionError') + ': ' + error.message);
                 }
                 setLoading(false);
+            };
+
+            const openNodeCredentials = (notice) => {
+                reconfigureFocusRef.current = 'nodeCreds';
+                setNodeCredsNotice(null);
+                setReconfigureCluster({ id: notice.clusterId, name: notice.name, display_name: notice.name, host: notice.host });
             };
 
             const handleDeleteCluster = async (clusterId) => {
@@ -15779,6 +18666,8 @@
                     const cfg = await cfgResp.json();
                     cfg._cluster_id = reconfigureCluster.id;
                     cfg._current_password = reconfigurePassword;
+                    cfg._focus = reconfigureFocusRef.current;
+                    reconfigureFocusRef.current = null;
                     setReconfigureConfig(cfg);
                     setReconfigureCluster(null);
                     setReconfigurePassword('');
@@ -15889,41 +18778,23 @@
                 }
             };
 
-            // #611 — non-blocking pre-flight RAM capacity check before entering
-            // maintenance. Any failure returns '' so the confirm proceeds unchanged.
-            const buildMaintPreviewWarning = async (clusterId, nodeName) => {
-                try {
-                    const pv = await authFetch(`${API_URL}/clusters/${clusterId}/nodes/${nodeName}/maintenance-preview?threshold=90`);
-                    if (!pv || !pv.ok) return '';
-                    const p = await pv.json();
-                    if (!p) return '';
-                    const proceed = '\n' + (t('maintPreviewProceed') || 'You can still proceed — this is only a capacity pre-check, not a hard block.');
-                    if (p.reason === 'no_target_nodes' && p.guest_count > 0)
-                        return '\n\n' + (t('maintPreviewNoTargets') || "Warning: no other online node to evacuate this node's guests to — they will keep running (a reboot takes them down).");
-                    if (!p.headroom_sufficient)
-                        return '\n\n' + (t('maintPreviewNoHeadroom') || 'Warning: the remaining online nodes may not have enough free RAM to hold all guests from this node. Some migrations could fail.') + proceed;
-                    if (p.over_threshold && p.over_threshold.length)
-                        return '\n\n' + (t('maintPreviewOverThreshold') || 'Warning: evacuating this node would push these node(s) over the RAM threshold: ') + p.over_threshold.join(', ') + proceed;
-                    return '';
-                } catch (_) { return ''; }
-            };
-
             // LW Oct 2026 (#763, #954) - options: the evacuation options the maintenance dialog of a
-            // node was left with ({ migrate_templates, relax_anti_affinity }), sent as they are
-            const handleMaintenanceToggle = async (nodeName, enable, options) => {
-                if (!selectedCluster) return;
+            // node was left with ({ migrate_templates, relax_anti_affinity }), sent as they are.
+            // NS Oct 2026 - enabling without options (the cloud menus, the sidebar) opens the
+            // maintenance dialog first, which runs the what-if of the node; the node dialogs ask
+            // on their own and call with their options. forCluster: the cluster of a sidebar node.
+            const handleMaintenanceToggle = async (nodeName, enable, options, forCluster) => {
+                const cid = forCluster || selectedCluster?.id;
+                if (!cid) return;
                 if (haReadOnly) { haRefusedRef.current?.(); return; }  // the active acts (#625)
+                if (enable && options === undefined) { setMaintDialog({ clusterId: cid, node: nodeName, options: {} }); return; }
                 // #147
-                const msg = enable
-                    ? `${t('startingMaintenanceMode') || 'Enable maintenance mode'}: "${nodeName}"? VMs will be evacuated.`
-                    : `${t('disableMaintenance') || 'Disable maintenance'}: "${nodeName}"?`;
-                const warn = enable ? await buildMaintPreviewWarning(selectedCluster.id, nodeName) : '';
-                if (!confirm(msg + warn)) return;
+                if (!enable && !confirm(`${t('disableMaintenance') || 'Disable maintenance'}: "${nodeName}"?`)) return;
 
                 try {
                     if (enable) {
                         addToast(`${t('startingMaintenanceMode') || 'Starting maintenance mode'}: ${nodeName}...`, 'info');
-                        const response = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/nodes/${nodeName}/maintenance`, {
+                        const response = await authFetch(`${API_URL}/clusters/${cid}/nodes/${nodeName}/maintenance`, {
                             method: 'PUT',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
@@ -15935,24 +18806,25 @@
                         
                         if (response && response.ok) {
                             addToast(`${t('maintenanceModeEnabled') || 'Maintenance mode enabled'}: ${nodeName}`);
-                            await fetchClusterMetrics(selectedCluster.id);
+                            await fetchClusterMetrics(cid);
                         } else {
                             const err = await response.json();
                             addToast(err.error || t('activationError') || 'Activation error', 'error');
                         }
                     } else {
-                        const response = await authFetch(`${API_URL}/clusters/${selectedCluster.id}/nodes/${nodeName}/maintenance`, {
+                        const response = await authFetch(`${API_URL}/clusters/${cid}/nodes/${nodeName}/maintenance`, {
                             method: 'DELETE'
                         });
                         
                         if (response && response.ok) {
                             addToast(`${t('nodeMaintenanceExited') || 'Maintenance mode exited'}: ${nodeName}`);
-                            await fetchClusterMetrics(selectedCluster.id);
+                            await fetchClusterMetrics(cid);
                         } else {
                             const err = await response.json();
                             addToast(err.error || t('deactivationError') || 'Deactivation error', 'error');
                         }
                     }
+                    if (forCluster) fetchSidebarClusterData(cid);
                 } catch (error) {
                     addToast(t('connectionError'), 'error');
                 }
@@ -16136,13 +19008,18 @@
             // LW Oct 2026 (#952) - a bulk migration is a run on the server: this starts it and
             // opens its progress. The dialog it comes from is the confirmation (#147), and
             // its answer is {ok} or {error} for that dialog to show
-            const handleBulkMigrate = async ({ clusterId, vms, target, online, withLocalDisks, mode, parallel }) => {
+            const handleBulkMigrate = async ({ clusterId, vms, target, online, withLocalDisks, mode, parallel, override }) => {
                 const cid = clusterId || selectedCluster?.id;
                 if (!cid) return { error: t('bulkMigrationFailed') };
                 try {
                     const body = { vms: vms.map(v => ({ vmid: v.vmid, node: v.node, type: v.type })), target,
                         online: online !== false, with_local_disks: !!withLocalDisks, mode };
                     if (mode === 'parallel') body.parallel = parallel;
+                    // LW Oct 2026 - blocks of the preflight the dialog's Check let the user override
+                    if (override && override.length) {
+                        body.override = override;
+                        body.confirm_override = true;
+                    }
                     const response = await authFetch(`${API_URL}/clusters/${encodeURIComponent(cid)}/vms/bulk-migrate`, {
                         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
                     });
@@ -16314,6 +19191,11 @@
                     if (response && response.ok) {
                         const result = await response.json();
                         addToast(result.message || t('crossClusterStarted'));
+                        // LW Oct 2026 - a target with a transfer network that this migration could not use
+                        const xn = result.transfer_network;
+                        if (xn && xn.via === 'management') {
+                            addToast(t('xferNetFallback').replace('{network}', xn.network).replace('{node}', xn.node || '?'), 'warning');
+                        }
                         setTimeout(() => fetchClusterResources(selectedCluster.id), 5000);
                     } else if (response) {
                         const err = await response.json();
@@ -16523,25 +19405,10 @@
                         { perm: 'vm.create', label: t('newVm') || 'New VM', icon: <Icons.Monitor className="w-3.5 h-3.5" />, onClick: () => openCreateOnCluster('qemu') },
                         { perm: 'vm.create', label: t('newContainer') || 'New Container', icon: <Icons.Box className="w-3.5 h-3.5" />, onClick: () => openCreateOnCluster('lxc') },
                         { separator: true },
-                        { perm: 'node.maintenance', label: maintenance ? (t('exitMaintenance') || 'Exit Maintenance') : (t('enterMaintenance') || 'Enter Maintenance'), icon: <Icons.Wrench className="w-3.5 h-3.5" />, onClick: async () => {
-                            // NS: Mar 2026 - inline API call with known clusterId to avoid stale closure on selectedCluster
-                            const mMsg = maintenance ? `${t('disableMaintenance') || 'Disable maintenance'}: "${nodeName}"?` : `${t('startingMaintenanceMode') || 'Enable maintenance mode'}: "${nodeName}"? VMs will be evacuated.`;
-                            const mWarn = maintenance ? '' : await buildMaintPreviewWarning(clusterId, nodeName);
-                            if (!confirm(mMsg + mWarn)) return;
+                        { perm: 'node.maintenance', label: maintenance ? (t('exitMaintenance') || 'Exit Maintenance') : (t('enterMaintenance') || 'Enter Maintenance'), icon: <Icons.Wrench className="w-3.5 h-3.5" />, onClick: () => {
+                            // NS: Mar 2026 - the cluster id of the node travels along, selectedCluster may be stale here
                             selectCluster();
-                            try {
-                                if (!maintenance) {
-                                    addToast(`${t('startingMaintenanceMode') || 'Starting maintenance mode'}: ${nodeName}...`, 'info');
-                                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/nodes/${nodeName}/maintenance`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enable: true }) });
-                                    if (r && r.ok) { addToast(`${t('maintenanceModeEnabled') || 'Maintenance mode enabled'}: ${nodeName}`); fetchClusterMetrics(clusterId); }
-                                    else { const err = await r?.json().catch(() => ({})); addToast(err?.error || t('activationError') || 'Activation error', 'error'); }
-                                } else {
-                                    const r = await authFetch(`${API_URL}/clusters/${clusterId}/nodes/${nodeName}/maintenance`, { method: 'DELETE' });
-                                    if (r && r.ok) { addToast(`${t('nodeMaintenanceExited') || 'Maintenance mode exited'}: ${nodeName}`); fetchClusterMetrics(clusterId); }
-                                    else { const err = await r?.json().catch(() => ({})); addToast(err?.error || t('deactivationError') || 'Deactivation error', 'error'); }
-                                }
-                                fetchSidebarClusterData(clusterId);
-                            } catch (e) { addToast(t('connectionError'), 'error'); }
+                            handleMaintenanceToggle(nodeName, !maintenance, undefined, clusterId);
                         }, disabled: !online },
                         ...(haConsolesElsewhere ? onActiveItems('node.shell', '', !online) : [
                         { perm: 'node.shell', label: t('sshConsole') || 'SSH Console', icon: <Icons.Terminal className="w-3.5 h-3.5" />, onClick: () => { selectCluster(); const c = clusters.find(cl => cl.id === clusterId); if (c) { setConsoleInfo({ vmid: 0, node: nodeName, type: 'node', host: c.host }); setConsoleVm({ vmid: 0, node: nodeName, type: 'node', name: nodeName }); } }, disabled: !online, console: true },
@@ -16914,6 +19781,12 @@
                         <UserProfileModal isOpen={showProfile} onClose={() => setShowProfile(false)} addToast={addToast} />
                         <PegaProxSettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} addToast={addToast} onGroupsChanged={fetchClusterGroups} />
                         {showApiReference && <ApiReferenceModal onClose={() => setShowApiReference(false)} />}
+                        {maintDialog && (
+                            <MaintenanceDialog clusterId={maintDialog.clusterId} node={maintDialog.node} options={maintDialog.options}
+                                onOptions={(o) => setMaintDialog(prev => prev ? { ...prev, options: o } : prev)}
+                                onCancel={() => setMaintDialog(null)}
+                                onConfirm={() => { const d = maintDialog; setMaintDialog(null); handleMaintenanceToggle(d.node, true, d.options, d.clusterId); }} />
+                        )}
                         {toastPortal}
                     </div>
                 );
@@ -17003,7 +19876,10 @@
                                             <><Icons.ChevronRight className="w-3 h-3" style={{color:'#4a6070'}} /><span className="corp-breadcrumb-current"><Icons.Server className="w-3 h-3" />{selectedCluster.display_name || selectedCluster.name}</span></>
                                         )}
                                         {activeTab && selectedCluster && (
-                                            <><Icons.ChevronRight className="w-3 h-3" style={{color:'#4a6070'}} /><span className={(selectedSidebarVm || selectedSidebarNode || selectedSidebarDatastore) ? 'corp-breadcrumb-segment' : 'corp-breadcrumb-current'} onClick={() => { if (selectedSidebarVm) setSelectedSidebarVm(null); if (selectedSidebarNode) setSelectedSidebarNode(null); if (selectedSidebarDatastore) setSelectedSidebarDatastore(null); }}>{t(activeTab)}</span></>
+                                            <><Icons.ChevronRight className="w-3 h-3" style={{color:'#4a6070'}} /><span className={(selectedSidebarVm || selectedSidebarNode || selectedSidebarDatastore || selectedSidebarQdevice) ? 'corp-breadcrumb-segment' : 'corp-breadcrumb-current'} onClick={() => { if (selectedSidebarVm) setSelectedSidebarVm(null); if (selectedSidebarNode) setSelectedSidebarNode(null); if (selectedSidebarDatastore) setSelectedSidebarDatastore(null); if (selectedSidebarQdevice) setSelectedSidebarQdevice(null); }}>{t(activeTab === 'timeline' ? 'tlTab' : activeTab)}</span></>
+                                        )}
+                                        {selectedSidebarQdevice && activeTab === 'overview' && (
+                                            <><Icons.ChevronRight className="w-3 h-3" style={{color:'#4a6070'}} /><span className="corp-breadcrumb-current" data-qdevice-crumb=""><Icons.Scale className="w-3 h-3" />{t('qdeviceTitle')}</span></>
                                         )}
                                         {selectedSidebarVm && activeTab === 'resources' && (
                                             <><Icons.ChevronRight className="w-3 h-3" style={{color:'#4a6070'}} /><span className="corp-breadcrumb-current"><Icons.Monitor className="w-3 h-3" />{selectedSidebarVm.name || `VM ${selectedSidebarVm.vmid}`}</span></>
@@ -17050,6 +19926,15 @@
                                                 }}
                                                 className={`${isCorporate ? 'w-48 md:w-72 lg:w-96 px-2 py-1' : 'w-48 md:w-72 lg:w-80 px-2 py-2'} bg-transparent text-white placeholder-gray-500 focus:outline-none text-sm`}
                                             />
+                                            {/* above the click-away layer of the open dropdown */}
+                                            <span className="relative z-50 mr-2 flex items-center flex-shrink-0">
+                                                <SearchSyntaxHelp t={t} onPick={(example) => {
+                                                    setGlobalSearchQuery(example);
+                                                    performGlobalSearch(example);
+                                                    setShowGlobalSearch(true);
+                                                    globalSearchRef.current?.focus();
+                                                }} />
+                                            </span>
                                             {globalSearchLoading ? (
                                                 <Icons.RotateCw className="w-4 h-4 mr-3 text-gray-400 animate-spin flex-shrink-0" />
                                             ) : (
@@ -17075,14 +19960,21 @@
                                                                 <Icons.X className="w-4 h-4" />
                                                             </button>
                                                         </div>
+                                                        {globalSearchResults.syntaxError && (
+                                                            <div data-search-syntax-error className="text-xs text-red-400 mt-1">
+                                                                {searchSyntaxMessage(t, globalSearchResults.syntaxError)}
+                                                            </div>
+                                                        )}
                                                         {/* MK: clickable tag pills for quick filtering */}
-                                                        {globalSearchResults.tag_suggestions?.length > 0 && !globalSearchQuery.startsWith('tag:') && (
+                                                        {/* LW Oct 2026 - a pill completes the last term (after AND/OR too), the rest stays */}
+                                                        {globalSearchResults.tag_suggestions?.length > 0 && (globalSearchResults.tag_complete || !globalSearchQuery.startsWith('tag:')) && (
                                                             <div className="flex flex-wrap gap-1 mt-2">
                                                                 <span className="text-xs text-gray-500 mr-1">Tags:</span>
                                                                 {globalSearchResults.tag_suggestions.slice(0, 6).map((tag, i) => (
-                                                                    <button key={i} onClick={() => {
-                                                                        setGlobalSearchQuery(`tag:${tag}`);
-                                                                        performGlobalSearch(`tag:${tag}`);
+                                                                    <button key={i} data-search-tag-pill={tag} onClick={() => {
+                                                                        const next = searchWithTag(globalSearchResults, tag);
+                                                                        setGlobalSearchQuery(next);
+                                                                        performGlobalSearch(next);
                                                                     }} className="px-1.5 py-0.5 text-xs rounded bg-proxmox-orange/20 text-proxmox-orange hover:bg-proxmox-orange/30 transition-colors">
                                                                         {tag}
                                                                     </button>
@@ -17090,7 +19982,7 @@
                                                             </div>
                                                         )}
                                                     </div>
-                                                    {globalSearchResults.results.length === 0 ? (
+                                                    {globalSearchResults.syntaxError ? null : globalSearchResults.results.length === 0 ? (
                                                         <div className="p-6 text-center text-gray-500">
                                                             <Icons.Search className="mx-auto mb-2 opacity-50" />
                                                             <p>{t('noResults') || 'No results'}</p>
@@ -17143,7 +20035,7 @@
                                                                             <div className="flex flex-wrap gap-1 mt-1">
                                                                                 {(Array.isArray(result.tags) ? result.tags : result.tags.split(';')).filter(t => t.trim()).slice(0, 4).map((tag, i) => (
                                                                                     <span key={i} className={`px-1.5 py-0.5 text-xs rounded ${
-                                                                                        globalSearchQuery.toLowerCase().replace('tag:', '').split(',').some(q => tag.trim().toLowerCase().includes(q.trim()))
+                                                                                        (globalSearchResults.highlight || globalSearchQuery.toLowerCase().replace('tag:', '').split(',')).some(q => q.trim() && tag.trim().toLowerCase().includes(q.trim()))
                                                                                         ? 'bg-proxmox-orange/30 text-proxmox-orange ring-1 ring-proxmox-orange/50'
                                                                                         : 'bg-proxmox-dark text-gray-400'
                                                                                     }`}>
@@ -17614,7 +20506,7 @@
                                         <div className={isCorporate ? 'space-y-0' : 'space-y-3'}>
                                             {/* MK: overview button, LW: compact for corporate */}
                                             <button
-                                                onClick={() => { setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); }}
+                                                onClick={() => { setSelectedCluster(null); setSelectedPBS(null); setSelectedVMware(null); setSelectedGroup(null); setSidebarTopology(false); setSidebarXHM(false); setSidebarWorldmap(false); setSidebarMultiSdn(false); setSidebarAutoInstall(false); setSidebarGuests(false); }}
                                                 className={`w-full flex items-center ${
                                                     isCorporate
                                                         ? 'gap-1.5 pl-1 pr-2 py-0.5 text-[13px] leading-5'
@@ -17668,6 +20560,27 @@
                                                         <div>
                                                             <div className="text-sm font-medium">{t('worldMap') || 'World Map'}</div>
                                                             <div className="text-xs text-gray-500">{t('worldMapHint') || 'Cluster locations'}</div>
+                                                        </div>
+                                                    </span>
+                                                </button>
+
+                                                {/* LW Oct 2026 - All Guests, one table of every guest; a standby shows it without the actions */}
+                                                <button
+                                                    onClick={openGuests}
+                                                    data-sidebar-guests=""
+                                                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all mt-1 ${
+                                                        sidebarGuests
+                                                            ? 'bg-gradient-to-r from-blue-500/20 to-blue-600/10 border border-blue-500/30 text-white'
+                                                            : 'bg-proxmox-card border border-proxmox-border hover:border-blue-500/30 text-gray-300 hover:text-white'
+                                                      }`}
+                                                >
+                                                    <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${sidebarGuests ? 'bg-blue-500/20' : 'bg-proxmox-dark'}`}>
+                                                        <span className="flex text-blue-400"><Icons.Monitor /></span>
+                                                    </div>
+                                                    <span className="flex-1 text-left">
+                                                        <div>
+                                                            <div className="text-sm font-medium">{t('allGuestsTitle')}</div>
+                                                            <div className="text-xs text-gray-500">{t('allGuestsHint')}</div>
                                                         </div>
                                                     </span>
                                                 </button>
@@ -17855,6 +20768,8 @@
                                         cluster; the empty card has the auto-install link. */}
                                     {isCorporate && clusters.length > 0 && (() => {
                                         const tools = [
+                                            { id: 'guests', show: true, active: sidebarGuests, label: t('allGuestsTitle'), onClick: openGuests,
+                                              icon: <Icons.Monitor /> },
                                             { id: 'topology', show: true, active: sidebarTopology, label: t('topologyView') || 'Topology', onClick: openTopology,
                                               icon: <Icons.Network className="w-4 h-4" /> },
                                             // Globe always draws at w-5, zoom puts it in the 16px column of the others
@@ -18238,6 +21153,7 @@
                                                     { id: 'datastore', labelKey: 'datastore', icon: Icons.Database },
                                                     { id: 'automation', labelKey: 'automation', icon: Icons.Zap },
                                                     { id: 'reports', labelKey: 'reports', icon: Icons.BarChart },
+                                                    { id: 'timeline', labelKey: 'tlTab', icon: Icons.Clock },
                                                     { id: 'compliance', labelKey: 'compliance', icon: Icons.Lock },
                                                     { id: 'site-recovery', labelKey: 'siteRecovery', icon: Icons.Shield },
                                                     { id: 'plugins', labelKey: 'plugins', icon: Icons.Package },
@@ -18249,7 +21165,7 @@
                                                 if (tab.id === 'site-recovery') return can('site_recovery.view');
                                                 if (tab.id === 'plugins') return can('plugins.view');
                                                 // compliance only reads, so a standby keeps it (#625)
-                                                if (tab.id === 'compliance') return holds('admin.audit') || holds('node.maintenance');
+                                                if (tab.id === 'compliance') return holds('admin.audit') || holds('node.maintenance') || holds('changes.view');
                                                 if (typeof tab.id === 'string' && tab.id.startsWith('plugin:')) return can('plugins.view');
                                                 return true;
                                             }).map(tab => (
@@ -18289,6 +21205,13 @@
                                                 onStartUpdate={handleStartUpdate}
                                                 onSelectVm={(vm) => { setSelectedSidebarVm({...vm, _clusterId: selectedSidebarNode.clusterId}); setSelectedSidebarNode(null); setActiveTab('resources'); setResourcesSubTab('management'); }}
                                                 addToast={addToast}
+                                            />
+                                            ) : isCorporate && selectedSidebarQdevice ? (
+                                            <QdeviceDetail
+                                                corporate
+                                                q={qdeviceByCluster[selectedSidebarQdevice]}
+                                                clusterName={(clusters.find(c => c.id === selectedSidebarQdevice) || {}).display_name || (clusters.find(c => c.id === selectedSidebarQdevice) || {}).name || ''}
+                                                onClose={() => setSelectedSidebarQdevice(null)}
                                             />
                                             ) : (
                                             <div className={isCorporate ? 'space-y-3' : 'grid grid-cols-1 xl:grid-cols-3 gap-6'}>
@@ -18602,7 +21525,34 @@
                                                                     </div>
                                                                 </div>
                                                             ))}
+                                                            {/* LW Oct 2026 (#1137) - the QDevice next to the nodes, only where the cluster has one */}
+                                                            {qdeviceByCluster[selectedCluster.id]?.present && (
+                                                                <button
+                                                                    type="button"
+                                                                    data-qdevice-entry={selectedCluster.id}
+                                                                    onClick={() => setQdeviceOpen(selectedCluster.id)}
+                                                                    className="self-start text-left card-hover bg-proxmox-card border border-proxmox-border rounded-xl p-5 animate-slide-up"
+                                                                >
+                                                                    <div className="flex items-center gap-3">
+                                                                        <div className="p-2 bg-proxmox-dark rounded-lg text-gray-300">
+                                                                            <Icons.Scale />
+                                                                        </div>
+                                                                        <div className="min-w-0 flex-1">
+                                                                            <h3 className="font-semibold text-white flex items-center gap-2">{t('qdeviceTitle')} <QdeviceDot q={qdeviceByCluster[selectedCluster.id]} /></h3>
+                                                                            <p className="text-xs text-gray-400 truncate">{t('qdeviceQnetdHost')}: {qdeviceByCluster[selectedCluster.id].qnetd_host || '-'}</p>
+                                                                        </div>
+                                                                    </div>
+                                                                    <div className="mt-3 text-xs text-gray-400">{qdeviceConnectedText(qdeviceByCluster[selectedCluster.id], t)}</div>
+                                                                </button>
+                                                            )}
                                                         </div>
+                                                        )}
+                                                        {!isCorporate && qdeviceOpen && (
+                                                            <QdeviceDetail
+                                                                q={qdeviceByCluster[qdeviceOpen]}
+                                                                clusterName={(clusters.find(c => c.id === qdeviceOpen) || {}).display_name || (clusters.find(c => c.id === qdeviceOpen) || {}).name || ''}
+                                                                onClose={() => setQdeviceOpen(null)}
+                                                            />
                                                         )}
                                                         {Object.keys(clusterMetrics).length === 0 && Object.keys(nodeAlerts).length === 0 && (
                                                             <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-8 text-center">
@@ -19372,7 +22322,8 @@
 
                                         {/* Datacenter Tab */}
                                         {activeTab === 'datacenter' && (
-                                            <DatacenterTab clusterId={selectedCluster.id} addToast={addToast} />
+                                            <DatacenterTab clusterId={selectedCluster.id} addToast={addToast}
+                                                initialSection={datacenterSection} onSectionShown={() => setDatacenterSection(null)} />
                                         )}
 
                                         {/* Datastore Tab */}
@@ -20102,8 +23053,11 @@
                                                             const controls = hardenStatus.controls || {};
                                                             // NS Apr 2026: verbose result is {status, evidence, command}, non-verbose is bool
                                                             const _isApplied = v => typeof v === 'object' ? v?.status === true : v === true;
+                                                            // null: the check's output did not come back, so it counts nowhere
+                                                            const _notChecked = v => ((v && typeof v === 'object') ? v.status : v) == null;
                                                             const appliedCount = Object.values(controls).filter(_isApplied).length;
-                                                            const totalCount = Object.keys(controls).length;
+                                                            const notCheckedCount = Object.values(controls).filter(_notChecked).length;
+                                                            const totalCount = Object.keys(controls).length - notCheckedCount;
                                                             const selectedCount = Object.values(hardenSelected).filter(Boolean).length;
 
                                                             // reusable render fn for a single control row
@@ -20112,6 +23066,7 @@
                                                                 // verbose: ctrlData is {status, evidence, command}, non-verbose: bool
                                                                 const isVerboseData = ctrlData && typeof ctrlData === 'object';
                                                                 const applied = isVerboseData ? ctrlData.status === true : ctrlData === true;
+                                                                const notChecked = (id in controls) && _notChecked(ctrlData);
                                                                 const evidence = isVerboseData ? (ctrlData.evidence || '') : '';
                                                                 const checkCmd = isVerboseData ? (ctrlData.command || '') : '';
                                                                 const failed = hardenResults?.[id]?.success === false;
@@ -20162,6 +23117,7 @@
                                                                                 <span className={`text-xs font-mono px-1.5 py-0.5 rounded ${source === 'cis' ? 'text-blue-400 bg-blue-500/10' : source === 'lynis' ? 'text-purple-400 bg-purple-500/10' : source === 'pega' ? 'text-orange-400 bg-orange-500/10' : 'text-amber-400 bg-amber-500/10'}`}>{source === 'cis' ? 'CIS' : source === 'lynis' ? 'Lynis' : source === 'pega' ? 'PegaProx' : 'STIG'} {info.ref}</span>
                                                                                 <span className="text-sm font-medium text-white">{info.title}</span>
                                                                                 {applied && <span className="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded">{t('applied') || 'Applied'}</span>}
+                                                                                {notChecked && <span className="text-xs bg-gray-500/20 text-gray-300 px-2 py-0.5 rounded" title={(isVerboseData && ctrlData.not_checked) || t('hardenNotCheckedHint') || 'The check did not return a result, so it is neither passed nor failed and the score leaves it out'}>{t('hardenNotCheckedBadge') || 'Not checked'}</span>}
                                                                                 {applied && info.reboot && <span className="text-xs bg-orange-500/20 text-orange-400 px-2 py-0.5 rounded font-semibold">{t('rebootRequired') || 'Reboot required'}</span>}
                                                                                 {failed && <span className="text-xs bg-red-500/20 text-red-400 px-2 py-0.5 rounded">{t('failed') || 'Failed'}</span>}
                                                                             </div>
@@ -20273,11 +23229,12 @@
                                                                     { name: 'PegaProx ' + (t('recommendations') || 'Recommendations'), ctrls: pegaControls, src: 'pega' },
                                                                     { name: 'VS-NfD / BSI Grundschutz (' + (t('informational') || 'informational') + ')', ctrls: vsnfdControls, src: 'vsnfd' },
                                                                 ];
-                                                                const statusLbl = (applied, failed) => failed ? (t('failed') || 'Failed') : applied ? (t('applied') || 'Applied') : (t('notApplied') || 'Not applied');
+                                                                const statusLbl = (applied, failed, unread) => failed ? (t('failed') || 'Failed') : applied ? (t('applied') || 'Applied') : unread ? (t('hardenNotCheckedBadge') || 'Not checked') : (t('notApplied') || 'Not applied');
                                                                 const blocks = [
                                                                     { type: 'stats', data: [
                                                                         { label: t('controlsActive') || 'Controls active', value: `${appliedCount}/${totalCount}`, color: appliedCount === totalCount ? '#2a9f2a' : '#c89600' },
                                                                         { label: t('notApplied') || 'Not applied', value: String(totalCount - appliedCount), color: '#dc3232' },
+                                                                        ...(notCheckedCount > 0 ? [{ label: t('hardenNotCheckedBadge') || 'Not checked', value: String(notCheckedCount), color: '#808080' }] : []),
                                                                         { label: t('selected') || 'Selected', value: String(selectedCount), color: '#3c82c8' },
                                                                     ]},
                                                                     { type: 'spacer', height: 4 },
@@ -20289,7 +23246,7 @@
                                                                         const isObj = v && typeof v === 'object';
                                                                         const applied = isObj ? v.status === true : v === true;
                                                                         const failed = hardenResults?.[id]?.success === false;
-                                                                        return [info.ref || '-', info.title || id, statusLbl(applied, failed), (info.impact || '').slice(0, 90)];
+                                                                        return [info.ref || '-', info.title || id, statusLbl(applied, failed, (id in controls) && _notChecked(v)), (info.impact || '').slice(0, 90)];
                                                                     });
                                                                     blocks.push({
                                                                         type: 'table',
@@ -20334,6 +23291,11 @@
                                                                             <span className={`text-sm font-semibold ${appliedCount === totalCount ? 'text-green-400' : appliedCount > totalCount / 2 ? 'text-yellow-400' : 'text-red-400'}`}>
                                                                                 {appliedCount}/{totalCount} {t('controlsActive') || 'controls active'}
                                                                             </span>
+                                                                            {notCheckedCount > 0 && (
+                                                                                <span className="text-xs text-gray-400" title={t('hardenNotCheckedHint') || 'The check did not return a result, so it is neither passed nor failed and the score leaves it out'}>
+                                                                                    · {notCheckedCount} {t('hardenNotChecked') || 'not checked'}
+                                                                                </span>
+                                                                            )}
                                                                         </div>
                                                                         <div className="w-full bg-gray-700 rounded-full h-2">
                                                                             <div className={`h-2 rounded-full transition-all ${appliedCount === totalCount ? 'bg-green-500' : appliedCount > totalCount / 2 ? 'bg-yellow-500' : 'bg-red-500'}`} style={{width: `${totalCount > 0 ? (appliedCount / totalCount * 100) : 0}%`}} />
@@ -20486,7 +23448,7 @@
                                                                     <div className="flex gap-3 text-xs">
                                                                         <button onClick={() => {
                                                                             const sel = {};
-                                                                            Object.entries(controls).forEach(([id, v]) => { const applied = typeof v === 'object' ? v.status : v; if (!applied) sel[id] = true; });
+                                                                            Object.entries(controls).forEach(([id, v]) => { const applied = (v && typeof v === 'object') ? v.status : v; if (applied === false) sel[id] = true; });
                                                                             setHardenSelected(sel);
                                                                         }} className="text-blue-400 hover:text-blue-300">{t('selectAll') || 'Select all'}</button>
                                                                         <button onClick={() => setHardenSelected({})} className="text-gray-500 hover:text-gray-400">{t('deselectAll') || 'Deselect all'}</button>
@@ -20521,6 +23483,7 @@
                                                         { id: 'costs', label: t('costDashboard') || 'Costs', icon: Icons.DollarSign },
                                                         { id: 'power', label: t('powerTitle') || 'Power & Carbon', icon: Icons.Zap },
                                                         { id: 'topology', label: t('topologyTitle') || 'Topology', icon: Icons.Network },
+                                                        { id: 'whatif', label: t('whatifTitle'), icon: Icons.Scale },
                                                         { id: 'api-health', label: t('apiHealth') || 'API Health', icon: Icons.Zap },
                                                     ].map(tab => (
                                                         <button
@@ -20546,6 +23509,7 @@
                                                     <div className="space-y-6">
                                                         <div className="flex justify-end">
                                                             <div className="flex items-center gap-2">
+                                                                {reportData?.timestamps?.length > 2 && <ChartZoomBar zoom={reportZoom} />}
                                                                 {['hour', 'day', 'week'].map(p => (
                                                                     <button
                                                                         key={p}
@@ -20686,21 +23650,15 @@
                                                                 </div>
 
                                                                 {/* Timeline Charts — CPU & Memory over time */}
-                                                                {reportData?.timestamps?.length > 2 && reportData?.cpu?.samples?.length > 2 && (() => {
-                                                                    // convert ISO strings to unix seconds for LineChart
-                                                                    const ts = reportData.timestamps.map(t => {
-                                                                        const d = new Date(t);
-                                                                        return isNaN(d.getTime()) ? 0 : Math.floor(d.getTime() / 1000);
-                                                                    });
-                                                                    return (
+                                                                {reportData?.timestamps?.length > 2 && reportData?.cpu?.samples?.length > 2 && (
+                                                                    <ChartZoomContext.Provider value={reportZoom}>
                                                                     <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
                                                                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-4">
                                                                             <h3 className="text-sm font-semibold text-gray-400 mb-2 flex items-center gap-2">
                                                                                 <Icons.Cpu className="w-4 h-4 text-blue-400" /> CPU {t('overTime') || 'over Time'}
                                                                             </h3>
                                                                             <LineChart
-                                                                                data={reportData.cpu?.samples || []}
-                                                                                timestamps={ts}
+                                                                                {...reportZoom.series('cpu')}
                                                                                 label="CPU" color="#3b82f6" unit="%"
                                                                                 yMin={0} yMax={100}
                                                                                 formatValue={v => v.toFixed(1)}
@@ -20711,15 +23669,15 @@
                                                                                 <Icons.HardDrive className="w-4 h-4 text-green-400" /> Memory {t('overTime') || 'over Time'}
                                                                             </h3>
                                                                             <LineChart
-                                                                                data={reportData.memory?.samples || []}
-                                                                                timestamps={ts}
+                                                                                {...reportZoom.series('memory')}
                                                                                 label="Memory" color="#22c55e" unit="%"
                                                                                 yMin={0} yMax={100}
                                                                                 formatValue={v => v.toFixed(1)}
                                                                             />
                                                                         </div>
-                                                                    </div>);
-                                                                })()}
+                                                                    </div>
+                                                                    </ChartZoomContext.Provider>
+                                                                )}
                                                                 {/* data points info */}
                                                                 {reportData?.data_points > 0 && (
                                                                     <div className="text-xs text-gray-600 text-center">
@@ -21249,6 +24207,11 @@
                                                     />
                                                 )}
 
+                                                {/* LW Oct 2026 - what-if simulator of the cluster */}
+                                                {reportSubTab === 'whatif' && selectedCluster?.id && (
+                                                    <WhatIfTab clusterId={selectedCluster.id} authFetch={authFetch} />
+                                                )}
+
                                                 {/* MK May 2026 — API latency dashboard */}
                                                 {reportSubTab === 'api-health' && selectedCluster?.id && (
                                                     <ApiLatencyDashboard
@@ -21266,23 +24229,50 @@
                                             this is a read-only audit view for ops/Compliance Officers
                                             without admin rights. Available with admin.audit OR
                                             node.maintenance permission. */}
+                                        {/* LW Oct 2026 - the flight recorder of the cluster */}
+                                        {activeTab === 'timeline' && (
+                                            <div className={isCorporate ? 'p-1' : 'bg-proxmox-card border border-proxmox-border rounded-xl p-6'}>
+                                                <TimelineView
+                                                    key={selectedCluster.id}
+                                                    clusterId={selectedCluster.id}
+                                                    authFetch={authFetch}
+                                                    t={t}
+                                                    onOpenGuest={(vmid) => {
+                                                        const guest = (clusterResources || []).find(r => Number(r.vmid) === Number(vmid));
+                                                        if (!guest) return;
+                                                        setActiveTab('resources');
+                                                        setResourcesSubTab('management');
+                                                        setSelectedSidebarVm({ ...guest, _clusterId: selectedCluster.id });
+                                                        setSelectedSidebarNode(null);
+                                                        setHighlightedVm({ vmid: guest.vmid, node: guest.node });
+                                                        setTimeout(() => setHighlightedVm(null), 3000);
+                                                    }}
+                                                    onOpenNode={(name) => {
+                                                        if (!isCorporate) { setConfigNode(name); return; }
+                                                        setActiveTab('overview');
+                                                        setSelectedSidebarVm(null);
+                                                        setSelectedSidebarNode({ name, clusterId: selectedCluster.id });
+                                                    }}
+                                                    onOpenTab={(tab) => setActiveTab(tab)}
+                                                />
+                                            </div>
+                                        )}
+
                                         {activeTab === 'compliance' && (
                                             <div className="space-y-4">
                                                 <div className={isCorporate
                                                     ? 'corp-tab-strip'
                                                     : 'flex items-center gap-1 border-b border-proxmox-border pb-2'
                                                 }>
-                                                    {[
-                                                        { id: 'hardening', label: t('compliance') || 'Compliance', icon: Icons.Lock },
-                                                        { id: 'drift', label: t('driftDetection') || 'Drift Detection', icon: Icons.Shield },
-                                                    ].map(sub => (
+                                                    {complianceSubs.map(sub => (
                                                         <button
                                                             key={sub.id}
+                                                            data-compliance-sub={sub.id}
                                                             onClick={() => setComplianceSubTab(sub.id)}
                                                             className={isCorporate
-                                                                ? `flex items-center gap-1 ${complianceSubTab === sub.id ? 'active' : ''}`
+                                                                ? `flex items-center gap-1 ${complianceSub === sub.id ? 'active' : ''}`
                                                                 : `flex items-center gap-2 px-4 py-2 rounded-lg text-sm transition-colors ${
-                                                                    complianceSubTab === sub.id
+                                                                    complianceSub === sub.id
                                                                         ? 'bg-proxmox-orange text-white'
                                                                         : 'text-gray-400 hover:text-white hover:bg-proxmox-hover'
                                                                   }`
@@ -21293,7 +24283,7 @@
                                                     ))}
                                                 </div>
 
-                                                {complianceSubTab === 'hardening' && (
+                                                {complianceSub === 'hardening' && (
                                                     <ComplianceDashboardTab
                                                         clusters={clusters}
                                                         selectedCluster={selectedCluster}
@@ -21304,7 +24294,16 @@
                                                         user={user}
                                                     />
                                                 )}
-                                                {complianceSubTab === 'drift' && (
+                                                {complianceSub === 'changes' && (
+                                                    <ChangesTab
+                                                        clusterId={selectedCluster?.id}
+                                                        authFetch={authFetch}
+                                                        addToast={addToast}
+                                                        t={t}
+                                                        canRequest={holds('changes.request')}
+                                                    />
+                                                )}
+                                                {complianceSub === 'drift' && (
                                                     <DriftTab
                                                         clusterId={selectedCluster?.id}
                                                         clusterName={selectedCluster?.name}
@@ -21460,7 +24459,33 @@
                                                         step={60}
                                                         unit="s"
                                                     />
-                                                    
+
+                                                    {/* LW Oct 2026 - the pause before the balancer moves the same guest again, in
+                                                        minutes here and seconds on the server; the active's to change (#625).
+                                                        Steps, not a slider: 1 min to 24 h on one track left no room for 5 to 60 */}
+                                                    <fieldset disabled={haReadOnly || !can('cluster.config')} className="min-w-0"
+                                                        data-ha-locked={haReadOnly ? '' : undefined} data-bal-cooldown>
+                                                        {(() => {
+                                                            const mins = Math.max(1, Math.round((selectedCluster.migration_cooldown ?? 900) / 60));
+                                                            const steps = [1, 5, 10, 15, 30, 60, 120, 240, 480, 720, 1440];
+                                                            const shown = steps.includes(mins) ? steps : [...steps, mins].sort((a, b) => a - b);
+                                                            const label = (m) => m % 60 === 0 && m >= 60 ? `${m / 60}${t('balCooldownHours')}` : `${m}${t('balCooldownUnit')}`;
+                                                            return (
+                                                                <div className="flex items-center justify-between gap-3">
+                                                                    <div className="min-w-0">
+                                                                        <label htmlFor="bal-cooldown" className="text-sm font-medium text-gray-200">{t('balCooldown')}</label>
+                                                                        <p className="text-xs text-gray-500">{t('balCooldownDesc')}</p>
+                                                                    </div>
+                                                                    <select id="bal-cooldown" value={mins}
+                                                                        onChange={e => updateConfig('migration_cooldown', Number(e.target.value) * 60)}
+                                                                        className="flex-shrink-0 bg-proxmox-dark border border-proxmox-border rounded-lg px-3 py-1.5 text-sm font-mono font-semibold text-proxmox-orange disabled:opacity-50 disabled:cursor-not-allowed">
+                                                                        {shown.map(m => <option key={m} value={m}>{label(m)}</option>)}
+                                                                    </select>
+                                                                </div>
+                                                            );
+                                                        })()}
+                                                    </fieldset>
+
                                                     {/* LW: Excluded Nodes Section - GitHub Feature Request */}
                                                     <div className="pt-4 border-t border-proxmox-border">
                                                         <h4 className="text-sm font-medium text-gray-400 mb-3 flex items-center gap-2">
@@ -21847,6 +24872,17 @@
                                                         </div>
                                                     </div>
 
+                                                    {/* LW Oct 2026 - where remote migrations into this cluster dial its nodes,
+                                                        next to how PegaProx connects; a standby shows it locked */}
+                                                    {(selectedCluster.cluster_type || 'proxmox') === 'proxmox' && can('cluster.view') && (
+                                                        <div className="pt-4 border-t border-proxmox-border">
+                                                            <TransferNetworkSection key={selectedCluster.id} cluster={selectedCluster} clusters={clusters}
+                                                                authFetch={authFetch} addToast={addToast} t={t}
+                                                                canEdit={can('cluster.config')} haReadOnly={haReadOnly}
+                                                                onSaved={v => setSelectedCluster(prev => prev ? {...prev, transfer_network: v} : prev)} />
+                                                        </div>
+                                                    )}
+
                                                     {/* HA Section */}
                                                     <div className="pt-4 border-t border-proxmox-border">
                                                         <h4 className="text-sm font-medium text-gray-400 mb-3">{t('highAvailability')}</h4>
@@ -21955,9 +24991,16 @@
                                                         </div>
                                                     </div>
                                                 </div>
-                                                
+
+                                                {/* LW Oct 2026 - the balancer's moves with why, under its settings */}
+                                                {can('cluster.view') && (
+                                                    <div className={`lg:col-span-2 min-w-0 ${isCorporate ? 'border border-proxmox-border p-4' : 'bg-proxmox-card border border-proxmox-border rounded-xl p-6'}`}>
+                                                        <BalancerHistory key={selectedCluster.id} clusterId={selectedCluster.id} authFetch={authFetch} t={t} />
+                                                    </div>
+                                                )}
+
                                                 {/* Update Manager Section */}
-                                                <div className="lg:col-span-2">
+                                                <div className="lg:col-span-2" data-update-manager>
                                                     <UpdateManagerSection key={selectedCluster.id} clusterId={selectedCluster.id} addToast={addToast} />
                                                 </div>
                                                 
@@ -22181,7 +25224,7 @@
                                                             const total = ds.total || ds.avail ? (ds.used || 0) + (ds.avail || 0) : 1;
                                                             const pct = total > 0 ? ((used / total) * 100).toFixed(1) : 0;
                                                             const detail = ds.detail || {};
-                                                            const gcStatus = detail['gc-status'] || {};
+                                                            const gc = pbsGcView(ds);
                                                             const pctColor = isCorporate ? (parseFloat(pct) > 85 ? '#f54f47' : parseFloat(pct) > 60 ? '#efc006' : '#60b515') : undefined;
                                                             return (
                                                                 <div key={ds.name || ds.store}
@@ -22200,7 +25243,7 @@
                                                                             </div>
                                                                             <span className="text-[12px] w-12 text-right" style={{color: pctColor}}>{pct}%</span>
                                                                             <span className="text-[11px]" style={{color: 'var(--corp-text-muted)'}}>{formatBytes(used)} / {formatBytes(total)}</span>
-                                                                            {gcStatus.index && <span className="text-[11px]" style={{color: 'var(--corp-accent)'}}>{(gcStatus['dedup-factor'] || 1).toFixed(1)}x</span>}
+                                                                            {gc.dedup !== null && <span className="text-[11px]" style={{color: 'var(--corp-accent)'}}>{gc.dedup.toFixed(1)}x</span>}
                                                                         </>
                                                                     ) : (
                                                                         <>
@@ -22217,10 +25260,10 @@
                                                                             <div className="grid grid-cols-2 gap-2 text-xs">
                                                                                 <div><span className="text-gray-500">{t('used') || 'Used'}:</span> <span className="text-gray-300">{formatBytes(used)}</span></div>
                                                                                 <div><span className="text-gray-500">{t('total') || 'Total'}:</span> <span className="text-gray-300">{formatBytes(total)}</span></div>
-                                                                                {gcStatus.index && (
+                                                                                {gc.dedup !== null && (
                                                                                     <>
-                                                                                        <div><span className="text-gray-500">{t('pbsDedupShort') || 'Dedup'}:</span> <span className="text-cyan-400">{(gcStatus['dedup-factor'] || 1).toFixed(2)}x</span></div>
-                                                                                        <div><span className="text-gray-500">{t('pbsChunksShort') || 'Chunks'}:</span> <span className="text-gray-300">{(gcStatus['disk-chunks'] || 0).toLocaleString()}</span></div>
+                                                                                        <div><span className="text-gray-500">{t('pbsDedupShort') || 'Dedup'}:</span> <span className="text-cyan-400">{gc.dedup.toFixed(2)}x</span></div>
+                                                                                        <div><span className="text-gray-500">{t('pbsChunksShort') || 'Chunks'}:</span> <span className="text-gray-300">{(gc.status['disk-chunks'] || 0).toLocaleString()}</span></div>
                                                                                     </>
                                                                                 )}
                                                                                 {detail['total-snapshots'] !== undefined && (
@@ -22531,7 +25574,13 @@
                                                             {/* Namespace Selector + GC Status */}
                                                             {(() => {
                                                                 const currentDs = pbsDatastores.find(d => (d.name || d.store) === pbsSelectedStore);
-                                                                const gcStatus = currentDs?.detail?.['gc-status'] || {};
+                                                                const gc = pbsGcView(currentDs);
+                                                                const gcStatus = gc.status;
+                                                                const gcSecs = Number(gc.job.duration) || 0;
+                                                                // PBS writes the task state: "OK", "WARNINGS: n", or the error itself
+                                                                const gcState = String(gc.job['last-run-state'] || '');
+                                                                const gcStateOk = !gcState || /^(TASK )?OK$/i.test(gcState);
+                                                                const gcStateWarn = /^(TASK )?WARNINGS/i.test(gcState);
                                                                 return (
                                                                     <div className="flex flex-wrap gap-4 items-start">
                                                                         {pbsNamespaces.length > 0 && (
@@ -22552,15 +25601,20 @@
                                                                                 </select>
                                                                             </div>
                                                                         )}
-                                                                        {gcStatus['last-run-endtime'] && (
+                                                                        {(gc.job['last-run-endtime'] || gcStatus.upid) && (
                                                                             <div className="bg-proxmox-card border border-proxmox-border rounded-xl p-3 flex-1 min-w-[300px]">
                                                                                 <span className="text-xs text-gray-500 block mb-1.5">{t('pbsGarbageCollection') || 'Garbage Collection'}</span>
                                                                                 <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-                                                                                    <span className="text-gray-500">{t('pbsLastGc') || 'Last GC'}:</span><span className="text-gray-300">{fmtDate(gcStatus['last-run-endtime'] * 1000)}</span>
-                                                                                    <span className="text-gray-500">{t('duration') || 'Duration'}:</span><span className="text-gray-300">{gcStatus['last-run-duration'] ? `${Math.floor(gcStatus['last-run-duration'] / 60)}m ${gcStatus['last-run-duration'] % 60}s` : '-'}</span>
-                                                                                    <span className="text-gray-500">{t('pbsDedupFactor') || 'Dedup Factor'}:</span><span className="text-cyan-400 font-medium">{(gcStatus['dedup-factor'] || 1).toFixed(2)}x</span>
-                                                                                    <span className="text-gray-500">{t('pbsDiskChunks') || 'Disk Chunks'}:</span><span className="text-gray-300">{(gcStatus['disk-chunks'] || 0).toLocaleString()}</span>
-                                                                                    <span className="text-gray-500">{t('pbsDiskBytes') || 'Disk Bytes'}:</span><span className="text-gray-300">{formatBytes(gcStatus['disk-bytes'] || 0)}</span>
+                                                                                    <span className="text-gray-500">{t('pbsLastGc') || 'Last GC'}:</span><span className="text-gray-300">{gc.job['last-run-endtime'] ? fmtDate(gc.job['last-run-endtime'] * 1000) : '-'}</span>
+                                                                                    {!gcStateOk && (
+                                                                                        <><span className="text-gray-500">{t('status') || 'Status'}:</span><span className={`${gcStateWarn ? 'text-yellow-400' : 'text-red-400'} break-words`}>{gcState}</span></>
+                                                                                    )}
+                                                                                    <span className="text-gray-500">{t('duration') || 'Duration'}:</span><span className="text-gray-300">{gcSecs ? `${Math.floor(gcSecs / 60)}m ${gcSecs % 60}s` : '-'}</span>
+                                                                                    <span className="text-gray-500">{t('pbsDedupFactor') || 'Dedup Factor'}:</span><span className="text-cyan-400 font-medium">{gc.dedup !== null ? `${gc.dedup.toFixed(2)}x` : '-'}</span>
+                                                                                    {gcStatus['disk-bytes'] !== undefined && (
+                                                                                        <><span className="text-gray-500">{t('pbsDiskChunks') || 'Disk Chunks'}:</span><span className="text-gray-300">{(gcStatus['disk-chunks'] || 0).toLocaleString()}</span>
+                                                                                        <span className="text-gray-500">{t('pbsDiskBytes') || 'Disk Bytes'}:</span><span className="text-gray-300">{formatBytes(gcStatus['disk-bytes'] || 0)}</span></>
+                                                                                    )}
                                                                                     {gcStatus['pending-chunks'] > 0 && (
                                                                                         <><span className="text-gray-500">{t('pending') || 'Pending'}:</span><span className="text-yellow-400">{gcStatus['pending-chunks']} chunks ({formatBytes(gcStatus['pending-bytes'] || 0)})</span></>
                                                                                     )}
@@ -22573,6 +25627,13 @@
                                                                     </div>
                                                                 );
                                                             })()}
+
+                                                            <PbsDatastoreSchedules
+                                                                store={pbsSelectedStore}
+                                                                datastore={pbsDatastores.find(d => (d.name || d.store) === pbsSelectedStore)}
+                                                                jobs={pbsJobs}
+                                                                error={pbsJobsError}
+                                                            />
 
                                                             {/* Backup Groups */}
                                                             <div>
@@ -22806,14 +25867,17 @@
                                         {/* Jobs Tab */}
                                         {pbsActiveTab === 'jobs' && (
                                             <div className="space-y-6">
+                                                {pbsJobsError && <div role="alert" className="bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-3 text-sm text-yellow-300">
+                                                    {t('pbsLoadAllDataError') || 'Could not load all data:'} {t('pbsJobsTab') || 'Jobs'}
+                                                </div>}
                                                 {/* Sync Jobs */}
                                                 <div>
                                                     <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">{t('pbsSyncJobs') || 'Sync Jobs'} ({(pbsJobs.sync || []).length})</h3>
-                                                    {(pbsJobs.sync || []).length > 0 ? (
+                                                    {pbsJobs.errors?.sync ? <PbsJobReadError kind="sync" /> : (pbsJobs.sync || []).length > 0 ? (
                                                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                             <table className="w-full text-sm">
                                                                 <thead><tr className="border-b border-proxmox-border text-gray-500 text-xs">
-                                                                    <th className="text-left p-3">{t('id') || 'ID'}</th><th className="text-left p-3">{t('pbsStore') || 'Store'}</th><th className="text-left p-3">{t('pbsRemote') || 'Remote'}</th><th className="text-left p-3">{t('schedule') || 'Schedule'}</th><th className="text-left p-3">{t('lastRun') || 'Last Run'}</th>
+                                                                    <th className="text-left p-3">{t('id') || 'ID'}</th><th className="text-left p-3">{t('pbsStore') || 'Store'}</th><th className="text-left p-3">{t('pbsRemote') || 'Remote'}</th><th className="text-left p-3">{t('schedule') || 'Schedule'}</th><th className="text-left p-3">{t('lastRun') || 'Last Run'}</th><th className="text-left p-3">{t('status') || 'Status'}</th><th className="text-left p-3">{t('pbsNextRun') || 'Next Run'}</th>
                                                                     {isAdmin && <th className="text-right p-3">{t('actions') || 'Actions'}</th>}
                                                                 </tr></thead>
                                                                 <tbody>
@@ -22824,6 +25888,8 @@
                                                                             <td className="p-3 text-gray-400">{job.remote || '-'} / {job['remote-store'] || '-'}</td>
                                                                             <td className="p-3 text-gray-400">{job.schedule || (t('manual') || 'manual')}</td>
                                                                             <td className="p-3 text-gray-500">{job['last-run-endtime'] ? fmtDate(job['last-run-endtime'] * 1000) : '-'}</td>
+                                                                            <td className="p-3"><PbsRunState state={job['last-run-state']} /></td>
+                                                                            <td className="p-3 text-gray-500">{job['next-run'] ? fmtDate(job['next-run'] * 1000) : '-'}</td>
                                                                             {isAdmin && (
                                                                                 <td className="p-3 text-right">
                                                                                     <button onClick={() => pbsRunJob('sync', job.id)} className="px-2 py-1 rounded text-xs bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 transition-all flex items-center gap-1 ml-auto">
@@ -22842,11 +25908,11 @@
                                                 {/* Verify Jobs */}
                                                 <div>
                                                     <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">{t('pbsVerifyJobs') || 'Verify Jobs'} ({(pbsJobs.verify || []).length})</h3>
-                                                    {(pbsJobs.verify || []).length > 0 ? (
+                                                    {pbsJobs.errors?.verify ? <PbsJobReadError kind="verify" /> : (pbsJobs.verify || []).length > 0 ? (
                                                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                             <table className="w-full text-sm">
                                                                 <thead><tr className="border-b border-proxmox-border text-gray-500 text-xs">
-                                                                    <th className="text-left p-3">{t('id') || 'ID'}</th><th className="text-left p-3">{t('pbsStore') || 'Store'}</th><th className="text-left p-3">{t('schedule') || 'Schedule'}</th><th className="text-left p-3">{t('pbsIgnoreVerified') || 'Ignore Verified'}</th><th className="text-left p-3">{t('lastRun') || 'Last Run'}</th>
+                                                                    <th className="text-left p-3">{t('id') || 'ID'}</th><th className="text-left p-3">{t('pbsStore') || 'Store'}</th><th className="text-left p-3">{t('schedule') || 'Schedule'}</th><th className="text-left p-3">{t('pbsIgnoreVerified') || 'Ignore Verified'}</th><th className="text-left p-3">{t('lastRun') || 'Last Run'}</th><th className="text-left p-3">{t('status') || 'Status'}</th><th className="text-left p-3">{t('pbsNextRun') || 'Next Run'}</th>
                                                                     {isAdmin && <th className="text-right p-3">{t('actions') || 'Actions'}</th>}
                                                                 </tr></thead>
                                                                 <tbody>
@@ -22857,6 +25923,8 @@
                                                                             <td className="p-3 text-gray-400">{job.schedule || (t('manual') || 'manual')}</td>
                                                                             <td className="p-3 text-gray-400">{job['ignore-verified'] ? (t('yes') || 'Yes') : (t('no') || 'No')}</td>
                                                                             <td className="p-3 text-gray-500">{job['last-run-endtime'] ? fmtDate(job['last-run-endtime'] * 1000) : '-'}</td>
+                                                                            <td className="p-3"><PbsRunState state={job['last-run-state']} /></td>
+                                                                            <td className="p-3 text-gray-500">{job['next-run'] ? fmtDate(job['next-run'] * 1000) : '-'}</td>
                                                                             {isAdmin && (
                                                                                 <td className="p-3 text-right">
                                                                                     <button onClick={() => pbsRunJob('verify', job.id)} className="px-2 py-1 rounded text-xs bg-green-500/20 text-green-400 hover:bg-green-500/30 transition-all flex items-center gap-1 ml-auto">
@@ -22875,11 +25943,11 @@
                                                 {/* Prune Jobs */}
                                                 <div>
                                                     <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">{t('pbsPruneJobs') || 'Prune Jobs'} ({(pbsJobs.prune || []).length})</h3>
-                                                    {(pbsJobs.prune || []).length > 0 ? (
+                                                    {pbsJobs.errors?.prune ? <PbsJobReadError kind="prune" /> : (pbsJobs.prune || []).length > 0 ? (
                                                         <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                             <table className="w-full text-sm">
                                                                 <thead><tr className="border-b border-proxmox-border text-gray-500 text-xs">
-                                                                    <th className="text-left p-3">{t('id') || 'ID'}</th><th className="text-left p-3">{t('pbsStore') || 'Store'}</th><th className="text-left p-3">{t('schedule') || 'Schedule'}</th><th className="text-left p-3">{t('retention') || 'Retention'}</th><th className="text-left p-3">{t('lastRun') || 'Last Run'}</th>
+                                                                    <th className="text-left p-3">{t('id') || 'ID'}</th><th className="text-left p-3">{t('pbsStore') || 'Store'}</th><th className="text-left p-3">{t('schedule') || 'Schedule'}</th><th className="text-left p-3">{t('retention') || 'Retention'}</th><th className="text-left p-3">{t('lastRun') || 'Last Run'}</th><th className="text-left p-3">{t('status') || 'Status'}</th><th className="text-left p-3">{t('pbsNextRun') || 'Next Run'}</th>
                                                                     {isAdmin && <th className="text-right p-3">{t('actions') || 'Actions'}</th>}
                                                                 </tr></thead>
                                                                 <tbody>
@@ -22892,6 +25960,8 @@
                                                                                 {[job['keep-last'] && `L:${job['keep-last']}`, job['keep-daily'] && `D:${job['keep-daily']}`, job['keep-weekly'] && `W:${job['keep-weekly']}`, job['keep-monthly'] && `M:${job['keep-monthly']}`, job['keep-yearly'] && `Y:${job['keep-yearly']}`].filter(Boolean).join(' ') || '-'}
                                                                             </td>
                                                                             <td className="p-3 text-gray-500">{job['last-run-endtime'] ? fmtDate(job['last-run-endtime'] * 1000) : '-'}</td>
+                                                                            <td className="p-3"><PbsRunState state={job['last-run-state']} /></td>
+                                                                            <td className="p-3 text-gray-500">{job['next-run'] ? fmtDate(job['next-run'] * 1000) : '-'}</td>
                                                                             {isAdmin && (
                                                                                 <td className="p-3 text-right">
                                                                                     <button onClick={() => pbsRunJob('prune', job.id)} className="px-2 py-1 rounded text-xs bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500/30 transition-all flex items-center gap-1 ml-auto">
@@ -23449,10 +26519,10 @@
                                             <div className={isCorporate ? 'corp-toolbar flex items-center gap-1' : 'flex items-center gap-2'}>
                                                 {isAdmin && !haReadOnly && (
                                                     <>
-                                                        <button onClick={() => { setEditingVMware(selectedVMware); setVmwareForm({ name: selectedVMware.name || '', host: selectedVMware.host, port: selectedVMware.port || 443, username: selectedVMware.username || 'root', password: '', ssl_verify: selectedVMware.ssl_verify || false, notes: selectedVMware.notes || '' }); setShowAddVMware(true); }} className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-white text-sm'}>
+                                                        <button onClick={() => openVmwareEdit(selectedVMware)} title={t('esxiEditServer')} data-esxi-edit className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-gray-400 hover:text-white text-sm'}>
                                                             <Icons.Settings className="w-4 h-4" />
                                                         </button>
-                                                        <button onClick={() => handleDeleteVMware(selectedVMware.id)} className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-red-400 hover:text-red-300 text-sm'}>
+                                                        <button onClick={() => handleDeleteVMware(selectedVMware.id)} title={t('esxiRemoveServer')} data-esxi-remove className={isCorporate ? '' : 'px-3 py-2 rounded-lg bg-proxmox-card border border-proxmox-border text-red-400 hover:text-red-300 text-sm'}>
                                                             <Icons.Trash className="w-4 h-4" />
                                                         </button>
                                                     </>
@@ -23496,13 +26566,30 @@
                                         
                                         {/* VMs Tab */}
                                         {/* Connection Warning */}
+                                        {/* LW Oct 2026 (#1142) - a server that refuses its stored password says so,
+                                            with its words, and leads to the settings; edit and remove stay up top */}
                                         {!vmwareConnectionOk && (
-                                            <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-3 flex items-center gap-3">
+                                            <div data-esxi-error={vmwareError?.code || 'connection'} className="bg-yellow-500/10 border border-yellow-500/30 rounded-xl p-3 flex items-center gap-3">
                                                 <Icons.AlertTriangle className="w-5 h-5 text-yellow-400 flex-shrink-0" />
-                                                <div className="flex-1">
-                                                    <span className="text-yellow-300 text-sm font-medium">{t('esxiConnectionLost')}</span>
-                                                    <span className="text-yellow-400/70 text-sm ml-2">{t('esxiSessionExpiredDataStale')}</span>
-                                                </div>
+                                                {vmwareError?.code === 'UPSTREAM_AUTH' ? (
+                                                    <div className="flex-1 min-w-0">
+                                                        <div className="text-yellow-300 text-sm font-medium">{t('esxiCredentialsRefused')}</div>
+                                                        <div className="text-yellow-400/70 text-sm break-all" data-esxi-error-message>{vmwareError.message}</div>
+                                                        <div className="text-yellow-400/70 text-xs mt-1">{t('esxiCredentialsHint')}</div>
+                                                    </div>
+                                                ) : (
+                                                    <div className="flex-1 min-w-0">
+                                                        <span className="text-yellow-300 text-sm font-medium">{t('esxiConnectionLost')}</span>
+                                                        <span className="text-yellow-400/70 text-sm ml-2">{t('esxiSessionExpiredDataStale')}</span>
+                                                        {vmwareError?.message && <div className="text-yellow-400/70 text-xs mt-1 break-all" data-esxi-error-message>{vmwareError.message}</div>}
+                                                    </div>
+                                                )}
+                                                {vmwareError?.code === 'UPSTREAM_AUTH' && isAdmin && !haReadOnly && (
+                                                    <button onClick={() => openVmwareEdit(selectedVMware)} data-esxi-error-edit
+                                                        className="px-3 py-1.5 bg-yellow-500/20 hover:bg-yellow-500/30 text-yellow-300 rounded-lg text-xs font-medium">
+                                                        {t('esxiEditServer')}
+                                                    </button>
+                                                )}
                                                 <button onClick={() => { fetchVMwareVms(selectedVMware.id); fetchVMwareHosts(selectedVMware.id); fetchVMwareDatastores(selectedVMware.id); }} 
                                                     className="px-3 py-1.5 bg-yellow-500/20 hover:bg-yellow-500/30 text-yellow-300 rounded-lg text-xs font-medium">
                                                     {t('esxiReconnect')}
@@ -25826,6 +28913,20 @@
                                             />
                                         </div>
                                     </div>
+                                ) : sidebarGuests ? (
+                                    <AllGuestsView
+                                        clusters={clusters}
+                                        authFetch={authFetch}
+                                        addToast={addToast}
+                                        onBulkMigrate={handleBulkMigrate}
+                                        onOpenGuest={(cluster, guest) => {
+                                            setSelectedCluster(cluster);
+                                            setSelectedSidebarVm({...guest, _clusterId: cluster.id});
+                                            setSelectedSidebarNode(null);
+                                            setActiveTab('resources');
+                                            setResourcesSubTab('management');
+                                        }}
+                                    />
                                 ) : (
                                     <AllClustersOverview
                                         clusters={clusters}
@@ -25843,7 +28944,21 @@
                                             setActiveTab('resources');
                                             setResourcesSubTab('management');
                                         }}
+                                        onOpenClusterTab={(cluster, tab, section) => {
+                                            setSelectedCluster(cluster);
+                                            setSelectedSidebarVm(null);
+                                            setSelectedSidebarNode(null);
+                                            setSelectedSidebarDatastore(null);
+                                            setDatacenterSection(tab === 'datacenter' ? section : null);
+                                            setActiveTab(tab);
+                                            // the update manager sits further down the settings tab
+                                            if (section === 'updates') setTimeout(() => {
+                                                const el = document.querySelector('[data-update-manager]');
+                                                if (el) el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+                                            }, 300);
+                                        }}
                                         onAutoInstall={user?.autoinstall_access === 'manage' ? () => openAutoInstall({ wizard: true }) : undefined}
+                                        onOpenGuests={openGuests}
                                     />
                                 )}
                             </div>
@@ -26936,14 +30051,21 @@
                         </div>
                     )}
 
+                    {maintDialog && (
+                        <MaintenanceDialog clusterId={maintDialog.clusterId} node={maintDialog.node} options={maintDialog.options}
+                            onOptions={(o) => setMaintDialog(prev => prev ? { ...prev, options: o } : prev)}
+                            onCancel={() => setMaintDialog(null)}
+                            onConfirm={() => { const d = maintDialog; setMaintDialog(null); handleMaintenanceToggle(d.node, true, d.options, d.clusterId); }} />
+                    )}
+
                     {/* Toast Notifications — rendered via portal to document.body to avoid corporate layout z-index/overflow issues */}
                     {toastPortal}
 
-                    {/* Session-expired overlay — any 401 (server restart, idle timeout, revoked token)
-                        surfaces this instead of silently failing every poll. Portal to body so it sits
-                        above the whole app regardless of layout z-index. */}
+                    {/* Session-expired overlay - a 401 of PegaProx's own (server restart, idle timeout,
+                        revoked token; #1142: its code says so) surfaces this instead of silently failing
+                        every poll. Portal to body so it sits above the whole app regardless of layout z-index. */}
                     {sessionExpired && ReactDOM.createPortal(
-                        <div className="fixed inset-0 flex items-center justify-center p-4" style={{ zIndex: 100000, background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(2px)' }}>
+                        <div data-session-expired className="fixed inset-0 flex items-center justify-center p-4" style={{ zIndex: 100000, background: 'rgba(0,0,0,0.8)', backdropFilter: 'blur(2px)' }}>
                             <div className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-sm p-7 text-center">
                                 <div className="mx-auto mb-4 rounded-full bg-yellow-500/15 flex items-center justify-center" style={{ width: 52, height: 52 }}>
                                     <Icons.Lock className="w-6 h-6 text-yellow-400" />
@@ -27201,7 +30323,8 @@
                                         payload.task_warnings = form.task_warnings.checked;
                                     }
                                     if (alertMetricSel === 'snapshot_age') payload.snapshot_ignore_policy = form.snapshot_ignore_policy.checked;
-                                    if (alertMetricSel === 'backup_coverage') payload.backup_exclude_tags = form.backup_exclude_tags.value;
+                                    if (alertMetricSel === 'backup_coverage' || alertMetricSel === 'restore_test_age') payload.backup_exclude_tags = form.backup_exclude_tags.value;
+                                    if (alertMetricSel === 'restart_loop') payload.restart_window_minutes = parseInt(form.restart_window_minutes.value);
                                     if (editingAlert) {  // #618 — edit keeps the alert's current enabled state
                                         await updateClusterAlert(editingAlert.id, payload);
                                     } else {
@@ -27220,8 +30343,8 @@
                                             <label className="block text-sm text-gray-400 mb-1">{t('targetType') || 'Apply to'}</label>
                                             <select name="target_type" defaultValue={editingAlert ? editingAlert.target_type : 'cluster'} className="w-full px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg">
                                                 <option value="cluster">{t('entireCluster') || 'Entire Cluster'}</option>
-                                                <option value="node">{t('specificNode') || 'Specific Node'}</option>
-                                                {alertMetricSel !== 'zfs_health' && <option value="vm">{t('specificVm') || 'Specific VM'}</option>}
+                                                {alertMetricSel !== 'replication_rpo' && <option value="node">{t('specificNode') || 'Specific Node'}</option>}
+                                                {alertMetricSel !== 'ceph_osd_latency' && alertMetricSel !== 'zfs_health' && alertMetricSel !== 'clock_drift' && alertMetricSel !== 'qdevice' && <option value="vm">{t('specificVm') || 'Specific VM'}</option>}
                                             </select>
                                         </div>
                                         <div>
@@ -27245,10 +30368,16 @@
                                                 <option value="backup_sla_compliance_pct">{t('backupSlaCompliancePct') || 'Backup SLA compliance %'}</option>
                                                 <option value="task_failed">{t('failedTasks')}</option>
                                                 <option value="ceph_health">{t('alertMetricCeph')}</option>
+                                                <option value="ceph_osd_latency">{t('cephOsdLatencyTitle')}</option>
                                                 <option value="replication">{t('replication')}</option>
+                                                <option value="replication_rpo">{t('replicationRpoTitle')}</option>
                                                 <option value="snapshot_age">{t('alertMetricSnapshots')}</option>
                                                 <option value="backup_coverage">{t('backupCoverageTitle')}</option>
                                                 <option value="zfs_health">{t('zfsAlertTitle')}</option>
+                                                <option value="clock_drift">{t('clockDriftTitle')}</option>
+                                                <option value="restart_loop">{t('restartLoopTitle')}</option>
+                                                <option value="qdevice">{t('qdeviceAlertTitle')}</option>
+                                                <option value="restore_test_age">{t('restoreTestAgeTitle')}</option>
                                             </select>
                                         </div>
                                         {alertMetricSel === 'rolling_update' ? (
@@ -27262,6 +30391,12 @@
                                                     : alertMetricSel === 'replication' ? t('alertReplHelp')
                                                     : alertMetricSel === 'backup_coverage' ? t('backupCoverageHelp')
                                                     : alertMetricSel === 'zfs_health' ? t('zfsAlertHelp')
+                                                    : alertMetricSel === 'clock_drift' ? t('clockDriftHelp')
+                                                    : alertMetricSel === 'restart_loop' ? t('restartLoopHelp')
+                                                    : alertMetricSel === 'qdevice' ? t('qdeviceAlertHelp')
+                                                    : alertMetricSel === 'ceph_osd_latency' ? t('cephOsdLatencyHelp')
+                                                    : alertMetricSel === 'replication_rpo' ? t('replicationRpoHelp')
+                                                    : alertMetricSel === 'restore_test_age' ? t('restoreTestAgeHelp')
                                                     : t('alertSnapHelp')}
                                             </div>
                                         ) : <>
@@ -27362,6 +30497,55 @@
                                                         <option value="0">{t('zfsAlertAny')}</option>
                                                         <option value="1">{t('zfsAlertStateOnly')}</option>
                                                     </select>
+                                                </div>
+                                            )}
+                                            {/* LW Oct 2026 - a clock limit in seconds; a restart loop is so many starts within a window */}
+                                            {alertMetricSel === 'clock_drift' && (
+                                                <div data-event-fields="clock_drift">
+                                                    <label className="block text-sm text-gray-400 mb-1">{t('clockDriftLimit')}</label>
+                                                    <input name="threshold" type="number" min="1" max="3600" required defaultValue={saved ? saved.threshold : 2} className={field} />
+                                                </div>
+                                            )}
+                                            {alertMetricSel === 'restart_loop' && (
+                                                <div data-event-fields="restart_loop" className="grid grid-cols-2 gap-3">
+                                                    <div>
+                                                        <label className="block text-sm text-gray-400 mb-1">{t('restartLoopStarts')}</label>
+                                                        <input name="threshold" type="number" min="2" max="100" required defaultValue={saved ? saved.threshold : 3} className={field} />
+                                                    </div>
+                                                    <div>
+                                                        <label className="block text-sm text-gray-400 mb-1">{t('restartLoopWindow')}</label>
+                                                        <input name="restart_window_minutes" type="number" min="1" max="1440" required defaultValue={saved ? (saved.restart_window_minutes || 15) : 15} className={field} />
+                                                    </div>
+                                                </div>
+                                            )}
+                                            {/* LW Oct 2026 - an OSD limit in ms; an RPO in minutes, 0 leaves it to each job's schedule */}
+                                            {alertMetricSel === 'ceph_osd_latency' && (
+                                                <div data-event-fields="ceph_osd_latency">
+                                                    <label className="block text-sm text-gray-400 mb-1">{t('cephOsdLatencyLimit')}</label>
+                                                    <input name="threshold" type="number" min="5" max="10000" required defaultValue={saved ? saved.threshold : 100} className={field} />
+                                                </div>
+                                            )}
+                                            {alertMetricSel === 'replication_rpo' && (
+                                                <div data-event-fields="replication_rpo" className="space-y-1">
+                                                    <label className="block text-sm text-gray-400 mb-1">{t('replicationRpoLimit')}</label>
+                                                    <input name="threshold" type="number" min="0" max="10080" required defaultValue={saved ? saved.threshold : 0} className={field} />
+                                                    <p className="text-xs text-gray-500">{t('replicationRpoAutoHint')}</p>
+                                                </div>
+                                            )}
+                                            {/* LW Oct 2026 - days without a restore test that passed; tagged guests are left out as for the backup coverage */}
+                                            {alertMetricSel === 'restore_test_age' && (
+                                                <div data-event-fields="restore_test_age" className="space-y-3">
+                                                    <div className="grid grid-cols-2 gap-3">
+                                                        <div>
+                                                            <label className="block text-sm text-gray-400 mb-1">{t('restoreTestAgeDays')}</label>
+                                                            <input name="threshold" type="number" min="1" max="365" required defaultValue={saved ? saved.threshold : 30} className={field} />
+                                                        </div>
+                                                        <div>
+                                                            <label className="block text-sm text-gray-400 mb-1">{t('backupCoverageExcludeTags')}</label>
+                                                            <input name="backup_exclude_tags" maxLength={500} placeholder="no-backup" defaultValue={saved ? (saved.backup_exclude_tags || []).join(', ') : 'no-backup'} className={`${field} font-mono text-sm`} />
+                                                        </div>
+                                                    </div>
+                                                    <p className="text-xs text-gray-500">{t('backupCoverageTagsHint')}</p>
                                                 </div>
                                             )}
                                             {alertMetricSel !== 'rolling_update' && (
@@ -27771,6 +30955,11 @@
                                 const data = await r?.json();
                                 if (r?.ok && data?.success) {
                                     addToast(t('clusterReconfigured') || 'Cluster re-configured successfully', 'success');
+                                    // LW Oct 2026 (#1136) - pointed elsewhere, the nodes' own passwords were dropped
+                                    if ((data.node_passwords_cleared || []).length) {
+                                        setNodeCredsNotice({ clusterId: reconfigureConfig._cluster_id, name: config.name, host: config.host,
+                                            nodes: data.node_passwords_cleared, reason: 'moved' });
+                                    }
                                     setShowAddModal(false); setReconfigureConfig(null);
                                     fetchClusters();
                                 } else {
@@ -28159,9 +31348,40 @@
                         </div>
                     )}
 
+                    {/* LW Oct 2026 (#1136) - nodes of a new cluster that refused the login, or whose
+                        own passwords a re-configure to another address dropped */}
+                    {nodeLoginsAfterAdd && (
+                        <NodeLoginsAfterAddModal cluster={nodeLoginsAfterAdd} onClose={() => setNodeLoginsAfterAdd(null)} />
+                    )}
+                    {nodeCredsNotice && (
+                        <div data-node-creds-notice={nodeCredsNotice.clusterId} data-node-creds-reason={nodeCredsNotice.reason || 'refused'}
+                            className="fixed bottom-6 right-6 z-50 w-full max-w-sm p-4 rounded-xl border border-red-500/30 bg-proxmox-card shadow-2xl">
+                            <div className="flex items-start gap-3">
+                                <Icons.AlertTriangle />
+                                <div className="min-w-0 flex-1">
+                                    <p className="text-sm text-gray-300">
+                                        {(nodeCredsNotice.reason === 'moved' ? t('nodeCredsClearedByMove') : t('nodeCredsRefusedNotice')).replace('{nodes}', nodeCredsNotice.nodes.join(', ')).replace('{cluster}', nodeCredsNotice.name || '')}
+                                    </p>
+                                    <div className="flex flex-wrap gap-2 mt-3">
+                                        {!haReadOnly && (
+                                            <button onClick={() => openNodeCredentials(nodeCredsNotice)}
+                                                className="px-3 py-1.5 rounded-lg text-sm font-medium bg-proxmox-orange hover:bg-orange-600 text-white">
+                                                {t('nodeCredsOpen')}
+                                            </button>
+                                        )}
+                                        <button onClick={() => setNodeCredsNotice(null)}
+                                            className="px-3 py-1.5 rounded-lg text-sm bg-proxmox-dark border border-proxmox-border text-gray-300 hover:bg-proxmox-hover">
+                                            {t('close')}
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
                     {/* #256: Re-configure cluster password dialog */}
                     {reconfigureCluster && (
-                        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => { setReconfigureCluster(null); setReconfigurePassword(''); }}>
+                        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => { setReconfigureCluster(null); setReconfigurePassword(''); reconfigureFocusRef.current = null; }}>
                             <div className="bg-proxmox-card border border-proxmox-border rounded-2xl w-full max-w-sm shadow-2xl animate-scale-in overflow-hidden" onClick={e => e.stopPropagation()}>
                                 <div className="px-6 py-4 border-b border-proxmox-border bg-gradient-to-r from-orange-500/10 to-yellow-500/5">
                                     <div className="flex items-center justify-between">
@@ -28169,7 +31389,7 @@
                                             <Icons.Settings className="w-4 h-4 text-proxmox-orange" />
                                             {t('reconfigureCluster') || 'Re-configure Cluster'}
                                         </h3>
-                                        <button onClick={() => { setReconfigureCluster(null); setReconfigurePassword(''); }} className="text-gray-400 hover:text-white transition-colors"><Icons.X className="w-4 h-4" /></button>
+                                        <button onClick={() => { setReconfigureCluster(null); setReconfigurePassword(''); reconfigureFocusRef.current = null; }} className="text-gray-400 hover:text-white transition-colors"><Icons.X className="w-4 h-4" /></button>
                                     </div>
                                     <p className="text-xs text-gray-400 mt-1">{reconfigureCluster.display_name || reconfigureCluster.name} — {reconfigureCluster.host}</p>
                                 </div>
@@ -28195,7 +31415,7 @@
                                         </>
                                     )}
                                     <div className="flex justify-end gap-3 mt-6">
-                                        <button type="button" onClick={() => { setReconfigureCluster(null); setReconfigurePassword(''); }} className="px-4 py-2 bg-proxmox-dark border border-proxmox-border hover:bg-proxmox-hover rounded-lg text-sm text-gray-300 transition-colors">
+                                        <button type="button" onClick={() => { setReconfigureCluster(null); setReconfigurePassword(''); reconfigureFocusRef.current = null; }} className="px-4 py-2 bg-proxmox-dark border border-proxmox-border hover:bg-proxmox-hover rounded-lg text-sm text-gray-300 transition-colors">
                                             {t('cancel') || 'Cancel'}
                                         </button>
                                         <button

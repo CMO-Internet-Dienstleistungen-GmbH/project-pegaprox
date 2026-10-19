@@ -98,6 +98,7 @@ def load_server_settings():
         'smtp_from_name': 'PegaProx Alerts',
         'smtp_tls': True,
         'smtp_ssl': False,
+        'smtp_verify_tls': True,  # MK Oct 2026 - check the relay's certificate (see below for older setups)
         # Alert notification settings
         'alert_email_recipients': [],  # list of email addresses
         'alert_cooldown': 300,  # Don't send same alert within 5 min
@@ -176,6 +177,7 @@ def load_server_settings():
         'oidc_group_mappings': [],
         'oidc_skip_jwt_verification': False,  # NS: disable JWT sig check for broken JWKS envs
         'oidc_skip_ssl_verify': False,        # NS Apr 2026 (#188): self-signed-cert escape hatch
+        'oidc_username_claim': '',            # NS Oct 2026 (#1149): '' = preferred_username, then email
         # MK May 2026 (#412 SeeJayEmm): SSRF guard's default behaviour rejects
         # any discovery URL that resolves to a private/loopback IP. Internal IdPs
         # (Keycloak/Authentik/Authentik-on-LAN at 10.x or 192.168.x) are the
@@ -194,7 +196,12 @@ def load_server_settings():
         saved = db.get_server_settings()
         if saved:
             # Merge with defaults (so new fields are always present)
-            return {**defaults, **saved}
+            merged = {**defaults, **saved}
+            # MK Oct 2026 - a relay set up before the certificate check keeps sending without
+            # it until an admin turns it on; a new setup gets the check
+            if 'smtp_verify_tls' not in saved:
+                merged['smtp_verify_tls'] = not str(saved.get('smtp_host') or '').strip()
+            return merged
     except Exception as e:
         logging.error(f"Error loading server settings from database: {e}")
         # NS May 2026 - plain-JSON SERVER_SETTINGS_FILE fallback removed (encrypted DB only).
@@ -410,6 +417,20 @@ def caller_acts_as_admin():
     account's role as stored: neither a token's floor nor a tenant override lowers it, so it
     is no answer to "may this caller skip the tenant checks". NS Oct 2026 (#1060)"""
     return acts_as_admin(acting_user())
+
+
+def find_user_key(users, name):
+    """The key an account is stored under, for a username taken from a route, or None.
+
+    The exact key first, then the lower-cased name. The admin routes used to lower-case
+    first, and an OIDC fallback account kept the case of the subject id (oidc_Wd...), so
+    it answered 404 everywhere: no edit, no delete, no 2FA reset (#1141). MK"""
+    if not isinstance(name, str) or not name:
+        return None
+    if name in users:
+        return name
+    lowered = name.lower()
+    return lowered if lowered in users else None
 
 
 def check_cluster_access(cluster_id):
@@ -660,6 +681,165 @@ def require_unconfined(cluster_id):
     return None
 
 
+def tenant_quota_gate(user, what, adds, cluster='', hold=None):
+    """The tenant quota for an operation that adds guests or resources: (refusal, warning).
+
+    `adds` is {vms, cores, memory_gb, disk_gb} or a callable returning it, called only when the
+    caller's tenant has a quota at all (it may cost a call to the cluster). 'block' refuses
+    with 403 like the create routes; 'warn' lets it through, writes an audit line and hands
+    back what the caller adds to its answer as quota_warning. Open on a failed check, as the
+    create routes are: a quota bug must not stop the work. MK Oct 2026
+
+    hold: where the operation lands, {'cluster_id', 'vmid' or 'vmids', 'grow', 'ttl', 'key',
+    'alive'} (rbac.quota_hold). The check and the hold on what it lets through are taken
+    under one lock per tenant, so two operations at once do not both fit into one slot, and
+    every check after it counts the hold until the cluster shows the guest or the growth.
+    A request that ends in a refusal or an error (400 and up) drops its hold again;
+    quota_hold_alive() ties it to a task that runs on after the answer."""
+    from flask import jsonify
+    from pegaprox.utils import rbac
+    tid = rbac.quota_tenant(user)
+    try:
+        if not rbac.tenant_has_quota(tid):
+            return None, None
+    except Exception as e:
+        logging.debug(f"[quota] {what} pre-flight skipped: {e}")
+        return None, None
+    tok = None
+    with rbac.quota_tenant_lock(tid):
+        try:
+            a = adds() if callable(adds) else adds
+            if not a:
+                return None, None
+            seen = {}
+            v = rbac.quota_verdict(tid, add_vms=a.get('vms', 0), add_cores=a.get('cores', 0),
+                                   add_mem_gb=a.get('memory_gb', 0), add_disk_gb=a.get('disk_gb', 0),
+                                   counted=seen)
+        except Exception as e:
+            logging.debug(f"[quota] {what} pre-flight skipped: {e}")
+            return None, None
+        msg = ''
+        if v is not None:
+            msg = (f"Tenant quota exceeded ({', '.join(v['violations'])}) - usage {v['usage']} "
+                   f"vs quota {v['quota']}")
+            if v.get('enforce') == 'block':
+                return (jsonify({'error': msg, 'quota': v}), 403), None
+        if hold:
+            try:
+                tok = _hold_quota(rbac, tid, a, hold, seen)
+            except Exception as e:
+                logging.debug(f"[quota] {what}: no hold kept: {e}")
+    if v is None:
+        return None, None
+    try:
+        from pegaprox.utils.audit import log_audit
+        log_audit((user or {}).get('username') or 'system', 'tenant.quota_warning',
+                  f"{what}: {msg}", cluster=cluster or None)
+    except Exception:
+        pass
+    return None, {'violations': v['violations'], 'usage': v['usage'], 'quota': v['quota'],
+                  'message': msg}
+
+
+def _hold_quota(rbac, tid, adds, hold, seen):
+    cid = hold.get('cluster_id')
+    vmids = hold.get('vmids')
+    if vmids is None:
+        vmids = [hold['vmid']] if hold.get('vmid') not in (None, '') else []
+    base = None
+    if hold.get('grow') and len(vmids) == 1:
+        try:
+            base = (seen.get(cid) or {}).get(int(vmids[0]))
+        except (TypeError, ValueError):
+            base = None
+    tok = rbac.quota_hold(tid, cid, adds, vmids=vmids, grow=bool(hold.get('grow')), base=base,
+                          ttl=hold.get('ttl'), key=hold.get('key'), alive=hold.get('alive'))
+    if tok is None:
+        return None
+    from flask import g, has_request_context, after_this_request
+    if has_request_context():
+        g.quota_holds = getattr(g, 'quota_holds', []) + [tok]
+
+        @after_this_request
+        def _drop_unless_it_went_through(resp):
+            if resp.status_code >= 400:
+                rbac.quota_release(tok)
+            return resp
+    return tok
+
+
+def quota_hold_alive(alive=None, vmids=None, key=None):
+    """Tie the hold this request's quota gate took to the task that carries the work on:
+    alive() answering False (the task failed) drops it; vmids once the landing VMID is
+    known, key for a release from elsewhere (rbac.quota_release_key)."""
+    from flask import g, has_request_context
+    if not has_request_context():
+        return
+    from pegaprox.utils import rbac
+    for tok in getattr(g, 'quota_holds', []):
+        rbac.quota_hold_update(tok, vmids=vmids, alive=alive, key=key)
+
+
+def guest_size(manager, node, vm_type, vmid):
+    """{cores, memory_gb, disk_gb} of a guest as the tenant quota counts it: cores and memory
+    from its row in the live view the manager keeps, disk from every volume in its config
+    (the row's maxdisk is the boot disk, or a container's rootfs, alone). Where the live view
+    has no row, its config gives all three; {} when neither can be read."""
+    from pegaprox.utils.rbac import guest_footprint, config_footprint
+    row = None
+    try:
+        for g_ in (manager.get_vm_resources(max_age=30) or []):
+            if str(g_.get('vmid')) == str(vmid):
+                row = g_
+                break
+    except Exception as e:
+        logging.debug(f"[quota] live view of {vmid} unreadable: {e}")
+    kind = vm_type or (row or {}).get('type') or 'qemu'
+    cfg = None
+    try:
+        got = manager.get_vm_config(node or (row or {}).get('node'), vmid, kind)
+        if isinstance(got, dict) and got.get('success', True) is not False:
+            if getattr(manager, 'cluster_type', 'proxmox') == 'xcpng':
+                # XAPI's record: vCPUs, memory and VDI sizes in bytes
+                c = got.get('config') or {}
+                cfg = {'cores': int(c.get('vcpus') or 0),
+                       'memory_gb': float(c.get('memory') or 0) / 1024.0 ** 3,
+                       'disk_gb': sum(float((d or {}).get('size') or 0) for d in (c.get('disks') or []))
+                       / 1024.0 ** 3}
+            else:
+                cfg = config_footprint(got, kind)
+    except Exception as e:
+        logging.debug(f"[quota] config of {vmid} unreadable: {e}")
+    if row is not None:
+        fp = guest_footprint(row)
+        if cfg:
+            fp['disk_gb'] = max(fp['disk_gb'], cfg['disk_gb'])
+        return fp
+    return cfg or {}
+
+
+def node_shell_address(mgr, node):
+    """The address a shell for `node` logs in at, or None: then there is no shell.
+
+    MK Oct 2026 (#1143) - both node shells fell back to the cluster's connection host
+    when the node's own address was not found (the main port one always, its lookup
+    read an undefined port), so the shell of every node opened on that one host under
+    the clicked node's name. Only a member of the cluster resolves, through the
+    manager's own lookup; nothing stands in for it, least of all an address the
+    browser sends along.
+    """
+    if not node or not isinstance(node, str):
+        return None
+    try:
+        # an XCP-ng pool answers membership from XAPI itself, its nodes are a poll cache
+        if getattr(mgr, 'cluster_type', 'proxmox') != 'xcpng' and node not in (mgr.nodes or {}):
+            return None
+        return mgr.member_node_ip(node) or None
+    except Exception as e:
+        logging.warning(f"[SHELL] no address for node {node!r}: {e}")
+        return None
+
+
 # NS Oct 2026 - an XCP-ng pool asks for its own xapi.vm.* permission next to the vm.* one,
 # as its power, config and migrate routes already did (#1110)
 XAPI_TWINS = {'vm.config': 'xapi.vm.config', 'vm.snapshot': 'xapi.vm.snapshot',
@@ -784,10 +964,41 @@ def parse_pve_error(response_text, fallback='Proxmox API error'):
     return html.escape(text) if text else fallback
 
 
+# MK Oct 2026 (#1142) - a 401 or 403 from a system behind PegaProx (Proxmox VE, PBS, an ESXi
+# server) is about the credentials PegaProx keeps for it, never about the caller's session.
+# Handed on as it came, the browser read the 401 as its own session running out and signed
+# the user off at every click on a server whose stored password had stopped working.
+UPSTREAM_AUTH = 'UPSTREAM_AUTH'
+UPSTREAM_AUTH_STATUSES = (401, 403)
+
+
+def upstream_status(status, default=500):
+    """The status to answer for an upstream one: its 401 and 403 are a 502 (#1142)."""
+    if status in UPSTREAM_AUTH_STATUSES:
+        return 502
+    return status or default
+
+
+def upstream_failure(status, error='', system='Proxmox VE', default=500, **extra):
+    """(response, status) for an upstream system that answered `status`.
+
+    401 and 403 go out as 502 with code UPSTREAM_AUTH and say whose credentials were
+    refused; everything else keeps its status, as before. extra: more fields of the body.
+    """
+    from flask import jsonify
+    if status in UPSTREAM_AUTH_STATUSES:
+        said = ('refused the stored credentials' if status == 401
+                else 'does not allow this with the stored credentials')
+        msg = f'{system} {said} (HTTP {status})'
+        return jsonify({**extra, 'error': f'{msg}: {error}' if error else msg,
+                        'code': UPSTREAM_AUTH, 'upstream_status': status}), 502
+    return jsonify({**extra, 'error': error}), status or default
+
+
 # MK Oct 2026 (#763, #954) - the two evacuation options of a rolling update. The run started
 # by hand (settings.py) and the scheduled one (schedules.py) are two copies of the loop; what
 # the options do in either of them is written down once, here. Each reads its flags from the
-# state of the run, mgr._rolling_update.
+# state of the run, mgr._rolling_update, and changes it through rolling_runs.change.
 
 def evacuation_options(mgr, data):
     """(migrate_templates, relax_anti_affinity) from a request body or a stored schedule: off
@@ -808,15 +1019,17 @@ def evacuation_options_said(migrate_templates, relax_anti_affinity):
 
 def rolling_log(mgr, msg):
     """One line with its time in the log of the rolling update that runs."""
+    from pegaprox.core import rolling_runs
     try:
-        mgr._rolling_update['logs'].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+        rolling_runs.change(mgr, log=msg)
     except Exception:
         pass
 
 
 def rolling_options_intro(mgr):
     """What the options mean for this run, said once when it starts."""
-    state = mgr._rolling_update or {}
+    from pegaprox.core import rolling_runs
+    state = rolling_runs.current(mgr) or {}
     if state.get('skip_evacuation'):
         return
     if state.get('migrate_templates'):
@@ -830,11 +1043,12 @@ def rolling_options_intro(mgr):
 
 def rolling_node_templates(mgr, vms_here):
     """#763 - said either way: without the option a template goes down with its node."""
+    from pegaprox.core import rolling_runs
     tpls = [v for v in vms_here if v.get('template')]
     if tpls:
         names = ', '.join(f"{v.get('name') or v.get('vmid')} ({v.get('vmid')})" for v in tpls[:8])
         more = f" and {len(tpls) - 8} more" if len(tpls) > 8 else ''
-        moving = (mgr._rolling_update or {}).get('migrate_templates')
+        moving = (rolling_runs.current(mgr) or {}).get('migrate_templates')
         rolling_log(mgr, f"  → template(s) {'to move' if moving else 'staying here'}: {names}{more}")
 
 
@@ -853,10 +1067,13 @@ def rolling_moved_templates(mgr, task):
 def rolling_rules_give_way(mgr, who):
     """#954 - the negative affinity rules off, once, before the first evacuation of a run that
     lets them give way. From here the daemon loop keeps its hands off them."""
-    state = mgr._rolling_update
+    from pegaprox.core import rolling_runs
+    state = rolling_runs.current(mgr) or {}
     if not state.get('relax_anti_affinity') or state.get('ha_rules_held') is not None:
         return
-    state['ha_rules_held'] = True
+    # in the run's row before the first rule is touched: whoever acts next keeps them off
+    # for the run, or switches them on when it has ended
+    rolling_runs.change(mgr, ha_rules_held=True)
     try:
         off, failed = mgr.suspend_negative_ha_rules(who=who)
     except Exception as e:
@@ -869,16 +1086,16 @@ def rolling_rules_give_way(mgr, who):
         rolling_log(mgr, "Negative affinity: no enabled negative Proxmox HA rule to switch off")
     if failed:
         rolling_log(mgr, f"⚠ Proxmox kept these rules on, their guests may still not move: {', '.join(failed)}")
-    state['ha_rules_off'] = list(off)
-    state['ha_rules_held'] = bool(off)
+    rolling_runs.change(mgr, ha_rules_off=list(off), ha_rules_held=bool(off))
 
 
 def rolling_rules_back_on(mgr, who):
     """#954 - on again when the run ends, however it ends. A rule a node's maintenance still
-    holds stays off until that node leaves it."""
-    state = mgr._rolling_update or {}
+    holds stays off until that node leaves it. Returns the rules still off for the run."""
+    from pegaprox.core import rolling_runs
+    state = rolling_runs.current(mgr) or {}
     if not state.get('ha_rules_held'):
-        return
+        return []
     try:
         on, left = mgr.restore_suspended_ha_rules(who=who)
         if on:
@@ -891,20 +1108,116 @@ def rolling_rules_back_on(mgr, who):
         left = None
         rolling_log(mgr, f"✗ Switching the negative affinity rules back on failed: {e} - PegaProx keeps retrying")
     finally:
-        state['ha_rules_held'] = False
+        rolling_runs.change(mgr, ha_rules_held=False)
     if left is None:
-        return
+        return list(state.get('ha_rules_off') or [])
     try:
         held = mgr.held_ha_rules()
     except Exception:
         held = None
     if not isinstance(held, dict):
-        return
+        return list(left)
     for rule in sorted(r for r in (state.get('ha_rules_off') or []) if r not in left and r in held):
         nodes = sorted(str(o).split(':', 1)[1] for o in held[rule] if str(o).startswith('maintenance:'))
         if nodes:
             rolling_log(mgr, f"Negative affinity: {rule} stays off while {', '.join(nodes)} "
                              f"{'is' if len(nodes) == 1 else 'are'} in maintenance")
+    return list(left)
+
+
+def rolling_in_maintenance(mgr, node, node_status=None):
+    """Whether a node is in maintenance as far as the manager knows: its own list, or the node
+    status (an XCP-ng host stays disabled through a restart of PegaProx, its list does not)."""
+    if node in (getattr(mgr, 'nodes_in_maintenance', None) or {}):
+        return True
+    if node_status is None:
+        try:
+            node_status = mgr.get_node_status() or {}
+        except Exception:
+            node_status = {}
+    row = node_status.get(node) if isinstance(node_status, dict) else None
+    return isinstance(row, dict) and row.get('maintenance_mode') is True
+
+
+def rolling_moved_guests(mgr, node_name, before, task=None):
+    """MK Oct 2026 - the guests the evacuation of a node took away, for the run's row: the ones
+    that ran there before it, less those that failed to move. Where they went is the guest
+    list as cached right now, one read for the node, never one per guest."""
+    from pegaprox.core import rolling_runs
+    failed = {str(v.get('vmid')) for v in (getattr(task, 'failed_vms', None) or [])}
+    try:
+        where = {str(r.get('vmid')): r.get('node') for r in (mgr.get_vm_resources() or [])}
+    except Exception:
+        where = {}
+    moved = []
+    for v in before:
+        vmid = str(v.get('vmid'))
+        if vmid in failed:
+            continue
+        to = where.get(vmid)
+        moved.append({'vmid': v.get('vmid'), 'name': v.get('name') or '',
+                      'to': to if to and to != node_name else None})
+    rolling_runs.change(mgr, node=(node_name, {'moved': moved[:rolling_runs.MOVED_KEEP],
+                                               'moved_count': len(moved)}))
+    return moved
+
+
+def rolling_guests_left_moved(mgr):
+    """For the report of a cancel: the guests the evacuation of a node the run did not finish
+    moved away. Nothing moves them back (a pinned one goes back with the pin reconciliation)."""
+    from pegaprox.core import rolling_runs
+    state = rolling_runs.current(mgr) or {}
+    return [{'kind': 'guests_stay', 'node': n, 'count': int(s.get('moved_count') or 0)}
+            for n, s in sorted((state.get('node_state') or {}).items())
+            if s.get('result') not in ('done', 'skipped') and int(s.get('moved_count') or 0) > 0]
+
+
+def rolling_wind_down(mgr, who, settle=15, sleep=time.sleep):
+    """MK Oct 2026 - the end of a run, however it ends: each node this run put into maintenance
+    and that is still in it gets one more try, and the negative affinity rules come back on.
+    A node someone else put into maintenance is left alone. Returns what stays undone, for
+    the log and the answer of a cancel: [{'kind': 'maintenance', 'node'}, {'kind': 'ha_rules',
+    'rules'}]."""
+    from pegaprox.core import rolling_runs
+    state = rolling_runs.current(mgr) or {}
+    try:
+        node_status = mgr.get_node_status() or {}
+    except Exception:
+        node_status = {}
+    # flagged when the run put it in; a node whose flag never got written (the process ended
+    # while it went in) counts by the phase it was in
+    between = ('maintenance', 'evacuating', 'updating', 'rebooting', 'finishing')
+    ours = [n for n, s in sorted((state.get('node_state') or {}).items())
+            if s.get('in_maintenance') or (s.get('in_maintenance') is None and not s.get('result')
+                                           and s.get('phase') in between)]
+    stuck = [n for n in ours if rolling_in_maintenance(mgr, n, node_status)]
+    for n in ours:
+        if n not in stuck:
+            rolling_runs.change(mgr, node=(n, {'in_maintenance': False}))
+    undone = []
+    if stuck:
+        rolling_log(mgr, f"Cleanup: {len(stuck)} node(s) still in maintenance, retrying"
+                         + (f" after {settle}s settle..." if settle else "..."))
+        if settle:
+            sleep(settle)
+        for nn in stuck:
+            try:
+                ok = bool(mgr.exit_maintenance_mode(nn))
+            except Exception as e:
+                logging.error(f"[RollingUpdate] exit of the maintenance of {nn} failed: {e}")
+                ok = False
+            if ok:
+                rolling_runs.change(mgr, node=(nn, {'in_maintenance': False}),
+                                    log=f"✓ {nn} maintenance cleared on retry")
+            else:
+                rolling_runs.change(mgr, add={'failed_nodes': {'node': nn, 'error': 'Stuck in maintenance after rolling update'}},
+                                    log=f"✗ {nn} STILL stuck - run `ha-manager crm-command node-maintenance "
+                                        f"disable {nn}` manually")
+                undone.append({'kind': 'maintenance', 'node': nn})
+    left = rolling_rules_back_on(mgr, who)
+    if left:
+        undone.append({'kind': 'ha_rules', 'rules': sorted(left)})
+    return undone
 
 
 # NS 2026-06-04 — shared metrics_history loader for insights/cost/power.
@@ -962,3 +1275,159 @@ def load_metrics_window(days):
     # NOTE: the returned dicts are the cached parsed structure — callers must
     # treat them as read-only (the aggregation paths only read, never mutate).
     return run_heavy_read(sql, sql_params, cache_key=f"mh_parsed:{days}", transform=_parse)
+
+
+# NS Oct 2026 - what the history reports (power, costs, right-sizing) work out of it: guests x
+# snapshots in plain Python, about 11 s at 10k guests over a month. Run on the hub, that held
+# every other request, event stream and console of the process for as long, and the renewal
+# of the HA lease with them. The arithmetic now runs in gevent's thread pool, one report at a
+# time (two side by side took 36 s where one after the other takes 26: the GIL). A result is
+# kept: younger than _REPORT_FRESH and of the same history it is served as is, younger than
+# _REPORT_KEEP it is served while a new one is worked out in the background. Only a report
+# nobody has asked for yet, or one older than that, is waited for.
+_REPORT_FRESH = 60
+_REPORT_KEEP = 900
+_REPORT_MAX = 256
+_REPORT_ROWS = 100000    # guest rows kept over all reports; a row per guest is the bulk of one
+_reports = {}            # key -> (value, version, monotonic when computed, wall clock, rows)
+_report_running = {}     # key -> AsyncResult of the computation under way
+_report_gen = [0]        # forget_reports() moves it on: what was under way then stores nothing
+_report_lock = []
+
+
+def history_version(snaps):
+    """What a report of the history goes stale with: how many snapshots, and the newest."""
+    try:
+        return len(snaps), snaps[-1][0]
+    except (IndexError, KeyError, TypeError):
+        return len(snaps), None
+
+
+def report_owner(mgr):
+    """What a report key names the cluster manager by. A reconnected cluster gets a new
+    manager, and the id() of a collected one can come back for the next."""
+    owner = getattr(mgr, '_report_owner', None)
+    if owner is None:
+        owner = mgr._report_owner = object()
+    return owner
+
+
+def run_off_hub(fn, *args):
+    """fn(*args) in gevent's thread pool, one at a time, inline where there is no hub. fn is
+    plain arithmetic: no request, no session, no cluster manager (their sockets belong to
+    the hub), and it only reads what it is handed."""
+    try:
+        from gevent import get_hub
+        pool = get_hub().threadpool
+    except Exception:
+        return fn(*args)
+    if not _report_lock:
+        try:
+            from gevent.lock import BoundedSemaphore
+            _report_lock.append(BoundedSemaphore(1))
+        except Exception:
+            _report_lock.append(None)
+    lock = _report_lock[0]
+    if lock is None:
+        return pool.apply(fn, args)
+    lock.acquire()
+    try:
+        task = pool.spawn(fn, *args)
+    except BaseException:
+        lock.release()
+        raise
+    # free once the thread is done, not when this greenlet stops waiting: a waiter that is
+    # killed leaves its thread running, and the next report must not start beside it
+    task.rawlink(lambda _done: lock.release())
+    return task.get()
+
+
+def history_report(key, version, build, rows=None):
+    """(value, stamp) of build() for `key`, which names everything the result depends on
+    apart from the history (cluster, window, rates); `version` is that history
+    (history_version). build() runs on the hub, in a greenlet of its own that no request
+    can cut off, so it may read live data, and hands its arithmetic to run_off_hub.
+    rows(value): how many guest rows it holds, for the cap on what is kept. The value is
+    shared: callers copy before they change it.
+    stamp = {'computed_at', 'refreshing'} for the page to say how old the figures are."""
+    _forget_old_reports()
+    have = _reports.get(key)
+    if have is not None:
+        if have[1] == version and time.monotonic() - have[2] < _REPORT_FRESH:
+            return have[0], _report_stamp(key, have)
+        if _report_start(key, version, build, rows) is not None:
+            return have[0], _report_stamp(key, have)
+    done = _report_start(key, version, build, rows)
+    have = done.get() if done is not None else _report_run(key, version, build, rows, None, _report_gen[0])
+    return have[0], _report_stamp(key, have)
+
+
+def forget_reports():
+    """Every kept report, for the tests: the next test's cluster_1 is another cluster."""
+    _report_gen[0] += 1
+    _reports.clear()
+    _report_running.clear()
+
+
+def _report_stamp(key, have):
+    from datetime import timezone
+    return {'computed_at': datetime.fromtimestamp(have[3], timezone.utc).isoformat(timespec='seconds'),
+            'refreshing': key in _report_running}
+
+
+def _report_start(key, version, build, rows):
+    """The AsyncResult of the run of `key`, started now unless one is under way; None
+    without gevent, where the caller works it out itself."""
+    done = _report_running.get(key)
+    if done is not None:
+        return done
+    try:
+        import gevent
+        from gevent.event import AsyncResult
+    except Exception:
+        return None
+    done = _report_running[key] = AsyncResult()
+    # the generation as of now: the greenlet may start after a forget_reports()
+    gevent.spawn(_report_run, key, version, build, rows, done, _report_gen[0])
+    return done
+
+
+def _report_run(key, version, build, rows, done, gen):
+    try:
+        value = build()
+        have = (value, version, time.monotonic(), time.time(), rows(value) if rows else 1)
+        if gen == _report_gen[0]:
+            _reports[key] = have
+            _forget_old_reports()
+        if done is not None:
+            done.set(have)
+        return have
+    except Exception as e:
+        if done is None:
+            raise
+        logging.exception(f'[reports] the {key[0]} report was not worked out')
+        done.set_exception(e)
+    except BaseException:
+        # the run itself killed (the process stops): whoever waits hears so, not GreenletExit
+        if done is not None:
+            done.set_exception(RuntimeError('the report was cut off'))
+        raise
+    finally:
+        if done is not None and _report_running.get(key) is done:
+            del _report_running[key]
+
+
+def _forget_old_reports():
+    """Past _REPORT_KEEP a report goes; over _REPORT_MAX reports or _REPORT_ROWS guest rows,
+    the oldest go first. The newest stays whatever its size: dropping it would only mean
+    working it out on every request."""
+    now = time.monotonic()
+    for k in [k for k, v in _reports.items() if now - v[2] >= _REPORT_KEEP]:
+        del _reports[k]
+    total = sum(v[4] for v in _reports.values())
+    if len(_reports) <= _REPORT_MAX and total <= _REPORT_ROWS:
+        return
+    for k in sorted(_reports, key=lambda k: _reports[k][2])[:-1]:
+        if len(_reports) <= _REPORT_MAX and total <= _REPORT_ROWS:
+            break
+        total -= _reports.pop(k)[4]

@@ -15,6 +15,7 @@ from pegaprox.constants import *
 from pegaprox.globals import *
 from pegaprox.models.permissions import *
 from pegaprox.utils.sanitization import sanitize_log_message as _sl  # CWE-117
+from pegaprox.utils.sanitization import task_ref_ok
 from pegaprox.core.db import get_db
 
 from pegaprox.utils.auth import require_auth, load_users, verify_password
@@ -61,33 +62,20 @@ def get_node_ip_api(cluster_id, node):
     # (never used here), which AttributeError'd BEFORE the cluster-type branch below on XCP-ng
     # (XcpngManager has no api_port) → 500 on the node-IP endpoint for XCP-ng clusters.
     cluster_host = mgr.host
-    node_ip = None
-    source = None
 
-    # NS Mar 2026: XCP-ng uses XAPI host.get_address instead of Proxmox REST
-    if getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng':
-        try:
-            node_ip = mgr._get_host_ip(node)
-            source = 'xapi_host_address'
-        except Exception as e:
-            logging.error(f"XCP-ng get_node_ip: {e}")
-            node_ip = cluster_host
-            source = 'xcpng_fallback'
+    # MK Oct 2026 (#1143) - the node shell's own lookup, members only. _get_node_ip took any
+    # name, so a node.view caller had this server resolve it and knock on its SSH port, and
+    # XCP-ng's _get_host_ip named the pool's host as the address of a host it did not find.
+    # (NS Mar 2026: XCP-ng answers from XAPI's host.get_address, not Proxmox REST)
+    from pegaprox.api.helpers import node_shell_address
+    xcpng = getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng'
+    node_ip = node_shell_address(mgr, node)
+    if node_ip:
+        source = 'xapi_host_address' if xcpng else 'manager_get_node_ip'
     else:
-        # NS Apr 2026 (PR #324): let manager._get_node_ip do the heavy lifting
-        # (scores interfaces, filters corosync IPs out of the mgmt net, probes
-        # the SSH port). This endpoint is informational -- fall back to
-        # cluster_host only when we truly couldn't resolve anything.
-        try:
-            node_ip = mgr._get_node_ip(node)
-            if node_ip:
-                source = 'manager_get_node_ip'
-        except Exception as e:
-            logging.error(f"Error getting node IP: {e}")
-
-        if not node_ip:
-            node_ip = cluster_host
-            source = 'cluster_host_fallback'
+        # informational: the cluster host, said to be a stand-in
+        node_ip = cluster_host
+        source = 'xcpng_fallback' if xcpng else 'cluster_host_fallback'
 
     return jsonify({
         'ip': node_ip,
@@ -182,6 +170,36 @@ def get_node_cluster_health_api(cluster_id, node):
     return jsonify(result)
 
 
+# MK Oct 2026 (#1137) - the QDevice as the QDevice daemons of the nodes report it
+# (core/qdevice.py). The QNetd host is no node of the cluster: its connection state and
+# answer times are all there is of it. Cluster infrastructure, so no pool or guest grant
+# reaches it.
+@bp.route('/api/clusters/<cluster_id>/qdevice', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_cluster_qdevice_api(cluster_id):
+    """The QDevice of a Proxmox VE cluster and the state of the QDevice daemon on each node"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    mgr = cluster_managers[cluster_id]
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'present': False})   # an XCP-ng pool has no corosync
+    if not getattr(mgr, 'is_connected', False):
+        return jsonify({'error': 'The cluster is not connected'}), 503
+    from pegaprox.core import qdevice
+    view = qdevice.view(cluster_id, mgr)
+    if view is None:
+        return jsonify({'error': 'The cluster did not answer'}), 503
+    if not view['present'] and not any(r['answered'] for r in view['nodes']):
+        return jsonify({'error': 'No node answered',
+                        'nodes': [{'node': r['node'], 'error': r['error']} for r in view['nodes'] if r['asked']]}), 503
+    return jsonify(qdevice.public(view))
+
+
 # MK May 2026 — lm-sensors readings (CPU temp, fan rpm, voltages).
 # Graceful on hosts without lm-sensors installed (returns error string the
 # UI can show as "not available").
@@ -233,6 +251,35 @@ def get_node_temperature_history_api(cluster_id, node):
         return jsonify({'error': f'history read failed: {e}'}), 500
     series.sort(key=lambda x: x['ts'])
     return jsonify({'series': series, 'unit': '°C', 'count': len(series)})
+
+
+# MK Oct 2026 - a range picked on the node charts that no RRD preset draws with more than
+# a handful of points (a few hours a week back): CPU and memory from the 5-minute snapshots
+# PegaProx stores itself. The same gate as the RRD charts it zooms.
+@bp.route('/api/clusters/<cluster_id>/nodes/<node>/metrics-history', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_node_metrics_history_api(cluster_id, node):
+    """CPU and memory of a node over a picked time range, from PegaProx's stored metrics
+
+    Query params:
+    - from, to: unix seconds, a year apart at most; cut to what is stored
+    """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    bad, code = _reject_bad_node(node)
+    if bad is not None: return bad, code
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    from pegaprox.background.metrics import history_range, load_metrics_range, history_series
+    start, end, why = history_range(request.args)
+    if why:
+        return jsonify({'error': why}), 400
+
+    def _node(clusters):
+        return ((clusters.get(cluster_id) or {}).get('nodes') or {}).get(node)
+    out = history_series(load_metrics_range(start, end, _node), {'cpu': 'cpu', 'memory': 'mem_percent'})
+    out.update({'node': node, 'from': int(start), 'to': int(end)})
+    return jsonify(out)
 
 
 # ── In-band hardware monitoring / BMC (#609) ──────────────────────────────────
@@ -941,6 +988,11 @@ def get_node_syslog_api(cluster_id, node):
     """Get node system log"""
     ok, err = check_cluster_access(cluster_id)
     if not ok: return err
+    # MK Oct 2026 - the host journal: sshd logins, other accounts, every guest on the node.
+    # Not for a caller confined to a pool or a few guests, like the node-level task logs.
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
 
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
@@ -1116,6 +1168,9 @@ def get_node_task_log_api(cluster_id, node, upid):
         return jsonify({'error': 'Cluster not found'}), 404
     
     manager = cluster_managers[cluster_id]
+    # MK Oct 2026 - a task id has no slash; anything else goes nowhere near the URL
+    if not task_ref_ok(getattr(manager, 'cluster_type', 'proxmox'), node, upid):
+        return jsonify({'error': 'Invalid node or task id'}), 400
 
     # sec (private disclosure Sep 2026 — audit): the UPID names a guest (PVE field 6). A scoped
     # caller must not read the task log of a VM outside their grant — the DELETE/cancel sibling
@@ -1135,8 +1190,44 @@ def get_node_task_log_api(cluster_id, node, upid):
     log_lines = manager.get_node_task_log(node, upid, start, limit)
     # Join lines into a single string for display
     log_text = '\n'.join(log_lines) if log_lines else ''
-    
-    return jsonify({'log': log_text})
+
+    # MK Oct 2026 - lines as well, for a reader that tails the log with ?start= and has to
+    # count what it got (an empty line joins away in the text)
+    return jsonify({'log': log_text, 'lines': log_lines or []})
+
+
+@bp.route('/api/clusters/<cluster_id>/nodes/<node>/tasks/<path:upid>/status', methods=['GET'])
+@require_auth(perms=['node.view'])
+def get_node_task_status_api(cluster_id, node, upid):
+    """Status of one task as Proxmox has it: {status, exitstatus, ...}
+
+    MK Oct 2026 - the live backup pane asked this route every 2 s before it existed. A scoped
+    caller reads the status of their own guests' tasks only, like the log next to it.
+    """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    manager = cluster_managers[cluster_id]
+    if not task_ref_ok(getattr(manager, 'cluster_type', 'proxmox'), node, upid):
+        return jsonify({'error': 'Invalid node or task id'}), 400
+
+    from pegaprox.utils.auth import build_authz_user as _bau
+    from pegaprox.utils.rbac import user_can_access_vm as _ucav
+    _au = _bau(request.session.get('user', ''), request.session)
+    if caller_is_scoped(_au, cluster_id):
+        _p = str(upid).split(':')
+        _tvmid = _p[6] if len(_p) > 6 and _p[6].isdigit() else None
+        if _tvmid is None or not _ucav(_au, cluster_id, int(_tvmid), 'vm.view'):
+            return jsonify({'error': 'Access denied to this task'}), 403
+
+    read = getattr(manager, 'get_task_status', None)
+    status = read(node, upid) if callable(read) else None
+    if not isinstance(status, dict):
+        return jsonify({'error': 'Task status could not be read'}), 502
+    return jsonify({k: status.get(k) for k in ('status', 'exitstatus', 'type', 'id', 'node',
+                                                'starttime', 'pid', 'upid') if k in status})
 
 
 @bp.route('/api/clusters/<cluster_id>/nodes/<node>/subscription', methods=['GET'])

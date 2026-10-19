@@ -2766,6 +2766,7 @@
                 oidc_tenant_id: '',
                 oidc_authority: '',
                 oidc_scopes: 'openid profile email',
+                oidc_username_claim: '',
                 oidc_redirect_uri: '',
                 oidc_admin_group_id: '',
                 oidc_user_group_id: '',
@@ -2869,6 +2870,7 @@
                 smtp_from_name: 'PegaProx Alerts',
                 smtp_tls: true,
                 smtp_ssl: false,
+                smtp_verify_tls: true,
                 alert_email_recipients: [],
                 alert_cooldown: 300,
                 alert_update_available: false,
@@ -3711,6 +3713,7 @@
                             smtp_from_name: data.smtp_from_name || 'PegaProx Alerts',
                             smtp_tls: data.smtp_tls !== false,
                             smtp_ssl: data.smtp_ssl || false,
+                            smtp_verify_tls: data.smtp_verify_tls !== false,
                             // Alert settings
                             alert_email_recipients: data.alert_email_recipients || [],
                             alert_cooldown: data.alert_cooldown || 300,
@@ -3775,6 +3778,7 @@
                             oidc_tenant_id: data.oidc_tenant_id || '',
                             oidc_authority: data.oidc_authority || '',
                             oidc_scopes: data.oidc_scopes || 'openid profile email',
+                            oidc_username_claim: data.oidc_username_claim || '',
                             oidc_redirect_uri: data.oidc_redirect_uri || '',
                             oidc_admin_group_id: data.oidc_admin_group_id || '',
                             oidc_user_group_id: data.oidc_user_group_id || '',
@@ -4096,6 +4100,7 @@
                             smtp_from_name: serverSettings.smtp_from_name,
                             smtp_tls: serverSettings.smtp_tls,
                             smtp_ssl: serverSettings.smtp_ssl,
+                            smtp_verify_tls: serverSettings.smtp_verify_tls !== false,
                             alert_email_recipients: serverSettings.alert_email_recipients,
                             alert_cooldown: serverSettings.alert_cooldown,
                             alert_update_available: !!serverSettings.alert_update_available,
@@ -4149,7 +4154,8 @@
                             smtp_from_email: serverSettings.smtp_from_email,
                             smtp_from_name: serverSettings.smtp_from_name || 'PegaProx Alerts',
                             smtp_tls: serverSettings.smtp_tls !== false,
-                            smtp_ssl: serverSettings.smtp_ssl || false
+                            smtp_ssl: serverSettings.smtp_ssl || false,
+                            smtp_verify_tls: serverSettings.smtp_verify_tls !== false
                         })
                     });
                     
@@ -7592,6 +7598,18 @@
                                                 <p className="text-xs text-gray-600 mt-1">Register this URL in your identity provider</p>
                                             </div>
                                         </div>
+                                        {/* NS Oct 2026 (#1149) - which claim names the account; AD FS sends its claims in the tokens only */}
+                                        <div>
+                                            <label className="block text-sm text-gray-400 mb-1">Username claim</label>
+                                            <select data-oidc="username-claim" value={oidcConfig.oidc_username_claim || ''} onChange={e => setOidcConfig(prev => ({...prev, oidc_username_claim: e.target.value}))}
+                                                className="w-full px-3 py-2 bg-proxmox-secondary border border-proxmox-border rounded-lg text-white text-sm">
+                                                <option value="">Automatic (preferred_username, then email)</option>
+                                                <option value="preferred_username">preferred_username</option>
+                                                <option value="email">email</option>
+                                                <option value="upn">upn (AD FS)</option>
+                                            </select>
+                                            <p className="text-xs text-gray-600 mt-1">Pick a claim users cannot change themselves. With a claim picked here an account stays with the sign-in it was made for, and a sign-in without that claim is refused. For AD FS also add allatclaims to the scopes. For Entra pick preferred_username (the UPN): email there is the mail attribute, which Entra does not verify.</p>
+                                        </div>
                                         <div>
                                             <label className="block text-sm text-gray-400 mb-1">Login Button Text</label>
                                             <input type="text" value={oidcConfig.oidc_button_text} onChange={e => setOidcConfig(prev => ({...prev, oidc_button_text: e.target.value}))}
@@ -7679,11 +7697,11 @@
                                             </div>
                                         ) : (
                                             <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg">
-                                                <p className="text-xs text-green-400">✓ {t('oidcPrivateIpDisabled') || 'SSRF guard active — private/loopback IPs rejected. Turn on only if your IdP runs on an internal network (10.x / 192.168.x / 172.16-31.x).'}</p>
+                                                <p className="text-xs text-green-400">✓ {t('oidcPrivateIpDisabled') || 'SSRF guard active: private and loopback addresses are refused. Turn on only if your IdP runs on an internal network (10.x, 172.16-31.x, 192.168.x, or 100.64.0.0/10 such as Tailscale or CGNAT, which is refused too since 1.4.0).'}</p>
                                             </div>
                                         )}
                                         <p className="text-[11px] text-gray-500 leading-snug">
-                                            {t('oidcPrivateIpHint') || 'Affects: the /.well-known/openid-configuration discovery call only. Other outbound paths (webhooks, plugin upstreams, SAML metadata) keep the strict guard.'}
+                                            {t('oidcPrivateIpHint') || 'Affects: discovery, the authorization, token and userinfo endpoints and the signing keys of the IdP. Other outbound paths (webhooks, plugin upstreams, SAML metadata) keep the strict guard.'}
                                         </p>
                                     </div>
 
@@ -8269,8 +8287,8 @@
                                                                 onChange={e => setServerSettings({...serverSettings, acme_allow_private_ca: e.target.checked})}
                                                                 className="rounded border-proxmox-border bg-proxmox-darker"
                                                             />
-                                                            <span className="text-sm text-gray-300">{t('acmeAllowPrivateCa') || 'Allow private/internal ACME CA'}</span>
-                                                            <span className="text-xs text-gray-500">({t('acmeAllowPrivateCaHint') || 'permit an RFC1918/loopback directory, e.g. an internal StepCA'})</span>
+                                                            <span className="text-sm text-gray-300">{t('acmeAllowPrivateCa') || 'Allow a private or internal ACME CA'}</span>
+                                                            <span className="text-xs text-gray-500">({t('acmeAllowPrivateCaHint') || 'a directory on a private address (10.x, 172.16-31.x, 192.168.x, 100.64.0.0/10) or loopback, e.g. an internal step-ca'})</span>
                                                         </label>
                                                     </div>
                                                 )}
@@ -8652,6 +8670,27 @@
                                                         <span className="text-sm text-gray-300">{t('smtpSsl')} (SSL/TLS)</span>
                                                     </label>
                                                 </div>
+                                                
+                                                {/* LW Oct 2026: check the relay's certificate, off only for a self-signed relay */}
+                                                {(serverSettings.smtp_tls || serverSettings.smtp_ssl) && (
+                                                    <div className="space-y-2">
+                                                        <label className="flex items-center gap-2 cursor-pointer">
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={serverSettings.smtp_verify_tls !== false}
+                                                                onChange={e => setServerSettings({...serverSettings, smtp_verify_tls: e.target.checked})}
+                                                                className="rounded"
+                                                            />
+                                                            <span className="text-sm text-gray-300">{t('smtpVerifyTls')}</span>
+                                                        </label>
+                                                        {serverSettings.smtp_verify_tls === false && (
+                                                            <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg">
+                                                                <p className="text-sm text-red-400 font-medium mb-1">⚠ {t('securityWarning')}</p>
+                                                                <p className="text-xs text-red-400/80">{t('smtpVerifyTlsWarning')}</p>
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
                                                 
                                                 {/* Test Email */}
                                                 <div className="pt-3 border-t border-proxmox-border">
@@ -11224,6 +11263,9 @@
             // leader, read on a member. Each card only shows what its server reports: none of them
             // on a server from before stage 2, and on a member nothing it has no data for.
             const groupCards = (leader) => {
+                // a removed instance is in no group any more: the removed note says by whom and
+                // what to do, and nothing of the config it left is shown next to it
+                if (status.removed) return null;
                 // auto is null while this release does not offer automatic failover: no switch
                 // and no witness form that could only be refused
                 const reported = status.auto != null;
@@ -11484,8 +11526,9 @@
         // LW Oct 2026 (#625) - stage 2 of the group, for HaPanel: automatic failover, its witness
         // and the time zone the schedules run in. The leader switches and sets them, a member
         // reads what its leader says. status.auto is null on a release that does not offer
-        // automatic failover yet; the switch and the witness code are refused there with 409
-        // HA_AUTO_NOT_SHIPPED, which is a note and no error.
+        // automatic failover; the switch and the witness code are refused there with 409
+        // HA_AUTO_NOT_SHIPPED, which is a note and no error. Where it is offered it is a beta,
+        // and both cards say so next to their title.
         // ═══════════════════════════════════════════════
 
         // the precondition each finding code of the server belongs to, in the order of the list
@@ -11520,6 +11563,7 @@
         // a witness that was removed and did not hear it lets go on its own host with this
         const HA_WITNESS_LEAVE = 'pegaprox-witness leave --force';
         const HA_GROUP_CARD = 'bg-proxmox-dark border border-proxmox-border rounded-xl p-4 space-y-3';
+        const HA_BETA_BADGE = 'px-1.5 py-0.5 rounded-full border text-[10px] font-semibold leading-none bg-purple-500/20 text-purple-300 border-purple-500/30';
         const HA_GROUP_FIELD = 'px-3 py-2 bg-proxmox-card border border-proxmox-border rounded text-sm text-white disabled:opacity-50';
         const HA_GROUP_BTN = 'flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed';
         const HA_GROUP_GHOST = 'flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white hover:border-gray-500';
@@ -11911,6 +11955,7 @@
                             <h4 className="font-medium text-white flex flex-wrap items-center gap-2">
                                 <Icons.Shield />
                                 {leader ? <label htmlFor="pgha-auto">{t('haAutoTitle')}</label> : <span>{t('haAutoTitle')}</span>}
+                                {!notShipped && <span className={HA_BETA_BADGE} data-ha-beta="auto">{t('haAutoBeta')}</span>}
                                 {auto && (
                                     <span data-ha-auto-mode={mode} className={`px-2 py-0.5 rounded-full border text-xs font-medium ${HA_AUTO_MODE_STYLE[mode]}`}>
                                         {t(HA_AUTO_MODES[mode])}
@@ -11926,6 +11971,7 @@
                                 className={`toggle-switch flex-shrink-0 disabled:opacity-50 disabled:cursor-not-allowed ${on ? 'active' : ''}`} />
                         )}
                     </div>
+                    {leader && !notShipped && <p className="text-xs text-purple-300" data-ha-auto-beta-note>{t('haAutoBetaNote')}</p>}
                     {notShipped && !on && (
                         <div className="rounded-lg p-3 text-sm border bg-blue-500/10 border-blue-500/30 text-blue-200 flex items-start gap-2" data-ha-auto-not-shipped>
                             <span className="mt-0.5 flex-shrink-0"><Icons.Info /></span>
@@ -12285,10 +12331,13 @@
 
             return (
                 <div className={HA_GROUP_CARD} data-ha-witness={witness ? 'paired' : code && !expired ? 'waiting' : 'none'}>
-                    <h4 className="font-medium text-white flex items-center gap-2">
-                        <Icons.Scale />
-                        {t(witness || !leader ? 'haWitnessTitle' : 'haWitnessAddTitle')}
-                    </h4>
+                    <div className="flex flex-wrap items-center gap-2">
+                        <h4 className="font-medium text-white flex items-center gap-2">
+                            <Icons.Scale />
+                            {t(witness || !leader ? 'haWitnessTitle' : 'haWitnessAddTitle')}
+                        </h4>
+                        {!notShipped && <span className={HA_BETA_BADGE} data-ha-beta="witness">{t('haAutoBeta')}</span>}
+                    </div>
                     <p className="text-sm text-gray-400">{t('haWitnessIntro')}</p>
                     {witness ? (
                         <>

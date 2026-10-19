@@ -35,6 +35,7 @@ CLOCK_FAIL_S = 60
 # What PegaProx asks PVE for and which features stop working without it. One entry
 # per privilege set: any of `privs` on `path` (or propagated from above) is enough.
 # VM.Monitor is the PVE 8 name of the guest agent read, VM.GuestAgent.Audit the PVE 9 one.
+# The role recipe of core/pve_access.py is built from this table.
 PRIVILEGE_NEEDS = (
     (('Sys.Audit',), '/', ('monitoring',)),
     (('VM.Audit',), '/vms', ('guests',)),
@@ -42,6 +43,7 @@ PRIVILEGE_NEEDS = (
     (('VM.Migrate',), '/vms', ('migration',)),
     (('VM.Console',), '/vms', ('consoles',)),
     (('VM.Snapshot',), '/vms', ('snapshots',)),
+    (('VM.Snapshot.Rollback',), '/vms', ('snapshots',)),
     (('VM.Backup',), '/vms', ('backups',)),
     (('VM.Allocate',), '/vms', ('create',)),
     (('VM.Clone',), '/vms', ('clone',)),
@@ -50,14 +52,33 @@ PRIVILEGE_NEEDS = (
     (('VM.Config.Disk',), '/vms', ('hardware',)),
     (('VM.Config.Network',), '/vms', ('hardware',)),
     (('VM.Config.Options',), '/vms', ('hardware',)),
+    (('VM.Config.CDROM',), '/vms', ('hardware',)),
+    (('VM.Config.HWType',), '/vms', ('hardware',)),
+    (('VM.Config.Cloudinit',), '/vms', ('hardware',)),
     (('VM.GuestAgent.Audit', 'VM.Monitor'), '/vms', ('agent',)),
     (('Datastore.Audit',), '/storage', ('storage',)),
     (('Datastore.AllocateSpace',), '/storage', ('disks',)),
     (('Datastore.AllocateTemplate',), '/storage', ('uploads',)),
+    # a replication job needs VM.Replicate on the guest (PVE API schema of /cluster/replication)
+    (('VM.Replicate',), '/vms', ('replication',)),
+    # PVE 8: a guest NIC on a bridge or vnet needs it on that bridge
+    (('SDN.Use',), '/sdn', ('networks',)),
+    (('Pool.Audit',), '/pool', ('pools',)),
+    # the pool editor, and a guest created into a pool (PVE checks /pool/<id> for it)
+    (('Pool.Allocate',), '/pool', ('pools',)),
+    (('Mapping.Audit',), '/mapping', ('mappings',)),
+    (('Mapping.Use',), '/mapping', ('mappings',)),
+    # the mapping editors (PCI, USB, directories)
+    (('Mapping.Modify',), '/mapping', ('mappings',)),
     (('Sys.PowerMgmt',), '/nodes', ('nodePower',)),
     (('Sys.Modify',), '/', ('nodeConfig',)),
     (('Sys.Syslog',), '/', ('syslog',)),
+    # HA resources and rules, the ones a rolling update lets give way among them
+    (('Sys.Console',), '/', ('haConfig',)),
     (('SDN.Audit',), '/sdn', ('sdn',)),
+    # MK Oct 2026 - the target side of remote_migrate (POST .../mtunnel wants it on /), the
+    # way cross-cluster migration, replication and Site Recovery move a guest in
+    (('Sys.Incoming',), '/', ('remoteMigration',)),
 )
 
 
@@ -361,6 +382,21 @@ def _ssh_user(mgr):
     return cfg.ssh_user if getattr(cfg, 'ssh_user', '') else (cfg.user or 'root').split('@')[0]
 
 
+def _credential_at(mgr, ip):
+    """Which login the node at `ip` gets: 'key', its own password ('node', #1136) or the
+    cluster's ('cluster'). The key goes first, so with one stored the answer is the key."""
+    if getattr(mgr.config, 'ssh_key', ''):
+        return 'key'
+    own = getattr(mgr, '_own_password_at', None)
+    if callable(own):
+        try:
+            if own(ip):
+                return 'node'
+        except Exception:
+            pass
+    return 'cluster'
+
+
 def probe_ssh(mgr, node):
     """One login attempt at most, and only where ssh_diagnose has nothing against it."""
     method = 'key' if getattr(mgr.config, 'ssh_key', '') else 'password'
@@ -377,6 +413,7 @@ def probe_ssh(mgr, node):
     if not ip:
         return _item('ssh', 'fail', item_id=iid, hint='ssh_no_ip', code='NO_IP', **base)
     base['ip'] = ip
+    base['credential'] = _credential_at(mgr, ip)
     failure = {}
     client = mgr._ssh_connect(ip, retries=1, connect_timeout=SSH_TIMEOUT, failure=failure)
     if client is None:
@@ -407,7 +444,8 @@ def probe_ssh(mgr, node):
 
 def check_ssh(mgr, nodes):
     """Per online node, except when SSH is off or has no credential for the whole
-    cluster: then one item says so and no node is contacted."""
+    cluster: then one item says so and no node is contacted. Each node is tried with
+    what it would get anywhere else, its own password where it has one (#1136)."""
     blocked = mgr.ssh_blocked_reason()
     if blocked:
         diag = mgr.ssh_diagnose(nodes[0]['name']) if nodes else None

@@ -13,8 +13,6 @@ import inspect
 
 import pytest
 
-from pegaprox.app import create_app
-
 
 # Any one of these appearing in a handler's (unwrapped) source counts as "the
 # route gates the specific VM object":
@@ -56,8 +54,9 @@ def _vm_scoped_rules(app):
 
 
 @pytest.fixture(scope="module")
-def flask_app():
-    return create_app()
+def flask_app(_integration_app):
+    # the app conftest builds on a temp database; one of its own would start on config/
+    return _integration_app
 
 
 def _handler_source(app, endpoint):

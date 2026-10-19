@@ -1341,11 +1341,13 @@ def test_the_node_modal_has_no_shell_and_locks_what_changes_on_a_standby():
     # the shell tab stays on every standby and points to the shell on the active, unless
     # the standby serves users
     assert 'const tabs = allTabs;' in body
-    assert "const lockedTab = haReadOnly && !['summary', 'performance', 'tasks'].includes(activeTab);" in body
+    # the timeline only reads as well
+    assert "const lockedTab = haReadOnly && !['summary', 'performance', 'tasks', 'timeline'].includes(activeTab);" in body
     assert "{activeTab === 'shell' && haConsolesElsewhere && <HaConsoleOnActive />}" in body
     assert "{activeTab === 'shell' && !haConsolesElsewhere && (" in body
-    assert '{!haConsolesElsewhere && data.shellFullscreen && (' in body
-    assert body.count('<NodeShellTerminal') == 2
+    # fullscreen is the same panel behind that gate, no second terminal of its own (#1143)
+    assert 'shellFullscreen' not in body
+    assert body.count('<NodeShellPanel ') == 1 and '<NodeShellTerminal' not in body
     assert "const haLock = { disabled: lockedTab, 'data-ha-locked': lockedTab ? '' : undefined };" in body
     # (#625 v2 review) no fieldset around all tab bodies any more, it disabled Refresh and
     # SMART too: each tab that changes the node locks its changing parts itself
@@ -1357,7 +1359,7 @@ def test_the_node_modal_has_no_shell_and_locks_what_changes_on_a_standby():
             'subscription', 'ceph'} <= set(tabs)
     for name in ('network', 'hardware', 'repos', 'ceph'):
         assert tabs[name].split('\n', 1)[1].lstrip().startswith('<fieldset {...haLock} className="contents">'), name
-    for name in ('summary', 'performance', 'tasks'):
+    for name in ('summary', 'performance', 'tasks', 'timeline'):
         assert 'haLock' not in tabs[name], name
 
     def locked(tab, needle):
@@ -1747,13 +1749,13 @@ def test_the_node_handlers_refuse_on_a_standby(dash):
     """Anything left that still reaches them: refused with the toast, before a question
     is asked or a request goes out."""
     guard = 'if (haReadOnly) { haRefusedRef.current?.(); return; }'
-    for head in ('const handleMaintenanceToggle = async (nodeName, enable, options) => {',
+    for head in ('const handleMaintenanceToggle = async (nodeName, enable, options, forCluster) => {',
                  'const handleStartUpdate = async (nodeName, reboot) => {',
                  'const handleNodeAction = async (nodeName, action) => {',
                  'const handleForceStop = async (resource) => {'):
         body = _block(dash, head, '\n            };')
         assert guard in body, head
-        later = [i for i in (body.find('confirm('), body.find('authFetch(')) if i >= 0]
+        later = [i for i in (body.find('confirm('), body.find('authFetch('), body.find('setMaintDialog(')) if i >= 0]
         assert later and body.index(guard) < min(later), head
 
 
@@ -1861,9 +1863,12 @@ def test_esxi_pbs_and_the_add_buttons_stay_on_the_active(dash):
     # PBS edit/delete, encryption key and auto-verify; ESXi re-configure/delete
     for opener in ('<button onClick={() => { setEditingPBS(selectedPBS);', '<button onClick={() => setShowEncryptionKeyModal(true)}',
                    '<button onClick={() => setShowVerifyScheduleModal(true)}',
-                   '<button onClick={() => { setEditingVMware(selectedVMware);'):
+                   '<button onClick={() => openVmwareEdit(selectedVMware)} title='):
         at = dash.index(opener)
         assert '{isAdmin && !haReadOnly && (' in dash[at - 220:at], opener
+    # the way to the settings of an ESXi server that refuses its password, too (#1142)
+    at = dash.index('<button onClick={() => openVmwareEdit(selectedVMware)} data-esxi-error-edit')
+    assert "{vmwareError?.code === 'UPSTREAM_AUTH' && isAdmin && !haReadOnly && (" in dash[at - 160:at]
     for head in ('const vmwarePowerAction = async (vmId, action) => {',
                  'const vmwareSnapshotAction = async (vmId, action, data = {}) => {',
                  'const toggleVMwareDRS = async (vmwId, clusterId, enabled, automation) => {',
@@ -2036,10 +2041,12 @@ def test_compliance_stays_a_reading_tab_on_a_standby(dash):
     its acting buttons still ask the flag."""
     assert ('const holds = (permission) => isAdmin || (Array.isArray(user?.permissions) '
             '&& user.permissions.includes(permission));') in dash
-    assert "if (tab.id === 'compliance') return holds('admin.audit') || holds('node.maintenance');" in dash
-    # holds() decides this tab, whether a standby offers a console on the active, and the
-    # console entries of a member that opens them itself
-    assert len(re.findall(r'\bholds\(', dash)) == 4
+    assert ("if (tab.id === 'compliance') return holds('admin.audit') || holds('node.maintenance') "
+            "|| holds('changes.view');") in dash
+    # holds() decides this tab (and the sub tabs of it, with the change plans' request button),
+    # whether a standby offers a console on the active, and the console entries of a member
+    # that opens them itself
+    assert len(re.findall(r'\bholds\(', dash)) == 9
     assert 'const onActiveItems = (permission, search, disabled = false) => !holds(permission) ? [] : [{' in dash
     assert 'const menuAllows = (i) => !i.perm || (i.console ? holds(i.perm) : can(i.perm));' in dash
     drift = _function(dash, 'DriftTab')
@@ -2263,7 +2270,10 @@ def test_runtime_the_node_modal_reads_but_changes_nothing_on_a_standby(open_app,
     page.get_by_text('Reallocated_Sector_Ct').first.wait_for(timeout=5000)
     assert ('GET', NODE_PATH + '/disks/sda/smart') in app.server.calls
 
-    page.mouse.click(5, 5)                     # the backdrop closes the SMART view
+    # the backdrop closes the SMART view. Clicked below the top edge: this harness has no live
+    # updates, so 'Live updates disconnected' sticks to the top about 3 s after the page loads
+    # and, on a slow run, catches a click at (5, 5) before the backdrop does
+    page.mouse.click(5, 300)
     page.get_by_text('Reallocated_Sector_Ct').first.wait_for(state='hidden', timeout=3000)
     page.locator('button', has_text='System').last.click()
     page.get_by_text('hello syslog').first.wait_for(timeout=5000)
@@ -3960,7 +3970,6 @@ CONSOLE_GATES = [
     ('dashboard.js', '}, [consoleKey, haConsolesElsewhere]);', 1),
     ('node_modals.js', "{activeTab === 'shell' && haConsolesElsewhere && <HaConsoleOnActive />}", 1),
     ('node_modals.js', "{activeTab === 'shell' && !haConsolesElsewhere && (", 1),
-    ('node_modals.js', '{!haConsolesElsewhere && data.shellFullscreen && (', 1),
     ('node_modals.js', "{activeDetailTab === 'shell' && haConsolesElsewhere && <HaConsoleOnActive />}", 1),
     ('node_modals.js', "{activeDetailTab === 'shell' && !haConsolesElsewhere && (", 1),
     ('tables.js', 'const consoles = !haConsolesElsewhere;', 1),
@@ -3995,7 +4004,7 @@ def test_no_console_surface_asks_the_standby_flag_any_more():
 
 # the per-instance rows that are forwarded now: they follow haReadOnly again (v6)
 FORWARDED_GATES = [
-    ('dashboard.js', 'onClick={e => { e.stopPropagation(); ack(ev.id, ', "{canAct && ev.status === 'open' && (", 700),
+    ('dashboard.js', 'onClick={e => { e.stopPropagation(); ack(ev.id, ', "{canAct && ev.status === 'open' && (", 800),
     ('dashboard.js', 'onClick={clearInbox}', '{items.length > 0 && !haReadOnly && (', 300),
     ('dashboard.js', 'onClick={() => ackAlert(a.id)}', '{!a.acked_at && !haReadOnly && (', 300),
 ]
@@ -4410,8 +4419,8 @@ def test_the_leader_only_lists_say_when_the_leader_is_away(ctx, dash):
     assert "return !!body && body.code === 'HA_ACTIVE_UNREACHABLE';" in helper
     drift = _function(dash, 'DriftTab')
     assert 'const away = (await haLeaderAway(sr)) || (await haLeaderAway(er));' in drift
-    assert 'if (away) { setStatus(null); setEvents([]); return; }' in drift
-    assert '}, [clusterId, filter, haReadOnly]);' in drift
+    assert 'if (away) { setStatus(null); setEvents([]); setPolicy([]); return; }' in drift
+    assert '}, [clusterId, filter, kindFilter, catFilter, haReadOnly]);' in drift
     assert drift.index('{leaderAway ? (') < drift.index('events.length === 0 ? (')
     bell = _function(dash, 'PushBellButton')
     assert 'const away = await haLeaderAway(r);' in bell

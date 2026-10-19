@@ -383,7 +383,7 @@
         }
 
         // ── side nav (collapsible, grouped) ────────────────────────
-        function CloudSideNav({ active, onSelect, isAdmin, canAutoInstall, collapsed, onToggle }) {
+        function CloudSideNav({ active, onSelect, isAdmin, canAutoInstall, canChanges, collapsed, onToggle }) {
             const { t } = useTranslation();
             const groups = [
                 { label: 'DASHBOARD', items: [{ id: 'overview', label: 'Overview', icon: 'Grid' }] },
@@ -432,10 +432,18 @@
                     { id: 'insights', label: 'Insights', icon: 'Zap' },
                     { id: 'costs', label: 'Costs', icon: 'DollarSign' },
                     { id: 'power', label: 'Power & Carbon', icon: 'Zap' },
+                    // LW Oct 2026 - what-if simulator of the selected cluster
+                    { id: 'whatif', label: t('whatifTitle'), icon: 'Scale' },
                     { id: 'apihealth', label: 'API Health', icon: 'Activity' },
                     { id: 'cve', label: 'CVE Scanner', icon: 'Shield' },
                 ] },
-                { label: 'ACTIVITY', items: [{ id: 'tasks', label: 'Tasks', icon: 'ClipboardList' }] },
+                { label: 'ACTIVITY', items: [
+                    { id: 'tasks', label: 'Tasks', icon: 'ClipboardList' },
+                    // LW Oct 2026 - the flight recorder of the selected cluster
+                    { id: 'timeline', label: t('tlTab'), icon: 'Clock' },
+                    // NS Oct 2026 - change plans of the selected cluster, for whoever may see them
+                    ...(canChanges ? [{ id: 'changes', label: t('chgTab'), icon: 'ClipboardList' }] : []),
+                ] },
             ];
             if (isAdmin) {
                 groups.push({ label: 'GOVERNANCE', items: [
@@ -1360,12 +1368,84 @@
         function CloudRowActions({ children }) { return <td><div style={{ display: 'flex', gap: 4, justifyContent: 'flex-end' }}>{children}</div></td>; }
 
         // ── Backups (vzdump jobs) ──────────────────────────────────
+        // LW Oct 2026 - the restore tests of the cluster under its backup jobs: how many guests
+        // passed one recently, and the ones that did not. Read only; the schedule and what the
+        // tests check are set in the classic views.
+        const CLOUD_RT_PAGE = 25;
+        function CloudRestoreTests({ clusterId, t }) {
+            const { data, loading, err, reload } = useCloudData(clusterId ? `/api/clusters/${clusterId}/recovery-report` : null);
+            // LW Oct 2026 - the share of critical and of all guests proven recoverable, from the assurance read
+            const asr = useCloudData(clusterId ? `/api/clusters/${clusterId}/recovery-assurance` : null);
+            const cov = (asr.data && asr.data.coverage) || null;
+            const gapTotal = asr.data ? Object.values(asr.data.gap_counts || {}).reduce((x, y) => x + y, 0) : 0;
+            const [page, setPage] = React.useState(0);
+            const rows = ((data && data.guests) || []).filter(g => g.state !== 'ok');
+            const sum = (data && data.summary) || {};
+            const stateText = (s) => ({ stale: t('rtestStateStale'), failing: t('rtestStateFailing'), never: t('rtestStateNever'),
+                rto_missed: t('rtestStateRto') })[s] || s;
+            const chip = (s) => (s === 'failing' ? 'cloud-chip-err' : s === 'never' || s === 'stale' ? 'cloud-chip-warn' : 'cloud-chip-soft');
+            const safePage = Math.min(page, Math.max(0, Math.ceil(rows.length / CLOUD_RT_PAGE) - 1));
+            const kpis = [
+                { icon: 'LifeBuoy', value: sum.total ?? 0, label: t('rtestTileTotal'), accent: '#6366f1' },
+                { icon: 'CheckCircle', value: sum.ok ?? 0, label: t('rtestStateOk'), accent: '#22c55e' },
+                { icon: 'XCircle', value: sum.failing ?? 0, label: t('rtestStateFailing'), accent: sum.failing ? '#ef4444' : '#14b8a6' },
+                { icon: 'AlertTriangle', value: (sum.never ?? 0) + (sum.stale ?? 0), label: t('rtestCloudNotRecent'), accent: '#f59e0b' },
+                ...(cov ? [
+                    { icon: 'Shield', value: cov.critical.percent == null ? '-' : `${cov.critical.percent}%`, label: t('rasrCloudCritical'), accent: cov.critical.percent == null ? '#6b7280' : cov.critical.percent >= 90 ? '#22c55e' : '#ef4444', attr: 'critical' },
+                    { icon: 'AlertTriangle', value: gapTotal, label: t('rasrCloudGaps'), accent: gapTotal ? '#f59e0b' : '#14b8a6', attr: 'gaps' },
+                ] : []),
+            ];
+            return (
+                <div data-rtest-cloud={clusterId}>
+                    <CloudSectionTitle right={<span style={{ display: 'flex', gap: 8 }}>
+                        <a className="cloud-link-btn" href={`/api/clusters/${clusterId}/recovery-report?format=csv`} download data-rtest-csv><Icons.Download /> {t('rtestExportCsv')}</a>
+                        <a className="cloud-link-btn" href={`/api/clusters/${clusterId}/recovery-evidence`} download data-rasr-export="json"><Icons.Download /> {t('rasrExportJson')}</a>
+                        <button type="button" className="cloud-link-btn" onClick={reload}><Icons.RefreshCw /> {t('refresh') || 'Refresh'}</button>
+                    </span>}>{t('rtestTitle')}</CloudSectionTitle>
+                    <CloudSectionState loading={loading} err={err} empty={!!data && !(data.guests || []).length} emptyIcon="LifeBuoy" emptyTitle={t('rtestNoGuests')} t={t}>
+                        <div className="cloud-kpi-grid">{kpis.map((k, i) => <div key={i} style={{ display: 'contents' }} data-rasr-cloud-kpi={k.attr || ''}><CloudKpiCard icon={k.icon} value={k.value} label={k.label} accent={k.accent} /></div>)}</div>
+                        {rows.length > 0 && (
+                            <div className="cloud-card cloud-table-card">
+                                {cloudHead({ icon: <Icons.LifeBuoy />, title: t('rtestCloudAttention'), count: rows.length })}
+                                <div className="cloud-table-scroll"><table className="cloud-table">
+                                    <thead><tr><th>{t('rtestColGuest')}</th><th>{t('rtestColState')}</th><th>{t('rtestColPassed')}</th><th>{t('rtestColFailure')}</th></tr></thead>
+                                    <tbody>{rows.slice(safePage * CLOUD_RT_PAGE, (safePage + 1) * CLOUD_RT_PAGE).map(g => (
+                                        <tr className="cloud-table-row cloud-table-row-static" key={g.vmid} data-rtest-row={g.vmid} data-state={g.state}>
+                                            <td><span className="cloud-table-mono">{g.vmid}</span> {g.name || ''}</td>
+                                            <td><span className={`cloud-chip ${chip(g.state)}`}>{stateText(g.state)}</span></td>
+                                            <td className="cloud-cell-muted">{g.last_success_at ? new Date(g.last_success_at).toLocaleString() : t('rtestNever')}</td>
+                                            <td className="cloud-cell-muted">{g.last_failure_cause || ''}</td>
+                                        </tr>
+                                    ))}</tbody>
+                                </table></div>
+                                <CloudPager page={safePage} pageSize={CLOUD_RT_PAGE} total={rows.length} onPage={setPage} />
+                            </div>
+                        )}
+                    </CloudSectionState>
+                </div>
+            );
+        }
+
         function CloudBackups({ clusterId, t }) {
             const { data, loading, err, reload } = useCloudData(clusterId ? `/api/clusters/${clusterId}/datacenter/backup` : null);
             const mut = useCloudMutate(reload);
+            const [runsOf, setRunsOf] = React.useState(null);
+            // LW Oct 2026 - Proxmox hands no last-run status with a job; the newest run of each
+            // comes from the job history (.../last-runs), after the list itself and again
+            // after every reload of it (Refresh, Run now)
+            const listedAt = React.useMemo(() => (Array.isArray(data) && data.length ? Date.now() : 0), [data]);
+            const last = useCloudData(clusterId && listedAt ? `/api/clusters/${clusterId}/datacenter/backup/last-runs?at=${listedAt}` : null);
+            const lastRuns = (last.data && last.data.jobs) || {};
             const jobs = Array.isArray(data) ? data : [];
             const active = jobs.filter(j => Number(j.enabled) === 1 || j.enabled === true).length;
-            const failed = jobs.filter(j => (j['last-run-status'] || '').toLowerCase().indexOf('err') >= 0).length;
+            const failed = jobs.filter(j => (lastRuns[j.id] || {}).state === 'failed').length;
+            const runChip = (run) => {
+                if (!run) return <span className="cloud-cell-muted">{last.loading ? '…' : '-'}</span>;
+                const label = { ok: t('bkpRunsStateOk'), warning: t('bkpRunsStateWarning'), failed: t('failed'), running: t('bkpRunsStateRunning') }[run.state] || run.state;
+                const cls = run.state === 'ok' ? 'cloud-chip-ok' : run.state === 'failed' ? 'cloud-chip-err' : 'cloud-chip-soft';
+                const when = run.start ? new Date(run.start * 1000).toLocaleString() : '';
+                return <span className={`cloud-chip ${cls}`} title={when} data-last-run={run.state}>{label}</span>;
+            };
             const kpis = [
                 { icon: 'Archive', value: jobs.length, label: t('cloud.bkpJobs') || 'Backup jobs', accent: '#6366f1' },
                 { icon: 'CheckCircle', value: active, label: t('cloud.bkpActive') || 'Enabled', accent: '#22c55e' },
@@ -1383,14 +1463,12 @@
                             <div className="cloud-table-scroll"><table className="cloud-table">
                                 <thead><tr><th>{t('cloud.colSchedule') || 'Schedule'}</th><th>{t('cloud.colGuests') || 'Guests'}</th><th>{t('cloud.colStorage') || 'Storage'}</th><th>{t('cloud.colMode') || 'Mode'}</th><th>{t('cloud.colStatus') || 'Status'}</th><th>{t('cloud.colState') || 'State'}</th><th style={{ textAlign: 'right' }}>{t('cloud.colActions') || ''}</th></tr></thead>
                                 <tbody>{jobs.map((j, i) => {
-                                    const st = (j['last-run-status'] || '').toLowerCase();
-                                    const ok = st === 'ok' || st === 'OK'.toLowerCase();
                                     return (<tr className="cloud-table-row cloud-table-row-static" key={j.id || i}>
                                         <td className="cloud-table-mono">{j.schedule || '—'}</td>
                                         <td>{(Number(j.all) === 1) ? <span className="cloud-chip cloud-chip-soft">{t('cloud.allGuests') || 'All guests'}</span> : <span className="cloud-table-mono">{j.vmid || '—'}</span>}</td>
                                         <td>{j.storage || '—'}</td>
                                         <td className="cloud-cell-muted">{j.mode || 'snapshot'}{j.compress && j.compress !== '0' ? ' · ' + j.compress : ''}</td>
-                                        <td>{st ? (ok ? <span className="cloud-chip cloud-chip-ok">OK</span> : <span className="cloud-chip cloud-chip-err">{j['last-run-status']}</span>) : <span className="cloud-cell-muted">—</span>}</td>
+                                        <td>{runChip(lastRuns[j.id])}</td>
                                         <td>{(Number(j.enabled) === 1 || j.enabled === true) ? <CloudConnChip connected={true} t={t} /> : <CloudConnChip connected={false} t={t} />}</td>
                                         <CloudRowActions>
                                             {mut.acts && (<>
@@ -1398,12 +1476,15 @@
                                             <CloudIconBtn icon="Power" title={(Number(j.enabled) === 1 || j.enabled === true) ? (t('disable') || 'Disable') : (t('enable') || 'Enable')} onClick={() => mut.run('t' + j.id, 'PUT', `/api/clusters/${clusterId}/datacenter/backup/${j.id}`, { enabled: (Number(j.enabled) === 1 || j.enabled === true) ? 0 : 1 })} />
                                             <CloudIconBtn icon="Trash2" danger title={t('delete') || 'Delete'} onClick={() => mut.run('d' + j.id, 'DELETE', `/api/clusters/${clusterId}/datacenter/backup/${j.id}`, undefined, (t('cloud.confirmDelBackup') || 'Delete this backup job?'))} />
                                             </>)}
+                                            <CloudIconBtn icon="Clock" title={t('bkpRunsHistory') || 'Run history'} onClick={() => setRunsOf(j)} />
                                         </CloudRowActions>
                                     </tr>);
                                 })}</tbody>
                             </table></div>
                         </div>
                     </CloudSectionState>
+                    <CloudRestoreTests clusterId={clusterId} t={t} />
+                    {runsOf && <BackupJobRunsModal clusterId={clusterId} job={runsOf} onClose={() => setRunsOf(null)} />}
                 </div>
             );
         }
@@ -2343,6 +2424,8 @@
             // even a forwarding one: the answer URL it would show is this instance's own.
             const { ha, haStandby, haConsolesElsewhere } = useAuth();
             const canAutoInstall = !!(currentUser && currentUser.autoinstall_access) && !haStandby;
+            const holdsPerm = (perm) => !!isAdmin || (Array.isArray(currentUser && currentUser.permissions) && currentUser.permissions.includes(perm));
+            const canChanges = holdsPerm('changes.view');
 
             // PegaProx t() ECHOES the key back on a miss, so `t('cloud.x') || 'Fallback'`
             // would render the raw key. treat key-echo as "no translation". -- NS
@@ -2425,6 +2508,7 @@
                 insights: T('insights') || 'Insights',
                 costs: T('costDashboard') || 'Costs',
                 power: T('powerTitle') || 'Power & Carbon',
+                whatif: T('whatifTitle') || 'What-if',
                 apihealth: T('apiHealth') || 'API Health',
                 drift: T('configDrift') || 'Config Drift',
                 siem: T('siem') || 'SIEM',
@@ -2436,6 +2520,8 @@
                 schedules: T('scheduledActions') || 'Schedules',
                 cve: T('cveScanner') || 'CVE Scanner',
                 tasks: T('cloud.tasks') || 'Tasks',
+                timeline: T('tlTab') || 'Timeline',
+                changes: T('chgTab') || 'Changes',
                 users: T('cloud.users') || 'Users',
                 settings: T('cloud.settings') || 'Settings',
             };
@@ -2563,8 +2649,19 @@
                     case 'power':
                         body = <div className="cloud-mounted"><PowerCarbonTab clusterId={cid} clusterName={selectedCluster && selectedCluster.name} authFetch={authFetch} addToast={addToast} t={T} isAdmin={isAdmin} /></div>;
                         break;
+                    case 'whatif':
+                        body = <div className="cloud-mounted">{cid && <WhatIfTab clusterId={cid} authFetch={authFetch} />}</div>;
+                        break;
                     case 'apihealth':
                         body = <div className="cloud-mounted"><ApiLatencyDashboard clusterId={cid} authFetch={authFetch} apiUrl={API_URL} t={T} /></div>;
+                        break;
+                    case 'timeline':
+                        body = <div className="cloud-mounted"><TimelineView key={cid} clusterId={cid} authFetch={authFetch} t={t} /></div>;
+                        break;
+                    case 'changes':
+                        body = canChanges
+                            ? <div className="cloud-mounted"><ChangesTab clusterId={cid} authFetch={authFetch} addToast={addToast} t={t} canRequest={holdsPerm('changes.request')} /></div>
+                            : <CloudDashboard clusters={safeClusters} resources={safeResources} metrics={clusterMetrics} dcStatus={dcStatus} tasks={tasks} onNav={selectSection} t={T} />;
                         break;
                     case 'drift':
                         body = <div className="cloud-mounted"><DriftTab clusterId={cid} clusterName={selectedCluster && selectedCluster.name} authFetch={authFetch} addToast={addToast} t={T} isAdmin={isAdmin} /></div>;
@@ -2613,7 +2710,7 @@
 
             return (
                 <div className="cloud-shell">
-                    <CloudSideNav active={section} onSelect={selectSection} isAdmin={!!isAdmin} canAutoInstall={canAutoInstall} collapsed={collapsed} onToggle={() => setCollapsed(c => !c)} />
+                    <CloudSideNav active={section} onSelect={selectSection} isAdmin={!!isAdmin} canAutoInstall={canAutoInstall} canChanges={canChanges} collapsed={collapsed} onToggle={() => setCollapsed(c => !c)} />
                     <div className="cloud-content">
                         <CloudTopbar
                             crumbs={crumbs}

@@ -11,8 +11,6 @@
 
 import pytest
 
-from pegaprox.app import create_app
-
 # The test client posts against http://localhost/ by default, so request.host is
 # 'localhost' with no port. Same-origin therefore == scheme://localhost.
 _BASE = 'http://localhost'
@@ -20,10 +18,9 @@ _PROBE = '/api/__csrf_probe_does_not_exist__'   # non-exempt, unrouted → 404 i
 
 
 @pytest.fixture(scope='module')
-def client():
-    app = create_app()
-    app.config['TESTING'] = True
-    return app.test_client()
+def client(_integration_app):
+    # the app conftest builds on a temp database; one of its own would start on config/
+    return _integration_app.test_client()
 
 
 def _csrf_blocked(resp):

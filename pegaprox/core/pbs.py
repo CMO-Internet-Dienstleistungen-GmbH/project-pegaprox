@@ -20,6 +20,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from pegaprox.core.db import get_db
 from pegaprox.globals import pbs_managers
 from pegaprox.utils.ssh import read_capped as _read_capped
+from pegaprox.utils.sanitization import valid_pbs_upid
 
 def _validate_pbs_host(host: str) -> bool:
     """Format-only check on the PBS host string.
@@ -47,32 +48,14 @@ def pbs_target_refusal(host: str, allow_loopback: bool = True) -> str:
     has no PBS on it, and the errors of a connection attempt tell whether anything listens
     there. Loopback only for a global admin, who may run PegaProx on the PBS host itself.
     A name that does not resolve is left to the connection, which reports it anyway.
+    The address rule lives in url_security.infra_target_refusal, ESXi uses it too.
     """
-    import ipaddress
-    import socket
-    from pegaprox.utils.url_security import _embedded_ipv4
+    from pegaprox.utils.url_security import infra_target_refusal
 
     host = (host or '').strip()
     if not _validate_pbs_host(host):
         return 'Invalid PBS host'
-    try:
-        found = socket.getaddrinfo(host, None)
-    except (OSError, UnicodeError):
-        return ''
-    for info in found:
-        try:
-            ip = ipaddress.ip_address(str(info[4][0]).split('%', 1)[0])
-        except ValueError:
-            continue
-        # the address itself and an IPv4 one carried inside it (mapped, 6to4, NAT64)
-        for addr in (ip, _embedded_ipv4(ip)):
-            if addr is None:
-                continue
-            if addr.is_link_local or str(addr) == 'fd00:ec2::254':
-                return 'The PBS host is a link-local or cloud metadata address'
-            if not allow_loopback and (addr.is_loopback or addr.is_unspecified):
-                return 'The PBS host is a loopback address of this server'
-    return ''
+    return infra_target_refusal(host, allow_loopback=allow_loopback, label='PBS host')
 
 class _PinnedFingerprintAdapter(requests.adapters.HTTPAdapter):
     """Verify the peer certificate against a configured SHA-256 fingerprint.
@@ -142,6 +125,9 @@ class PBSManager:
             self._session.mount('https://', _PinnedFingerprintAdapter(_pin))
             logging.info(f"[PBS] {self.name}: pinning the server certificate to its "
                          f"configured fingerprint")
+        # MK Oct 2026 - no path from a request is folded into another endpoint (as for PVE)
+        from pegaprox.utils.sanitization import refuse_climbing_paths
+        refuse_climbing_paths(self._session)
         # an automatic leader that lost its lease changes nothing on the PBS (#625)
         from pegaprox.core import ha_transport
         ha_transport.guard_session(self._session)
@@ -593,6 +579,11 @@ class PBSManager:
     def get_datastore_status(self, store: str) -> dict:
         """Get detailed status of a datastore (usage, GC status, counts)"""
         return self.api_get(f'/admin/datastore/{store}/status')
+
+    def get_gc_jobs(self) -> dict:
+        """GC of every datastore: end and state of the last run, its duration, the next run.
+        The gc-status of a datastore holds the counters of the last run, not when it ran."""
+        return self.api_get('/admin/gc')
     
     def get_snapshots(self, store: str, ns: str = None, backup_type: str = None, backup_id: str = None) -> dict:
         """List snapshots in a datastore, optionally filtered by group.
@@ -688,25 +679,29 @@ class PBSManager:
     
     def get_task_status(self, upid: str) -> dict:
         """Get status of a specific task"""
+        if not valid_pbs_upid(upid):
+            return {'error': 'Invalid task id'}
         return self.api_get(f'/nodes/localhost/tasks/{upid}/status')
     
     def get_task_log(self, upid: str) -> dict:
         """Get log output of a task"""
+        if not valid_pbs_upid(upid):
+            return {'error': 'Invalid task id'}
         return self.api_get(f'/nodes/localhost/tasks/{upid}/log')
     
     # ── Jobs ──
     
     def get_sync_jobs(self) -> dict:
-        """List configured sync jobs"""
-        return self.api_get('/config/sync')
+        """List sync jobs with their schedules and last-run status."""
+        return self.api_get('/admin/sync')
     
     def get_verify_jobs(self) -> dict:
-        """List configured verify jobs"""
-        return self.api_get('/config/verify')
+        """List verify jobs with their schedules and last-run status."""
+        return self.api_get('/admin/verify')
     
     def get_prune_jobs(self) -> dict:
-        """List configured prune jobs"""
-        return self.api_get('/config/prune')
+        """List prune jobs with their schedules and last-run status."""
+        return self.api_get('/admin/prune')
     
     def run_sync_job(self, job_id: str) -> dict:
         """Manually trigger a sync job"""
@@ -917,6 +912,8 @@ class PBSManager:
     
     def stop_task(self, upid: str) -> dict:
         """Stop/abort a running task"""
+        if not valid_pbs_upid(upid):
+            return {'error': 'Invalid task id'}
         return self.api_delete(f'/nodes/localhost/tasks/{upid}')
     
     # ── Notification CRUD ──

@@ -99,6 +99,63 @@ def validate_hostname(hostname: str) -> bool:
     return bool(re.match(ip_pattern, hostname) or re.match(hostname_pattern, hostname))
 
 
+# MK Oct 2026 - what a task id of Proxmox VE or PBS looks like. It never holds a slash: the
+# task log is a file of that name. The same check as manager.get_task_status.
+UPID_RE = re.compile(r'UPID:[^/?#%\s]{1,400}')
+
+
+def valid_upid(value) -> bool:
+    return isinstance(value, str) and bool(UPID_RE.fullmatch(value))
+
+
+def task_ref_ok(cluster_type, node, upid) -> bool:
+    """A node and task reference of a cluster as they may go into an API path: for XCP-ng
+    and ESXi a task reference without a slash, for any other a Proxmox VE node name and
+    UPID (a type nobody named here gets the strict check, not the loose one)."""
+    if cluster_type in ('xcpng', 'esxi'):
+        return isinstance(upid, str) and bool(re.fullmatch(r'[^/?#%\s]{1,400}', upid))
+    return validate_hostname(node) and valid_upid(upid)
+
+
+def valid_pbs_upid(value) -> bool:
+    """A PBS task id. PBS escapes its worker id ('store1\\x3avm-100'), but the routes have
+    taken one with the slashes in since they exist, so a slash is let through here; a '.'
+    or '..' segment, a query, a fragment or an escape is not."""
+    if not isinstance(value, str) or not value.startswith('UPID:') or len(value) > 400:
+        return False
+    if any(c in value for c in '?#%') or any(c.isspace() for c in value):
+        return False
+    return not any(seg in ('.', '..') for seg in value.replace('\\', '/').split('/'))
+
+
+def url_path_climbs(url) -> bool:
+    """True when the path of `url` has a '.' or '..' segment, also percent-encoded or
+    written with a backslash. requests folds those away before it sends, so a value put
+    into an API path that carries one would reach another endpoint than the code names."""
+    from urllib.parse import urlsplit, unquote
+    try:
+        path = urlsplit(str(url)).path
+    except ValueError:
+        return True
+    return any(seg in ('.', '..') for seg in unquote(path).replace('\\', '/').split('/'))
+
+
+def refuse_climbing_paths(session):
+    """Wrap session.request so a URL whose path climbs (url_path_climbs) is refused with a
+    ValueError before requests folds it. Returns the session."""
+    if getattr(session, '_paths_checked', False):
+        return session
+    request = session.request
+
+    def checked(method, url, *args, **kwargs):
+        if url_path_climbs(url):
+            raise ValueError('refused an API path with a . or .. segment')
+        return request(method, url, *args, **kwargs)
+    session.request = checked
+    session._paths_checked = True
+    return session
+
+
 # NS Oct 2026 - an SSH login name goes onto the ssh/sshpass/scp command line and into
 # shell strings run on the nodes. Starting with '-' it is an OpenSSH option there
 # (-oProxyCommand=... runs a command on this host), so only what a POSIX login name

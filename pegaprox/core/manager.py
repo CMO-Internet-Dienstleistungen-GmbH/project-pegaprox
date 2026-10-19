@@ -48,7 +48,8 @@ from pegaprox.globals import (
     cluster_managers, _ssh_active_connections,
     _ssh_connection_lock, task_pegaprox_users_cache, task_pegaprox_users_lock,
 )
-from pegaprox.models.tasks import MaintenanceTask, PegaProxConfig
+from pegaprox.models.tasks import (MaintenanceTask, PegaProxConfig, balancer_cooldown,
+                                   BALANCER_COOLDOWN_DEFAULT)
 from pegaprox.core.config import save_config
 from pegaprox.utils.realtime import broadcast_sse, is_cluster_watched
 from pegaprox.utils.ssh import get_ssh_connection_stats, _ssh_track_connection, ssh_password_for
@@ -57,6 +58,9 @@ from pegaprox.utils.concurrent import GEVENT_PATCHED
 from pegaprox.core.db import get_db
 from pegaprox.core import ha  # PegaProx's own warm standby (#625), not PVE HA
 from pegaprox.core import ha_transport, ha_vote
+from pegaprox.core import rolling_runs
+from pegaprox.core import node_creds
+from pegaprox.core import node_history
 from pegaprox.core.ha_transport import node_cmd
 from pegaprox.utils.ssh import read_capped as _read_capped
 
@@ -500,6 +504,146 @@ def drop_own_recovery_locks(instance_id):
     return removed
 
 
+# MK Oct 2026 - every move the balancer makes goes into migration_history with why. The
+# sentence is for whoever reads the table, the numbers beside it let the UI word it in
+# the reader's language. The guest dict carries it into migrate_vm under this key, so
+# no caller of migrate_vm (or stand-in for it) has to take a new argument.
+BALANCE_WHY = '_balance_why'
+MIGRATION_LOG_MAX = 200   # the in-memory list behind "last migrations"
+
+
+def _node_load(node_status, node):
+    d = (node_status or {}).get(node) or {}
+
+    def num(key):
+        try:
+            return round(float(d.get(key) or 0), 1)
+        except (TypeError, ValueError):
+            return 0.0
+    return {'score': num('score'), 'cpu': num('cpu_percent'), 'mem': num('mem_percent')}
+
+
+def balance_reason(kind, source, target, node_status=None, **facts):
+    """{trigger, reason, details} of one balancer move. kind 'balance' (threshold,
+    tolerance), 'predictive' (forecast, confidence 0..1, threshold), 'affinity' (rule) or
+    'pin' (pinned); manual=True when someone started it by hand (Balance Now, Move back now)."""
+    def num(key, digits=1):
+        try:
+            return round(float(facts.get(key) or 0), digits)
+        except (TypeError, ValueError):
+            return 0.0
+    details = {'source': source, 'target': target}
+    tgt = _node_load(node_status, target)
+    if kind == 'balance':
+        src = _node_load(node_status, source)
+        diff = round(src['score'] - tgt['score'], 1)
+        threshold, tolerance = num('threshold'), num('tolerance')
+        details.update(source_load=src, target_load=tgt, diff=diff,
+                       threshold=threshold, tolerance=tolerance)
+        text = (f"{source} score {src['score']} (CPU {src['cpu']}%, RAM {src['mem']}%) and "
+                f"{target} score {tgt['score']} (CPU {tgt['cpu']}%, RAM {tgt['mem']}%) are "
+                f"{diff} apart, above threshold {threshold:g} + tolerance {tolerance:g}")
+    elif kind == 'predictive':
+        forecast, threshold = num('forecast'), num('threshold')
+        confidence = int(round(num('confidence', 4) * 100))
+        details.update(forecast=forecast, confidence=confidence, threshold=threshold,
+                       target_load=tgt)
+        text = (f"{source} is heading for overload (forecast score {forecast} above "
+                f"{threshold:g}, confidence {confidence}%), moved to the least loaded node "
+                f"{target} (score {tgt['score']})")
+    elif kind == 'affinity':
+        rule = str(facts.get('rule') or '')[:200]
+        details.update(rule=rule, target_load=tgt)
+        text = (f"anti-affinity rule '{rule}': another guest of the rule runs on {source}, "
+                f"moved to {target} (score {tgt['score']})")
+    else:
+        pinned = sorted(str(n) for n in (facts.get('pinned') or []))
+        details.update(pinned=pinned)
+        text = f"pinned to {', '.join(pinned)} but running on {source}, returned to {target}"
+    if facts.get('manual'):
+        details['manual'] = True
+        text += ' (started by hand)'
+    return {'trigger': kind, 'reason': text, 'details': details}
+
+
+def record_balance_move(cluster_id, vm, target, why, status, duration=0.0, note=''):
+    """One balancer move into migration_history. Never raises: the move happened (or
+    failed) whether or not its line could be written."""
+    try:
+        reason = why.get('reason') or ''
+        if note:
+            reason = f"{reason}; {note}" if reason else note
+        get_db().add_migration_event(
+            cluster_id, vm.get('vmid'), vm.get('name') or '', vm.get('node') or '', target or '',
+            status, reason=reason[:1000], trigger=why.get('trigger'),
+            details=why.get('details'), duration=duration)
+    except Exception as e:
+        logging.warning(f"[BAL] could not record the move of {vm.get('vmid')} in the history: {e}")
+
+
+def _iso_epoch(value):
+    try:
+        ts = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return ts.timestamp()
+
+
+def balancer_cooldown_secs(mgr):
+    return balancer_cooldown(getattr(getattr(mgr, 'config', None), 'migration_cooldown',
+                                     BALANCER_COOLDOWN_DEFAULT))
+
+
+def recent_balancer_moves(mgr):
+    """{vmid: when the balancer last moved it}, the cooldown table. The first look after a
+    start fills it from the history: a restart used to hand the balancer a guest it had
+    moved a minute before. In a group the cluster's own task list goes in as well."""
+    table = mgr._vm_migration_cooldown
+    cid = getattr(mgr, 'id', None)
+    if isinstance(cid, str) and not getattr(mgr, '_cooldown_seeded', False):
+        mgr._cooldown_seeded = True
+        horizon = time.time() - balancer_cooldown_secs(mgr)
+        try:
+            db = get_db()
+            for row in db.list_balancer_moves(cid, status='success', limit=db.MIGRATION_HISTORY_KEEP):
+                ts = _iso_epoch(row['timestamp'])
+                if ts is None or ts < horizon:
+                    continue
+                vmid = int(row['vmid'])
+                table[vmid] = max(table.get(vmid, 0), ts)
+        except Exception as e:
+            logging.debug(f"[BAL] cooldown not read back from the history: {e}")
+    if isinstance(cid, str) and isinstance(mgr, PegaProxManager):
+        _cooldown_from_tasks(mgr, table)
+    return table
+
+
+# a task list that did not answer is asked again at a later look, not sooner than this
+COOLDOWN_TASKS_RETRY = 60
+
+
+def _cooldown_from_tasks(mgr, table):
+    """#625 - migration_history is per instance: after a change of leader it holds what this
+    instance moved when it led before, not the moves of the leader before it. Those are in
+    the cluster's task list, so a process in a group (a new leader always is a new process)
+    adds the guest migrations from there at its first look - one read for the whole
+    cluster, never one per guest. A list that did not answer is asked again later."""
+    if getattr(mgr, '_cooldown_tasks_read', False) or ha.role() == ha.ROLE_STANDALONE:
+        return
+    if time.monotonic() < getattr(mgr, '_cooldown_tasks_retry', 0):
+        return
+    moved = mgr.recent_guest_migrations(time.time() - balancer_cooldown_secs(mgr))
+    if moved is None:
+        mgr._cooldown_tasks_retry = time.monotonic() + COOLDOWN_TASKS_RETRY
+        return
+    mgr._cooldown_tasks_read = True
+    for vmid, ts in moved.items():
+        table[vmid] = max(table.get(vmid, 0), ts)
+    if moved:
+        logging.info(f"[BAL] {mgr.id}: {len(moved)} guest(s) migrated within the cooldown, "
+                     f"from the cluster's task list: {', '.join(str(v) for v in sorted(moved)[:20])}")
+
+
 class UnreadList(list):
     """The [] get_vm_resources() answers when cluster/resources did not answer.
 
@@ -509,6 +653,31 @@ class UnreadList(list):
     """
     __slots__ = ()
     unavailable = True
+
+
+def _rrd_value(point, key, scale=1):
+    """One value of a PVE rrddata slot, None where PVE has no sample (it leaves the key out)."""
+    v = point.get(key)
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v in (float('inf'), float('-inf')):
+        return None
+    return round(v * scale, 2)
+
+
+def _rrd_share(point, used_key, total_key, no_total=None):
+    """used of total in percent, None without a sample; no_total when the total is 0 (no swap)."""
+    used = _rrd_value(point, used_key)
+    if used is None:
+        return None
+    total = _rrd_value(point, total_key)
+    if not total:
+        return no_total
+    return round(used / total * 100, 2)
 
 
 class PegaProxManager:
@@ -579,6 +748,8 @@ class PegaProxManager:
         self._disk_cache_lock = threading.Lock()
         # #237: track VMs where guest agent is disabled to avoid spamming PVE with failed requests
         self._no_agent_vms = set()  # vmids with no agent (cleared on VM start/config change)
+        # (node, vmid) -> whether the guest agent answered the sweep's last call, under _ip_cache_lock
+        self._agent_state = {}
 
         # update tracking
         self.nodes_updating = {}
@@ -820,6 +991,10 @@ class PegaProxManager:
                 kwargs['timeout'] = 15  # 15 s is plenty for any PVE API call
             return _original_request(method, url, **kwargs)
         session.request = _request_with_default_timeout
+        # MK Oct 2026 - a node, a task id or a volume from a request goes into these paths;
+        # one with a '..' segment would be folded into another endpoint by requests
+        from pegaprox.utils.sanitization import refuse_climbing_paths
+        refuse_climbing_paths(session)
         # an automatic leader that lost its lease sends no change from here (#625)
         ha_transport.guard_session(session)
 
@@ -896,6 +1071,11 @@ class PegaProxManager:
             if resp.status_code == 200:
                 self._cached_node_dict = {n['node']: n for n in resp.json().get('data', [])}
                 self._nodes_cache_time = now
+                try:
+                    # the stored login of a node that left goes with it (#1136)
+                    node_creds.note_membership(self.id, list(self._cached_node_dict))
+                except Exception:
+                    pass
                 return self._cached_node_dict
         except:
             pass
@@ -1248,6 +1428,7 @@ class PegaProxManager:
             # NS: clear stale IPs/disk so reconnect doesn't serve old data
             with self._ip_cache_lock:
                 self._ip_cache.clear()
+                self._agent_state.clear()
             with self._disk_cache_lock:
                 self._disk_cache.clear()
             # N-1 (regression fix): also drop the short node-status/tasks result
@@ -1281,6 +1462,9 @@ class PegaProxManager:
             # returned 401 the fallbacks will too (same creds), no point hitting
             # each node and inflating pveproxy's failed-login counter.
             auth_failed_401 = False
+            # MK Oct 2026 (#1136) - same creds, that is: a fallback host whose node has a
+            # root password of its own logs in with that one, and gets its one try
+            refused_logins = []
 
             # MK May 2026 (dead-node hang) — skip hosts that timed out in the
             # last 60s. Without this, on a 3-host cluster where the primary
@@ -1296,6 +1480,11 @@ class PegaProxManager:
                 hosts_to_try = warm_hosts
 
             for host in hosts_to_try:
+                login_password = None
+                if not self._using_api_token:
+                    login_password = self.api_password_for(host)
+                    if login_password in refused_logins:
+                        continue
                 try:
                     # Create a temporary session just for login
                     session = requests.Session()
@@ -1362,9 +1551,12 @@ class PegaProxManager:
 
                     if not self._using_api_token:
                         # Password auth - get ticket from /access/ticket
+                        if login_password is None:
+                            # the stored token was just refused above
+                            login_password = self.api_password_for(host)
                         login_data = {
                             'username': self.config.user,
-                            'password': self.config.pass_
+                            'password': login_password
                         }
                         # print(f"DEBUG: trying {host}")  # dont commit this
 
@@ -1444,10 +1636,12 @@ class PegaProxManager:
                             # MK May 2026 (#444) — stale creds. Don't try fallbacks
                             # (same user/pass → same outcome, just more failed
                             # logins for pveproxy to count against us). Mark + bail.
-                            self.logger.warning(f"Auth failed at {host} (401) — skipping remaining hosts")
+                            # #1136: a host with a password of its own still gets its try
+                            self.logger.warning(f"Auth failed at {host} (401) - skipping the hosts with the same login")
                             self.connection_error = "Authentication failed — if 2FA is enabled, use an API token (user@realm!tokenid)"
                             auth_failed_401 = True
-                            break
+                            refused_logins.append(login_password)
+                            continue
                         else:
                             self.logger.warning(f"Failed to login to Proxmox at {host}: {resp.status_code}")
                             # self.logger.debug(f"Response body: {resp.text}")  # too verbose
@@ -2077,6 +2271,8 @@ class PegaProxManager:
                         }
                         self.logger.info(f"Node {ha_node}: OFFLINE (from HA tracking)")
 
+                # what changed since the last read goes into the node state history (MK Oct 2026)
+                node_history.observe(getattr(self, 'id', None), node_status)
                 # cache the successful result for the short TTL (see top of method)
                 if _ns_ttl > 0 and node_status:
                     self._node_status_cache = (time.monotonic(), node_status)
@@ -2130,7 +2326,9 @@ class PegaProxManager:
                 r['disk_percent'] = round((r.get('disk', 0) / maxdisk) * 100, 1) if maxdisk > 0 else 0
 
             # inject cached IP addresses + disk usage (only for running VMs)
-            if self._ip_cache or self._disk_cache:
+            agents = getattr(self, '_agent_state', None)
+            if self._ip_cache or self._disk_cache or agents:
+                no_agent = getattr(self, '_no_agent_vms', ())
                 with self._ip_cache_lock:
                     for r in resources:
                         if r.get('status') != 'running':
@@ -2140,6 +2338,13 @@ class PegaProxManager:
                         if ips:
                             r['ip'] = ips[0]
                             r['ip_addresses'] = ips
+                        if agents is not None and r.get('type') == 'qemu':
+                            # MK Oct 2026 - the agent column of the guest list, from the IP sweep
+                            up = agents.get(key)
+                            if up is None and r.get('vmid') in no_agent:
+                                up = False
+                            if up is not None:
+                                r['agent_running'] = up
                 with self._disk_cache_lock:
                     for r in resources:
                         if r.get('status') != 'running':
@@ -2290,6 +2495,7 @@ class PegaProxManager:
         affinity_groups, anti_groups = {}, {}
         ignored, pins = set(), {}
         unresolved = []
+        from pegaprox.core.recovery import TEST_TAG
 
         for res in (vms or []):
             if res.get('type') not in ('qemu', 'lxc'):
@@ -2302,6 +2508,10 @@ class PegaProxManager:
             except (TypeError, ValueError):
                 continue
             tags = [t.strip().lower() for t in re.split(r'[;,\s]+', str(raw)) if t.strip()]
+            if TEST_TAG in tags:
+                # MK Oct 2026 - a restore test's copy carries the original's tags; it is in
+                # no group and pinned nowhere, the pin reconcile would move it mid-test
+                continue
             for tag in tags:
                 if tag.startswith('plb_affinity_'):
                     g = tag[len('plb_affinity_'):]
@@ -2534,8 +2744,8 @@ class PegaProxManager:
             # stop ping-pong. The reconcile records that cooldown after a move but
             # never read it back, so a guest HA or an operator keeps pulling off
             # its pin got dragged back on every cycle. Defer it until it lapses.
-            last_move = self._vm_migration_cooldown.get(v['vmid'])
-            if last_move and (time.time() - last_move) < 900:
+            last_move = recent_balancer_moves(self).get(v['vmid'])
+            if last_move and (time.time() - last_move) < balancer_cooldown_secs(self):
                 self.logger.info(
                     f"[PROXLB] {v['name']} ({v['vmid']}) is off its pin but was migrated "
                     "recently - waiting out the cooldown")
@@ -2594,6 +2804,8 @@ class PegaProxManager:
             if not ha.confirm_step(f"returning {v['vmid']} to its pinned node"):
                 break
             migrated_now += 1
+            vm[BALANCE_WHY] = balance_reason('pin', v['node'], target, pinned=v['pinned_nodes'],
+                                             manual=force)
             if self.migrate_vm(vm, target, dry_run=False, wait_timeout=1800):
                 result['migrated'].append({**v, 'target': target})
                 self._vm_migration_cooldown[v['vmid']] = time.time()
@@ -2742,51 +2954,78 @@ class PegaProxManager:
             r = self._create_session().get(cfg_url, timeout=8)
             if r.status_code != 200:
                 return {'compatible': True, 'reason': 'config_unavailable'}
-            raw_cpu = r.json().get('data', {}).get('cpu', 'kvm64')
-            # MK: PVE cpu config is composite: "host,flags=+pcid;-spec-ctrl" or "cputype=x86-64-v3,hidden=1"
-            vm_cpu = raw_cpu.split(',')[0].replace('cputype=', '')
+            vm_cpu = self.cpu_type_of(r.json().get('data', {}))
         except Exception:
             return {'compatible': True, 'reason': 'config_error'}
 
+        ns = node_status or (self.get_node_status() if vm_cpu in ('host', 'max') else {})
+        return self.cpu_verdict(vm_cpu, ns.get(source_node, {}).get('cpuinfo', {}),
+                                ns.get(target_node, {}).get('cpuinfo', {}),
+                                getattr(self.config, 'cpu_baseline', None))
+
+    @staticmethod
+    def cpu_type_of(config):
+        """The CPU type of a VM config. MK: PVE cpu config is composite:
+        "host,flags=+pcid;-spec-ctrl" or "cputype=x86-64-v3,hidden=1" """
+        raw_cpu = (config or {}).get('cpu', 'kvm64') or 'kvm64'
+        return str(raw_cpu).split(',')[0].replace('cputype=', '')
+
+    @staticmethod
+    def cpu_vendor(cpuinfo):
+        """GenuineIntel or AuthenticAMD of a node's cpuinfo, '' when it does not say. PVE's
+        node status names the model only, so the vendor comes from that when it is missing."""
+        vendor = str((cpuinfo or {}).get('vendor') or '')
+        if vendor:
+            return vendor
+        model = str((cpuinfo or {}).get('model') or '')
+        if 'Intel' in model:
+            return 'GenuineIntel'
+        if 'AMD' in model:
+            return 'AuthenticAMD'
+        return ''
+
+    @classmethod
+    def cpu_verdict(cls, vm_cpu, src_info, tgt_info, baseline=None):
+        """Whether a VM of this CPU type runs on after a live move between two nodes, from their
+        cpuinfo - the nodes may be in two clusters (the migration preflight asks it that way).
+        Returns {compatible, reason, warning}."""
         # cpu:host requires matching physical CPU vendor
         if vm_cpu == 'host' or vm_cpu == 'max':
-            ns = node_status or self.get_node_status()
-            src_info = ns.get(source_node, {}).get('cpuinfo', {})
-            tgt_info = ns.get(target_node, {}).get('cpuinfo', {})
-            src_model = src_info.get('model', '')
-            tgt_model = tgt_info.get('model', '')
+            src_model = (src_info or {}).get('model', '')
+            tgt_model = (tgt_info or {}).get('model', '')
 
             # if same model string, definitely compatible
             if src_model and tgt_model and src_model == tgt_model:
                 return {'compatible': True, 'reason': 'same_cpu_model'}
 
-            # different model — check at least same vendor
-            src_vendor = src_info.get('vendor', '')
-            tgt_vendor = tgt_info.get('vendor', '')
+            # different model - check at least same vendor
+            src_vendor = cls.cpu_vendor(src_info)
+            tgt_vendor = cls.cpu_vendor(tgt_info)
             if src_vendor and tgt_vendor and src_vendor != tgt_vendor:
                 return {
                     'compatible': False,
                     'reason': f"cpu:host - vendor mismatch ({src_vendor} vs {tgt_vendor})"
                 }
+            if not src_model or not tgt_model:
+                return {'compatible': True, 'reason': 'cpu_model_unknown'}
 
-            # same vendor but different model — risky, warn but allow
+            # same vendor but different model - risky, warn but allow
             return {
                 'compatible': True,
-                'warning': f"cpu:host with different models ({src_model} → {tgt_model}) — migration may fail on CPU flag mismatch"
+                'warning': f"cpu:host with different models ({src_model} -> {tgt_model}) - migration may fail on CPU flag mismatch"
             }
 
         # check cpu_baseline enforcement
-        baseline = getattr(self.config, 'cpu_baseline', None)
         if baseline and baseline != 'none':
-            bl_level = self._CPU_COMPAT_LEVELS.get(baseline, -1)
-            vm_level = self._CPU_COMPAT_LEVELS.get(vm_cpu, -1)
+            bl_level = cls._CPU_COMPAT_LEVELS.get(baseline, -1)
+            vm_level = cls._CPU_COMPAT_LEVELS.get(vm_cpu, -1)
             if bl_level >= 0 and vm_level >= 0 and vm_level > bl_level:
                 return {
                     'compatible': False,
                     'reason': f"VM cpu '{vm_cpu}' exceeds cluster baseline '{baseline}'"
                 }
 
-        # named cpu type — always compatible as long as QEMU supports it on target
+        # named cpu type - always compatible as long as QEMU supports it on target
         # (Proxmox emulates named types on any hardware that's >= the type level)
         return {'compatible': True, 'reason': 'named_cpu_type'}
 
@@ -2968,9 +3207,12 @@ class PegaProxManager:
 
                     if not ha.confirm_step(f'the anti-affinity move of {vid}'):
                         return migrations
+                    vm_res[BALANCE_WHY] = balance_reason('affinity', nd, target, node_status,
+                                                         rule=rule.get('name'))
                     ok = self.migrate_vm(vm_res, target)
                     if ok:
                         migrations += 1
+                        self._vm_migration_cooldown[vm_res.get('vmid')] = time.time()
                         # update maps so next iteration sees the new position
                         vm_nodes[vid] = target
                         node_groups.setdefault(target, []).append(vid)
@@ -2981,6 +3223,38 @@ class PegaProxManager:
         if migrations:
             self.logger.info(f"[AFFINITY] Completed {migrations} affinity enforcement migration(s)")
         return migrations
+
+    def recent_guest_migrations(self, since):
+        """{vmid: when it moved} of the guest migrations in the cluster's task list (qmigrate,
+        vzmigrate) that ended well at `since` or later, or run now (stamped now). One read of
+        /cluster/tasks for the whole cluster; None when it did not answer."""
+        try:
+            resp = self._api_get(f"https://{self.host}:{self.api_port}/api2/json/cluster/tasks")
+            tasks = resp.json().get('data') if resp.status_code == 200 else None
+        except Exception as e:
+            self.logger.debug(f"[BAL] task list unreadable: {e}")
+            return None
+        if not isinstance(tasks, list):
+            return None
+        now, out = time.time(), {}
+        for task in tasks:
+            if not isinstance(task, dict) or task.get('type') not in ('qmigrate', 'vzmigrate'):
+                continue
+            try:
+                vmid = int(task.get('id'))
+                end = task.get('endtime')
+                status = str(task.get('status') or '')
+                if end is None and not status:
+                    at = now
+                elif status == 'OK' or status.startswith('WARNINGS'):
+                    at = float(end)
+                else:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            if at >= since:
+                out[vmid] = max(out.get(vmid, 0), at)
+        return out
 
     def find_migration_candidate(self, source_node: str, target_node: str, exclude_vmids: list = None, include_containers: bool = None, node_status: dict = None, target_mgr=None) -> Optional[Dict]:
         """
@@ -3030,11 +3304,13 @@ class PegaProxManager:
 
         # Filter VMs on source node that are running
         # NS: VM cooldown — skip VMs migrated in last 15 min to prevent ping-pong
-        cooldown_secs = 900
+        # MK Oct 2026 - per cluster now (migration_cooldown), and it survives a restart
+        cooldown_secs = balancer_cooldown_secs(self)
         now = time.time()
-        cooled_vmids = {vmid for vmid, ts in self._vm_migration_cooldown.items() if now - ts < cooldown_secs}
+        recent = recent_balancer_moves(self)
+        cooled_vmids = {vmid for vmid, ts in recent.items() if now - ts < cooldown_secs}
         # clean up old entries
-        self._vm_migration_cooldown = {v: t for v, t in self._vm_migration_cooldown.items() if now - t < cooldown_secs}
+        self._vm_migration_cooldown = {v: t for v, t in recent.items() if now - t < cooldown_secs}
 
         # MK May 2026 — coexistence with PVE 9.2's CRS. Two-layer check:
         #
@@ -3096,6 +3372,11 @@ class PegaProxManager:
         else:
             self.logger.debug("[BAL] cluster CRS not active — balancer runs full set (compat path)")
 
+        # MK Oct 2026 - a restore test's copy stays on the node its run addresses for the
+        # checks, the stop and the removal
+        from pegaprox.core.recovery import TEST_TAG, guest_tags
+        test_guests = {vm.get('vmid') for vm in vms if TEST_TAG in guest_tags(vm.get('tags'))}
+
         candidates = [
             vm for vm in vms
             if vm.get('node') == source_node and
@@ -3107,6 +3388,7 @@ class PegaProxManager:
             vm.get('vmid') not in cooled_vmids and  # NS: Skip recently migrated VMs
             vm.get('vmid') not in pve_crs_managed_vmids and  # MK: PVE CRS owns these (9.2+)
             vm.get('vmid') not in proxlb_ignored and  # #426: ProxLB plb_ignore tag
+            vm.get('vmid') not in test_guests and
             (vm.get('vmid') not in proxlb_pins or target_node in proxlb_pins.get(vm.get('vmid'), set()))  # #426: plb_pin — only if target is a pinned node
         ]
 
@@ -3355,21 +3637,8 @@ class PegaProxManager:
         (exit 2) and the CRM quietly drops a move to a node without the guest's storage,
         and we used to pick such targets. Returns (vmid -> allowed nodes, storage ->
         nodes it is limited to); a guest or storage missing from a map is unrestricted."""
-        def _on(v):
-            return str(v).strip().lower() in ('1', 'true', 'yes', 'on')
-
-        def _nodes(spec):
-            # 'pve1:2,pve2' -> {'pve1', 'pve2'}, priorities dropped
-            return {p.split(':')[0].strip() for p in str(spec or '').split(',') if p.strip()}
-
+        from pegaprox.core.preflight import ha_node_limits, node_names, restricted_groups
         ha_nodes, storage_nodes = {}, {}
-
-        def _restrict(sid, nodes):
-            try:
-                vmid = int(str(sid).strip().split(':')[-1])
-            except ValueError:
-                return
-            ha_nodes[vmid] = ha_nodes[vmid] & nodes if vmid in ha_nodes else set(nodes)
 
         try:
             base = f"https://{self.host}:{self.api_port}/api2/json"
@@ -3384,24 +3653,15 @@ class PegaProxManager:
                 self.logger.debug(f"[MAINT] {path} unreadable for placement: {e}")
                 return []
 
-        # PVE 9 node-affinity rules; only strict ones forbid, the rest are preferences
-        for rule in _data('/cluster/ha/rules'):
-            if (str(rule.get('type') or '').lower() == 'node-affinity'
-                    and _on(rule.get('strict')) and not _on(rule.get('disable'))):
-                for sid in str(rule.get('resources') or '').split(','):
-                    if sid.strip():
-                        _restrict(sid, _nodes(rule.get('nodes')))
-        # PVE 8 restricted groups (and a 9.0 cluster that has not migrated them yet)
-        groups = {g.get('group'): _nodes(g.get('nodes'))
-                  for g in _data('/cluster/ha/groups') if _on(g.get('restricted'))}
-        if groups:
-            for res in _data('/cluster/ha/resources'):
-                if res.get('group') in groups:
-                    _restrict(res.get('sid'), groups[res['group']])
+        # PVE 9 node-affinity rules and PVE 8 restricted groups (and a 9.0 cluster that has
+        # not migrated them yet); the migration preflight reads them the same way
+        rules = _data('/cluster/ha/rules')
+        groups = restricted_groups(_data('/cluster/ha/groups'))
+        ha_nodes = ha_node_limits(rules, groups, _data('/cluster/ha/resources') if groups else [])
 
         for s in _data('/storage'):
             if s.get('nodes'):
-                storage_nodes[s.get('storage')] = _nodes(s['nodes'])
+                storage_nodes[s.get('storage')] = node_names(s['nodes'])
         return ha_nodes, storage_nodes
 
     def _evacuation_allowed_nodes(self, vm, placement):
@@ -3662,9 +3922,18 @@ class PegaProxManager:
             rules = [r for r in rules if not r['off']]
             if not rules and not joined:
                 return [], []
+            # #625 - the rows go in before the confirm round, and to the members with it: a
+            # leader gone after the first PUT leaves the next one the list to switch back on
+            # (_restore_suspended_ha_rules_if_due). A row of a rule that stayed on only makes
+            # that a switch-on of an enabled rule
+            names = joined + [r['rule'] for r in rules]
+            db.save_suspended_ha_rules(self.id, names, owner=owner)
+            ha.send_on('the HA rules switched off')
             if not ha.confirm_step('switching off the negative affinity rules'):
+                for name in names:
+                    if owner not in held.get(name, ()):
+                        db.remove_suspended_ha_rule(self.id, name, owners=owner)
                 return [], [r['rule'] for r in rules]
-            db.save_suspended_ha_rules(self.id, joined + [r['rule'] for r in rules], owner=owner)
             off, failed = [], []
             for r in rules:
                 try:
@@ -3841,6 +4110,22 @@ class PegaProxManager:
             'held': held_now,
         }
 
+    def placement_pool(self, node_status, drop=()):
+        """The nodes a guest may be placed on, mirroring get_best_target_node's filters:
+        online, not in maintenance, not excluded from balancing in the config and not one a
+        rolling update has out, without the nodes in drop. The capacity preview below and the
+        migration preflight (core/preflight.py) pick from these."""
+        exclude = []
+        if hasattr(self, '_rolling_update') and self._rolling_update:
+            rebooting = self._rolling_update.get('rebooting_nodes', [])
+            current = self._rolling_update.get('current_node', '')
+            exclude = [n for n in rebooting + [current] if n]
+        config_excluded = getattr(self.config, 'excluded_nodes', []) or []
+        all_excluded = set(exclude) | set(config_excluded) | set(drop)
+        return {n: d for n, d in node_status.items()
+                if d.get('status') == 'online' and not d.get('maintenance_mode', False)
+                and n not in all_excluded}
+
     def maintenance_capacity_preview(self, node_name, threshold=90.0):
         """#611 — read-only pre-flight: would evacuating node_name push any
         remaining node past `threshold`% RAM?
@@ -3868,23 +4153,11 @@ class PegaProxManager:
                     'guest_count': 0, 'total_guest_mem': 0, 'nodes': [],
                     'over_threshold': [], 'headroom_sufficient': True}
 
-        # Target pool — mirror get_best_target_node's filters (rolling-update
-        # exclusions + config excluded_nodes + online + not-in-maintenance) and
-        # drop the source node itself.
-        exclude = []
-        if hasattr(self, '_rolling_update') and self._rolling_update:
-            rebooting = self._rolling_update.get('rebooting_nodes', [])
-            current = self._rolling_update.get('current_node', '')
-            exclude = [n for n in rebooting + [current] if n]
-        config_excluded = getattr(self.config, 'excluded_nodes', []) or []
-        all_excluded = set(exclude) | set(config_excluded) | {node_name}
+        # Target pool, without the source node itself
         targets = {
             n: {'mem_used': d.get('mem_used', 0), 'mem_total': d.get('mem_total', 0),
                 'mem_percent': d.get('mem_percent', 0)}
-            for n, d in node_status.items()
-            if d.get('status') == 'online'
-            and not d.get('maintenance_mode', False)
-            and n not in all_excluded
+            for n, d in self.placement_pool(node_status, drop=(node_name,)).items()
         }
 
         # Guests to evacuate — mirror _evacuate_node (running qemu/lxc on node).
@@ -4076,13 +4349,17 @@ class PegaProxManager:
         """migrate vm to another node"""
         # NS: this handles the proxmox api call
         # MK: had to add iso unmount, was breaking migrations silently for weeks
+        # MK Oct 2026 - a balancer move brings its reason along (BALANCE_WHY); taken off the
+        # dict first thing, it must not stick to the guest for the next caller
+        why = vm.pop(BALANCE_WHY, None) if isinstance(vm, dict) else None
+        started = time.time()
         if dry_run is None:
             dry_run = self.config.dry_run
         
         # dry run = just log, dont actually do it
         if dry_run:
             self.logger.info(f"[DRY RUN] Would migrate {vm.get('name', 'unnamed')} ({vm.get('vmid')}) to {target_node}")
-            self.last_migration_log.append({
+            self._note_migration({
                 'timestamp': datetime.now().isoformat(),
                 'vm': vm.get('name', 'unnamed'),
                 'vmid': vm.get('vmid'),
@@ -4090,7 +4367,7 @@ class PegaProxManager:
                 'to_node': target_node,
                 'dry_run': True,
                 'success': True
-            })
+            }, why, started)
             return True
         
         try:
@@ -4171,7 +4448,7 @@ class PegaProxManager:
                     success = self._wait_for_task(source_node, task_id, timeout=wait_timeout)
                     if success:
                         self.logger.info(f"[OK] Successfully migrated {vm.get('name', 'unnamed')} to {target_node}")
-                        self.last_migration_log.append({
+                        self._note_migration({
                             'timestamp': datetime.now().isoformat(),
                             'vm': vm.get('name', 'unnamed'),
                             'vmid': vmid,
@@ -4179,7 +4456,7 @@ class PegaProxManager:
                             'to_node': target_node,
                             'dry_run': False,
                             'success': True
-                        })
+                        }, why, started)
                         return True
                     else:
                         # MK Apr 2026 (#340): HA + negative-affinity setups fail the original
@@ -4221,7 +4498,7 @@ class PegaProxManager:
                                 f"ended up on {actual_node} (HA likely re-routed from {target_node}). "
                                 "Treating as success."
                             )
-                            self.last_migration_log.append({
+                            self._note_migration({
                                 'timestamp': datetime.now().isoformat(),
                                 'vm': vm.get('name', 'unnamed'),
                                 'vmid': vmid,
@@ -4231,10 +4508,10 @@ class PegaProxManager:
                                 'dry_run': False,
                                 'success': True,
                                 'note': 'HA re-routed during evacuation',
-                            })
+                            }, why, started)
                             return True
                         self.logger.error(f"[ERROR] Migration task failed for {vm.get('name', 'unnamed')}")
-                        self.last_migration_log.append({
+                        self._note_migration({
                             'timestamp': datetime.now().isoformat(),
                             'vm': vm.get('name', 'unnamed'),
                             'vmid': vmid,
@@ -4243,9 +4520,19 @@ class PegaProxManager:
                             'dry_run': False,
                             'success': False,
                             'error': 'Task failed'
-                        })
+                        }, why, started)
                         return False
-                
+
+                if why:
+                    self._note_migration({
+                        'timestamp': datetime.now().isoformat(),
+                        'vm': vm.get('name', 'unnamed'),
+                        'vmid': vmid,
+                        'from_node': source_node,
+                        'to_node': target_node,
+                        'dry_run': False,
+                        'success': True
+                    }, why, started)
                 return True
             else:
                 resp_text = response.text or ''
@@ -4271,7 +4558,7 @@ class PegaProxManager:
                             f"[OK] {vm.get('name', 'unnamed')} left {source_node} (now on "
                             f"{landed}) via the in-flight migration — evacuation successful."
                         )
-                        self.last_migration_log.append({
+                        self._note_migration({
                             'timestamp': datetime.now().isoformat(),
                             'vm': vm.get('name', 'unnamed'),
                             'vmid': vmid,
@@ -4280,10 +4567,10 @@ class PegaProxManager:
                             'dry_run': False,
                             'success': True,
                             'note': 'already migrating (migrate lock) — confirmed off source',
-                        })
+                        }, why, started)
                         return True
                 self.logger.error(f"[ERROR] Failed to migrate {vm.get('name', 'unnamed')}: {response.status_code} - {resp_text}")
-                self.last_migration_log.append({
+                self._note_migration({
                     'timestamp': datetime.now().isoformat(),
                     'vm': vm.get('name', 'unnamed'),
                     'vmid': vmid,
@@ -4292,13 +4579,49 @@ class PegaProxManager:
                     'dry_run': False,
                     'success': False,
                     'error': resp_text
-                })
+                }, why, started)
                 return False
                 
         except Exception as e:
             self.logger.error(f"[ERROR] Error migrating VM: {e}")
+            if why:
+                self._note_migration({
+                    'timestamp': datetime.now().isoformat(),
+                    'vm': vm.get('name', 'unnamed'),
+                    'vmid': vm.get('vmid'),
+                    'from_node': vm.get('node'),
+                    'to_node': target_node,
+                    'dry_run': False,
+                    'success': False,
+                    'error': str(e)
+                }, why, started)
             return False
-    
+
+    def _note_migration(self, entry, why=None, started=None):
+        """A line of the in-memory "last migrations" list, and for a move of the balancer
+        (why set) its row in migration_history."""
+        log = self.last_migration_log
+        log.append(entry)
+        if len(log) > MIGRATION_LOG_MAX:
+            del log[:-MIGRATION_LOG_MAX]
+        if not why:
+            return
+        entry['trigger'] = why.get('trigger')
+        status = 'dry_run' if entry.get('dry_run') else ('success' if entry.get('success') else 'failed')
+        extra, note = {}, ''
+        if entry.get('requested_target'):
+            extra['requested_target'] = entry['requested_target']
+            note = f"HA placed it on {entry.get('to_node')} instead of {entry['requested_target']}"
+        if entry.get('error'):
+            extra['error'] = str(entry['error'])[:300]
+            note = f"failed: {extra['error']}"
+        if extra:
+            why = dict(why, details=dict(why.get('details') or {}, **extra))
+        record_balance_move(self.id, {'vmid': entry.get('vmid'), 'name': entry.get('vm'),
+                                      'node': entry.get('from_node')},
+                            entry.get('to_node'), why, status,
+                            duration=(time.time() - started) if started else 0.0, note=note)
+
     def _wait_for_task(self, node: str, task_id: str, timeout: int = 600) -> bool:
         """
         Wait for a Proxmox task to complete.
@@ -4827,7 +5150,7 @@ class PegaProxManager:
 
             ok = False
             ssh_key = getattr(self.config, 'ssh_key', '')
-            ssh_password = self.ssh_password_to_offer()
+            ssh_password = self.ssh_password_to_offer(node_ip)
             if ssh_key:
                 ok = self._ssh_run_command_with_key(node_ip, ssh_user, cmd, ssh_key)
             if not ok:
@@ -5151,7 +5474,6 @@ class PegaProxManager:
             prefix = "sudo " if ssh_user != 'root' else ""
             cmd = f"{prefix}ha-manager crm-command node-maintenance disable {node_name}"
             ssh_key = getattr(self.config, 'ssh_key', '')
-            ssh_password = self.ssh_password_to_offer()
 
             # build list of IPs to try: target node first, then other cluster nodes
             candidate_ips = []
@@ -5179,6 +5501,8 @@ class PegaProxManager:
 
             for ip in candidate_ips:
                 ok = False
+                # each node with its own password where it has one (#1136)
+                ssh_password = self.ssh_password_to_offer(ip)
                 if ssh_key:
                     ok = self._ssh_run_command_with_key(ip, ssh_user, cmd, ssh_key)
                 if not ok:
@@ -5306,13 +5630,21 @@ class PegaProxManager:
         recovery_delay = saved_ha.get('recovery_delay', 30)
         if not self._ha_countable(recovery_delay):
             recovery_delay = 30
+        # same for the vote count and the heartbeat timeout: the UI sends back what it
+        # was given, so a bad stored value would get every later save refused
+        quorum_votes = saved_ha.get('quorum_required_votes', 2)
+        if not self._ha_quorum_votes_ok(quorum_votes):
+            quorum_votes = 2
+        heartbeat_timeout = saved_ha.get('storage_heartbeat_timeout', 30)
+        if not (self._ha_countable(heartbeat_timeout) and heartbeat_timeout > 0):
+            heartbeat_timeout = 30
 
         # split-brain stuff (complicated, dont touch) - NS
         ha_config = {
             'quorum_enabled': saved_ha.get('quorum_enabled', True),
             'quorum_hosts': saved_ha.get('quorum_hosts', []),
             'quorum_gateway': saved_ha.get('quorum_gateway', ''),
-            'quorum_required_votes': saved_ha.get('quorum_required_votes', 2),
+            'quorum_required_votes': quorum_votes,
             
             # self-fencing
             'self_fence_enabled': saved_ha.get('self_fence_enabled', True),
@@ -5331,7 +5663,7 @@ class PegaProxManager:
             'storage_heartbeat_enabled': saved_ha.get('storage_heartbeat_enabled', False),
             'storage_heartbeat_path': self._heartbeat_path_or_none(saved_ha.get('storage_heartbeat_path', '')),
             'storage_heartbeat_interval': saved_ha.get('storage_heartbeat_interval', 5),
-            'storage_heartbeat_timeout': saved_ha.get('storage_heartbeat_timeout', 30),
+            'storage_heartbeat_timeout': heartbeat_timeout,
             'poison_pill_enabled': saved_ha.get('poison_pill_enabled', True),
             
             # ═══════════════════════════════════════════════════════════════
@@ -7296,7 +7628,9 @@ class PegaProxManager:
         # where the nodes outside can be asked, should this host be the one outside
         self.__dict__['_ha_status_ips'] = {e.get('name'): e.get('ip') for e in entries
                                            if e.get('type') == 'node' and e.get('name') and e.get('ip')}
-        return self._ha_quorum_in(entries)
+        quorate, outside = self._ha_quorum_in(entries)
+        node_history.observe_quorum(getattr(self, 'id', None), quorate, outside)
+        return quorate, outside
 
     QUORATE_LOOK_EVERY = 30    # seconds between two looks from the monitor
     QUORATE_LOOK_HOSTS = 8     # hosts asked per look, side by side
@@ -8084,7 +8418,6 @@ if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } ||
             # Get SSH credentials from cluster config
             api_user = self.config.user
             ssh_user = (api_user or 'root').split('@')[0]  # PR #62 (ry-ops): null-safe
-            ssh_password = self.ssh_password_to_offer()
             ssh_key = getattr(self.config, 'ssh_key', '')
             
             # Try SSH on ALL IPs (parallel for speed - reduces worst-case from N*30s to 30s)
@@ -8094,6 +8427,7 @@ if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } ||
                 """Try all SSH auth methods for one IP, return (ip, output) or None."""
                 self.logger.info(f"[HA] Trying SSH to {node} via {ip}...")
                 output = None
+                ssh_password = self.ssh_password_to_offer(ip)
                 # qm list and pct list: a look, no step (#625)
                 with ha.reading():
                     if ssh_key:
@@ -8174,7 +8508,6 @@ if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } ||
             
             api_user = self.config.user
             ssh_user = (api_user or 'root').split('@')[0]  # PR #62 (ry-ops): null-safe
-            ssh_password = self.ssh_password_to_offer()
             ssh_key = getattr(self.config, 'ssh_key', '')
             
             self.logger.warning(f"[HA] ═══════════════════════════════════════════════════════")
@@ -8185,6 +8518,8 @@ if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } ||
             # Find a working IP
             working_ip = None
             for ip in all_ips:
+                # the node's own password where it has one; the one of working_ip stays (#1136)
+                ssh_password = self.ssh_password_to_offer(ip)
                 # Quick connectivity test (a look, no round of its own in an automatic group, #625)
                 with ha.reading():
                     test_output = self._ssh_run_command_output(ip, ssh_user, "echo OK")
@@ -8656,7 +8991,7 @@ WantedBy=multi-user.target
         when none of them got through."""
         ssh_user = getattr(self.config, 'ssh_user', None) or 'root'
         ssh_key = getattr(self.config, 'ssh_key_path', None) or getattr(self.config, 'ssh_key', None)
-        ssh_password = self.ssh_password_to_offer()
+        ssh_password = self.ssh_password_to_offer(node_ip)
         out = None
         if ssh_key:
             out = self._ssh_run_command_with_key_output(node_ip, ssh_user, cmd, ssh_key, timeout=timeout)
@@ -8834,6 +9169,13 @@ WantedBy=multi-user.target
         timing can be worked out from: int or float, no bool, finite, not negative."""
         return (isinstance(value, (int, float)) and not isinstance(value, bool)
                 and value == value and value not in (float('inf'), float('-inf')) and value >= 0)
+
+    @staticmethod
+    def _ha_quorum_votes_ok(value) -> bool:
+        """Whether quorum_required_votes is a vote count _ha_check_quorum can use: an
+        int, no bool, 1 to 64. Zero or true made it quorate with every host down,
+        a string or null raised in it."""
+        return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 64
 
     def _ha_interval(self) -> int:
         """Seconds between two passes of the HA monitor. The loop sleeps this and
@@ -9495,7 +9837,6 @@ fi
 
             ssh_user = getattr(self.config, 'ssh_user', None) or 'root'
             ssh_key = getattr(self.config, 'ssh_key_path', None) or getattr(self.config, 'ssh_key', None)
-            ssh_password = self.ssh_password_to_offer()
 
             import re as _re
             cmd = "pvecm status 2>/dev/null"
@@ -9505,6 +9846,7 @@ fi
                 node_ip = self._ha_get_node_ip(node_name) if node_name else None
                 if not node_ip:
                     continue
+                ssh_password = self.ssh_password_to_offer(node_ip)
 
                 out = None
                 # pvecm status: a look at corosync, no step (#625)
@@ -9648,7 +9990,6 @@ fi
 
             ssh_user = getattr(self.config, 'ssh_user', None) or 'root'
             ssh_key = getattr(self.config, 'ssh_key_path', None) or getattr(self.config, 'ssh_key', None)
-            ssh_password = self.ssh_password_to_offer()
 
             # Defense-in-depth: refuse to rm -rf anything that doesn't look
             # like a heartbeat dir. Path must end in `.pegaprox` exactly.
@@ -9664,6 +10005,7 @@ fi
                 node_ip = self._ha_get_node_ip(node_name) if node_name else None
                 if not node_ip:
                     continue
+                ssh_password = self.ssh_password_to_offer(node_ip)
 
                 out = None
                 if ssh_key:
@@ -10070,7 +10412,7 @@ echo "AGENT_INSTALLED_OK"
             
             api_user = self.config.user
             ssh_user = (api_user or 'root').split('@')[0]  # PR #62 (ry-ops): null-safe
-            ssh_password = self.ssh_password_to_offer()
+            ssh_password = self.ssh_password_to_offer(node_ip)
             ssh_key = getattr(self.config, 'ssh_key', '')
             
             self.logger.info(f"[HA] 🔧 Installing node agent on {node} ({node_ip})...")
@@ -10269,7 +10611,7 @@ echo "AGENT_INSTALLED_OK"
         # _ssh_connect, so gating that one reached one of five ways out of this process.
         # Live E2E is what caught it: the switch read True in the cluster listing and the
         # hardening report still came back full of real results.
-        _blocked = self.ssh_blocked_reason()
+        _blocked = self.ssh_blocked_reason(host)
         if _blocked:
             self.logger.debug(f"SSH suppressed ({_blocked}) for {host}")
             return None
@@ -10317,7 +10659,7 @@ echo "AGENT_INSTALLED_OK"
         # _ssh_connect, so gating that one reached one of five ways out of this process.
         # Live E2E is what caught it: the switch read True in the cluster listing and the
         # hardening report still came back full of real results.
-        _blocked = self.ssh_blocked_reason()
+        _blocked = self.ssh_blocked_reason(host)
         if _blocked:
             self.logger.debug(f"SSH suppressed ({_blocked}) for {host}")
             return None
@@ -10383,13 +10725,16 @@ echo "AGENT_INSTALLED_OK"
         # _ssh_connect, so gating that one reached one of five ways out of this process.
         # Live E2E is what caught it: the switch read True in the cluster listing and the
         # hardening report still came back full of real results.
-        _blocked = self.ssh_blocked_reason()
+        _blocked = self.ssh_blocked_reason(host)
         if _blocked:
             self.logger.debug(f"SSH suppressed ({_blocked}) for {host}")
             return None
         if self._withheld_from_sshd(password):
             self.logger.debug(f"SSH password step refused for {host}: the stored secret is "
                               "an API token, not an SSH password")
+            return None
+        password = self._step_password(host, password)
+        if not password:
             return None
 
         # NS 2026-04-24 — auto-sudo for non-root SSH users (pegaprox@pam etc).
@@ -10931,7 +11276,7 @@ echo "AGENT_INSTALLED_OK"
             # User format is usually "root@pam" - extract just the username
             api_user = self.config.user  # e.g. "root@pam"
             ssh_user = (api_user or 'root').split('@')[0]  # PR #62 (ry-ops): null-safe
-            ssh_password = self.ssh_password_to_offer()
+            ssh_password = self.ssh_password_to_offer(node_ip)
             ssh_key = getattr(self.config, 'ssh_key', '')  # SSH private key from cluster config
             
             self.logger.info(f"[HA] Using cluster credentials (user: {ssh_user})")
@@ -11017,7 +11362,7 @@ echo "AGENT_INSTALLED_OK"
             # Use cluster credentials
             api_user = self.config.user
             ssh_user = (api_user or 'root').split('@')[0]  # PR #62 (ry-ops): null-safe
-            ssh_password = self.ssh_password_to_offer()
+            ssh_password = self.ssh_password_to_offer(node_ip)
             ssh_key = getattr(self.config, 'ssh_key', '')  # SSH key from cluster config
             
             restore_cmd = f'pvecm expected {total_nodes}'
@@ -11173,6 +11518,13 @@ echo "AGENT_INSTALLED_OK"
         for ip in other_ips:
             if ip and ip not in ips:
                 ips.append(ip)
+        # the node's own by the cluster's word (#1136). Not the manual override: an address
+        # typed into the HA settings is no resolution of ours, nor the DNS guesses below
+        typed = node_ips.get(node_name) or []
+        typed = set(typed if isinstance(typed, list) else [typed])
+        for ip in ips:
+            if ip not in typed:
+                node_creds.note_address(getattr(self, 'id', None), node_name, ip)
         
         # Try DNS resolution as fallback
         if not ips:
@@ -11287,11 +11639,11 @@ echo "AGENT_INSTALLED_OK"
             # Get SSH credentials
             api_user = self.config.user
             ssh_user = (api_user or 'root').split('@')[0]  # PR #62 (ry-ops): null-safe
-            ssh_password = self.ssh_password_to_offer()
             
             surviving_ip = self._ha_get_node_ip(surviving_node)
             if not surviving_ip:
                 return False
+            ssh_password = self.ssh_password_to_offer(surviving_ip)
             
             # Get the failed node's SCSI registration key
             # Convention: key is based on node name hash or configured
@@ -11387,7 +11739,7 @@ echo "AGENT_INSTALLED_OK"
         # _ssh_connect, so gating that one reached one of five ways out of this process.
         # Live E2E is what caught it: the switch read True in the cluster listing and the
         # hardening report still came back full of real results.
-        _blocked = self.ssh_blocked_reason()
+        _blocked = self.ssh_blocked_reason(host)
         if _blocked:
             self.logger.debug(f"SSH suppressed ({_blocked}) for {host}")
             return False
@@ -11442,7 +11794,7 @@ echo "AGENT_INSTALLED_OK"
         # _ssh_connect, so gating that one reached one of five ways out of this process.
         # Live E2E is what caught it: the switch read True in the cluster listing and the
         # hardening report still came back full of real results.
-        _blocked = self.ssh_blocked_reason()
+        _blocked = self.ssh_blocked_reason(host)
         if _blocked:
             self.logger.debug(f"SSH suppressed ({_blocked}) for {host}")
             return False
@@ -11508,13 +11860,16 @@ echo "AGENT_INSTALLED_OK"
         # _ssh_connect, so gating that one reached one of five ways out of this process.
         # Live E2E is what caught it: the switch read True in the cluster listing and the
         # hardening report still came back full of real results.
-        _blocked = self.ssh_blocked_reason()
+        _blocked = self.ssh_blocked_reason(host)
         if _blocked:
             self.logger.debug(f"SSH suppressed ({_blocked}) for {host}")
             return False
         if self._withheld_from_sshd(password):
             self.logger.debug(f"SSH password step refused for {host}: the stored secret is "
                               "an API token, not an SSH password")
+            return False
+        password = self._step_password(host, password)
+        if not password:
             return False
 
         # NS 2026-04-24 — auto-sudo for non-root SSH users (pegaprox@pam etc).
@@ -11630,7 +11985,7 @@ echo "AGENT_INSTALLED_OK"
             # Use cluster credentials for SSH
             api_user = self.config.user
             ssh_user = (api_user or 'root').split('@')[0]  # PR #62 (ry-ops): null-safe
-            ssh_password = self.ssh_password_to_offer()
+            ssh_password = self.ssh_password_to_offer(target_ip)
             
             # Build the move command - use mv to atomically move the config
             # The /etc/pve filesystem (pmxcfs) is cluster-aware
@@ -12019,6 +12374,8 @@ echo "AGENT_INSTALLED_OK"
             return []
 
     def stop_task(self, node: str, upid: str) -> bool:
+        if not validate_hostname(node or '') or not re.fullmatch(r'UPID:[^/?#%\s]{1,400}', upid or ''):
+            return False
 
         if not self.is_connected:
             if not self.connect_to_proxmox():
@@ -12282,6 +12639,7 @@ echo "AGENT_INSTALLED_OK"
         ip = self._get_node_ip_impl(node_name)
         if ip:
             self._reset_node_failures(node_name)
+            node_creds.note_address(getattr(self, 'id', None), node_name, ip, primary=True)
         else:
             self._register_node_failure(node_name)
         return ip
@@ -12314,6 +12672,11 @@ echo "AGENT_INSTALLED_OK"
 
             host = self.host
             primary_ip = self.config.host
+            # MK Oct 2026 - the address no other node may resolve to is the one of the host
+            # this manager talks to (answered by the local-node shortcut below). In a failover
+            # that is not config.host: the configured host is then just another member, and
+            # skipping its address left that node with none (SSH and its own password, #1136)
+            connected = host
 
             # If target is the local/primary node, return its IP directly
             # Otherwise the logic below skips it (ip == primary_ip filter)
@@ -12321,7 +12684,16 @@ echo "AGENT_INSTALLED_OK"
                 cs_url = f"https://{host}:{self.api_port}/api2/json/cluster/status"
                 cs_resp = self._api_get(cs_url)
                 if cs_resp.status_code == 200:
-                    for item in cs_resp.json().get('data', []):
+                    cs_rows = cs_resp.json().get('data', [])
+                    # every member at the address the cluster gives it, and the one answering
+                    # here at the API host: whose own password goes where (#1136)
+                    for item in cs_rows:
+                        if item.get('type') == 'node' and item.get('name'):
+                            if item.get('ip'):
+                                node_creds.note_address(getattr(self, 'id', None), item['name'], item['ip'])
+                            if item.get('local'):
+                                node_creds.note_address(getattr(self, 'id', None), item['name'], self.raw_host)
+                    for item in cs_rows:
                         if item.get('type') == 'node' and item.get('name') == node_name and item.get('local', 0) == 1:
                             # #199: in failover, self.host is the actual connected node,
                             # self.config.host is the (possibly dead) configured primary
@@ -12458,7 +12830,7 @@ echo "AGENT_INSTALLED_OK"
                     for item in cs_resp.json().get('data', []):
                         if item.get('type') == 'node' and item.get('name') == node_name:
                             node_direct_ip = item.get('ip', '')
-                            if node_direct_ip and node_direct_ip != primary_ip:
+                            if node_direct_ip and node_direct_ip != connected:
                                 in_mgmt_net = True
                                 if primary_network:
                                     try:
@@ -12567,7 +12939,7 @@ echo "AGENT_INSTALLED_OK"
             # ================================================================
             probed = 0
             for score, ip, iface, reason in candidates:
-                if score < 20 or ip == primary_ip:
+                if score < 20 or ip == connected:
                     continue
                 if probed >= 3:
                     self.logger.debug(f"[NodeIP] {node_name}: probe cap reached, falling through to STEP 4")
@@ -12610,7 +12982,7 @@ echo "AGENT_INSTALLED_OK"
             # STEP 5: High-confidence without probe (firewall may block)
             # ================================================================
             for score, ip, iface, reason in candidates:
-                if score >= 85 and ip != primary_ip:
+                if score >= 85 and ip != connected:
                     self.logger.warning(f"[NodeIP] {node_name} -> {ip} (score={score}, {reason}) -- probe failed, high confidence")
                     return ip
             
@@ -12623,7 +12995,7 @@ echo "AGENT_INSTALLED_OK"
                 addrs = socket.getaddrinfo(node_name, 8006, socket.AF_UNSPEC, socket.SOCK_STREAM)
                 for af, socktype, proto, canonname, sa in addrs:
                     ip = sa[0]
-                    if ip and ip != primary_ip and not ip.startswith('127.') and ip != '::1':
+                    if ip and ip != connected and not ip.startswith('127.') and ip != '::1':
                         if _quick_probe(ip, port=probe_port):
                             self.logger.info(f"[NodeIP] Resolved {node_name} to {ip} (DNS, {'IPv6' if af == socket.AF_INET6 else 'IPv4'})")
                             return ip
@@ -12639,10 +13011,21 @@ echo "AGENT_INSTALLED_OK"
             # NS Apr 2026 (PR #324): only fall back to the connected host when
             # the requested node is literally that host -- otherwise multi-node
             # clusters would silently SSH into the wrong box.
-            connected = self.host or self.config.host
-            if connected and (node_name in connected or node_name in self.config.host):
-                self.logger.debug(f"[NodeIP] {node_name} matches connected host, using {connected}")
-                return connected
+            # MK Oct 2026 (#1143) - "literally" was a substring test: pve1 matched a host
+            # named pve10.lab, and in a failover the configured host's name handed back the
+            # one connected to. The whole name or a host name's first label, and that host.
+            for h in (self.host, self.config.host):
+                bare = (h or '').strip('[]').lower()
+                if not bare:
+                    continue
+                try:
+                    ipaddress.ip_address(bare)
+                    names = {bare}
+                except ValueError:
+                    names = {bare, bare.split('.')[0]}
+                if node_name.lower() in names:
+                    self.logger.debug(f"[NodeIP] {node_name} is the host {h}, using it")
+                    return h
 
             self.logger.warning(f"[NodeIP] No reachable management IP for {node_name}")
             return None
@@ -12652,7 +13035,7 @@ echo "AGENT_INSTALLED_OK"
             return None
 
 
-    def ssh_blocked_reason(self):
+    def ssh_blocked_reason(self, host=None, node=None):
         """Why SSH to this cluster's nodes must not be attempted — a code, or None.
 
         MK Sep 2026 (#941) — reported by an operator whose security team noticed SSH
@@ -12675,6 +13058,11 @@ echo "AGENT_INSTALLED_OK"
         own token on first connect (#110) — there pass_ is still the account password and
         perfectly good for SSH. Asking the wrong one refuses the most ordinary setup there
         is; ssh_diagnose learned that the hard way and this is the same rule, in one place.
+
+        MK Oct 2026 (#1136) - `host` (an address the caller is about to connect to) or
+        `node` (a member name, for a diagnosis): on a token cluster a node with a root
+        password of its own still has a credential. Without either, any node password
+        on the cluster is enough to go on, and each step asks again for its address.
         """
         if bool(getattr(self.config, 'ssh_disabled', False)):
             return 'SSH_DISABLED'
@@ -12682,15 +13070,84 @@ echo "AGENT_INSTALLED_OK"
             return None
         if ssh_password_for(self.config):
             return None
+        own = node_creds.secrets_of(getattr(self, 'id', None))
+        if own:
+            if host is not None:
+                return None if self._own_password_at(host) else 'SSH_NO_CREDENTIALS'
+            if node is not None:
+                return None if node in own else 'SSH_NO_CREDENTIALS'
+            return None
         return 'SSH_NO_CREDENTIALS'
 
-    def ssh_password_to_offer(self):
+    def node_for_address(self, host):
+        """The member of this cluster at `host` by what this manager resolved itself
+        (_get_node_ip, /cluster/status), or None: for an address it never placed, one it
+        placed on more than one node, or a node no longer in the cluster. Never a name a
+        request supplied - that would let a caller pick whose password goes where."""
+        cid = getattr(self, 'id', None)
+        if not cid or not host:
+            return None
+        names = node_creds.nodes_at(cid, host)
+        members = getattr(self, '_cached_node_dict', None) or {}
+        if members:
+            names = {n for n in names if n in members}
+        return next(iter(names)) if len(names) == 1 else None
+
+    def _own_password_at(self, host):
+        """The root password of the node at `host` where it has one of its own, else ''."""
+        own = node_creds.secrets_of(getattr(self, 'id', None))
+        if not own or not host:
+            return ''
+        node = self.node_for_address(host)
+        return own.get(node, '') if node else ''
+
+    def ssh_password_to_offer(self, host=None):
         """The SSH password to offer this cluster's nodes, '' for none (token secret, SSH off).
 
         A stored key gets ssh_blocked_reason past its check, and the key can still be
         refused - every password step after that asks here, never config.pass_.
+        MK Oct 2026 (#1136) - with `host`, the node there gets its own password where it
+        has one. Without it, the cluster's.
         """
+        if bool(getattr(self.config, 'ssh_disabled', False)):
+            return ''
+        if host and node_creds.secrets_of(getattr(self, 'id', None)):
+            own = self._own_password_at(host)
+            if own:
+                return own
         return ssh_password_for(self.config)
+
+    def _step_password(self, host, password):
+        """What a password step to `host` may send, '' for nothing. The node's own
+        password where `host` is that node, whatever the caller handed in; the password of
+        another node goes to no other address."""
+        own = node_creds.secrets_of(getattr(self, 'id', None))
+        if not own:
+            return password
+        mine = self._own_password_at(host)
+        if mine:
+            return mine
+        if password and password in own.values() and password != ssh_password_for(self.config):
+            self.logger.warning(f"[SSH] password step to {host} refused: the password handed in "
+                                "belongs to another node")
+            return ''
+        return password
+
+    def api_password_for(self, host):
+        """The password a PVE API login at `host` sends. The registered host keeps the
+        cluster password. A fallback host whose node has a root password of its own gets
+        that one, for a @pam account of the same name as the SSH login it belongs to
+        (@pam is node-local, every other realm is one password for the whole cluster)."""
+        cluster_pw = getattr(self.config, 'pass_', '') or ''
+        if not host or node_creds._norm(host) == node_creds._norm(self.config.host):
+            return cluster_pw
+        user = getattr(self.config, 'user', '') or ''
+        if '!' in user or not user.endswith('@pam'):
+            return cluster_pw
+        login = getattr(self.config, 'ssh_user', '') or user.split('@')[0]
+        if login != user.split('@')[0]:
+            return cluster_pw
+        return self._own_password_at(host) or cluster_pw
 
     def _withheld_from_sshd(self, password):
         """True for config.pass_ where that is no SSH password (the token secret).
@@ -12702,7 +13159,7 @@ echo "AGENT_INSTALLED_OK"
         return bool(password) and password == stored and not ssh_password_for(self.config)
 
     def _ssh_connect(self, host: str, retries: int = 3, retry_delay: float = 2.0,
-                     connect_timeout: int = 30, failure: dict = None):
+                     connect_timeout: int = 30, failure: dict = None, pinned_as: str = None):
         """SSH connect with retry logic and connection rate limiting
 
         NS: Jan 2026 - Limits concurrent CONNECTION ATTEMPTS (not active sessions).
@@ -12715,11 +13172,17 @@ echo "AGENT_INSTALLED_OK"
         MK Oct 2026 - `failure`, when given, gets {'kind', 'detail'} on a None return
         (auth, host_key, unreachable, key, blocked, error); the connection check names
         the reason per node instead of a bare "SSH failed".
+
+        `pinned_as`: another address of the same node (its management address). `host`
+        is then accepted only with the host key pinned for that one, nothing is learned
+        or saved, and without such a pin there is no connection (transfer network).
         """
         # #941 — decide before we open a socket. Every SSH path to a PVE node comes
         # through here, so refusing here is what stops the traffic AND stops the token
         # secret being offered as a password. Callers all handle None already.
-        _blocked = self.ssh_blocked_reason()
+        # A transfer address is the node at pinned_as: judged and credited as that one.
+        _node_addr = pinned_as or host
+        _blocked = self.ssh_blocked_reason(_node_addr)
         if _blocked:
             if failure is not None:
                 failure.update(kind='blocked', detail=_blocked)
@@ -12764,9 +13227,13 @@ echo "AGENT_INSTALLED_OK"
                 else:
                     self.logger.info(f"Connecting to {host}:{ssh_port} as {username}...")
                 
-                from pegaprox.utils.ssh_security import apply_host_key_policy, persist_host_keys
+                from pegaprox.utils.ssh_security import apply_host_key_policy, persist_host_keys, pin_as
                 ssh = paramiko.SSHClient()
                 apply_host_key_policy(ssh, paramiko)
+                if pinned_as and not pin_as(ssh, paramiko, host, pinned_as, ssh_port):
+                    if failure is not None:
+                        failure.update(kind='host_key', detail=f'no host key pinned for {pinned_as}')
+                    return None
 
                 connect_kwargs = {
                     'hostname': host,
@@ -12805,10 +13272,13 @@ echo "AGENT_INSTALLED_OK"
                     
                     connect_kwargs['pkey'] = pkey
                 else:
-                    connect_kwargs['password'] = self.ssh_password_to_offer()
+                    # the node's own password where it has one (#1136); at a transfer
+                    # address only once pin_as above held the key to the management one
+                    connect_kwargs['password'] = self.ssh_password_to_offer(_node_addr)
                 
                 ssh.connect(**connect_kwargs)
-                persist_host_keys(ssh)
+                if not pinned_as:
+                    persist_host_keys(ssh)
                 self.logger.info(f"SSH connected to {host}" + (f" (attempt {attempt})" if attempt > 1 else ""))
 
                 # SUCCESS - release semaphore immediately, connection is established
@@ -12984,7 +13454,8 @@ echo "AGENT_INSTALLED_OK"
             task.add_output(f"Node IP: {node_ip}")
             
             # Connect via SSH
-            ssh = self._ssh_connect(node_ip)
+            failure = {}
+            ssh = self._ssh_connect(node_ip, failure=failure)
             if not ssh:
                 # Check why SSH failed - get username for hint
                 if self.config.ssh_user:
@@ -12993,10 +13464,13 @@ echo "AGENT_INSTALLED_OK"
                     username = self.config.user.split('@')[0]
                 ssh_port = getattr(self.config, 'ssh_port', 22) or 22
                 
+                if failure.get('kind') == 'auth' and not self.config.ssh_key:
+                    # MK Oct 2026 (#1136) - most often a node with a root password of its own
+                    raise Exception(f"SSH login refused by {username}@{node_ip}:{ssh_port} - if {node_name} has a root password of its own, set it under Re-configure > Node credentials / SSH-Anmeldung abgelehnt - hat {node_name} ein eigenes Root-Passwort, hinterlege es unter Neu konfigurieren > Node-Zugangsdaten")
                 if self.config.ssh_key:
                     raise Exception(f"SSH connection failed to {username}@{node_ip}:{ssh_port} - Check SSH key configuration / SSH Verbindung fehlgeschlagen - Prüfe SSH Key Konfiguration")
                 else:
-                    raise Exception(f"SSH connection failed to {username}@{node_ip}:{ssh_port} - Check if password auth is enabled on the node or configure an SSH key / SSH Verbindung fehlgeschlagen - Prüfe ob Passwort-Auth auf dem Node aktiviert ist oder konfiguriere einen SSH Key")
+                    raise Exception(f"SSH connection failed to {username}@{node_ip}:{ssh_port} - Check that password login is allowed on the node, or set its own password under Re-configure > Node credentials / SSH Verbindung fehlgeschlagen - Prüfe ob Passwort-Login auf dem Node erlaubt ist, oder hinterlege sein Passwort unter Neu konfigurieren > Node-Zugangsdaten")
             
             task.add_output("SSH connection established / SSH Verbindung hergestellt")
             
@@ -13133,7 +13607,7 @@ echo "AGENT_INSTALLED_OK"
                             # A rolling update may elect not to reboot a fully patched node.
                             # Notify only after this node's reboot command was actually issued,
                             # rather than when the run merely has include_reboot enabled.
-                            if (getattr(self, '_rolling_update', {}).get('status') == 'running'
+                            if ((getattr(self, '_rolling_update', None) or {}).get('status') == 'running'
                                     and not getattr(task, 'rolling_reboot_alert_emitted', False)):
                                 try:
                                     from pegaprox.background.alerts import emit_rolling_update_reboot_event
@@ -13154,7 +13628,7 @@ echo "AGENT_INSTALLED_OK"
                         self.logger.info(f"Reboot command sent (connection closed as expected): {e}")
                         task.add_output("Reboot command sent / Reboot-Befehl gesendet")
                         task.reboot_issued = True   # #715 — assume reboot on a dropped connection (safe: wait)
-                        if (getattr(self, '_rolling_update', {}).get('status') == 'running'
+                        if ((getattr(self, '_rolling_update', None) or {}).get('status') == 'running'
                                 and not getattr(task, 'rolling_reboot_alert_emitted', False)):
                             try:
                                 from pegaprox.background.alerts import emit_rolling_update_reboot_event
@@ -13422,6 +13896,9 @@ echo "AGENT_INSTALLED_OK"
             if response.status_code == 200:
                 result = response.json()
                 self.logger.info(f"[OK] Clone started: {vmid} -> {newid}")
+                # MK Oct 2026 - newid is a new guest, the search index forgets an older one there
+                from pegaprox.background import guest_index
+                guest_index.drop(self.id, vm_type, newid)
                 return {'success': True, 'data': result.get('data')}
             else:
                 error_msg = response.text
@@ -13785,6 +14262,10 @@ echo "AGENT_INSTALLED_OK"
                         return {'success': False, 'error': error_detail, 'task': task_upid}
 
                 self.logger.info(f"[OK] {vm_type}/{vmid} successfully deleted")
+                # MK Oct 2026 - and what the search index read of it (notes, MACs, IPs),
+                # before the id goes to the next new guest
+                from pegaprox.background import guest_index
+                guest_index.drop(self.id, vm_type, vmid)
 
                 # MK: Cleanup - remove VM from balancing exclusion list
                 try:
@@ -14135,6 +14616,8 @@ echo "AGENT_INSTALLED_OK"
                     except Exception as ha_err:
                         self.logger.warning(f"[WARN] HA config failed: {ha_err}")
                 
+                from pegaprox.background import guest_index
+                guest_index.drop(self.id, 'qemu', vmid)    # a guest that had the id before
                 return {'success': True, 'vmid': vmid, 'task': task_data.get('data')}
             else:
                 error_msg = response.text
@@ -14322,6 +14805,8 @@ echo "AGENT_INSTALLED_OK"
                     except Exception as ha_err:
                         self.logger.warning(f"[WARN] HA config failed: {ha_err}")
                 
+                from pegaprox.background import guest_index
+                guest_index.drop(self.id, 'lxc', vmid)    # a guest that had the id before
                 return {'success': True, 'vmid': vmid, 'task': task_data.get('data')}
             else:
                 error_msg = response.text
@@ -14730,7 +15215,7 @@ echo "AGENT_INSTALLED_OK"
         # available at all there is nothing to measure, and saying so is the honest answer.
         # Falling through left vg_free_gb at its 0.0 default and the user was told
         # "Not enough VG free space (0.0 GB free)" — a measurement we never took.
-        _ssh_blocked = self.ssh_blocked_reason()
+        _ssh_blocked = self.ssh_blocked_reason(node=node)
         if _ssh_blocked:
             result['warnings'].append(
                 'Efficient snapshots need to read the volume group over SSH, and SSH is '
@@ -15403,11 +15888,18 @@ echo "AGENT_INSTALLED_OK"
             ctx.verify_mode = _ssl.CERT_NONE
 
         last = None
+        # MK Oct 2026 (#1136) - a fallback whose node has a root password of its own logs
+        # in with that one. A 401 ends the walk for that password, not for another
+        refused = []
+        own = node_creds.secrets_of(getattr(self, 'id', None))
         for idx, host in enumerate(candidates):
+            host_pwd = self.api_password_for(host) if own else pwd
+            if not host_pwd or host_pwd in refused:
+                continue
             try:
                 req = _ur.Request(
                     f"https://{self._bracket_ipv6(host)}:{self.api_port}/api2/json/access/ticket",
-                    data=_ue({'username': usr, 'password': pwd}).encode('utf-8'),
+                    data=_ue({'username': usr, 'password': host_pwd}).encode('utf-8'),
                     method='POST',
                 )
                 # short per-host budget: a dead node should cost seconds, not the whole
@@ -15428,7 +15920,8 @@ echo "AGENT_INSTALLED_OK"
             except _uerr.HTTPError as he:
                 # the node answered and said no — credentials, not reachability
                 self.logger.warning(f"[CONSOLE] auth-ticket rejected by {host}: HTTP {he.code}")
-                return (None, None) if with_csrf else None
+                refused.append(host_pwd)
+                continue
             except Exception as e:
                 last = e
                 continue
@@ -15494,6 +15987,9 @@ echo "AGENT_INSTALLED_OK"
             ha_transport.guard_session(s)
             # self.host is already IPv6-bracketed by the property — use it directly.
             login_url = f"https://{self.host}:{self.api_port}/api2/json/access/ticket"
+            # failed over to a node with a root password of its own: that one (#1136)
+            if node_creds.secrets_of(getattr(self, 'id', None)):
+                pwd = self.api_password_for(self.host) or pwd
             resp = s.post(login_url, data={'username': usr, 'password': pwd}, timeout=10)
             if resp.status_code != 200:
                 try: s.close()
@@ -15907,44 +16403,40 @@ echo "AGENT_INSTALLED_OK"
                 ]
                 active_pressure_keys = []
 
-                # Check first valid point to determine available metrics
-                if rrd_data:
-                    first_point = next((p for p in rrd_data if p), None)
-                    if first_point:
-                        for k in pressure_keys:
-                            if k in first_point:
-                                active_pressure_keys.append(k)
-                                formatted_data['metrics'][k] = []
+                # a PSI series exists when any slot carries it: the first one may be a gap
+                for k in pressure_keys:
+                    if any(p and p.get(k) is not None for p in rrd_data):
+                        active_pressure_keys.append(k)
+                        formatted_data['metrics'][k] = []
 
+                # MK Oct 2026 - PVE leaves a value out of a slot it has no sample for (the guest
+                # stopped, the node was down); it goes on as None, so the chart draws a gap
+                # there and not a measured 0
                 for point in rrd_data:
                     if not point:
                         continue
-                    
+
                     timestamp = point.get('time', 0)
                     formatted_data['timestamps'].append(timestamp)
-                    
+
                     # CPU usage (0-1 -> 0-100%)
-                    cpu = point.get('cpu', 0)
-                    formatted_data['metrics']['cpu'].append(round((cpu or 0) * 100, 2))
-                    
+                    formatted_data['metrics']['cpu'].append(_rrd_value(point, 'cpu', 100))
+
                     # Memory usage (bytes)
-                    mem = point.get('mem', 0)
-                    maxmem = point.get('maxmem', 1)
-                    mem_percent = ((mem or 0) / (maxmem or 1)) * 100
-                    formatted_data['metrics']['memory'].append(round(mem_percent, 2))
-                    
+                    formatted_data['metrics']['memory'].append(_rrd_share(point, 'mem', 'maxmem'))
+
                     # Disk I/O (bytes/s)
-                    formatted_data['metrics']['disk_read'].append(point.get('diskread', 0) or 0)
-                    formatted_data['metrics']['disk_write'].append(point.get('diskwrite', 0) or 0)
-                    
+                    formatted_data['metrics']['disk_read'].append(_rrd_value(point, 'diskread'))
+                    formatted_data['metrics']['disk_write'].append(_rrd_value(point, 'diskwrite'))
+
                     # Network I/O (bytes/s)
-                    formatted_data['metrics']['net_in'].append(point.get('netin', 0) or 0)
-                    formatted_data['metrics']['net_out'].append(point.get('netout', 0) or 0)
+                    formatted_data['metrics']['net_in'].append(_rrd_value(point, 'netin'))
+                    formatted_data['metrics']['net_out'].append(_rrd_value(point, 'netout'))
 
                     # Pressure Stall (PSI)
                     for k in active_pressure_keys:
-                        formatted_data['metrics'][k].append(point.get(k, 0) or 0)
-                
+                        formatted_data['metrics'][k].append(_rrd_value(point, k))
+
                 return {'success': True, 'data': formatted_data}
             else:
                 return {'success': False, 'error': response.text}
@@ -16876,7 +17368,6 @@ echo "AGENT_INSTALLED_OK"
         self.logger.info(f"[SYNC] Source: {src_ip}:{src_file}")
 
         ssh_user = getattr(self.config, 'ssh_user', '') or 'root'
-        ssh_pass = self.ssh_password_to_offer()
 
         for tgt_node in online_nodes:
             # already an intersection with the live online-node list, but resolve it the same
@@ -16918,6 +17409,12 @@ echo "AGENT_INSTALLED_OK"
                 pass
 
             synced = False
+            # MK Oct 2026 (#1136) - this scp runs in a shell on the SOURCE node, so the
+            # password it gets is handed to that node. A target with a root password of its
+            # own gets none here (node-to-node keys or nothing), and the relay below logs in
+            # to each side with that side's own password from here.
+            own_target = bool(self._own_password_at(tgt_ip))
+            ssh_pass = '' if own_target else self.ssh_password_to_offer(tgt_ip)
 
             # method 1: node-to-node scp with sshpass (most PVE nodes don't have keys to each other)
             try:
@@ -16936,7 +17433,9 @@ echo "AGENT_INSTALLED_OK"
                 # node to any local user for the duration of the sync — same leak class as the
                 # fencing fix (4c2487e). Feed the password over stdin into an SSHPASS env var and
                 # use `sshpass -e`, so neither the shell's nor sshpass's argv carries the secret.
-                scp_tail = (f"scp -o StrictHostKeyChecking={_hkc} -o ConnectTimeout=10 -- "
+                # keys only towards a node with a password of its own, never a waiting prompt
+                batch = '-o BatchMode=yes ' if own_target else ''
+                scp_tail = (f"scp {batch}-o StrictHostKeyChecking={_hkc} -o ConnectTimeout=10 -- "
                             f"{shlex.quote(src_file)} {shlex.quote(f'{ssh_user}@{tgt_ip}')}:"
                             f"{shlex.quote(tgt_path + '/')}")
                 if ssh_pass:
@@ -18093,67 +18592,38 @@ echo "AGENT_INSTALLED_OK"
                 ]
                 active_pressure_keys = []
 
-                # Check first valid point to determine available metrics
-                if rrd_data:
-                    first_point = next((p for p in rrd_data if p), None)
-                    if first_point:
-                        for k in pressure_keys:
-                            if k in first_point:
-                                active_pressure_keys.append(k)
-                                formatted_data['metrics'][k] = []
+                # a PSI series exists when any slot carries it: the first one may be a gap
+                for k in pressure_keys:
+                    if any(p and p.get(k) is not None for p in rrd_data):
+                        active_pressure_keys.append(k)
+                        formatted_data['metrics'][k] = []
 
+                # same as the guest charts: a slot without a sample stays None
                 for point in rrd_data:
                     if not point:
                         continue
                     
                     timestamp = point.get('time', 0)
                     formatted_data['timestamps'].append(timestamp)
+                    metrics = formatted_data['metrics']
                     
-                    # CPU usage (0-1 -> 0-100%)
-                    cpu = point.get('cpu', 0)
-                    formatted_data['metrics']['cpu'].append(round((cpu or 0) * 100, 2))
+                    # CPU usage and IO wait (0-1 -> 0-100%)
+                    metrics['cpu'].append(_rrd_value(point, 'cpu', 100))
+                    metrics['iowait'].append(_rrd_value(point, 'iowait', 100))
                     
-                    # IO Wait
-                    iowait = point.get('iowait', 0)
-                    formatted_data['metrics']['iowait'].append(round((iowait or 0) * 100, 2))
+                    # memory, swap and root fs in percent; a node without swap has 0%
+                    metrics['memory'].append(_rrd_share(point, 'memused', 'memtotal'))
+                    metrics['swap'].append(_rrd_share(point, 'swapused', 'swaptotal', no_total=0))
+                    metrics['loadavg'].append(_rrd_value(point, 'loadavg'))
                     
-                    # Memory usage
-                    memused = point.get('memused', 0)
-                    memtotal = point.get('memtotal', 1)
-                    mem_percent = ((memused or 0) / (memtotal or 1)) * 100
-                    formatted_data['metrics']['memory'].append(round(mem_percent, 2))
-                    
-                    # Swap usage
-                    swapused = point.get('swapused', 0)
-                    swaptotal = point.get('swaptotal', 1)
-                    if swaptotal and swaptotal > 0:
-                        swap_percent = ((swapused or 0) / swaptotal) * 100
-                    else:
-                        swap_percent = 0
-                    formatted_data['metrics']['swap'].append(round(swap_percent, 2))
-                    
-                    # Load average
-                    loadavg = point.get('loadavg', 0)
-                    formatted_data['metrics']['loadavg'].append(round(loadavg or 0, 2))
-                    
-                    # Network I/O (bytes/s)
-                    netin = point.get('netin', 0)
-                    netout = point.get('netout', 0)
-                    formatted_data['metrics']['net_in'].append(round((netin or 0) / 1024, 2))  # KB/s
-                    formatted_data['metrics']['net_out'].append(round((netout or 0) / 1024, 2))  # KB/s
-                    
-                    # Root FS usage
-                    rootused = point.get('rootused', 0)
-                    roottotal = point.get('roottotal', 1)
-                    if roottotal and roottotal > 0:
-                        rootfs_percent = ((rootused or 0) / roottotal) * 100
-                    else:
-                        rootfs_percent = 0
-                    formatted_data['metrics']['rootfs'].append(round(rootfs_percent, 2))
+                    # Network I/O (bytes/s -> KB/s)
+                    metrics['net_in'].append(_rrd_value(point, 'netin', 1 / 1024))
+                    metrics['net_out'].append(_rrd_value(point, 'netout', 1 / 1024))
+                    metrics['rootfs'].append(_rrd_share(point, 'rootused', 'roottotal', no_total=0))
 
                     # Pressure Stall (PSI)
                     for k in active_pressure_keys:
-                        formatted_data['metrics'][k].append(point.get(k, 0) or 0)
+                        metrics[k].append(_rrd_value(point, k))
                 
                 return formatted_data
             return {'error': 'Failed to get RRD data'}
@@ -18560,7 +19030,7 @@ echo "AGENT_INSTALLED_OK"
         # MK Oct 2026 - with SSH off for the cluster, answer before _get_node_ip: that
         # lookup TCP-probes every address the node reports, and a live cluster with SSH
         # switched off still got those connects every collector cycle.
-        _blocked = self.ssh_blocked_reason()
+        _blocked = self.ssh_blocked_reason(node=node)
         if _blocked:
             why = ('SSH is switched off for this cluster' if _blocked == 'SSH_DISABLED'
                    else 'this cluster has no SSH credentials (an API token is not one)')
@@ -19212,6 +19682,8 @@ echo "AGENT_INSTALLED_OK"
     
     def get_node_task_log(self, node: str, upid: str, start: int = 0, limit: int = 500) -> List[str]:
         """Get log for a specific task"""
+        if not validate_hostname(node or '') or not re.fullmatch(r'UPID:[^/?#%\s]{1,400}', upid or ''):
+            return []
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return []
@@ -19478,6 +19950,10 @@ echo "AGENT_INSTALLED_OK"
                     # an automatic leader that lost its lease starts no migration (#625)
                     if not ha.confirm_step(f'balancing {vm_name} ({vmid})'):
                         break
+                    vm[BALANCE_WHY] = balance_reason(
+                        'balance', source_node, target_node, node_status,
+                        threshold=self.config.migration_threshold,
+                        tolerance=getattr(self.config, 'migration_tolerance', 10) or 0, manual=force)
                     success = self.migrate_vm(vm, target_node)
                     
                     if success:
@@ -19519,6 +19995,9 @@ echo "AGENT_INSTALLED_OK"
                                 self.logger.info(f"[PREDICTIVE] Migrating {vm.get('name', '')} (VMID {vm.get('vmid')}): {nname} → {tgt}")
                                 if not ha.confirm_step(f"balancing {vm.get('vmid')} ahead of a trend"):
                                     break
+                                vm[BALANCE_WHY] = balance_reason(
+                                    'predictive', nname, tgt, node_status, forecast=ps['score'],
+                                    confidence=ps['confidence'], threshold=pred_threshold)
                                 if self.migrate_vm(vm, tgt):
                                     migrations_done += 1
                                     self._vm_migration_cooldown[vm.get('vmid')] = time.time()
@@ -19639,8 +20118,9 @@ echo "AGENT_INSTALLED_OK"
         # MK Sep 2026 (#941) — this function used to carry its own copy of the
         # "is pass_ actually an SSH password?" rule. _ssh_connect needed the same answer
         # and did not have it, which is how the token secret ended up being offered to
-        # sshd. One predicate now, used by both.
-        _blocked = self.ssh_blocked_reason()
+        # sshd. One predicate now, used by both. MK Oct 2026 (#1136): per node, a node
+        # with a password of its own has a credential on a token cluster too.
+        _blocked = self.ssh_blocked_reason(node=node_name)
         if _blocked == 'SSH_DISABLED':
             return ('SSH_DISABLED',
                     "SSH to this cluster's nodes is switched off in its settings, and these "
@@ -19704,7 +20184,7 @@ echo "AGENT_INSTALLED_OK"
 
         # MK Oct 2026 - a stored key gets past ssh_blocked_reason, so a refused key used to
         # land here with config.pass_ - the token secret on a token cluster.
-        ssh_password = self.ssh_password_to_offer()
+        ssh_password = self.ssh_password_to_offer(node_ip)
         if ssh_password:
             out = self._ssh_run_command_with_password_output(node_ip, ssh_user, cmd, ssh_password, timeout=timeout)
             if out is not None:
@@ -21047,37 +21527,56 @@ echo DONE""",
         if raw is None:
             return None
 
+        # MK Oct 2026 - every check prints OK or FAIL. A control whose section never came
+        # back (output cut short) or holds neither (the command itself failed) was not
+        # judged, so it answers None - not checked - instead of the False it used to
+        # read as. Every requested control is in the answer.
+        def _verdict(lines):
+            for l in lines:
+                if l.strip() in ('OK', 'FAIL'):
+                    return l.strip() == 'OK'
+            return None
+
         # simple (non-verbose) parse — preserved for backward compat
         if not verbose:
-            results = {}
-            current_id = None
+            results = {cid: None for cid in checks}
+            current_id, seen = None, []
             for line in raw.splitlines():
                 line = line.strip()
                 if line.startswith('---') and line.endswith('---'):
                     tag = line.strip('-')
+                    if current_id:
+                        results[current_id] = _verdict(seen)
+                    current_id, seen = (tag if tag in checks else None), []
                     if tag == 'END':
                         break
-                    if tag in checks:
-                        current_id = tag
                 elif current_id:
-                    results[current_id] = line.strip() == 'OK'
-                    current_id = None
+                    seen.append(line)
+            else:
+                if current_id:      # cut off before END: its verdict line may have come
+                    results[current_id] = _verdict(seen)
             return results
 
         # verbose parse — capture status + everything up to next marker as evidence
-        results = {}
+        results = {cid: {'status': None, 'evidence': '', 'command': ctrl.get('check', ''),
+                         'not_checked': 'No output came back for this control'}
+                   for cid, ctrl in checks.items()}
         current_id = None
         section = 'status'  # 'status' or 'evidence'
         evidence_lines = []
-        status_line = None
+        status_lines = []
 
         def _flush(cid):
             if cid and cid in checks:
+                status = _verdict(status_lines)
+                extra = [l for l in status_lines if l.strip() not in ('OK', 'FAIL')]
                 results[cid] = {
-                    'status': (status_line or '').strip() == 'OK',
-                    'evidence': '\n'.join(l for l in evidence_lines if l.strip())[:2000],
+                    'status': status,
+                    'evidence': '\n'.join(l for l in extra + evidence_lines if l.strip())[:2000],
                     'command': checks[cid].get('check', ''),
                 }
+                if status is None:
+                    results[cid]['not_checked'] = 'The check printed neither OK nor FAIL'
 
         for line in raw.splitlines():
             stripped = line.strip()
@@ -21085,6 +21584,7 @@ echo DONE""",
                 tag = stripped.strip('-')
                 if tag == 'END':
                     _flush(current_id)
+                    current_id = None
                     break
                 # evidence sub-marker like "ssh_perms:EVIDENCE"
                 if ':EVIDENCE' in tag:
@@ -21094,16 +21594,17 @@ echo DONE""",
                 _flush(current_id)
                 current_id = tag if tag in checks else None
                 section = 'status'
-                status_line = None
+                status_lines = []
                 evidence_lines = []
                 continue
 
             if not current_id:
                 continue
-            if section == 'status' and status_line is None:
-                status_line = stripped
+            if section == 'status':
+                status_lines.append(line)
             else:
                 evidence_lines.append(line)  # keep original (with whitespace)
+        _flush(current_id)          # cut off before END
 
         return results
 
@@ -21196,17 +21697,34 @@ echo DONE""",
     def _fetch_qemu_ips(self, node: str, vmid: int) -> list:
         """Fetch IP addresses from QEMU guest agent for a running VM.
         Returns IPv4 addresses first, then IPv6."""
+        return self._probe_qemu_agent(node, vmid)[0]
+
+    def _probe_qemu_agent(self, node: str, vmid: int) -> tuple:
+        """(ips, agent) from one network-get-interfaces call: agent is True when the guest
+        agent answered (a command error from inside the guest included), False when PVE says
+        it is not running, not configured or timed out, None when this tells nothing (skipped,
+        or another error)."""
         if vmid in self._no_agent_vms:
-            return []
+            return [], None
         try:
             url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces"
             resp = self._create_session().get(url, timeout=8)
             if resp.status_code == 500:
                 self._no_agent_vms.add(vmid)
-                return []
+                said = (getattr(resp, 'text', '') or '').lower()
+                if any(s in said for s in ('not running', 'no qemu guest agent configured', 'got timeout')):
+                    return [], False
+                # "Agent error: <desc>" is the agent itself refusing the command
+                return [], (True if 'agent error' in said else None)
             if resp.status_code != 200:
-                return []
-            interfaces = resp.json().get('data', {}).get('result', [])
+                return [], None
+            return self._agent_ips(resp.json().get('data', {}).get('result', [])), True
+        except Exception:
+            return [], None
+
+    @staticmethod
+    def _agent_ips(interfaces) -> list:
+        try:
             ipv4s, ipv6s = [], []
             for iface in interfaces:
                 if iface.get('name') == 'lo':
@@ -21314,11 +21832,11 @@ echo DONE""",
                 vm_type = r.get('type', 'qemu')
                 if vm_type == 'lxc':
                     ips = self._fetch_lxc_ips(node, vmid)
-                    return (node, vmid, ips, None)
+                    return (node, vmid, ips, None, None)
                 else:
-                    ips = self._fetch_qemu_ips(node, vmid)
+                    ips, agent = self._probe_qemu_agent(node, vmid)
                     disk = self._fetch_qemu_disk_usage(node, vmid)
-                    return (node, vmid, ips, disk)
+                    return (node, vmid, ips, disk, agent)
 
             tasks = [lambda r=r: fetch_one(r) for r in running]
             # own pool — this is the one sweep whose size follows the estate, not the nodes
@@ -21328,13 +21846,17 @@ echo DONE""",
                 for result in results:
                     if result is None:
                         continue
-                    node, vmid, ips, disk = result
+                    node, vmid, ips, disk, agent = result
                     self._ip_cache[(node, vmid)] = ips
+                    # MK Oct 2026 - what the same call said about the agent, for the guest list;
+                    # a guest skipped or unreadable this round keeps what it last said
+                    if agent is not None:
+                        self._agent_state[(node, vmid)] = agent
             with self._disk_cache_lock:
                 for result in results:
                     if result is None:
                         continue
-                    node, vmid, ips, disk = result
+                    node, vmid, ips, disk, agent = result
                     if disk:
                         self._disk_cache[(node, vmid)] = disk
         except Exception as e:
@@ -21450,6 +21972,9 @@ echo DONE""",
             return
 
         self._restore_persisted_maintenance()   # #720 — before the first poll assumes everything Online
+        # MK Oct 2026 - and a rolling update still open, before the daemon loop asks whose HA
+        # rules stay off; one that was running is paused where this instance acts
+        rolling_runs.restore(self)
         self.stop_event.clear()
         self.thread = threading.Thread(target=self.daemon_loop)
         self.thread.daemon = True

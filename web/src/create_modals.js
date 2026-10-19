@@ -1965,6 +1965,455 @@
             ssl_verify: false, notes: '',
         });
 
+        // LW Oct 2026 (#1136) - the root password of single nodes, for clusters whose nodes do
+        // not share one. Each save, clear and check is a request of its own, apart from the
+        // dialog's submit. The value goes out and never comes back.
+        const NODE_CRED_LOGIN_OK = ['OK', 'SUDO_REFUSED'];
+        function NodeCredentialsSection({ clusterId, focus = false }) {
+            const { t } = useTranslation();
+            const { haReadOnly } = useAuth();
+            const [open, setOpen] = useState(!!focus);
+            const [info, setInfo] = useState(null);
+            const [error, setError] = useState('');
+            const [notice, setNotice] = useState('');
+            const [drafts, setDrafts] = useState({});
+            const [busy, setBusy] = useState('');
+            const [checking, setChecking] = useState(false);
+            const boxRef = useRef(null);
+            const scrolled = useRef(false);
+
+            const call = async (path, options = {}) => {
+                try {
+                    return await fetch(`${API_URL}/clusters/${encodeURIComponent(clusterId)}/node-credentials${path}`, {
+                        ...options, credentials: 'include',
+                        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+                    });
+                } catch (e) {
+                    return null;
+                }
+            };
+            const bodyOf = async (res) => (res ? await res.json().catch(() => ({})) : {});
+
+            const load = async () => {
+                const res = await call('');
+                const body = await bodyOf(res);
+                if (res && res.ok) { setInfo(body); setError(''); }
+                else setError(body.error || t('nodeCredsLoadFailed'));
+            };
+            useEffect(() => { if (open) load(); }, [open, clusterId]);
+            useEffect(() => {
+                // the notice after adding a cluster leads here: show the section, once
+                if (focus && info && boxRef.current && !scrolled.current) {
+                    scrolled.current = true;
+                    boxRef.current.scrollIntoView({ block: 'start' });
+                }
+            }, [focus, info]);
+
+            const save = async (node) => {
+                const value = drafts[node] || '';
+                if (!value || busy) return;
+                setBusy(node); setNotice(''); setError('');
+                const res = await call(`/${encodeURIComponent(node)}`, { method: 'PUT', body: JSON.stringify({ password: value }) });
+                const body = await bodyOf(res);
+                if (res && res.ok) {
+                    setDrafts(d => ({ ...d, [node]: '' }));
+                    setNotice(t('nodeCredsSaved').replace('{node}', node));
+                    // try the new password on that node right away, so the state says whether it works
+                    await call('/check', { method: 'POST', body: JSON.stringify({ nodes: [node] }) });
+                    await load();
+                } else setError(body.error || t('saveFailed'));
+                setBusy('');
+            };
+            const clear = async (node) => {
+                if (busy) return;
+                setBusy(node); setNotice(''); setError('');
+                const res = await call(`/${encodeURIComponent(node)}`, { method: 'DELETE' });
+                const body = await bodyOf(res);
+                if (res && res.ok) {
+                    setNotice(t('nodeCredsCleared').replace('{node}', node));
+                    await load();
+                } else setError(body.error || t('saveFailed'));
+                setBusy('');
+            };
+            const check = async () => {
+                setChecking(true); setNotice(''); setError('');
+                const res = await call('/check', { method: 'POST', body: '{}' });
+                const body = await bodyOf(res);
+                if (res && res.ok) {
+                    if (!(body.refused || []).length) setNotice(t('nodeCredsCheckDone'));
+                    await load();
+                } else setError(body.error || t('connCheckFailed'));
+                setChecking(false);
+            };
+
+            const when = (iso) => (iso ? new Date(iso).toLocaleString() : '');
+            const via = (c) => c === 'node' ? t('nodeCredsViaOwn') : c === 'cluster' ? t('nodeCredsViaCluster') : c === 'key' ? t('connCheckSshKey') : '';
+            const stateOf = (n) => {
+                if (n.last_check && n.last_check.code === 'AUTH_REFUSED') return ['refused', t('nodeCredsStateRefused'), 'bg-red-500/10 text-red-400 border-red-500/30'];
+                if (n.has_password) return ['own', t('nodeCredsStateOwn'), 'bg-blue-500/10 text-blue-400 border-blue-500/30'];
+                return ['cluster', t('nodeCredsStateCluster'), 'bg-gray-500/10 text-gray-400 border-gray-500/30'];
+            };
+            const nodes = (info && info.nodes) || [];
+            const refusedCount = nodes.filter(n => n.last_check && n.last_check.code === 'AUTH_REFUSED').length;
+
+            return (
+                <div ref={boxRef} data-node-creds={clusterId} className="pt-4 border-t border-proxmox-border">
+                    <button type="button" onClick={() => setOpen(!open)}
+                        className="flex items-center gap-2 text-sm text-gray-400 hover:text-white transition-colors">
+                        <Icons.ChevronRight className={`w-3 h-3 transform transition-transform ${open ? 'rotate-90' : ''}`} />
+                        {t('nodeCredsTitle')}
+                        {refusedCount > 0 && <span className="text-xs px-1.5 py-0.5 rounded bg-red-500/10 text-red-400">{refusedCount}</span>}
+                    </button>
+                    {open && (
+                        <div className="mt-4 space-y-3 p-4 bg-proxmox-dark/50 rounded-lg">
+                            <p className="text-xs text-gray-400">{t('nodeCredsIntro')}</p>
+                            {info && info.ssh_disabled && <p className="text-xs text-yellow-300">{t('nodeCredsSshOff')}</p>}
+                            {info && info.token_auth && <p className="text-xs text-gray-400">{t('nodeCredsTokenHint')}</p>}
+                            {info && info.ssh_key && <p className="text-xs text-gray-400">{t('nodeCredsKeyFirst')}</p>}
+                            {error && <div className="p-2 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-300">{error}</div>}
+                            {notice && <div className="p-2 rounded-lg bg-green-500/10 border border-green-500/30 text-xs text-green-400">{notice}</div>}
+                            {!info && !error && <span className="inline-flex animate-spin text-gray-500"><Icons.Loader /></span>}
+                            {info && !nodes.length && <p className="text-xs text-gray-500">{t('nodeCredsNoNodes')}</p>}
+                            {nodes.map(n => {
+                                const [state, label, cls] = stateOf(n);
+                                const works = n.last_check && NODE_CRED_LOGIN_OK.includes(n.last_check.code);
+                                return (
+                                    <div key={n.node} data-node-cred={n.node} data-node-cred-state={state}
+                                        className="p-3 rounded-lg border border-proxmox-border bg-proxmox-card space-y-2">
+                                        <div className="flex flex-wrap items-center gap-2">
+                                            <span className="font-mono text-sm text-white">{n.node}</span>
+                                            {n.address && <span className="font-mono text-xs text-gray-500">{n.address}</span>}
+                                            <span className={`text-xs px-1.5 py-0.5 rounded border ${cls}`}>{label}</span>
+                                            {works && <span className="text-xs text-green-400">{t('nodeCredsStateOk')}</span>}
+                                            {n.online === false && <span className="text-xs text-gray-500">{t('nodeCredsOffline')}</span>}
+                                        </div>
+                                        {n.has_password && n.updated_by && (
+                                            <div className="text-xs text-gray-500">{t('nodeCredsSetBy').replace('{user}', n.updated_by).replace('{time}', when(n.updated_at))}</div>
+                                        )}
+                                        {n.last_check && (
+                                            <div className="text-xs text-gray-500">
+                                                {t('nodeCredsCheckedAt').replace('{time}', when(n.last_check.checked_at))}
+                                                {n.last_check.credential ? ` - ${via(n.last_check.credential)}` : ''}
+                                                {n.last_check.code && !works ? ` - ${n.last_check.code}` : ''}
+                                            </div>
+                                        )}
+                                        {!haReadOnly && (
+                                            <div className="flex gap-2">
+                                                <input type="password" autoComplete="new-password" value={drafts[n.node] || ''}
+                                                    maxLength={(info && info.max_length) || 256}
+                                                    onChange={e => setDrafts(d => ({ ...d, [n.node]: e.target.value }))}
+                                                    onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); save(n.node); } }}
+                                                    placeholder={t('nodeCredsPlaceholder')}
+                                                    className="flex-1 min-w-0 px-3 py-2 bg-proxmox-dark border border-proxmox-border rounded-lg text-white text-sm placeholder-gray-500 focus:outline-none focus:border-proxmox-orange" />
+                                                <button type="button" onClick={() => save(n.node)} disabled={!!busy || !drafts[n.node]}
+                                                    className="px-3 py-2 rounded-lg text-sm font-medium bg-proxmox-orange hover:bg-orange-600 text-white disabled:opacity-50">
+                                                    {t('save')}
+                                                </button>
+                                                {n.has_password && (
+                                                    <button type="button" onClick={() => clear(n.node)} disabled={!!busy}
+                                                        className="px-3 py-2 rounded-lg text-sm bg-proxmox-dark border border-proxmox-border text-gray-300 hover:bg-proxmox-hover disabled:opacity-50">
+                                                        {t('nodeCredsClear')}
+                                                    </button>
+                                                )}
+                                            </div>
+                                        )}
+                                    </div>
+                                );
+                            })}
+                            {!haReadOnly && nodes.length > 0 && (
+                                <button type="button" onClick={check} disabled={checking}
+                                    className="flex items-center gap-2 px-3 py-2 rounded-lg text-sm bg-proxmox-dark border border-proxmox-border text-gray-300 hover:bg-proxmox-hover disabled:opacity-50">
+                                    {checking ? <span className="inline-flex animate-spin"><Icons.Loader /></span> : <Icons.Activity />}
+                                    {checking ? t('nodeCredsChecking') : t('nodeCredsCheck')}
+                                </button>
+                            )}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // LW Oct 2026 (#1136) - opens right after a cluster was added. The server tries the login
+        // on every node in the background; a node that refuses it gets its own password here,
+        // without a trip through Re-configure first. Every node fine: it says so and goes.
+        function NodeLoginsAfterAddModal({ cluster, onClose }) {
+            const { t } = useTranslation();
+            const [phase, setPhase] = useState('checking');   // checking | refused | ok | slow
+            const [count, setCount] = useState(0);
+            useEffect(() => {
+                let stop = false;
+                (async () => {
+                    for (let i = 0; i < 30; i++) {
+                        await new Promise(r => setTimeout(r, 2000));
+                        if (stop) return;
+                        let body = null;
+                        try {
+                            const r = await fetch(`${API_URL}/clusters/${encodeURIComponent(cluster.id)}/node-credentials`, {
+                                credentials: 'include', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+                            if (r.ok) body = await r.json();
+                        } catch (e) { body = null; }
+                        if (stop) return;
+                        // done once every node that is up has a result
+                        const due = ((body && body.nodes) || []).filter(n => n.online !== false);
+                        if (!due.length || due.some(n => !n.last_check)) continue;
+                        const refused = due.filter(n => n.last_check.code === 'AUTH_REFUSED').length;
+                        setCount(refused);
+                        setPhase(refused ? 'refused' : 'ok');
+                        return;
+                    }
+                    if (!stop) setPhase('slow');
+                })();
+                return () => { stop = true; };
+            }, [cluster.id]);
+            useEffect(() => {
+                if (phase !== 'ok') return;
+                const tm = setTimeout(onClose, 4000);
+                return () => clearTimeout(tm);
+            }, [phase]);
+
+            return (
+                <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4"
+                    data-node-logins={cluster.id} data-node-logins-phase={phase}>
+                    <div className="bg-proxmox-card border border-proxmox-border rounded-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto p-6 space-y-4">
+                        <div className="flex items-center justify-between gap-4">
+                            <h2 className="text-lg font-semibold text-white">{t('nodeLoginsTitle').replace('{cluster}', cluster.name || '')}</h2>
+                            <button type="button" onClick={onClose} className="p-1 rounded-lg hover:bg-proxmox-hover text-gray-400">
+                                <Icons.X className="w-5 h-5" />
+                            </button>
+                        </div>
+                        {phase === 'checking' && (
+                            <div className="flex items-center gap-2 text-sm text-gray-300">
+                                <span className="inline-flex animate-spin"><Icons.Loader /></span>{t('nodeLoginsChecking')}
+                            </div>
+                        )}
+                        {phase === 'ok' && (
+                            <div className="p-3 rounded-lg bg-green-500/10 border border-green-500/30 text-sm text-green-400">{t('nodeLoginsAllOk')}</div>
+                        )}
+                        {phase === 'refused' && (
+                            <div className="p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/30 text-sm text-yellow-300">{t('nodeLoginsRefused').replace('{count}', count)}</div>
+                        )}
+                        {phase === 'slow' && <p className="text-sm text-gray-400">{t('nodeLoginsSlow')}</p>}
+                        {(phase === 'refused' || phase === 'slow') && <NodeCredentialsSection clusterId={cluster.id} focus={true} />}
+                        <div className="flex justify-end">
+                            <button type="button" onClick={onClose}
+                                className="px-4 py-2 rounded-lg text-sm bg-proxmox-dark border border-proxmox-border text-gray-300 hover:bg-proxmox-hover">
+                                {phase === 'refused' ? t('nodeLoginsLater') : t('close')}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        // LW Oct 2026 - least privilege. The server builds the role from the privilege table of
+        // the connection check (GET /api/pve-role-recipe); here the admin picks the optional
+        // features, the release and token or account, and copies the commands.
+        const PVE_ROLE_FEATURES = {
+            uploads: 'connCheckFeatUploads', nodeConfig: 'connCheckFeatNodeConfig', nodePower: 'connCheckFeatNodePower',
+            syslog: 'connCheckFeatSyslog', sdn: 'connCheckFeatSdn', mappings: 'connCheckFeatMappings',
+            replication: 'connCheckFeatReplication', haConfig: 'connCheckFeatHaConfig',
+            remoteMigration: 'connCheckFeatRemoteMigration',
+        };
+        const PVE_ROLE_NEEDS = { ssh: 'pveRoleNeedSsh', root_pam: 'pveRoleNeedRoot', password_login: 'pveRoleNeedPassword' };
+        // the features of GET /api/clusters/<id>/capabilities, and why one is not there
+        const CAPAB_FEATURES = {
+            consoles: 'capabFeatConsoles', guestTerminal: 'capabFeatGuestTerminal', nodeShell: 'capabFeatNodeShell',
+            rollingUpdates: 'capabFeatRollingUpdates', smbios: 'capabFeatSmbios', customScripts: 'capabFeatCustomScripts',
+            hardening: 'capabFeatHardening', haAgents: 'capabFeatHaAgents', mappings: 'capabFeatMappings',
+            rawDevices: 'capabFeatRawDevices', cephOsd: 'capabFeatCephOsd', backups: 'capabFeatBackups',
+            replication: 'capabFeatReplication', crossCluster: 'capabFeatCrossCluster', siteRecovery: 'capabFeatSiteRecovery',
+            nodeCredentials: 'capabFeatNodeCredentials', transferCheck: 'capabFeatTransferCheck',
+            fileRestoreVm: 'capabFeatFileRestoreVm', fileRestoreCt: 'capabFeatFileRestoreCt', esxiMigration: 'capabFeatEsxiMigration',
+        };
+        const CAPAB_NEEDS = {
+            not_checked: 'capabNeedNotChecked', not_connected: 'capabNeedNotConnected', priv_unread: 'capabNeedPrivUnread', ssh_disabled: 'capabNeedSshDisabled',
+            ssh_no_credentials: 'capabNeedSshNoCredentials', ssh_some_nodes: 'capabNeedSshSomeNodes', ssh_password: 'capabNeedSshPassword',
+            token_login: 'capabNeedTokenLogin', no_password: 'capabNeedNoPassword', root_token: 'capabNeedRootToken',
+            root_only: 'capabNeedRootOnly', root_password: 'capabNeedRootPassword', root_unknown: 'capabNeedRootUnknown',
+        };
+        const CAPAB_TONE = {
+            yes: { icon: 'CheckCircle', cls: 'text-green-400', key: 'capabStatusYes' },
+            partial: { icon: 'AlertTriangle', cls: 'text-yellow-400', key: 'capabStatusPartial' },
+            no: { icon: 'XCircle', cls: 'text-red-400', key: 'capabStatusNo' },
+            unknown: { icon: 'Info', cls: 'text-gray-500', key: 'capabStatusUnknown' },
+        };
+
+        function PveRoleRecipe() {
+            const { t } = useTranslation();
+            const [pve, setPve] = useState(9);
+            const [via, setVia] = useState('token');
+            const [picked, setPicked] = useState(Object.keys(PVE_ROLE_FEATURES));
+            const [recipe, setRecipe] = useState(null);
+            const [error, setError] = useState('');
+            const [copied, setCopied] = useState(false);
+
+            useEffect(() => {
+                let stop = false;
+                const q = `features=${encodeURIComponent(picked.join(','))}&pve=${pve}`;
+                fetch(`${API_URL}/pve-role-recipe?${q}`, { credentials: 'include', headers: { 'X-Requested-With': 'XMLHttpRequest' } })
+                    .then(async r => {
+                        const body = await r.json().catch(() => ({}));
+                        if (stop) return;
+                        if (r.ok) { setRecipe(body); setError(''); }
+                        else setError(body.error || t('pveRoleLoadFailed'));
+                    })
+                    .catch(() => { if (!stop) setError(t('pveRoleLoadFailed')); });
+                return () => { stop = true; };
+            }, [pve, picked.join(',')]);
+
+            const toggle = (f) => setPicked(p => p.includes(f) ? p.filter(x => x !== f) : [...p, f]);
+            const lines = recipe ? (recipe.commands[via] || []) : [];
+            const copy = async () => {
+                try {
+                    await navigator.clipboard.writeText(lines.join('\n') + '\n');
+                    setCopied(true);
+                    setTimeout(() => setCopied(false), 2000);
+                } catch (e) { setCopied(false); }
+            };
+            const tab = (on) => `px-3 py-1.5 rounded-lg text-xs font-medium border ${on ? 'bg-orange-500/20 text-orange-400 border-orange-500/40' : 'bg-proxmox-dark text-gray-400 border-proxmox-border hover:text-white'}`;
+
+            return (
+                <div data-pve-role className="space-y-3">
+                    <p className="text-xs text-gray-400">{t('pveRoleIntro')}</p>
+                    <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-xs text-gray-500">{t('pveRoleRelease')}</span>
+                        {[9, 8].map(v => (
+                            <button type="button" key={v} data-pve-release={v} onClick={() => setPve(v)} className={tab(pve === v)}>PVE {v}</button>
+                        ))}
+                        <span className="mx-1 text-gray-600">|</span>
+                        <button type="button" data-pve-via="token" onClick={() => setVia('token')} className={tab(via === 'token')}>{t('pveRoleViaToken')}</button>
+                        <button type="button" data-pve-via="account" onClick={() => setVia('account')} className={tab(via === 'account')}>{t('pveRoleViaAccount')}</button>
+                    </div>
+                    {recipe && <div className="text-xs text-gray-400">{t('pveRoleCore').replace('{n}', String(recipe.core.privileges.length))}</div>}
+                    <div>
+                        <div className="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-1">{t('pveRoleOptional')}</div>
+                        <div className="grid grid-cols-2 gap-1">
+                            {Object.keys(PVE_ROLE_FEATURES).map(f => {
+                                const privs = ((recipe && recipe.optional.find(o => o.feature === f)) || {}).privileges || [];
+                                return (
+                                    <label key={f} className="flex items-start gap-2 text-xs text-gray-300 cursor-pointer" title={privs.join(', ')}>
+                                        <input type="checkbox" data-pve-feature={f} checked={picked.includes(f)} onChange={() => toggle(f)} className="mt-0.5" />
+                                        <span>{t(PVE_ROLE_FEATURES[f])}</span>
+                                    </label>
+                                );
+                            })}
+                        </div>
+                    </div>
+                    {error && <div className="p-2 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-300">{error}</div>}
+                    {recipe && (
+                        <div className="space-y-2">
+                            <div className="flex justify-end">
+                                <button type="button" onClick={copy}
+                                    className="px-2 py-1 rounded text-xs bg-proxmox-card border border-proxmox-border text-gray-300 hover:text-white flex items-center gap-1">
+                                    {copied ? <Icons.Check className="w-3 h-3" /> : <Icons.Copy className="w-3 h-3" />}
+                                    {copied ? t('pveRoleCopied') : t('pveRoleCopy')}
+                                </button>
+                            </div>
+                            <pre data-pve-commands={via} className="p-3 rounded-lg bg-proxmox-dark border border-proxmox-border text-xs font-mono text-gray-200 whitespace-pre-wrap break-all">{lines.join('\n')}</pre>
+                            <p className="text-xs text-gray-400">
+                                {via === 'token' ? t('pveRoleThenToken').replace('{user}', recipe.token_id) : t('pveRoleThenAccount').replace('{user}', recipe.user)}
+                            </p>
+                            <p className="text-xs text-gray-500">{t('pveRoleUpdate')} <span className="font-mono break-all">{recipe.commands.update_role}</span></p>
+                            <div className="p-3 rounded-lg bg-yellow-500/10 border border-yellow-500/30 space-y-1">
+                                <div className="text-xs font-medium text-yellow-300">{t('pveRoleNotByRole')}</div>
+                                {recipe.not_by_role.map(n => (
+                                    <div key={n.need} data-pve-not-by-role={n.need} className="text-xs text-yellow-200/80">
+                                        {t(PVE_ROLE_NEEDS[n.need] || n.need).replace('{features}', n.features.map(f => t(CAPAB_FEATURES[f] || f)).join(', '))}
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
+        // LW Oct 2026 - per feature of PegaProx, whether it works with this cluster's connection
+        // and what it still needs. The server answers from the last connection check; refreshKey
+        // changes after a new one.
+        function ClusterCapabilities({ clusterId, refreshKey = '' }) {
+            const { t } = useTranslation();
+            const [data, setData] = useState(null);
+            const [error, setError] = useState('');
+            const [loading, setLoading] = useState(false);
+
+            const load = async (refresh) => {
+                setLoading(true);
+                try {
+                    const r = await fetch(`${API_URL}/clusters/${encodeURIComponent(clusterId)}/capabilities${refresh ? '?refresh=1' : ''}`, {
+                        credentials: 'include', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+                    const body = await r.json().catch(() => ({}));
+                    if (r.ok) { setData(body); setError(''); }
+                    else setError(body.error || t('capabLoadFailed'));
+                } catch (e) {
+                    setError(t('capabLoadFailed'));
+                }
+                setLoading(false);
+            };
+            useEffect(() => { load(false); }, [clusterId, refreshKey]);
+
+            const needText = (n) => {
+                if (n.code === 'priv') {
+                    return t(n.partial ? 'capabNeedPrivPartial' : 'capabNeedPriv')
+                        .replace('{privs}', (n.privs || []).join(' / ')).replace('{path}', n.path || '/');
+                }
+                return t(CAPAB_NEEDS[n.code] || n.code).replace('{nodes}', (n.nodes || []).join(', ') || '-');
+            };
+            const login = data && data.login;
+            const loginKind = login ? (login.type === 'api_token' ? t('capabLoginToken') : login.type === 'minted_token' ? t('capabLoginMinted') : t('capabLoginPassword')) : '';
+            const privs = data && data.privileges;
+
+            return (
+                <div data-capabilities={clusterId} className="space-y-2">
+                    <p className="text-xs text-gray-400">{t('capabIntro')}</p>
+                    {error && <div className="p-2 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-300">{error}</div>}
+                    {!data && !error && <span className="inline-flex animate-spin text-gray-500"><Icons.Loader /></span>}
+                    {login && (
+                        <div className="flex flex-wrap items-center gap-2 text-xs">
+                            <span className="px-2 py-0.5 rounded bg-proxmox-dark border border-proxmox-border text-gray-300">
+                                {t('capabLogin').replace('{user}', login.token_id || login.user || '-')} - {loginKind}
+                            </span>
+                            <span className="px-2 py-0.5 rounded bg-proxmox-dark border border-proxmox-border text-gray-300">{login.ssh_key ? t('capabSshKey') : t('capabNoSshKey')}</span>
+                            {login.ssh_disabled && <span className="px-2 py-0.5 rounded bg-yellow-500/10 border border-yellow-500/30 text-yellow-300">{t('capabSshOff')}</span>}
+                            {login.node_passwords > 0 && <span className="px-2 py-0.5 rounded bg-proxmox-dark border border-proxmox-border text-gray-300">{t('capabNodePasswords').replace('{n}', String(login.node_passwords))}</span>}
+                        </div>
+                    )}
+                    {privs && (
+                        <div className="flex flex-wrap items-center gap-2 text-xs text-gray-500">
+                            <span>{privs.state === 'read' && privs.checked_at ? t('capabPrivAt').replace('{time}', new Date(privs.checked_at).toLocaleString()) : t('capabPrivNotRead')}</span>
+                            <button type="button" onClick={() => load(true)} disabled={loading}
+                                className="flex items-center gap-1 text-gray-400 hover:text-white disabled:opacity-50">
+                                <Icons.RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} />{t('capabRefresh')}
+                            </button>
+                        </div>
+                    )}
+                    {data && (
+                        <div className="divide-y divide-proxmox-border border border-proxmox-border rounded-lg">
+                            {data.features.map(f => {
+                                const tone = CAPAB_TONE[f.status] || CAPAB_TONE.unknown;
+                                const Icon = Icons[tone.icon];
+                                return (
+                                    <div key={f.id} data-cap={f.id} data-cap-status={f.status} className="flex gap-3 px-3 py-2">
+                                        <Icon className={`w-4 h-4 mt-0.5 flex-shrink-0 ${tone.cls}`} />
+                                        <div className="min-w-0 flex-1">
+                                            <div className="flex flex-wrap items-center gap-2 text-sm">
+                                                <span>{t(CAPAB_FEATURES[f.id] || f.id)}</span>
+                                                <span className={`text-xs ${tone.cls}`}>{t(tone.key)}</span>
+                                                {f.via === 'ssh' && <span className="text-xs px-1.5 py-0.5 rounded bg-proxmox-dark border border-proxmox-border text-gray-400">SSH</span>}
+                                            </div>
+                                            {f.needs.map((n, i) => (
+                                                <div key={i} className="text-xs text-gray-400">{needText(n)}</div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                );
+                            })}
+                        </div>
+                    )}
+                </div>
+            );
+        }
+
         function AddClusterModal({ isOpen, onClose, onSubmit, onAddPBS, onAddVMware, loading, error, initialType = 'proxmox', reconfigureConfig = null }) {
             const { t } = useTranslation();
             const { isCorporate } = useLayout();
@@ -1992,6 +2441,8 @@
             // Proxmox config
             const [config, setConfig] = useState(emptyProxmoxConfig);
             const [showSshSettings, setShowSshSettings] = useState(false);
+            const [showRoleRecipe, setShowRoleRecipe] = useState(false);
+            const [showCapabilities, setShowCapabilities] = useState(false);
 
             // XCP-ng config
             const [xcpConfig, setXcpConfig] = useState(emptyXcpConfig);
@@ -2013,6 +2464,8 @@
                 setVmwConfig(emptyVmwareConfig());
                 setShowSshSettings(false);
                 setShowPbsSshSettings(false);
+                setShowRoleRecipe(false);
+                setShowCapabilities(false);
             }, [isOpen]);
 
             if (!isOpen) return null;
@@ -2127,6 +2580,17 @@
                                 </div>
                             )}
 
+                            {/* LW Oct 2026 - the least-privilege account or token, before the credentials are typed in */}
+                            <div className="pt-4 border-t border-proxmox-border">
+                                <button type="button" data-pve-role-toggle onClick={() => setShowRoleRecipe(!showRoleRecipe)}
+                                    className="flex items-center gap-2 text-sm text-gray-400 hover:text-white transition-colors">
+                                    <Icons.ChevronRight className={`w-3 h-3 transform transition-transform ${showRoleRecipe ? 'rotate-90' : ''}`} />
+                                    <Icons.Shield className="w-3.5 h-3.5" />
+                                    {t('pveRoleShow')}
+                                </button>
+                                {showRoleRecipe && <div className="mt-4 p-4 bg-proxmox-dark/50 rounded-lg"><PveRoleRecipe /></div>}
+                            </div>
+
                             <div className="pt-4 border-t border-proxmox-border">
                                 <button type="button" onClick={() => setShowSshSettings(!showSshSettings)}
                                     className="flex items-center gap-2 text-sm text-gray-400 hover:text-white transition-colors">
@@ -2135,7 +2599,7 @@
                                 </button>
                                 {showSshSettings && (
                                     <div className="mt-4 space-y-4 p-4 bg-proxmox-dark/50 rounded-lg">
-                                        <p className="text-xs text-gray-400">{t('sshKeyExplanation') || 'SSH features use your login credentials automatically. Only add a key here if password authentication is disabled on your nodes.'}</p>
+                                        <p className="text-xs text-gray-400">{t('sshKeyExplanation')}</p>
                                         <textarea value={config.ssh_key} onChange={e => setConfig({...config, ssh_key: e.target.value})}
                                             className="w-full px-4 py-2.5 bg-proxmox-dark border border-proxmox-border rounded-lg text-white placeholder-gray-500 focus:outline-none focus:border-proxmox-orange transition-colors font-mono text-xs"
                                             placeholder="-----BEGIN OPENSSH PRIVATE KEY-----" rows={4} />
@@ -2146,6 +2610,20 @@
                                     </div>
                                 )}
                             </div>
+
+                            {reconfigureConfig && reconfigureConfig._cluster_id && (
+                                <NodeCredentialsSection clusterId={reconfigureConfig._cluster_id} focus={reconfigureConfig._focus === 'nodeCreds'} />
+                            )}
+                            {reconfigureConfig && reconfigureConfig._cluster_id && (
+                                <div className="pt-4 border-t border-proxmox-border">
+                                    <button type="button" data-capabilities-toggle onClick={() => setShowCapabilities(!showCapabilities)}
+                                        className="flex items-center gap-2 text-sm text-gray-400 hover:text-white transition-colors">
+                                        <Icons.ChevronRight className={`w-3 h-3 transform transition-transform ${showCapabilities ? 'rotate-90' : ''}`} />
+                                        {t('capabTitle')}
+                                    </button>
+                                    {showCapabilities && <div className="mt-4 p-4 bg-proxmox-dark/50 rounded-lg"><ClusterCapabilities clusterId={reconfigureConfig._cluster_id} /></div>}
+                                </div>
+                            )}
 
                             <div className="space-y-4 pt-4 border-t border-proxmox-border">
                                 <Slider label={t('migrationThreshold')} description={t('migrationThresholdDesc')} value={config.migration_threshold}

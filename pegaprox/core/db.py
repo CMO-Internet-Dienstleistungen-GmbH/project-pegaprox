@@ -13,6 +13,7 @@ import logging
 import threading
 import hashlib
 import hmac
+import socket
 import base64
 import uuid
 # MK May 2026 — DB connections now go through `dbcrypto.connect()` so
@@ -32,6 +33,7 @@ from pegaprox.constants import (
     MIGRATION_HISTORY_FILE, SERVER_SETTINGS_FILE, CUSTOM_ROLES_FILE,
     ESXI_CONFIG_FILE, STORAGE_CLUSTERS_FILE,
 )
+from pegaprox.models.tasks import balancer_cooldown, BALANCER_COOLDOWN_DEFAULT
 
 # Fallback tenant ID for existing users (mirrors pegaprox.utils.rbac.DEFAULT_TENANT_ID)
 # Defined here to avoid circular import: rbac imports from db
@@ -136,6 +138,40 @@ def _directory_groups(auth_source, value):
     return [g for g in value if isinstance(g, str) and g]
 
 
+def _replay_sr_failover_state(cursor):
+    """Mark the guests a finished failover moved and no failback brought home since.
+
+    The events are replayed oldest first: a guest a failover moved is failed over until
+    a failback moved it back. A failover event keeps {vmid: {success, ...}} as its details;
+    anything else there (a pre-flight abort, a restart) moved nobody. Returns how many
+    guests it marked."""
+    rows = cursor.execute(
+        "SELECT plan_id, event_type, completed_at, details FROM site_recovery_events "
+        "WHERE event_type IN ('planned', 'emergency', 'failback') AND completed_at IS NOT NULL "
+        "AND completed_at != '' ORDER BY started_at").fetchall()
+    where = {}
+    for plan_id, kind, done, details in rows:
+        try:
+            results = json.loads(details or '{}')
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(results, dict):
+            continue
+        for vmid, res in results.items():
+            if not (str(vmid).isdigit() and isinstance(res, dict) and res.get('success') is True):
+                continue
+            if res.get('skipped'):
+                continue
+            if kind == 'failback':
+                where.pop((plan_id, int(vmid)), None)
+            else:
+                where[(plan_id, int(vmid))] = (kind, done)
+    for (plan_id, vmid), (kind, done) in where.items():
+        cursor.execute("UPDATE site_recovery_vms SET failed_over = ?, failed_over_at = ? "
+                       "WHERE plan_id = ? AND vmid = ?", (kind, done, plan_id, vmid))
+    return len(where)
+
+
 class PegaProxDB:
     """
     SQLite database wrapper - MK
@@ -148,6 +184,9 @@ class PegaProxDB:
     
     _instance = None
     _lock = threading.Lock()
+    # the failed_over columns came in with this process and their replay waits for it to act
+    _sr_replay_owed = False
+    _sr_replay_lock = threading.Lock()
     
     def __new__(cls):
         # singleton - only one db connection
@@ -168,10 +207,14 @@ class PegaProxDB:
         self.aes_key = None  # raw key for HMAC signing
         self._conn = None
         self._local = threading.local()
+        # MK Oct 2026 - the newest audit checkpoint, kept beside the field key
+        self._audit_anchor_file = os.path.join(CONFIG_DIR, '.pegaprox_audit_anchor.json')
         
         self._init_encryption()
         self._init_db()
         self._migrate_from_legacy()
+        # after the file migration, so rows it brought in are inside the genesis digest
+        self._ensure_audit_genesis()
         
         self._initialized = True
         logging.info(f"DB initialized: {self.db_path}")
@@ -620,11 +663,17 @@ class PegaProxDB:
                 reason TEXT,
                 status TEXT,
                 duration_seconds REAL,
-                timestamp TEXT NOT NULL
+                timestamp TEXT NOT NULL,
+                trigger_kind TEXT,
+                details TEXT
             )
         ''')
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_migration_timestamp ON migration_history(timestamp DESC)
+        ''')
+        # the balancer history pages one cluster newest first, and the trim keeps per cluster
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_migration_cluster ON migration_history(cluster_id, id)
         ''')
 
         # #720 — persist node maintenance so it survives a PegaProx restart.
@@ -684,6 +733,26 @@ class PegaProxDB:
             cursor.execute("INSERT OR IGNORE INTO suspended_ha_rules (cluster_id, rule, rule_type, suspended_at, owner) "
                            "SELECT cluster_id, rule, rule_type, suspended_at, 'rolling' FROM suspended_ha_rules_keyed")
             cursor.execute('DROP TABLE suspended_ha_rules_keyed')
+
+        # MK Oct 2026 - rolling updates, so a restart or another instance taking over finds a
+        # run again (core/rolling_runs.py). state: everything but the log, as JSON. Shared
+        # (core/ha.py SYNC_TABLES); logs and updated_at change with every log line and step no
+        # config version.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rolling_update_runs (
+                id TEXT PRIMARY KEY,
+                cluster_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT '{}',
+                logs TEXT NOT NULL DEFAULT '[]',
+                started_by TEXT,
+                started_at TEXT,
+                updated_at TEXT,
+                completed_at TEXT
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_rolling_runs_cluster '
+                       'ON rolling_update_runs(cluster_id, started_at)')
 
         # Server settings table
         cursor.execute('''
@@ -867,6 +936,26 @@ class PegaProxDB:
                 enabled INTEGER DEFAULT 1,
                 created_at TEXT,
                 updated_at TEXT,
+                UNIQUE(cluster_id, node)
+            )
+        ''')
+
+        # MK Oct 2026 (#1136) - a root password of one node, for clusters whose nodes do not
+        # share one. Sealed like clusters.pass_encrypted. A row without a password only holds
+        # the last login check of that node (core/node_creds.py).
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS cluster_node_credentials (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cluster_id TEXT NOT NULL,
+                node TEXT NOT NULL,
+                password_encrypted TEXT DEFAULT '',
+                updated_by TEXT DEFAULT '',
+                updated_at TEXT,
+                address TEXT DEFAULT '',
+                check_status TEXT DEFAULT '',
+                check_detail TEXT DEFAULT '',
+                check_credential TEXT DEFAULT '',
+                checked_at TEXT,
                 UNIQUE(cluster_id, node)
             )
         ''')
@@ -1371,6 +1460,11 @@ class PegaProxDB:
                 # MK Aug 2026 (#689) — optional FQDN suffix for "Open in Proxmox" node links.
                 # e.g. "example.local" turns pve01 → https://pve01.example.local:8006. Empty = off.
                 ('node_ui_suffix', "TEXT DEFAULT ''"),
+                # seconds the balancer leaves a guest alone after moving it (was a fixed 900)
+                ('migration_cooldown', "INTEGER DEFAULT 900"),
+                # MK Oct 2026 - CIDR the remote migrations into this cluster dial its nodes in.
+                # Empty = off, the management host as before (core/transfer_net.py)
+                ('transfer_network', "TEXT DEFAULT ''"),
             ]:
                 if col_name not in cluster_columns:
                     try:
@@ -1429,6 +1523,17 @@ class PegaProxDB:
                     logging.error(f"Failed to add enforce column: {e}")
         except Exception as e:
             logging.error(f"Error checking affinity_rules schema: {e}")
+
+        # what started a move (the balancer, and which of its rules) and the
+        # numbers behind the reason, so the history can be filtered and worded in the UI
+        try:
+            cursor.execute("PRAGMA table_info(migration_history)")
+            mh_columns = [col[1] for col in cursor.fetchall()]
+            for col_name in ('trigger_kind', 'details'):
+                if col_name not in mh_columns:
+                    cursor.execute(f"ALTER TABLE migration_history ADD COLUMN {col_name} TEXT")
+        except Exception as e:
+            logging.error(f"Error checking migration_history schema: {e}")
 
         # MK: Migration - create balancing_excluded_vms table if not exists
         try:
@@ -1587,6 +1692,27 @@ class PegaProxDB:
             if 'last_snapshot' not in cols:
                 cursor.execute("ALTER TABLE cross_cluster_replications ADD COLUMN last_snapshot TEXT DEFAULT ''")
                 logging.info("Added last_snapshot column to cross_cluster_replications")
+            # MK Oct 2026 - last_run is written by every run, a failed one too; the RPO alert
+            # needs the last one that went through. What is known of it so far: last_run of
+            # a job whose last run was fine, else the newest 'succeeded' in the audit log
+            if 'last_ok_at' not in cols:
+                cursor.execute("ALTER TABLE cross_cluster_replications ADD COLUMN last_ok_at TEXT")
+                cursor.execute("UPDATE cross_cluster_replications SET last_ok_at = last_run "
+                               "WHERE last_status = 'ok' AND last_run IS NOT NULL")
+                pending = [r[0] for r in cursor.execute(
+                    "SELECT id FROM cross_cluster_replications WHERE last_ok_at IS NULL").fetchall()]
+                if pending:
+                    found = {}
+                    head, tail = 'xcrepl job ', ' succeeded'
+                    for details, at in cursor.execute(
+                            "SELECT details, MAX(timestamp) FROM audit_log "
+                            "WHERE action = 'replication.completed' GROUP BY details").fetchall():
+                        details = str(details or '')
+                        if details.startswith(head) and details.endswith(tail):
+                            found[details[len(head):-len(tail)]] = at
+                    cursor.executemany("UPDATE cross_cluster_replications SET last_ok_at = ? WHERE id = ?",
+                                       [(found[j], j) for j in pending if j in found])
+                logging.info("Added last_ok_at column to cross_cluster_replications")
         except Exception:
             pass
 
@@ -1692,7 +1818,9 @@ class PegaProxDB:
                     boot_delay INTEGER DEFAULT 30,
                     replication_job_id TEXT DEFAULT '',
                     target_vmid INTEGER,
-                    notes TEXT DEFAULT ''
+                    notes TEXT DEFAULT '',
+                    failed_over TEXT DEFAULT '',
+                    failed_over_at TEXT DEFAULT ''
                 )
             ''')
             cursor.execute('''
@@ -1711,6 +1839,9 @@ class PegaProxDB:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_sr_vms_plan ON site_recovery_vms(plan_id, vmid)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_sr_events_plan ON site_recovery_events(plan_id, started_at)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_sr_plans_status ON site_recovery_plans(status)')
+            # the replication scheduler asks per job whether a plan has its guest failed over
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_sr_vms_vmid ON site_recovery_vms(vmid)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_sr_vms_repl ON site_recovery_vms(replication_job_id)')
             # MK Oct 2026 - one console frame per guest a test failover booted, the evidence
             # that it came up. The event's details say what was taken and how long it took;
             # the pictures live here so the event list stays small. Size-capped and pruned in
@@ -1738,6 +1869,21 @@ class PegaProxDB:
                     logging.info("Added test_disconnect_nics column to site_recovery_plans")
             except Exception as e:
                 logging.error(f"Failed to add test_disconnect_nics column: {e}")
+            # MK Oct 2026 - where each guest of a plan is: '' at the source, else the kind of
+            # failover that moved it ('planned' / 'emergency'). A plan can be failed over guest
+            # by guest, so the plan's status alone no longer says it. A database from before
+            # gets it replayed from its failover events once - by the instance that acts,
+            # when it may (replay_sr_failover_state): the events are per instance (#625)
+            try:
+                vm_cols = [row[1] for row in cursor.execute("PRAGMA table_info(site_recovery_vms)").fetchall()]
+                if 'failed_over' not in vm_cols:
+                    cursor.execute("ALTER TABLE site_recovery_vms ADD COLUMN failed_over TEXT DEFAULT ''")
+                    cursor.execute("ALTER TABLE site_recovery_vms ADD COLUMN failed_over_at TEXT DEFAULT ''")
+                    self._sr_replay_owed = True
+                    logging.info("Added failed_over columns to site_recovery_vms, their state is "
+                                 "replayed from the failover events once this instance acts")
+            except Exception as e:
+                logging.error(f"Failed to add failed_over columns: {e}")
             logging.info("Ensured site_recovery tables exist")
         except Exception as e:
             logging.error(f"Error creating site_recovery tables: {e}")
@@ -1815,6 +1961,70 @@ class PegaProxDB:
             logging.info("Ensured backup_verifications table exists")
         except Exception as e:
             logging.error(f"Error creating backup_verifications table: {e}")
+
+        # MK Oct 2026 - restore tests: what each cluster, guest and tag is held to, and the
+        # last result per guest. Both are shared with the standbys (core/ha.py SYNC_TABLES):
+        # the history above stays per host, a new active needs to know what was tested.
+        try:
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_backup_verifications_guest '
+                           'ON backup_verifications(cluster_id, vmid, started_at)')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS recovery_targets (
+                    cluster_id TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    scope_key TEXT NOT NULL DEFAULT '',
+                    rto_minutes INTEGER,
+                    agent TEXT,
+                    ports TEXT,
+                    command TEXT,
+                    isolation TEXT,
+                    test_bridge TEXT,
+                    test_storage TEXT,
+                    boot_timeout INTEGER,
+                    updated_at TEXT,
+                    updated_by TEXT,
+                    PRIMARY KEY (cluster_id, scope, scope_key)
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS restore_test_marks (
+                    cluster_id TEXT NOT NULL,
+                    vmid INTEGER NOT NULL,
+                    last_at REAL,
+                    last_result TEXT,
+                    last_task TEXT,
+                    ok_at REAL,
+                    ok_backup_ts INTEGER,
+                    ok_seconds REAL,
+                    ok_rto_seconds INTEGER,
+                    ok_checks TEXT,
+                    fail_at REAL,
+                    fail_cause TEXT,
+                    PRIMARY KEY (cluster_id, vmid)
+                )
+            ''')
+            # MK Oct 2026 - the tags that make a guest critical, on the cluster row; and the
+            # manual confirmations an admin records beside the automatic facts
+            cols = [r[1] for r in cursor.execute('PRAGMA table_info(recovery_targets)').fetchall()]
+            if 'critical_tags' not in cols:
+                cursor.execute('ALTER TABLE recovery_targets ADD COLUMN critical_tags TEXT')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS recovery_confirmations (
+                    id TEXT PRIMARY KEY,
+                    cluster_id TEXT NOT NULL,
+                    vmid INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    confirmed_by TEXT,
+                    confirmed_at REAL,
+                    expires_at REAL,
+                    revoked_at REAL,
+                    revoked_by TEXT
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_recovery_conf_guest '
+                           'ON recovery_confirmations(cluster_id, vmid)')
+        except Exception as e:
+            logging.error(f"Error creating the restore test tables: {e}")
 
         # NS: Apr 2026 - portal_only column for client portal
         try:
@@ -1954,6 +2164,49 @@ class PegaProxDB:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_audit_cluster_id ON audit_log(cluster_id)')
         except Exception as e:
             logging.error(f"Error extending audit_log schema: {e}")
+
+        # MK Oct 2026 - the HMAC on each row catches an edit, never a row that is gone. Every
+        # row from now on carries its place in a chain and the hash of the row before it, and
+        # signed checkpoints say how far the chain went (and how far retention cut it). Rows
+        # from before keep chain_seq NULL; the genesis checkpoint takes their digest.
+        try:
+            cols = [r[1] for r in cursor.execute("PRAGMA table_info(audit_log)").fetchall()]
+            if 'chain_seq' not in cols:
+                cursor.execute("ALTER TABLE audit_log ADD COLUMN chain_seq INTEGER")
+                logging.info("Added chain_seq column to audit_log")
+            if 'prev_hash' not in cols:
+                cursor.execute("ALTER TABLE audit_log ADD COLUMN prev_hash TEXT DEFAULT ''")
+            cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_chain_seq ON audit_log(chain_seq)')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS audit_checkpoints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL,
+                    chain_seq INTEGER NOT NULL,
+                    row_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    pruned_rows INTEGER DEFAULT 0,
+                    legacy_count INTEGER DEFAULT 0,
+                    legacy_digest TEXT DEFAULT '',
+                    hmac_signature TEXT DEFAULT '',
+                    cp_seq INTEGER,
+                    prev_cp_hash TEXT DEFAULT '',
+                    cutoff TEXT DEFAULT '',
+                    legacy_changed INTEGER DEFAULT 0,
+                    instance TEXT DEFAULT ''
+                )
+            ''')
+            # the checkpoints are numbered and linked too, so one that goes leaves a hole
+            cp_cols = [r[1] for r in cursor.execute("PRAGMA table_info(audit_checkpoints)").fetchall()]
+            for col, ddl in (('cp_seq', 'INTEGER'), ('prev_cp_hash', "TEXT DEFAULT ''"),
+                             ('cutoff', "TEXT DEFAULT ''"), ('legacy_changed', 'INTEGER DEFAULT 0'),
+                             ('instance', "TEXT DEFAULT ''")):
+                if col not in cp_cols:
+                    cursor.execute(f"ALTER TABLE audit_checkpoints ADD COLUMN {col} {ddl}")
+            # every audit write asks for the newest checkpoint
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_audit_cp_seq ON audit_checkpoints(chain_seq)')
+            cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_cp_num ON audit_checkpoints(cp_seq)')
+        except Exception as e:
+            logging.error(f"Error adding the audit chain: {e}")
 
         # MK May 2026 — SIEM forwarder targets
         try:
@@ -2099,6 +2352,24 @@ class PegaProxDB:
         except Exception as e:
             logging.error(f"Error creating power_rates table: {e}")
 
+        # #965 - per-host power profile (whole-system idle/max watts). A host without a
+        # row inherits node_idle_w / node_max_w from power_rates.
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS power_host_profiles (
+                    cluster_id TEXT NOT NULL,
+                    node TEXT NOT NULL,
+                    idle_w REAL NOT NULL,
+                    max_w REAL NOT NULL,
+                    notes TEXT DEFAULT '',
+                    updated_at TEXT,
+                    updated_by TEXT DEFAULT '',
+                    PRIMARY KEY (cluster_id, node)
+                )
+            ''')
+        except Exception as e:
+            logging.error(f"Error creating power_host_profiles table: {e}")
+
         # MK May 2026 — Cost dashboard rates (global default + optional per-cluster overrides)
         try:
             cursor.execute('''
@@ -2152,9 +2423,48 @@ class PegaProxDB:
             ''')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_drift_events_cluster ON drift_events(cluster_id, detected_at DESC)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_drift_events_status ON drift_events(status, cluster_id)')
+            # MK Oct 2026 - what an event is: a deviation from the baseline (default), a policy
+            # violation, or an incident an admin confirmed. Local table, like the rest of the events.
+            _have = {r[1] for r in cursor.execute("PRAGMA table_info(drift_events)").fetchall()}
+            for _cn, _cd in (('category', "TEXT NOT NULL DEFAULT 'deviation'"),
+                             ('confirmed_by', "TEXT DEFAULT ''"),
+                             ('confirmed_at', 'TEXT'),
+                             # NS Oct 2026 - the approved change plan a deviation was planned under
+                             ('change_id', 'TEXT')):
+                if _cn not in _have:
+                    cursor.execute(f"ALTER TABLE drift_events ADD COLUMN {_cn} {_cd}")
             logging.info("Ensured drift_baselines + drift_events tables exist")
         except Exception as e:
             logging.error(f"Error creating drift tables: {e}")
+
+        # NS Oct 2026 - Change Guardian, basic stage: a planned change with a scope and a window,
+        # approved by a second person. Shared with the standbys (core/ha.py SYNC_TABLES); times are UTC ISO.
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS change_plans (
+                    id TEXT PRIMARY KEY,
+                    cluster_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT DEFAULT '',
+                    scope TEXT NOT NULL DEFAULT '{}',
+                    window_start TEXT,
+                    window_end TEXT,
+                    status TEXT NOT NULL DEFAULT 'draft',
+                    requested_by TEXT NOT NULL,
+                    requester_tenant TEXT DEFAULT '',
+                    approved_by TEXT DEFAULT '',
+                    approved_at TEXT,
+                    rejected_by TEXT DEFAULT '',
+                    rejected_at TEXT,
+                    reject_reason TEXT DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_change_plans_cluster ON change_plans(cluster_id, status)')
+            logging.info("Ensured change_plans table exists")
+        except Exception as e:
+            logging.error(f"Error creating change_plans table: {e}")
 
         # MK May 2026 — Web Push subscriptions for browser notifications
         try:
@@ -2264,6 +2574,40 @@ class PegaProxDB:
             logging.info("Ensured auto_install tables exist")
         except Exception as e:
             logging.error(f"Error creating auto_install tables: {e}")
+
+        # MK Oct 2026 - when a node went offline, came back, entered or left maintenance, and
+        # when the cluster lost or regained quorum (node ''), as the poller saw it
+        # (core/node_history.py). at is UTC with its offset, so the rows sort by it. Per host
+        # (core/ha.py LOCAL_TABLES) like the migration history: what this instance saw.
+        # The other indexes are the windows the timeline reads (api/timeline.py).
+        try:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS node_state_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cluster_id TEXT NOT NULL,
+                    node TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL,
+                    previous TEXT NOT NULL DEFAULT '',
+                    at TEXT NOT NULL,
+                    detail TEXT NOT NULL DEFAULT ''
+                )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_node_state_cluster '
+                           'ON node_state_history(cluster_id, at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_node_state_node '
+                           'ON node_state_history(cluster_id, node, at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_audit_cluster_time ON audit_log(cluster_id, timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_active_alerts_cluster_fired '
+                           'ON active_alerts(cluster_id, triggered_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_active_alerts_cluster_resolved '
+                           'ON active_alerts(cluster_id, resolved_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_migration_cluster_time '
+                           'ON migration_history(cluster_id, timestamp)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_backup_verify_cluster_time '
+                           'ON backup_verifications(cluster_id, started_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_status_incidents_started ON status_incidents(started_at)')
+        except Exception as e:
+            logging.error(f"Error creating node_state_history and the timeline indexes: {e}")
 
         conn.commit()
         logging.info("DB schema initialized")
@@ -2396,6 +2740,94 @@ class PegaProxDB:
     def delete_bmc_endpoint(self, cluster_id, node):
         cur = self.conn.cursor()
         cur.execute('DELETE FROM node_bmc_endpoints WHERE cluster_id=? AND node=?',
+                    (cluster_id, node))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    # --- #1136: per-node root passwords (core/node_creds.py) -------------------
+    _NODE_CRED_STATE = ('node', 'password_encrypted', 'updated_by', 'updated_at', 'address',
+                        'check_status', 'check_detail', 'check_credential', 'checked_at')
+
+    def list_node_credentials(self, cluster_id):
+        """Every row of one cluster, the password reduced to has_password."""
+        cur = self.conn.cursor()
+        cur.execute(f"SELECT {', '.join(self._NODE_CRED_STATE)} FROM cluster_node_credentials "
+                    "WHERE cluster_id = ? ORDER BY node", (cluster_id,))
+        out = []
+        for r in cur.fetchall():
+            row = dict(r)
+            row['has_password'] = bool(row.pop('password_encrypted'))
+            out.append(row)
+        return out
+
+    def node_credential_secrets(self, cluster_id, with_addresses=False):
+        """{node: password} of one cluster, opened. Server side only, never into a response.
+        A value that does not open is left out: that node gets the cluster's password.
+        with_addresses: ({node: password}, {node: last address the manager placed it at})."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT node, password_encrypted, address FROM cluster_node_credentials "
+                    "WHERE cluster_id = ? AND password_encrypted IS NOT NULL "
+                    "AND password_encrypted != ''", (cluster_id,))
+        out, where = {}, {}
+        for r in cur.fetchall():
+            try:
+                plain = self._decrypt(r['password_encrypted'])
+            except Exception:
+                logging.warning(f"[NodeCreds] the password of node {r['node']} does not open "
+                                "with this key - that node gets the cluster password")
+                continue
+            if plain:
+                out[r['node']] = plain
+                if r['address']:
+                    where[r['node']] = r['address']
+        return (out, where) if with_addresses else out
+
+    def set_node_credential_address(self, cluster_id, node, address):
+        """Where the manager last placed a node that has a password of its own."""
+        cur = self.conn.cursor()
+        cur.execute("UPDATE cluster_node_credentials SET address = ? WHERE cluster_id = ? AND node = ?",
+                    (address or '', cluster_id, node))
+        self.conn.commit()
+
+    def save_node_credential(self, cluster_id, node, password_plain, updated_by):
+        """Set (or with '' clear) the password of one node. Either way the last check
+        went with the old credential and is dropped; a clear drops the kept address too,
+        so a password set later does not start from an address nobody placed it at since."""
+        cur = self.conn.cursor()
+        now = datetime.now().astimezone().isoformat(timespec='seconds')  # with its offset, like the check answer
+        sealed = self._encrypt(password_plain) if password_plain else ''
+        cur.execute('''
+            INSERT INTO cluster_node_credentials
+              (cluster_id, node, password_encrypted, updated_by, updated_at,
+               check_status, check_detail, check_credential, checked_at)
+            VALUES (?, ?, ?, ?, ?, '', '', '', NULL)
+            ON CONFLICT(cluster_id, node) DO UPDATE SET
+              password_encrypted = excluded.password_encrypted,
+              updated_by = excluded.updated_by, updated_at = excluded.updated_at,
+              address = CASE WHEN excluded.password_encrypted = '' THEN '' ELSE address END,
+              check_status = '', check_detail = '', check_credential = '', checked_at = NULL
+        ''', (cluster_id, node, sealed, updated_by or '', now))
+        self.conn.commit()
+
+    def record_node_credential_checks(self, cluster_id, results):
+        """results: {node: (status, detail, credential)}; one transaction for all of them."""
+        cur = self.conn.cursor()
+        now = datetime.now().astimezone().isoformat(timespec='seconds')
+        for node, (status, detail, credential) in results.items():
+            cur.execute('''
+                INSERT INTO cluster_node_credentials
+                  (cluster_id, node, password_encrypted, check_status, check_detail,
+                   check_credential, checked_at)
+                VALUES (?, ?, '', ?, ?, ?, ?)
+                ON CONFLICT(cluster_id, node) DO UPDATE SET
+                  check_status = excluded.check_status, check_detail = excluded.check_detail,
+                  check_credential = excluded.check_credential, checked_at = excluded.checked_at
+            ''', (cluster_id, node, status or '', (detail or '')[:300], credential or '', now))
+        self.conn.commit()
+
+    def delete_node_credential(self, cluster_id, node):
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM cluster_node_credentials WHERE cluster_id = ? AND node = ?',
                     (cluster_id, node))
         self.conn.commit()
         return cur.rowcount > 0
@@ -3310,6 +3742,7 @@ class PegaProxDB:
                 'ssl_verification': bool(row['ssl_verification']),
                 'migration_threshold': row['migration_threshold'],
                 'migration_tolerance': row['migration_tolerance'] if 'migration_tolerance' in row.keys() else 10,
+                'migration_cooldown': balancer_cooldown(row['migration_cooldown']) if 'migration_cooldown' in row.keys() else BALANCER_COOLDOWN_DEFAULT,
                 'check_interval': row['check_interval'],
                 'auto_migrate': bool(row['auto_migrate']),
                 'balance_containers': bool(row['balance_containers']),
@@ -3345,6 +3778,7 @@ class PegaProxDB:
                 'longitude': float(row['longitude']) if 'longitude' in row.keys() and row['longitude'] is not None else None,
                 'location_label': row['location_label'] if 'location_label' in row.keys() and row['location_label'] else '',
                 'node_ui_suffix': row['node_ui_suffix'] if 'node_ui_suffix' in row.keys() and row['node_ui_suffix'] else '',
+                'transfer_network': row['transfer_network'] if 'transfer_network' in row.keys() and row['transfer_network'] else '',
             }
 
         return clusters
@@ -3400,6 +3834,7 @@ class PegaProxDB:
             'ssl_verification': bool(row['ssl_verification']),
             'migration_threshold': row['migration_threshold'],
             'migration_tolerance': row['migration_tolerance'] if 'migration_tolerance' in row.keys() else 10,
+            'migration_cooldown': balancer_cooldown(row['migration_cooldown']) if 'migration_cooldown' in row.keys() else BALANCER_COOLDOWN_DEFAULT,
             'check_interval': row['check_interval'],
             'auto_migrate': bool(row['auto_migrate']),
             'balance_containers': bool(row['balance_containers']),
@@ -3435,6 +3870,7 @@ class PegaProxDB:
             'latitude': float(row['latitude']) if 'latitude' in row.keys() and row['latitude'] is not None else None,
             'longitude': float(row['longitude']) if 'longitude' in row.keys() and row['longitude'] is not None else None,
             'location_label': row['location_label'] if 'location_label' in row.keys() and row['location_label'] else '',
+            'transfer_network': row['transfer_network'] if 'transfer_network' in row.keys() and row['transfer_network'] else '',
         }
 
     def save_cluster(self, cluster_id: str, data: dict):
@@ -3444,8 +3880,8 @@ class PegaProxDB:
 
         # MK: Mar 2026 - preserve group_id/display_name/sort_order that aren't in config data (#111)
         cursor.execute('SELECT group_id, display_name, sort_order, created_at, '
-                       'proxlb_tags_enabled, proxlb_pins_auto_migrate, proxlb_pins_strict '
-                       'FROM clusters WHERE id = ?', (cluster_id,))
+                       'proxlb_tags_enabled, proxlb_pins_auto_migrate, proxlb_pins_strict, '
+                       'migration_cooldown, transfer_network FROM clusters WHERE id = ?', (cluster_id,))
         existing = cursor.fetchone()
 
         # MK May 2026 — preserve previously-set worldmap location across save_cluster
@@ -3469,7 +3905,8 @@ class PegaProxDB:
         cursor.execute('''
             INSERT OR REPLACE INTO clusters
             (id, name, host, user, pass_encrypted, ssl_verification,
-             migration_threshold, migration_tolerance, check_interval, auto_migrate,
+             migration_threshold, migration_tolerance, migration_cooldown,
+             check_interval, auto_migrate,
              balance_containers, balance_local_disks, dry_run, enabled,
              ha_enabled, fallback_hosts, ssh_user, ssh_key_encrypted,
              ssh_port, ha_settings, excluded_nodes, smbios_autoconfig,
@@ -3484,9 +3921,11 @@ class PegaProxDB:
              latitude, longitude, location_label,
              node_ui_suffix,
              proxlb_tags_enabled, proxlb_pins_auto_migrate, proxlb_pins_strict,
+             transfer_network,
              created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?)
         ''', (
             cluster_id,
             data.get('name', ''),
@@ -3496,6 +3935,9 @@ class PegaProxDB:
             1 if data.get('ssl_verification', True) else 0,
             data.get('migration_threshold', 30),
             data.get('migration_tolerance', 10),
+            # a restore from a backup that predates the field keeps what is stored
+            balancer_cooldown(data.get('migration_cooldown',
+                                       existing['migration_cooldown'] if existing else BALANCER_COOLDOWN_DEFAULT)),
             data.get('check_interval', 300),
             1 if data.get('auto_migrate', False) else 0,
             1 if data.get('balance_containers', False) else 0,
@@ -3537,6 +3979,7 @@ class PegaProxDB:
             1 if data.get('proxlb_tags_enabled', existing['proxlb_tags_enabled'] if existing else False) else 0,
             1 if data.get('proxlb_pins_auto_migrate', existing['proxlb_pins_auto_migrate'] if existing else False) else 0,
             1 if data.get('proxlb_pins_strict', existing['proxlb_pins_strict'] if existing else False) else 0,
+            str(data.get('transfer_network', existing['transfer_network'] if existing else '') or '').strip(),
             existing['created_at'] if existing else now,
             now
         ))
@@ -3595,6 +4038,113 @@ class PegaProxDB:
             if 'cluster_id' in cols:
                 cursor.execute('DELETE FROM "%s" WHERE cluster_id = ?' % tbl, (cluster_id,))
         self.conn.commit()
+
+    # MK Oct 2026 - the moves the balancer made, with why. migration_history is a local
+    # table: the instance whose balancer moved the guest holds the row, a standby asks it.
+    MIGRATION_HISTORY_KEEP = 1000
+    BALANCER_TRIGGERS = ('balance', 'predictive', 'affinity', 'pin')
+
+    def add_migration_event(self, cluster_id, vmid, vm_name, source_node, target_node, status,
+                            reason='', trigger=None, details=None, duration=0.0, timestamp=None):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO migration_history
+            (cluster_id, vmid, vm_name, source_node, target_node, reason, status,
+             duration_seconds, timestamp, trigger_kind, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (cluster_id, int(vmid), vm_name or '', source_node or '', target_node or '',
+              reason or '', status or '', round(float(duration or 0), 1),
+              timestamp or datetime.now().astimezone().isoformat(timespec='seconds'),
+              trigger, json.dumps(details) if details else None))
+        row_id = cursor.lastrowid
+        # the newest rows of each cluster stay, a busy cluster does not push the others out
+        cursor.execute('''
+            DELETE FROM migration_history WHERE cluster_id = ? AND id <= (
+                SELECT id FROM migration_history WHERE cluster_id = ?
+                ORDER BY id DESC LIMIT 1 OFFSET ?)
+        ''', (cluster_id, cluster_id, self.MIGRATION_HISTORY_KEEP))
+        self.conn.commit()
+        return row_id
+
+    def list_balancer_moves(self, cluster_id, triggers=None, status=None, before_id=None, limit=None):
+        """Balancer moves of one cluster, newest first; limit None is every row kept."""
+        kinds = [k for k in (triggers or self.BALANCER_TRIGGERS) if k in self.BALANCER_TRIGGERS]
+        if not kinds:
+            return []
+        sql = ('SELECT id, vmid, vm_name, source_node, target_node, reason, status, '
+               'duration_seconds, timestamp, trigger_kind, details FROM migration_history '
+               'WHERE cluster_id = ? AND trigger_kind IN (%s)' % ','.join('?' * len(kinds)))
+        params = [cluster_id, *kinds]
+        if status:
+            sql += ' AND status = ?'
+            params.append(status)
+        if before_id is not None:
+            sql += ' AND id < ?'
+            params.append(int(before_id))
+        sql += ' ORDER BY id DESC'
+        if limit is not None:
+            sql += ' LIMIT ?'
+            params.append(int(limit))
+        out = []
+        for row in self.query(sql, tuple(params)):
+            try:
+                details = json.loads(row['details']) if row['details'] else {}
+            except (TypeError, ValueError):
+                details = {}
+            out.append({'id': row['id'], 'vmid': row['vmid'], 'vm_name': row['vm_name'] or '',
+                        'source_node': row['source_node'], 'target_node': row['target_node'],
+                        'trigger': row['trigger_kind'], 'reason': row['reason'] or '',
+                        'details': details if isinstance(details, dict) else {},
+                        'status': row['status'], 'duration': row['duration_seconds'],
+                        'timestamp': row['timestamp']})
+        return out
+
+    # MK Oct 2026 - node state changes (core/node_history.py); the newest rows of each cluster stay
+    NODE_STATE_KEEP = 5000
+
+    def add_node_states(self, cluster_id, rows):
+        """rows: [(node, state, previous, at, detail)], one transaction, then the trim."""
+        if not rows:
+            return
+        cursor = self.conn.cursor()
+        cursor.executemany(
+            'INSERT INTO node_state_history (cluster_id, node, state, previous, at, detail) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            [(cluster_id, node or '', state, previous or '', at, (detail or '')[:300])
+             for node, state, previous, at, detail in rows])
+        cursor.execute('''
+            DELETE FROM node_state_history WHERE cluster_id = ? AND id <= (
+                SELECT id FROM node_state_history WHERE cluster_id = ?
+                ORDER BY id DESC LIMIT 1 OFFSET ?)
+        ''', (cluster_id, cluster_id, self.NODE_STATE_KEEP))
+        self.conn.commit()
+
+    def last_node_states(self, cluster_id, states):
+        """{node: newest of `states`} of one cluster: where each node stood when this
+        process last looked, before a restart. Reads the bounded rows of one cluster."""
+        marks = ','.join('?' * len(states))
+        out = {}
+        for row in self.query(
+                f'SELECT node, state FROM node_state_history WHERE id IN ('
+                f'SELECT MAX(id) FROM node_state_history WHERE cluster_id = ? AND state IN ({marks}) '
+                f'GROUP BY node)', (cluster_id, *states)):
+            out[row['node']] = row['state']
+        return out
+
+    def list_node_states(self, cluster_id, since, until, node=None, limit=200):
+        """State changes of one cluster with since <= at < until, newest first. `node`
+        keeps that node's rows; since and until compare as text with the stored UTC."""
+        if node is None:
+            sql = ('SELECT id, node, state, previous, at, detail FROM node_state_history '
+                   'WHERE cluster_id = ? AND at >= ? AND at < ?')
+            params = [cluster_id, since, until]
+        else:
+            sql = ('SELECT id, node, state, previous, at, detail FROM node_state_history '
+                   'WHERE cluster_id = ? AND node = ? AND at >= ? AND at < ?')
+            params = [cluster_id, node, since, until]
+        sql += ' ORDER BY at DESC, id DESC LIMIT ?'
+        params.append(int(limit))
+        return [dict(r) for r in self.query(sql, tuple(params))]
 
     # XCP-ng VMID mapping helpers - MK Mar 2026
     #
@@ -4131,6 +4681,11 @@ class PegaProxDB:
         if not stored_sig:
             return False  # No signature = potentially tampered or old entry
 
+        # a row in the chain has one format only; falling back to the older ones would let
+        # its place in the chain change under a signature that never covered it
+        if entry.get('chain_seq') is not None:
+            return hmac.compare_digest(str(stored_sig), self._audit_chain_hmac(entry))
+
         # Try new format (with cluster + severity).
         expected_new = self._generate_audit_hmac(
             entry.get('timestamp', ''),
@@ -4155,6 +4710,279 @@ class PegaProxDB:
         legacy_sig = hmac.new(self.aes_key, legacy_data.encode('utf-8'), hashlib.sha256).hexdigest()
         return hmac.compare_digest(stored_sig, legacy_sig)
     
+    # ---- the hash chain (MK Oct 2026) ----------------------------------------------------
+    # Row n stores chain_seq n and prev_hash = hash of row n-1; its HMAC covers both, so a
+    # row cannot be moved, and a deleted one leaves a hole in the numbers. Checkpoints sign
+    # (seq, hash) of where the chain stood: genesis (the rows from before the chain),
+    # periodic (a later truncation of the tail shows), prune (retention removed rows up to
+    # n, so that hole is no tampering). The hashes are unkeyed sha256, only the HMACs
+    # use the field key, so a key rotation re-signs rows without touching any link.
+
+    @staticmethod
+    def _audit_chain_body(row) -> bytes:
+        return json.dumps([
+            row.get('chain_seq'), row.get('prev_hash') or '', row.get('timestamp') or '',
+            row.get('user') or '', row.get('action') or '', row.get('details') or '',
+            row.get('ip_address') or '', row.get('cluster') or '', row.get('severity') or '',
+            row.get('cluster_id') or '',
+        ], separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+
+    @classmethod
+    def _audit_row_hash(cls, row) -> str:
+        return hashlib.sha256(b'pegaprox-audit-row\x00' + cls._audit_chain_body(row)).hexdigest()
+
+    def _audit_chain_hmac(self, row) -> str:
+        if not self.aes_key:
+            return ''
+        return hmac.new(self.aes_key, b'pegaprox-audit-chain\x00' + self._audit_chain_body(row),
+                        hashlib.sha256).hexdigest()
+
+    # The checkpoints form a chain of their own: cp_seq 1 is the genesis, each later one
+    # carries the hash of the one before, so deleting one (the genesis included) leaves a
+    # hole there too. The newest is also kept in a file beside the field key, outside the
+    # database: whoever can only write the database cannot cut the end of the log together
+    # with the checkpoints over it unseen.
+
+    @staticmethod
+    def _checkpoint_body(cp) -> bytes:
+        return json.dumps([
+            'checkpoint', cp.get('kind') or '', cp.get('chain_seq'), cp.get('row_hash') or '',
+            cp.get('created_at') or '', int(cp.get('pruned_rows') or 0),
+            int(cp.get('legacy_count') or 0), cp.get('legacy_digest') or '',
+            cp.get('cp_seq'), cp.get('prev_cp_hash') or '', cp.get('cutoff') or '',
+            int(cp.get('legacy_changed') or 0), cp.get('instance') or '',
+        ], separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+
+    @classmethod
+    def _checkpoint_hash(cls, cp) -> str:
+        return hashlib.sha256(b'pegaprox-audit-cp\x00' + cls._checkpoint_body(cp)).hexdigest()
+
+    def _checkpoint_hmac(self, cp) -> str:
+        if not self.aes_key:
+            return ''
+        return hmac.new(self.aes_key, self._checkpoint_body(cp), hashlib.sha256).hexdigest()
+
+    def _verify_checkpoint_hmac(self, cp) -> bool:
+        sig = cp.get('hmac_signature') or ''
+        return bool(self.aes_key and sig) and hmac.compare_digest(str(sig), self._checkpoint_hmac(cp))
+
+    @staticmethod
+    def _audit_legacy_digest(cur, since=None):
+        """(count, digest) of the rows from before the chain, in id order; since: only
+        those a prune at that cutoff leaves (a row without a time stays)"""
+        h, n = hashlib.sha256(), 0
+        for r in cur.execute('SELECT id, timestamp, user, action, details, ip_address, cluster, '
+                             'severity, cluster_id, hmac_signature FROM audit_log '
+                             'WHERE chain_seq IS NULL'
+                             + (' AND (timestamp IS NULL OR timestamp >= ?)' if since else '')
+                             + ' ORDER BY id', (since,) if since else ()):
+            h.update(json.dumps([r[0], r[1], r[2] or '', r[3] or '', r[4] or '', r[5] or '',
+                                 r[6] or '', r[7] or '', r[8] or '', r[9] or ''],
+                                separators=(',', ':'), ensure_ascii=False).encode('utf-8') + b'\n')
+            n += 1
+        return n, h.hexdigest()
+
+    def _insert_checkpoint(self, cur, cp):
+        """Number, link and sign cp; called inside the write transaction, so the newest
+        checkpoint read here is the one it follows"""
+        last = cur.execute('SELECT * FROM audit_checkpoints WHERE cp_seq IS NOT NULL '
+                           'ORDER BY cp_seq DESC LIMIT 1').fetchone()
+        cp['cp_seq'] = (int(last['cp_seq']) + 1) if last else 1
+        cp['prev_cp_hash'] = self._checkpoint_hash(dict(last)) if last else ''
+        cp.setdefault('cutoff', '')
+        cp['legacy_changed'] = 1 if cp.get('legacy_changed') else 0
+        if not cp.get('instance'):
+            cp['instance'] = socket.gethostname() or ''
+        cp['hmac_signature'] = self._checkpoint_hmac(cp)
+        cur.execute('INSERT INTO audit_checkpoints (kind, chain_seq, row_hash, created_at, '
+                    'pruned_rows, legacy_count, legacy_digest, hmac_signature, cp_seq, '
+                    'prev_cp_hash, cutoff, legacy_changed, instance) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    (cp['kind'], cp['chain_seq'], cp['row_hash'], cp['created_at'],
+                     int(cp.get('pruned_rows') or 0), int(cp.get('legacy_count') or 0),
+                     cp.get('legacy_digest') or '', cp['hmac_signature'], cp['cp_seq'],
+                     cp['prev_cp_hash'], cp['cutoff'], cp['legacy_changed'], cp['instance']))
+        cp['id'] = cur.lastrowid
+        return cp
+
+    def _audit_genesis(self, cur):
+        """The checkpoint the chain starts from: seq 0, over every row from before it"""
+        count, digest = self._audit_legacy_digest(cur)
+        created = datetime.now().isoformat()
+        cp = {'kind': 'genesis', 'chain_seq': 0, 'created_at': created, 'pruned_rows': 0,
+              'legacy_count': count, 'legacy_digest': digest,
+              'row_hash': hashlib.sha256(json.dumps(['genesis', count, digest, created])
+                                         .encode('utf-8')).hexdigest()}
+        self._audit_chain_id = None
+        return self._insert_checkpoint(cur, cp)
+
+    def _audit_chain_name(self, cur):
+        """A short name of this chain for the copies outside (SIEM): the start of its
+        genesis hash. An active and its standby each have their own."""
+        cid = getattr(self, '_audit_chain_id', None)
+        if cid is None:
+            g = cur.execute("SELECT row_hash FROM audit_checkpoints WHERE cp_seq = 1 "
+                            "AND kind = 'genesis'").fetchone()
+            cid = self._audit_chain_id = (g['row_hash'][:16] if g else '')
+        return cid
+
+    # ---- the copy of the newest checkpoint outside the database ----------------------------
+
+    def _anchor_sig(self, a, key=None) -> str:
+        k = key or self.aes_key
+        if not k:
+            return ''
+        body = json.dumps([a.get('cp_seq'), a.get('chain_seq'), a.get('cp_hash') or '',
+                           a.get('genesis') or '', a.get('created_at') or ''], separators=(',', ':'))
+        return hmac.new(k, b'pegaprox-audit-anchor\x00' + body.encode('utf-8'), hashlib.sha256).hexdigest()
+
+    def _read_audit_anchor(self, key=None):
+        """The anchor: None when there is none, {'bad': True} when it does not verify"""
+        path = getattr(self, '_audit_anchor_file', None)
+        if not path:
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as fh:
+                a = json.load(fh)
+        except FileNotFoundError:
+            return None
+        except Exception:
+            return {'bad': True}
+        if (not isinstance(a, dict) or not a.get('sig') or not isinstance(a.get('cp_seq'), int)
+                or not hmac.compare_digest(str(a['sig']), self._anchor_sig(a, key))):
+            return {'bad': True}
+        return a
+
+    def _write_audit_anchor(self, a):
+        path = self._audit_anchor_file
+        a = dict(a, sig=self._anchor_sig(a))
+        tmp = f'{path}.tmp'
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            json.dump(a, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+
+    def _anchor_checkpoint(self, cp):
+        """Move the anchor to a checkpoint that was just committed. Only forward along the
+        chain it holds: when the checkpoint it names is gone from the database or another
+        one sits in its place, it stays as it is - that is the finding, and a new
+        checkpoint must not paper over it. An anchor over an empty chain (a genesis and
+        nothing after) may follow a new genesis."""
+        if not getattr(self, '_audit_anchor_file', None) or not self.aes_key:
+            return
+        conn = self.conn
+        g = conn.execute("SELECT row_hash FROM audit_checkpoints WHERE cp_seq = 1 "
+                         "AND kind = 'genesis'").fetchone()
+        new = {'cp_seq': int(cp['cp_seq']), 'chain_seq': int(cp['chain_seq']),
+               'cp_hash': self._checkpoint_hash(cp), 'genesis': g['row_hash'] if g else '',
+               'created_at': cp.get('created_at') or ''}
+        old = self._read_audit_anchor()
+        if old and not old.get('bad'):
+            if old.get('genesis') == new['genesis'] and old['cp_seq'] >= new['cp_seq']:
+                return                      # a writer next to us got there first
+            if not (old['cp_seq'] == 1 and int(old.get('chain_seq') or 0) == 0):
+                held = conn.execute('SELECT * FROM audit_checkpoints WHERE cp_seq = ?',
+                                    (old['cp_seq'],)).fetchone()
+                if held is None or self._checkpoint_hash(dict(held)) != old.get('cp_hash'):
+                    logging.error(f"AUDIT LOG CHAIN: checkpoint {old['cp_seq']} (entry "
+                                  f"{old.get('chain_seq')}), kept outside the database, is not in "
+                                  f"it any more; {self._audit_anchor_file} stays as it is. Remove "
+                                  f"that file only once the gap is accounted for.")
+                    return
+        elif old:
+            logging.warning(f"audit anchor {self._audit_anchor_file} failed its signature, replaced")
+        self._write_audit_anchor(new)
+
+    def _after_checkpoint(self, cp, forward=True):
+        """What follows a committed checkpoint: the copy beside the key, the SIEM targets"""
+        try:
+            self._anchor_checkpoint(cp)
+        except Exception as e:
+            logging.warning(f"audit anchor not written: {e}")
+        if forward:
+            self._forward_checkpoint(cp)
+
+    def _audit_chain_tail(self, cur):
+        """(seq, hash) the next row links to: the last row, or a checkpoint past it (the tail
+        was pruned, or cut off after the checkpoint), None before the genesis"""
+        row = cur.execute('SELECT * FROM audit_log WHERE chain_seq IS NOT NULL '
+                          'ORDER BY chain_seq DESC LIMIT 1').fetchone()
+        cp = cur.execute('SELECT chain_seq, row_hash FROM audit_checkpoints '
+                         'ORDER BY chain_seq DESC, id DESC LIMIT 1').fetchone()
+        if row is not None and (cp is None or row['chain_seq'] >= cp['chain_seq']):
+            return row['chain_seq'], self._audit_row_hash(dict(row))
+        if cp is not None:
+            return cp['chain_seq'], cp['row_hash']
+        return None
+
+    def audit_chain_head(self):
+        """{'chain_seq', 'hash'} the audit chain of this host stands at, None when it has no
+        chain yet or cannot be read. MK Oct 2026"""
+        try:
+            tail = self._audit_chain_tail(self.conn.cursor())
+        except Exception:
+            return None
+        return {'chain_seq': tail[0], 'hash': tail[1]} if tail else None
+
+    def audit_chain_has(self, seq, row_hash):
+        """True when the chain holds `row_hash` at `seq`: as a row, or as the checkpoint of
+        a pruned stretch. MK Oct 2026"""
+        try:
+            cur = self.conn.cursor()
+            row = cur.execute('SELECT * FROM audit_log WHERE chain_seq = ?', (int(seq),)).fetchone()
+            if row is not None:
+                return hmac.compare_digest(self._audit_row_hash(dict(row)), str(row_hash))
+            cp = cur.execute('SELECT row_hash FROM audit_checkpoints WHERE chain_seq = ? '
+                             'ORDER BY id DESC LIMIT 1', (int(seq),)).fetchone()
+            return bool(cp) and hmac.compare_digest(str(cp['row_hash']), str(row_hash))
+        except Exception:
+            return False
+
+    def _audit_chain_txn(self, conn, work):
+        """work(cursor) with the chain held. The one lock is the database's write lock, taken
+        up front by BEGIN IMMEDIATE: every greenlet and thread writes on a connection of its
+        own (self._local), and nothing in here yields, so a Python lock would add nothing but
+        a hub that waits on an OS thread (a gevent lock across threads hangs outright). A
+        write the caller has pending on this connection already holds that lock, and is
+        committed with ours, as before."""
+        began = not conn.in_transaction
+        if began:
+            conn.execute('BEGIN IMMEDIATE')
+        try:
+            out = work(conn.cursor())
+            conn.commit()
+            return out
+        except Exception:
+            if began:
+                conn.rollback()
+            raise
+
+    def _ensure_audit_genesis(self):
+        try:
+            conn = self.conn
+            if conn.execute('SELECT 1 FROM audit_checkpoints LIMIT 1').fetchone():
+                return
+            def _work(cur):
+                if cur.execute('SELECT 1 FROM audit_checkpoints LIMIT 1').fetchone():
+                    return None
+                # chained rows without any checkpoint: the start was deleted. A new one
+                # signed now would vouch for rows it never saw, so the check reports it
+                if cur.execute('SELECT 1 FROM audit_log WHERE chain_seq IS NOT NULL LIMIT 1').fetchone():
+                    logging.error("AUDIT LOG CHAIN: entries are chained but no checkpoint is left; "
+                                  "not starting a new chain over them")
+                    return None
+                cp = self._audit_genesis(cur)
+                logging.info(f"Audit chain starts here, over {cp['legacy_count']} earlier entries")
+                return cp
+            cp = self._audit_chain_txn(conn, _work)
+            if cp:
+                # not to the SIEM targets: this runs while the database is still being set up
+                self._after_checkpoint(cp, forward=False)
+        except Exception as e:
+            logging.error(f"Could not start the audit chain: {e}")
+
     def add_audit_entry(self, user: str, action: str, details: str = '', ip: str = '',
                         cluster: str = '', severity: str = None, cluster_id: str = ''):
         """Add audit log entry with HMAC signature for integrity verification.
@@ -4163,9 +4991,6 @@ class PegaProxDB:
         keep working unchanged. cluster is the name shown, cluster_id the cluster
         the row belongs to (#1121).
         """
-        cursor = self.conn.cursor()
-        timestamp = datetime.now().isoformat()
-
         # Auto-derive severity from action prefix when caller didn't pass one
         if severity is None:
             a = (action or '').lower()
@@ -4178,26 +5003,49 @@ class PegaProxDB:
             else:
                 severity = 'info'
 
-        signature = self._generate_audit_hmac(timestamp, user, action, details, ip,
-                                               cluster or '', severity, cluster_id or '')
+        # stored as text whatever came in, so the row reads back as it was hashed
+        def _txt(v):
+            return None if v is None else str(v)
+        row = {'user': _txt(user), 'action': _txt(action) or '', 'details': _txt(details),
+               'ip_address': _txt(ip), 'cluster': _txt(cluster) or '', 'severity': severity,
+               'cluster_id': _txt(cluster_id) or ''}
 
-        cursor.execute('''
-            INSERT INTO audit_log (timestamp, user, action, details, ip_address,
-                                   hmac_signature, cluster, severity, cluster_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (timestamp, user, action, details, ip, signature, cluster or '', severity,
-              cluster_id or ''))
-        last_id = cursor.lastrowid
-        self.conn.commit()
+        started = []
+
+        def _append(cur):
+            tail = self._audit_chain_tail(cur)
+            if tail is None:
+                cp = self._audit_genesis(cur)
+                started.append(cp)
+                tail = (cp['chain_seq'], cp['row_hash'])
+            row['chain_id'] = self._audit_chain_name(cur)
+            # the time is taken in the lock too, so it never runs backwards along the chain
+            row.update(timestamp=datetime.now().isoformat(), chain_seq=tail[0] + 1,
+                       prev_hash=tail[1])
+            cur.execute('''
+                INSERT INTO audit_log (timestamp, user, action, details, ip_address,
+                                       hmac_signature, cluster, severity, cluster_id,
+                                       chain_seq, prev_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (row['timestamp'], row['user'], row['action'], row['details'], row['ip_address'],
+                  self._audit_chain_hmac(row), row['cluster'], severity, row['cluster_id'],
+                  row['chain_seq'], row['prev_hash']))
+            return cur.lastrowid
+
+        last_id = self._audit_chain_txn(self.conn, _append)
+        for cp in started:
+            self._after_checkpoint(cp)
 
         # Hand off to SIEM forwarder if anyone has plugged into the queue.
         # Late import to avoid import cycles at module load.
         try:
             from pegaprox.api import siem as _siem_mod
             _siem_mod.enqueue({
-                'id': last_id, 'timestamp': timestamp, 'user': user,
-                'action': action, 'details': details, 'ip_address': ip,
-                'cluster': cluster or '', 'severity': severity,
+                'id': last_id, 'timestamp': row['timestamp'], 'user': row['user'],
+                'action': row['action'], 'details': row['details'], 'ip_address': row['ip_address'],
+                'cluster': row['cluster'], 'severity': severity,
+                'chain_seq': row['chain_seq'], 'chain_hash': self._audit_row_hash(row),
+                'chain_id': row['chain_id'],
             })
         except Exception:
             # silently swallow — SIEM is optional and shouldn't break audit writes
@@ -4315,64 +5163,322 @@ class PegaProxDB:
     def verify_audit_log_integrity(self, limit: int = None) -> dict:
         """Verify integrity of the audit log — returns statistics.
 
-        NS Jul 2026 (scale): runs FULLY off the gevent hub via run_heavy_read — the
-        SELECT *and* the per-row SQLCipher decrypt + HMAC verify happen in a worker
-        thread on a fresh connection, so the UI never freezes even when the audit_log
-        holds hundreds of thousands of rows (100 nodes / 1000+ VMs). Coverage is NOT
-        reduced — the full log is verified by default (the HMAC verify is pure CPU,
-        no DB access, so it is safe in the worker). Pass limit=N for a bounded
-        spot-check; omit for the complete off-hub scan.
-        """
-        def _verify_rows(rows):
-            total = 0
-            verified = 0
-            unsigned = 0
-            tampered = 0
-            for row in rows:
-                entry = dict(row)
-                total += 1
-                if not entry.get('hmac_signature'):
-                    unsigned += 1  # Old entry without signature
-                elif self._verify_audit_hmac(entry):
-                    verified += 1
-                else:
-                    tampered += 1
-                    logging.warning(f"AUDIT LOG INTEGRITY VIOLATION: Entry ID {entry.get('id')} may have been tampered!")
-            return {
-                'total_entries': total,
-                'verified': verified,
-                'unsigned': unsigned,
-                'potentially_tampered': tampered,
-                'integrity_percentage': round((verified / total * 100) if total > 0 else 100, 2),
-                'scanned_limit': (limit if limit and limit > 0 else None)  # None = full scan
-            }
+        NS Jul 2026 (scale): runs FULLY off the gevent hub - the SELECT *and* the
+        per-row SQLCipher decrypt + HMAC verify happen in a worker thread on a fresh
+        connection, so the UI never freezes even when the audit_log holds hundreds of
+        thousands of rows. The full log is verified by default; limit=N is a bounded
+        spot-check of the newest N chained rows (the legacy part is then left out).
 
-        if limit and limit > 0:
-            sql = 'SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?'
-            params = (limit,)
-        else:
-            sql = 'SELECT * FROM audit_log ORDER BY timestamp DESC'
-            params = ()
+        MK Oct 2026 - walks the hash chain too. An edit was all this ever caught; now a
+        missing number is a deleted row, a prev_hash that does not match the row before
+        is a broken link, a tail below the last signed checkpoint is a cut-off end, and
+        the rows written since that checkpoint are counted (they could still go
+        unnoticed). Rows from before the chain are reported on their own, against the
+        digest the genesis (or the latest prune) took of them.
+
+        The checkpoints are numbered and linked from the genesis on, and the newest one is
+        kept in a file beside the field key as well: with write access to the database
+        alone, deleting the end of the log together with the checkpoints over it, or the
+        whole log and every checkpoint, shows here. What this instance cannot see is an
+        attacker who holds the field key, or who can write the key's directory as well
+        (the copy goes with it): only the checkpoints the SIEM targets received can
+        contradict that log.
+        """
+        lim = int(limit) if limit and int(limit) > 0 else None
+
+        def _walk(conn):
+            return self._audit_integrity_walk(conn, lim)
 
         try:
-            from pegaprox.core.dbcrypto import run_heavy_read
-            # transform runs INSIDE the worker thread → verify stays off the hub too.
-            return run_heavy_read(sql, params, transform=_verify_rows)
-        except Exception:
-            # Fallback: gevent/off-hub path unavailable (CLI/test) — run in-thread.
-            cursor = self.conn.cursor()
-            cursor.execute(sql, params)
-            return _verify_rows(cursor.fetchall())
-    
+            return dbcrypto.run_off_hub(_walk, self.db_path)
+        except Exception as e:
+            # never off the hub when it cannot open its own connection (CLI, tests on an
+            # odd path): the same walk on this one
+            logging.debug(f"audit integrity: off-hub walk unavailable ({e}), running in-thread")
+            return self._audit_integrity_walk(self.conn, lim)
+
+    _AUDIT_LISTED = 50   # seqs / ranges named per finding; the counts are always whole
+
+    def _audit_integrity_walk(self, conn, lim=None) -> dict:
+        listed = self._AUDIT_LISTED
+        cps = [dict(r) for r in conn.execute('SELECT * FROM audit_checkpoints ORDER BY cp_seq, id')]
+        good = [c for c in cps if self._verify_checkpoint_hmac(c)]
+        good_ids = {c['id'] for c in good}
+        bad_cps = [c['id'] for c in cps if c['id'] not in good_ids]
+
+        # the checkpoints' own chain, numbered from the genesis on: a hole is a deleted
+        # checkpoint, a link that does not match is one put in another's place
+        cp_missing = cp_broken = 0
+        by_num = {}
+        expect, prev_hash, prev_good = 1, '', True
+        for c in cps:
+            n = c.get('cp_seq')
+            if n is None:
+                continue                      # unnumbered: fails its signature, counted there
+            by_num[n] = c
+            if n > expect:
+                cp_missing += n - expect      # the link across the hole is unknowable
+            elif prev_good and (c.get('prev_cp_hash') or '') != prev_hash:
+                cp_broken += 1
+            expect, prev_hash, prev_good = n + 1, self._checkpoint_hash(c), c['id'] in good_ids
+        first = by_num.get(1)
+        genesis = first if (first is not None and first['kind'] == 'genesis'
+                            and first['id'] in good_ids) else None
+
+        # the newest checkpoint as the file beside the key has it
+        anchor = self._read_audit_anchor()
+        anchor_state = 'missing' if anchor is None else ('bad' if anchor.get('bad') else 'ok')
+        restarted, anchor_top = False, 0
+        if anchor_state == 'ok':
+            if genesis is not None and anchor.get('genesis') != genesis['row_hash']:
+                restarted = True              # its numbers belong to a chain that is gone
+            else:
+                a_num, top_num = int(anchor['cp_seq']), max(by_num or [0])
+                if a_num > top_num:
+                    cp_missing += a_num - top_num
+                elif a_num in by_num and self._checkpoint_hash(by_num[a_num]) != anchor.get('cp_hash'):
+                    cp_broken += 1
+                anchor_top = int(anchor.get('chain_seq') or 0)
+
+        prunes = [c for c in good if c['kind'] == 'prune']
+        base = max(prunes, key=lambda c: (c['chain_seq'], c.get('cp_seq') or 0)) if prunes else genesis
+        base_seq = base['chain_seq'] if base else 0
+        base_hash = base['row_hash'] if base else None
+        anchors = {c['chain_seq']: c['row_hash'] for c in good
+                   if c['kind'] == 'periodic' and c['chain_seq'] > base_seq}
+        top = max([c['chain_seq'] for c in good] + [anchor_top])
+        last_cp = max(good, key=lambda c: (c.get('cp_seq') or 0, c['id'])) if good else None
+
+        start = base_seq
+        if lim:
+            hi = conn.execute('SELECT MAX(chain_seq) FROM audit_log').fetchone()[0] or 0
+            if hi - lim > base_seq:
+                start, base_hash = hi - lim, None     # a window: its first link is not judged
+
+        chained = verified = unsigned = 0
+        edited, broken, missing_ranges = [], [], []
+        n_edited = n_broken = n_missing = after_cp = 0
+        expect_seq, expect_prev, first_seq = start + 1, base_hash, None
+        prev_edited = False
+
+        def _gap(a, b):
+            nonlocal n_missing
+            n_missing += b - a + 1
+            if len(missing_ranges) < listed:
+                missing_ranges.append([a, b])
+
+        cur = conn.execute('SELECT * FROM audit_log WHERE chain_seq > ? ORDER BY chain_seq', (start,))
+        for r in cur:
+            e = dict(r)
+            s = e['chain_seq']
+            chained += 1
+            first_seq = s if first_seq is None else first_seq
+            is_edited = False
+            if not e.get('hmac_signature') and not self.aes_key:
+                unsigned += 1                 # an instance without a key signs nothing
+            elif e.get('hmac_signature') and self._verify_audit_hmac(e):
+                verified += 1
+            else:
+                # with a key every chained row is signed: one without was stripped
+                is_edited = True
+                n_edited += 1
+                if len(edited) < listed:
+                    edited.append(s)
+            h = self._audit_row_hash(e)
+            link_ok = True
+            if s > expect_seq:
+                _gap(expect_seq, s - 1)        # deleted; the link across the hole is unknowable
+            elif expect_prev is not None and not prev_edited and e.get('prev_hash') != expect_prev:
+                # after an edited row the link cannot match; that row is the finding
+                link_ok = False
+            if s in anchors and anchors[s] != h:
+                link_ok = False                # not the row the checkpoint signed
+            if not link_ok:
+                n_broken += 1
+                if len(broken) < listed:
+                    broken.append(s)
+            if s > top:
+                after_cp += 1
+            expect_seq, expect_prev, prev_edited = s + 1, h, is_edited
+        last_seq = expect_seq - 1
+        truncated = top > last_seq
+        if truncated:
+            _gap(last_seq + 1, top)            # signed as written once, gone now
+        # rows before the prune point would be rows put back after the prune
+        stale = conn.execute('SELECT COUNT(*) FROM audit_log WHERE chain_seq IS NOT NULL '
+                             'AND chain_seq <= ?', (base_seq,)).fetchone()[0] if not lim else 0
+        n_broken += stale
+
+        ref = max((c for c in good if c['kind'] in ('genesis', 'prune')),
+                  key=lambda c: (c.get('cp_seq') or 0, c['id']), default=None)
+        legacy = None
+        if not lim:
+            lv = lu = lt = 0
+            for r in conn.execute('SELECT * FROM audit_log WHERE chain_seq IS NULL'):
+                e = dict(r)
+                if not e.get('hmac_signature'):
+                    lu += 1
+                elif self._verify_audit_hmac(e):
+                    lv += 1
+                else:
+                    lt += 1
+            count, digest = self._audit_legacy_digest(conn.cursor())
+            changed = None
+            if ref is not None:
+                # a prune carries a difference it found forward, it never signs it away
+                changed = (bool(ref.get('legacy_changed'))
+                           or count != int(ref.get('legacy_count') or 0)
+                           or digest != (ref.get('legacy_digest') or ''))
+            legacy = {'rows': count, 'verified': lv, 'unsigned': lu, 'tampered': lt,
+                      'changed_since_chain_start': changed,
+                      'count_at_last_checkpoint': int(ref.get('legacy_count') or 0) if ref else None}
+
+        total = chained + (legacy['rows'] if legacy else 0)
+        all_verified = verified + (legacy['verified'] if legacy else 0)
+        tampered = n_edited + (legacy['tampered'] if legacy else 0)
+        # chained rows or checkpoints and no signed genesis: the start of the chain is gone
+        no_start = bool(chained or cps) and genesis is None
+        for s in edited:
+            logging.warning(f"AUDIT LOG INTEGRITY VIOLATION: chain entry {s} was changed")
+        if n_missing or n_broken or bad_cps or cp_missing or cp_broken or no_start or restarted:
+            logging.warning(f"AUDIT LOG CHAIN: {n_missing} missing, {n_broken} broken links, "
+                            f"{len(bad_cps)} checkpoints failing their signature, {cp_missing} "
+                            f"checkpoints missing, {cp_broken} out of order"
+                            + (', no signed start' if no_start else '')
+                            + (', started over' if restarted else ''))
+        prune_cp = max(prunes, key=lambda c: (c['chain_seq'], c.get('cp_seq') or 0)) if prunes else None
+        return {
+            'total_entries': total,
+            'verified': all_verified,
+            'unsigned': unsigned + (legacy['unsigned'] if legacy else 0),
+            'potentially_tampered': tampered,
+            'integrity_percentage': round((all_verified / total * 100) if total > 0 else 100, 2),
+            'scanned_limit': lim,   # None = full scan
+            'chain': {
+                'rows': chained, 'first_seq': first_seq, 'last_seq': last_seq if chained else None,
+                'edited': n_edited, 'edited_seqs': edited,
+                'missing': n_missing, 'missing_ranges': missing_ranges,
+                'broken_links': n_broken, 'broken_link_seqs': broken,
+                'truncated': truncated,
+                'after_checkpoint': after_cp,
+                'checkpoints': len(cps), 'bad_checkpoints': len(bad_cps),
+                'checkpoints_missing': cp_missing, 'checkpoints_broken': cp_broken,
+                'last_checkpoint': ({'seq': last_cp['chain_seq'], 'kind': last_cp['kind'],
+                                     'number': last_cp.get('cp_seq'),
+                                     'created_at': last_cp['created_at']} if last_cp else None),
+                'pruned_through': prune_cp['chain_seq'] if prune_cp else 0,
+                'pruned_at': prune_cp['created_at'] if prune_cp else None,
+                'started': genesis is not None,
+                'no_start': no_start,
+                'anchor': anchor_state,
+                'anchor_seq': anchor_top if anchor_state == 'ok' and not restarted else None,
+                'restarted': restarted,
+                'restarted_after': int(anchor.get('chain_seq') or 0) if restarted else None,
+            },
+            'legacy': legacy,
+            'intact': not (tampered or n_missing or n_broken or bad_cps or cp_missing or cp_broken
+                           or no_start or restarted or anchor_state == 'bad'
+                           or (legacy and legacy['changed_since_chain_start'])),
+        }
+
+    def audit_checkpoint(self, kind: str = 'periodic'):
+        """Sign where the chain stands now. None when it has not moved since the last
+        checkpoint. Goes to the SIEM targets as an event of its own."""
+        def _work(cur):
+            last = cur.execute('SELECT MAX(chain_seq) FROM audit_checkpoints').fetchone()[0]
+            row = cur.execute('SELECT * FROM audit_log WHERE chain_seq IS NOT NULL '
+                              'ORDER BY chain_seq DESC LIMIT 1').fetchone()
+            if row is None or (last is not None and row['chain_seq'] <= last):
+                return None
+            return self._insert_checkpoint(cur, {
+                'kind': kind, 'chain_seq': row['chain_seq'],
+                'row_hash': self._audit_row_hash(dict(row)),
+                'created_at': datetime.now().isoformat()})
+        cp = self._audit_chain_txn(self.conn, _work)
+        if cp:
+            self._after_checkpoint(cp)
+        return cp
+
+    def _forward_checkpoint(self, cp):
+        try:
+            from pegaprox.api import siem as _siem_mod
+            _siem_mod.enqueue_checkpoint(dict(cp, chain_id=getattr(self, '_audit_chain_id', None) or ''))
+        except Exception as e:
+            logging.debug(f"audit checkpoint not forwarded: {e}")
+
+    def prune_audit_log(self, cutoff_iso: str) -> dict:
+        """Delete what retention lets go of (rows older than cutoff_iso) and sign 'pruned
+        up to N, whose hash was H, at this cutoff' in the same transaction, so the hole it
+        leaves is not read as tampering. Off the hub on its own connection, like the prune
+        it replaces. None when nothing went, or when there is no signed base to cut from.
+
+        MK Oct 2026 - a row's time is not what decides on its own: an attacker without the
+        key can set it into the past, and one entry written while the clock was wrong
+        would take every row before it. Retention walks up from the last signed base and
+        takes the unbroken run of rows that are older than the cutoff, carry a signature
+        that verifies and link to the row before; the first row that is newer, unsigned,
+        changed or out of place ends the run, and nothing past it goes. The rows from
+        before the chain are compared with the base first: a difference is carried into
+        the new checkpoint (legacy_changed), never signed away. The reads come first,
+        outside the write lock (in WAL a reader holds no writer up): the walk and the
+        digest can take a while on a big log, and every audit write would wait on them."""
+        def _work(conn):
+            cur = conn.cursor()
+            bases = [dict(r) for r in cur.execute(
+                "SELECT * FROM audit_checkpoints WHERE kind IN ('genesis', 'prune') ORDER BY cp_seq, id")]
+            ref = next((c for c in reversed(bases) if self._verify_checkpoint_hmac(c)), None)
+            if ref is None:
+                logging.warning("Audit retention skipped: no signed base of the chain to cut from "
+                                "(see the integrity check under Settings > Compliance)")
+                return None
+            seq, h, held = int(ref['chain_seq']), ref['row_hash'], None
+            for r in cur.execute('SELECT * FROM audit_log WHERE chain_seq > ? ORDER BY chain_seq', (seq,)):
+                e = dict(r)
+                if not (e.get('timestamp') or '') < cutoff_iso:
+                    break
+                if (e['chain_seq'] != seq + 1 or (e.get('prev_hash') or '') != h
+                        or not e.get('hmac_signature') or not self._verify_audit_hmac(e)):
+                    held = e['chain_seq']
+                    break
+                seq, h = e['chain_seq'], self._audit_row_hash(e)
+            if held is not None:
+                logging.warning(f"Audit retention stops before entry {held}: it is missing, "
+                                f"out of place or fails its signature, and nothing past it is deleted")
+            legacy_old = cur.execute('SELECT COUNT(*) FROM audit_log WHERE chain_seq IS NULL '
+                                     'AND timestamp < ?', (cutoff_iso,)).fetchone()[0]
+            if seq == int(ref['chain_seq']) and not legacy_old:
+                return None
+            count, digest = self._audit_legacy_digest(cur)
+            changed = (bool(ref.get('legacy_changed')) or count != int(ref.get('legacy_count') or 0)
+                       or digest != (ref.get('legacy_digest') or ''))
+            if changed and not ref.get('legacy_changed'):
+                logging.warning("AUDIT LOG CHAIN: entries from before the chain changed since its "
+                                "last base; the prune records that and does not sign it away")
+            if legacy_old:
+                count, digest = self._audit_legacy_digest(cur, since=cutoff_iso)
+            # the write transaction starts with the first DELETE
+            cur.execute('DELETE FROM audit_log WHERE chain_seq IS NULL AND timestamp < ?', (cutoff_iso,))
+            gone = cur.rowcount or 0
+            if seq > int(ref['chain_seq']):
+                cur.execute('DELETE FROM audit_log WHERE chain_seq IS NOT NULL AND chain_seq <= ?', (seq,))
+                gone += cur.rowcount or 0
+            return self._insert_checkpoint(cur, {
+                'kind': 'prune', 'chain_seq': seq, 'row_hash': h,
+                'created_at': datetime.now().isoformat(), 'pruned_rows': gone,
+                'legacy_count': count, 'legacy_digest': digest, 'legacy_changed': changed,
+                'cutoff': cutoff_iso})
+        cp = dbcrypto.run_off_hub(_work, self.db_path, commit=True)
+        if cp:
+            self._after_checkpoint(cp)
+        return cp
+
     def cleanup_audit_log(self, days: int = 90):
-        """Remove audit entries older than specified days"""
-        cursor = self.conn.cursor()
+        """Remove audit entries older than specified days (through prune_audit_log, which
+        signs what it removed). Returns how many rows went."""
         cutoff = (datetime.now() - timedelta(days=days)).isoformat()
-        cursor.execute('DELETE FROM audit_log WHERE timestamp < ?', (cutoff,))
-        deleted = cursor.rowcount
-        self.conn.commit()
-        return deleted
-    
+        cp = self.prune_audit_log(cutoff)
+        return int(cp['pruned_rows']) if cp else 0
+
     # ========================================
     # ALERT OPERATIONS
     # ========================================
@@ -4867,7 +5973,9 @@ class PegaProxDB:
                                 # password of the host it builds. Missing here would mean a
                                 # rotation leaves every stored profile unreadable and the
                                 # next ISO fetch answering 500.
-                                ('auto_install_profiles', ('answer_encrypted',))):
+                                ('auto_install_profiles', ('answer_encrypted',)),
+                                # the root passwords of single nodes (#1136)
+                                ('cluster_node_credentials', ('password_encrypted',))):
                 try:
                     cursor.execute(f"SELECT id, {', '.join(_cols)} FROM {_tbl}")
                     for _r in cursor.fetchall():
@@ -4927,10 +6035,12 @@ class PegaProxDB:
             # cannot be used to launder a tampered entry.
             stats['audit_resigned'] = 0
             stats['audit_unverifiable'] = 0
+            _anchor_old = None
             try:
                 _saved_key = self.aes_key
                 cursor.execute('SELECT id, timestamp, user, action, details, ip_address, '
-                               'cluster, severity, cluster_id, hmac_signature FROM audit_log '
+                               'cluster, severity, cluster_id, hmac_signature, chain_seq, '
+                               'prev_hash FROM audit_log '
                                'WHERE hmac_signature IS NOT NULL AND hmac_signature != ""')
                 _rows = cursor.fetchall()
                 for _r in _rows:
@@ -4939,6 +6049,7 @@ class PegaProxDB:
                         'details': _r['details'], 'ip_address': _r['ip_address'],
                         'cluster': _r['cluster'], 'severity': _r['severity'],
                         'cluster_id': _r['cluster_id'], 'hmac_signature': _r['hmac_signature'],
+                        'chain_seq': _r['chain_seq'], 'prev_hash': _r['prev_hash'],
                     }
                     self.aes_key = old_key
                     _ok = self._verify_audit_hmac(_entry)
@@ -4946,13 +6057,29 @@ class PegaProxDB:
                         stats['audit_unverifiable'] += 1
                         continue                     # leave it as-is; it was already broken
                     self.aes_key = new_key
-                    _new_sig = self._generate_audit_hmac(
-                        _r['timestamp'], _r['user'], _r['action'], _r['details'],
-                        _r['ip_address'], _r['cluster'], _r['severity'], _r['cluster_id'])
+                    if _entry['chain_seq'] is not None:
+                        # the links are unkeyed hashes and stay; only the signature moves
+                        _new_sig = self._audit_chain_hmac(_entry)
+                    else:
+                        _new_sig = self._generate_audit_hmac(
+                            _r['timestamp'], _r['user'], _r['action'], _r['details'],
+                            _r['ip_address'], _r['cluster'], _r['severity'], _r['cluster_id'])
                     cursor.execute('UPDATE audit_log SET hmac_signature = ? WHERE id = ?',
                                    (_new_sig, _r['id']))
                     stats['audit_resigned'] += 1
+                # the checkpoints, by the same rule: one that fails under the old key stays failed
+                cursor.execute('SELECT * FROM audit_checkpoints')
+                for _c in [dict(r) for r in cursor.fetchall()]:
+                    self.aes_key = old_key
+                    if not self._verify_checkpoint_hmac(_c):
+                        stats['audit_unverifiable'] += 1
+                        continue
+                    self.aes_key = new_key
+                    cursor.execute('UPDATE audit_checkpoints SET hmac_signature = ? WHERE id = ?',
+                                   (self._checkpoint_hmac(_c), _c['id']))
                 self.aes_key = _saved_key
+                # and the copy beside the key, re-signed once the new key is in place (step 5)
+                _anchor_old = self._read_audit_anchor(key=old_key)
             except Exception as e:
                 self.aes_key = _saved_key
                 stats['errors'].append(f"Audit re-sign: {e}")
@@ -5016,7 +6143,13 @@ class PegaProxDB:
             # 5. Update in-memory key
             self.aes_key = new_key
             self.aesgcm = new_aesgcm
-            
+            # an anchor that failed under the old key stays as it is, like a row would
+            if _anchor_old and not _anchor_old.get('bad'):
+                try:
+                    self._write_audit_anchor({k: v for k, v in _anchor_old.items() if k != 'sig'})
+                except Exception as e:
+                    stats['errors'].append(f"Audit anchor re-sign: {e}")
+
             stats['success'] = True
             stats['key_backup'] = backup_file
             stats['rotated_at'] = datetime.now().isoformat()
@@ -5140,6 +6273,58 @@ class PegaProxDB:
         cursor.execute('SELECT rule, rule_type, suspended_at, owner FROM suspended_ha_rules WHERE cluster_id=? '
                        'ORDER BY rule, owner', (cluster_id,))
         return [(r['rule'], r['rule_type'], r['suspended_at'], r['owner']) for r in cursor.fetchall()]
+
+    def insert_rolling_run(self, run_id, cluster_id, status, state, logs, started_by, started_at):
+        """A new rolling update run; state and logs are JSON text."""
+        self.conn.cursor().execute(
+            'INSERT INTO rolling_update_runs (id, cluster_id, status, state, logs, started_by, started_at, '
+            'updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (run_id, cluster_id, status, state, logs, started_by, started_at, started_at))
+        self.conn.commit()
+
+    def update_rolling_run(self, run_id, status, state, logs, updated_at, completed_at=None):
+        """Only a run that has its row: a worker of a run whose row is gone writes nothing."""
+        cursor = self.conn.cursor()
+        cursor.execute('UPDATE rolling_update_runs SET status = ?, state = ?, logs = ?, updated_at = ?, '
+                       'completed_at = ? WHERE id = ?',
+                       (status, state, logs, updated_at, completed_at, run_id))
+        self.conn.commit()
+        return cursor.rowcount
+
+    def update_rolling_run_logs(self, run_id, logs, updated_at):
+        cursor = self.conn.cursor()
+        cursor.execute('UPDATE rolling_update_runs SET logs = ?, updated_at = ? WHERE id = ?',
+                       (logs, updated_at, run_id))
+        self.conn.commit()
+        return cursor.rowcount
+
+    def get_rolling_runs(self, cluster_id, statuses=None, limit=None):
+        """Runs of a cluster, newest first: [{id, cluster_id, status, state, logs, started_by,
+        started_at, updated_at, completed_at}] with state and logs as text."""
+        sql = 'SELECT * FROM rolling_update_runs WHERE cluster_id = ?'
+        params = [cluster_id]
+        if statuses:
+            sql += ' AND status IN (%s)' % ','.join('?' * len(statuses))
+            params += list(statuses)
+        sql += ' ORDER BY started_at DESC, rowid DESC'
+        if limit:
+            sql += ' LIMIT ?'
+            params.append(int(limit))
+        cursor = self.conn.cursor()
+        cursor.execute(sql, params)
+        return [dict(r) for r in cursor.fetchall()]
+
+    def prune_rolling_runs(self, cluster_id, keep, finished):
+        """The newest `keep` finished runs of a cluster stay; a run still open always does."""
+        marks = ','.join('?' * len(finished))
+        cursor = self.conn.cursor()
+        cursor.execute(
+            f'DELETE FROM rolling_update_runs WHERE cluster_id = ? AND status IN ({marks}) AND id NOT IN '
+            f'(SELECT id FROM rolling_update_runs WHERE cluster_id = ? AND status IN ({marks}) '
+            f'ORDER BY started_at DESC, rowid DESC LIMIT ?)',
+            (cluster_id, *finished, cluster_id, *finished, int(keep)))
+        self.conn.commit()
+        return cursor.rowcount
 
     def get_affinity_rules(self, cluster_id: str = None) -> dict:
         """Get affinity rules"""
@@ -5320,6 +6505,25 @@ class PegaProxDB:
         for tenant in tenants:
             self.save_tenant(tenant.get('id', str(uuid.uuid4())[:8]), tenant)
     
+    def replay_sr_failover_state(self):
+        """The replay the failed_over columns owe since this process added them: the marks
+        of the guests from this instance's failover events, once. Returns how many it
+        marked, None when nothing is owed.
+
+        #625 - the events are a LOCAL table, the marks a synced one. Only the instance that
+        acts runs this (background/site_recovery.py replay_failover_state); a member takes
+        the active's marks with the sync. A member's process never acts, and the one that
+        acts after its promotion is a new process that owes nothing."""
+        with self._sr_replay_lock:
+            if not self._sr_replay_owed:
+                return None
+            cursor = self.conn.cursor()
+            marked = _replay_sr_failover_state(cursor)
+            self.conn.commit()
+            self._sr_replay_owed = False
+        logging.info(f"site_recovery_vms: {marked} guest(s) failed over, replayed from the failover events")
+        return marked
+
     # Generic query methods for custom tables like scripts
     def execute(self, sql: str, params: tuple = ()):
         """Execute SQL statement (CREATE, INSERT, UPDATE, DELETE)"""

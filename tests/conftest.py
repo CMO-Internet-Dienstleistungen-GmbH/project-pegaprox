@@ -22,6 +22,15 @@ import shutil
 
 import pytest
 
+# The metrics collector starts itself ten seconds after pegaprox.api.reports is imported (the
+# thread at the end of reports.py), in every process, each test worker too. Every five minutes
+# it wrote a snapshot of whatever fake clusters a test had into the file named in
+# pegaprox.constants: the checkout's config/pegaprox.db whenever no test held a database of
+# its own. A test that wants a snapshot takes one by hand (collect_metrics_snapshot,
+# save_metrics_snapshot).
+import pegaprox.background.metrics as _metrics  # noqa: E402
+_metrics.metrics_collector_loop = lambda: None
+
 
 def _poll(done):
     import gevent
@@ -95,6 +104,16 @@ def db():
     # connection to the previous test's (now-deleted) DB file.
     dbmod._db = None
     dbmod.PegaProxDB._instance = None
+    # The heavy reads and writes (core/dbcrypto.py: the metrics history behind power, costs
+    # and insights, the metrics snapshots) open the file named in constants, not db.py's,
+    # and keep what they read for a minute. Left alone, tests read the checkout's
+    # config/pegaprox.db and wrote their snapshots into it, and one test's history answered
+    # the next.
+    import pegaprox.constants as constants
+    import pegaprox.core.dbcrypto as dbcrypto
+    _orig_const = constants.DATABASE_FILE
+    constants.DATABASE_FILE = dbmod.DATABASE_FILE
+    dbcrypto._HEAVY_CACHE.clear()
 
     database = dbmod.get_db()
     _reset_rbac_caches()  # start each test with empty process-global caches
@@ -115,6 +134,8 @@ def db():
         dbmod._db = None
         dbmod.PegaProxDB._instance = None
         dbmod.CONFIG_DIR, dbmod.DATABASE_FILE, dbmod.KEY_FILE = _orig
+        constants.DATABASE_FILE = _orig_const
+        dbcrypto._HEAVY_CACHE.clear()
         shutil.rmtree(tmp, ignore_errors=True)
         _reset_rbac_caches()
 
@@ -209,6 +230,26 @@ def _ha_state_out_of_the_checkout(tmp_path, monkeypatch, request):
                     'mark the test guard_refusals where the refusal is what it tests')
 
 
+@pytest.fixture(autouse=True)
+def _node_history_forgotten():
+    """What core/node_history.py knows of each node lives as long as the process, and the
+    next test's cluster_1 is another cluster with another database."""
+    from pegaprox.core import node_history
+    node_history.forget()
+    yield
+    node_history.forget()
+
+
+@pytest.fixture(autouse=True)
+def _history_reports_forgotten():
+    """The power, cost and right-sizing reports are kept per cluster id for minutes
+    (helpers.history_report), and the next test's cluster_1 has another history."""
+    from pegaprox.api import helpers
+    helpers.forget_reports()
+    yield
+    helpers.forget_reports()
+
+
 def _reset_api_rate_window():
     """Forget every client the API rate limiter has seen. Shared process state, and the
     whole harness looks like one client to it."""
@@ -242,6 +283,9 @@ def _reset_rbac_caches():
         rbac._vm_acls_cache = None
         with rbac._pool_cache_lock:
             rbac._pool_membership_cache.clear()
+        # the quota's holds and the storage contents it read are process state too
+        rbac._quota_holds.clear()
+        rbac._disk_alloc_cache.clear()
     except Exception:
         pass
 

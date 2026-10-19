@@ -100,7 +100,7 @@ def _migrate_with(ssl_verification, monkeypatch):
     mgr.config = types.SimpleNamespace(ssl_verification=not ssl_verification,
                                        user='src', pass_='srcpw')
     fake_api = types.SimpleNamespace(
-        VM=types.SimpleNamespace(get_power_state=lambda ref: 'Halted'))
+        VM=types.SimpleNamespace(get_power_state=lambda ref: 'Running'))
     mgr._api = lambda: fake_api
     mgr._resolve_vm = lambda vmid: 'OpaqueRef:vm'
     mgr.logger = logging.getLogger('test.xcpng')

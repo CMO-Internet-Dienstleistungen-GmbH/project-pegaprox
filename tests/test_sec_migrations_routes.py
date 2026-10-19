@@ -40,8 +40,9 @@ def test_xcpng_remote_migrate_never_sends_stored_creds_to_a_request_url(monkeypa
 
     src = object.__new__(xcpng.XcpngManager)
     src.config = types.SimpleNamespace(ssl_verification=False, user='SRC', pass_='SRCPW', name='src')
+    # running: a guest that is not is refused before any session is built
     src._api = lambda: types.SimpleNamespace(
-        VM=types.SimpleNamespace(get_power_state=lambda r: 'Halted'))
+        VM=types.SimpleNamespace(get_power_state=lambda r: 'Running'))
     src._resolve_vm = lambda v: 'vmref'
     import logging
     src.logger = logging.getLogger('t.xcpng')

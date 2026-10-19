@@ -11,7 +11,8 @@ from flask import Blueprint, jsonify, request
 from pegaprox.constants import *
 from pegaprox.globals import *
 from pegaprox.models.permissions import *
-from pegaprox.models.tasks import PegaProxConfig
+from pegaprox.models.tasks import (PegaProxConfig, balancer_cooldown, BALANCER_COOLDOWN_MIN,
+                                   BALANCER_COOLDOWN_MAX)
 from pegaprox.core.db import get_db
 from pegaprox.core import ha
 from pegaprox.core.cache import StorageDataCache
@@ -29,9 +30,10 @@ from pegaprox.core.config import load_config, save_config
 from pegaprox.core.manager import PegaProxManager
 from pegaprox.core.xcpng import XcpngManager, XENAPI_AVAILABLE
 from pegaprox.utils.sanitization import bounded_list, validate_ssh_user, validate_host_address
+from pegaprox.utils.sanitization import task_ref_ok
 from pegaprox.api.helpers import (load_server_settings, get_connected_manager, check_cluster_access,
                                   safe_error, scope_vm_rows, require_unconfined, parse_pve_error,
-                                  bounded_limit, node_maintenance_for_caller)
+                                  bounded_limit, node_maintenance_for_caller, upstream_failure)
 
 # MK: this used to be 200 lines down in the monolith, good luck finding anything there
 bp = Blueprint('clusters', __name__)
@@ -131,6 +133,7 @@ def get_clusters():
                 'ssh_disabled': bool(getattr(mgr.config, 'ssh_disabled', False)),
                 'migration_threshold': mgr.config.migration_threshold,
                 'migration_tolerance': getattr(mgr.config, 'migration_tolerance', 10),
+                'migration_cooldown': balancer_cooldown(getattr(mgr.config, 'migration_cooldown', None)),
                 'check_interval': mgr.config.check_interval,
                 'auto_migrate': mgr.config.auto_migrate,
                 'balance_containers': getattr(mgr.config, 'balance_containers', False),
@@ -158,6 +161,7 @@ def get_clusters():
                 'longitude': getattr(mgr.config, 'longitude', None),
                 'location_label': getattr(mgr.config, 'location_label', '') or '',
                 'node_ui_suffix': getattr(mgr.config, 'node_ui_suffix', '') or '',
+                'transfer_network': getattr(mgr.config, 'transfer_network', '') or '',
             })
 
     # MK: Sort clusters by sort_order first, then by name for consistent ordering
@@ -192,6 +196,12 @@ def add_cluster():
     _uerr = _ssh_user_error(data)
     if _uerr:
         return _uerr
+    _cd_err = _cooldown_error(data)
+    if _cd_err:
+        return _cd_err
+    _xn_err = _transfer_network_error(data)
+    if _xn_err:
+        return _xn_err
 
     # Generate unique ID
     cluster_id = str(uuid.uuid4())[:8]
@@ -238,6 +248,12 @@ def add_cluster():
     # NS: let frontend know if we auto-created an API token (#110)
     if getattr(manager, '_token_auto_created', False):
         result['api_token_created'] = True
+    if cluster_type == 'proxmox':
+        # MK Oct 2026 (#1136) - one login per node in the background: a node with a root
+        # password of its own refuses the cluster's, and the UI points at Node credentials
+        from pegaprox.core import node_creds
+        node_creds.check_in_background(cluster_id)
+        result['node_check'] = True
     return jsonify(result), 201
 
 
@@ -258,6 +274,7 @@ def export_cluster_config(cluster_id):
         'ssl_verification': c.ssl_verification,
         'migration_threshold': c.migration_threshold,
         'migration_tolerance': getattr(c, 'migration_tolerance', 10),
+        'migration_cooldown': balancer_cooldown(getattr(c, 'migration_cooldown', None)),
         'check_interval': c.check_interval,
         'auto_migrate': c.auto_migrate,
         'balance_containers': getattr(c, 'balance_containers', False),
@@ -269,6 +286,7 @@ def export_cluster_config(cluster_id):
         'cluster_type': getattr(mgr, 'cluster_type', 'proxmox'),
         'vnc_tunnel': bool(getattr(c, 'vnc_tunnel', False)),  # MK Apr 2026
         'ssh_disabled': bool(getattr(c, 'ssh_disabled', False)),  # MK Sep 2026 (#941)
+        'transfer_network': getattr(c, 'transfer_network', '') or '',
         # secrets intentionally omitted: pass, ssh_key, api_token_secret
     })
 
@@ -314,7 +332,7 @@ def rotate_cluster_api_token(cluster_id):
                 elif resp.status_code in (404, 405, 501):
                     preserved = False  # fall through to delete+create
                 else:
-                    return jsonify({'error': parse_pve_error(resp.text)}), resp.status_code
+                    return upstream_failure(resp.status_code, parse_pve_error(resp.text))
             except Exception as probe_err:
                 mgr.logger.warning(f"[token-rotate] in-place regenerate probe failed ({probe_err}); falling back")
                 preserved = False
@@ -326,7 +344,7 @@ def rotate_cluster_api_token(cluster_id):
             mgr._create_session().delete(base, timeout=10)
             create_resp = mgr._api_post(base, data={})
             if create_resp.status_code != 200:
-                return jsonify({'error': parse_pve_error(create_resp.text)}), create_resp.status_code
+                return upstream_failure(create_resp.status_code, parse_pve_error(create_resp.text))
             data = create_resp.json().get('data') or {}
             new_secret = data.get('value') or data.get('secret')
             preserved = False
@@ -413,6 +431,16 @@ def reconfigure_cluster(cluster_id):
     else:
         kept = getattr(old_mgr.config, 'ha_settings', None)
         data['ha_settings'] = dict(kept) if isinstance(kept, dict) else {}
+    # the balancer cooldown is no connection setting either: one the dialog leaves out stays
+    _cd_err = _cooldown_error(data)
+    if _cd_err:
+        return _cd_err
+    data.setdefault('migration_cooldown', balancer_cooldown(getattr(old_mgr.config, 'migration_cooldown', None)))
+    # nor is the transfer network
+    _xn_err = _transfer_network_error(data)
+    if _xn_err:
+        return _xn_err
+    data.setdefault('transfer_network', getattr(old_mgr.config, 'transfer_network', '') or '')
 
     # Create new config + manager, test connection
     new_config = PegaProxConfig(data)
@@ -427,6 +455,15 @@ def reconfigure_cluster(cluster_id):
         if not new_mgr.connect_to_proxmox():
             return jsonify({'error': f'Connection failed: {new_mgr.connection_error or "unknown"}',
                             'error_code': getattr(new_mgr, 'connection_error_code', None)}), 400
+
+    # MK Oct 2026 (#1136) - the dialog types the cluster's credential again, never the
+    # nodes' own passwords. Where it points the cluster elsewhere those go, as in
+    # _config_edit_checks, before the new manager resolves a single node
+    cleared = []
+    if cluster_type != 'xcpng':
+        moved = _moved_by_reconfigure(old_mgr.config, new_config, data)
+        if moved:
+            cleared = _drop_node_passwords(cluster_id, data.get('name') or cluster_id, moved)
 
     # Stop old manager, swap in new one
     try:
@@ -443,7 +480,34 @@ def reconfigure_cluster(cluster_id):
     result = {'success': True, 'message': 'Cluster re-configured successfully'}
     if getattr(new_mgr, '_token_auto_created', False):
         result['api_token_created'] = True
+    if cleared:
+        result['node_passwords_cleared'] = cleared
     return jsonify(result)
+
+
+def _moved_by_reconfigure(old, new, data):
+    """What of host, fallback_hosts, ssh_port and ssl_verification a re-configure moves,
+    by the rule of _config_edit_checks: an address not among the old ones, another SSH
+    port, verification switched off. The dialog sends no SSH port; one the body leaves
+    out is the default port 22 of the node itself, no move."""
+    known = {_host_key(old.host)} | {_host_key(h) for h in (getattr(old, 'fallback_hosts', None) or [])}
+    moved = []
+    if _host_key(new.host) not in known:
+        moved.append('host')
+    fallback = getattr(new, 'fallback_hosts', None) or []
+    if isinstance(fallback, (list, tuple)) and any(_host_key(h) not in known for h in fallback):
+        moved.append('fallback_hosts')
+
+    def port(cfg):
+        try:
+            return int(getattr(cfg, 'ssh_port', 22) or 22)
+        except (TypeError, ValueError):
+            return 22
+    if data.get('ssh_port') not in (None, '') and port(new) != port(old):
+        moved.append('ssh_port')
+    if getattr(old, 'ssl_verification', False) and not getattr(new, 'ssl_verification', False):
+        moved.append('ssl_verification')
+    return moved
 
 
 @bp.route('/api/clusters/<cluster_id>/nodes', methods=['GET'])
@@ -618,12 +682,366 @@ def check_cluster_connection(cluster_id):
         return jsonify({'error': safe_error(e, 'The connection check failed')}), 500
     report['cluster_id'] = cluster_id
     report['ssh_checked'] = with_ssh
+    # the capability matrix answers from these privileges until the next check
+    from pegaprox.core import pve_access
+    pve_access.remember_report(cluster_id, mgr, report)
+    if with_ssh:
+        # what each node said goes to its row under Node credentials (#1136)
+        from pegaprox.core import node_creds
+        try:
+            node_creds.record(cluster_id, report.get('items') or [], [])
+        except Exception as e:
+            logging.warning(f"[NodeCreds] could not keep the SSH results of {_sl(cluster_id)}: {e}")
+        report['refused'] = node_creds.refused(report.get('items') or [])
     s = report['summary']
     log_audit(request.session['user'], 'cluster.connection_check',
               f"Connection check of {mgr.config.name}: {s['ok']} ok, {s['warn']} warnings, "
               f"{s['fail']} failed" + ('' if with_ssh else ' (without SSH)'),
               cluster=mgr.config.name)
     return jsonify(report)
+
+
+@bp.route('/api/clusters/<cluster_id>/capabilities', methods=['GET'])
+@require_auth(perms=['cluster.config'])
+def get_cluster_capabilities(cluster_id):
+    """Which features of PegaProx work with this cluster's connection, and what each one
+    that does not still needs (core/pve_access.py).
+
+    MK Oct 2026 - from the privileges the last connection check read, whether SSH is off,
+    the kind of login and whether a key or a password is stored. Asking sends nothing to
+    the cluster; ?refresh=1 reads /access/permissions once, the read of the check. Nothing
+    is changed and nothing goes to a node. Like the check itself: the login and SSH setup
+    of the whole cluster are no business of a caller confined to part of it.
+    """
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return _cerr
+    mgr = cluster_managers[cluster_id]
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return jsonify({'error': 'The capability list covers Proxmox VE clusters only',
+                        'code': 'PVE_ONLY'}), 400
+    refresh = request.args.get('refresh', '')
+    if refresh not in ('', '0', '1'):
+        return jsonify({'error': 'refresh must be 0 or 1'}), 400
+    from pegaprox.core import pve_access
+    try:
+        item, source = pve_access.privileges(cluster_id, mgr, refresh=refresh == '1')
+        out = pve_access.capabilities(cluster_id, mgr, item, source)
+    except Exception as e:
+        logging.exception(f"capability list failed for {_sl(cluster_id)}")
+        return jsonify({'error': safe_error(e, 'The capability list failed')}), 500
+    out.update(cluster_id=cluster_id, connected=bool(mgr.is_connected))
+    return jsonify(out)
+
+
+@bp.route('/api/pve-role-recipe', methods=['GET'])
+@require_auth()
+def get_pve_role_recipe():
+    """The pveum commands for a least-privilege PegaProx role, a dedicated account and an
+    API token with privilege separation (core/pve_access.recipe).
+
+    MK Oct 2026 - ?features=a,b picks the optional features (all of them without the
+    parameter, none for an empty value), ?pve=8|9 the release (the guest agent read has
+    another name in each), ?user=, ?token= and ?role= the names. Built from the privilege
+    table of the connection check, no cluster is asked. For whoever adds or sets up a
+    cluster: cluster.add or cluster.config.
+    """
+    user = build_authz_user(request.session.get('user', ''), request.session)
+    if not (has_permission(user, 'cluster.add') or has_permission(user, 'cluster.config')):
+        return jsonify({'error': 'Permission denied: cluster.add or cluster.config'}), 403
+    from pegaprox.core import pve_access
+    args = request.args
+    try:
+        features = pve_access.parse_features(args.get('features'))
+        pve = args.get('pve', '9')
+        if pve not in ('8', '9'):
+            raise ValueError('pve must be 8 or 9')
+        out = pve_access.recipe(features, pve=int(pve), user=args.get('user', 'pegaprox@pve'),
+                                token=args.get('token', 'pegaprox'), role=args.get('role', 'PegaProx'))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    return jsonify(out)
+
+
+_XFER_NODE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9.\-]{0,62}$')
+_XFER_CHECK_STATUS = {'NO_NETWORK': 409, 'NOT_MEMBER': 400, 'SSH_DISABLED': 409,
+                      'SSH_NO_CREDENTIALS': 409, 'NODE_BACKOFF': 409, 'SSH_FAILED': 502}
+
+
+def _pve_cluster_or_error(cluster_id):
+    """(manager, None) for a Proxmox VE cluster the caller may act on as a whole, else
+    (None, response)."""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return None, err
+    if cluster_id not in cluster_managers:
+        return None, (jsonify({'error': 'Cluster not found'}), 404)
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return None, _cerr
+    mgr = cluster_managers[cluster_id]
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return None, (jsonify({'error': 'The transfer network applies to Proxmox VE clusters only',
+                               'code': 'PVE_ONLY'}), 400)
+    return mgr, None
+
+
+@bp.route('/api/clusters/<cluster_id>/transfer-network', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_transfer_network(cluster_id):
+    """The transfer network of a Proxmox VE cluster and each node's address in it.
+
+    MK Oct 2026 - remote migrations PegaProx starts into this cluster dial the target node
+    at that address instead of the management host (core/transfer_net.py). Answers from
+    the cache of the nodes' network configs; nodes it lacks are read in the background and
+    come back with state 'pending' until then. ?network=<cidr> shows another network
+    before it is saved. migration_network is the datacenter option PVE uses for
+    migrations inside the cluster, for reference: it is edited there, not here.
+    """
+    mgr, err = _pve_cluster_or_error(cluster_id)
+    if err:
+        return err
+    from pegaprox.core import transfer_net
+    override = request.args.get('network')
+    if override is not None:
+        cidr, nerr = transfer_net.normalize(override)
+        if nerr:
+            return jsonify({'error': nerr.replace('transfer_network', 'network')}), 400
+        override = cidr
+    view = transfer_net.cluster_view(mgr, override)
+    view['cluster_id'] = cluster_id
+    view['saved'] = getattr(mgr.config, 'transfer_network', '') or ''
+    return jsonify(view)
+
+
+@bp.route('/api/clusters/<cluster_id>/transfer-network/check', methods=['POST'])
+@require_auth(perms=['cluster.config'])
+def check_transfer_network(cluster_id):
+    """From one node of a source cluster, whether the transfer addresses of this cluster's
+    nodes answer on port 8006 - the path the disk data of a remote migration takes.
+
+    MK Oct 2026 - body {"source_cluster": id, "source_node": name}. Logs in to that node
+    over SSH once, through the same path as the other node checks, and opens one TCP
+    connection per address from there; nothing is changed. Both clusters must be ones the
+    caller may act on as a whole. A standby forwards it to the active or refuses it like
+    any other write (app.py).
+    """
+    mgr, err = _pve_cluster_or_error(cluster_id)
+    if err:
+        return err
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'The request body must be a JSON object'}), 400
+    src_id, node = data.get('source_cluster'), data.get('source_node')
+    if not isinstance(src_id, str) or not src_id or len(src_id) > 64:
+        return jsonify({'error': 'source_cluster must be the id of a cluster'}), 400
+    if not isinstance(node, str) or not _XFER_NODE_RE.match(node):
+        return jsonify({'error': 'source_node must be a node name'}), 400
+    src, err = _pve_cluster_or_error(src_id)
+    if err:
+        return err
+    from pegaprox.core import transfer_net
+    try:
+        report, fail = transfer_net.check_from(src, node, mgr)
+    except Exception as e:
+        logging.exception(f"transfer network check failed for {_sl(cluster_id)}")
+        return jsonify({'error': safe_error(e, 'The check failed')}), 500
+    user = request.session['user']
+    if fail:
+        code, detail = fail
+        log_audit(user, 'cluster.transfer_network_check',
+                  f"Transfer network check of {mgr.config.name} from {_sl(node)} could not run: {code}",
+                  cluster=mgr.config.name)
+        return jsonify({'error': detail, 'code': code}), _XFER_CHECK_STATUS.get(code, 400)
+    rows = report['nodes']
+    log_audit(user, 'cluster.transfer_network_check',
+              f"Transfer network check of {mgr.config.name} ({report['network']}) from "
+              f"{src.config.name}/{_sl(node)}: {sum(1 for r in rows if r['status'] == 'ok')} answer, "
+              f"{sum(1 for r in rows if r['status'] == 'fail')} do not, "
+              f"{sum(1 for r in rows if r['status'] in ('none', 'unreadable'))} without an address",
+              cluster=mgr.config.name)
+    report.update(cluster_id=cluster_id, source_cluster=src_id)
+    return jsonify(report)
+
+
+# --- per-node root passwords (#1136) -----------------------------------------------------
+# MK Oct 2026 - a node with a root password of its own gets that one instead of the
+# cluster's (core/node_creds.py). Seen and set like the cluster's own credentials: by
+# whoever may re-configure the cluster, never by a confined admin or a caller who reaches
+# the cluster through a pool. The value goes in and never comes back out.
+
+def _node_creds_cluster(cluster_id):
+    """(manager, None) for a cluster whose node logins the caller may see and set, else
+    (None, the response)."""
+    if cluster_id not in cluster_managers:
+        return None, (jsonify({'error': 'Cluster not found'}), 404)
+    ok, err = check_cluster_access(cluster_id)
+    if not ok:
+        return None, err
+    _cerr = require_unconfined(cluster_id)
+    if _cerr:
+        return None, _cerr
+    mgr = cluster_managers[cluster_id]
+    if getattr(mgr, 'cluster_type', 'proxmox') != 'proxmox':
+        return None, (jsonify({'error': 'Node credentials are for Proxmox VE clusters',
+                               'code': 'PVE_ONLY'}), 400)
+    return mgr, None
+
+
+def _cluster_members(mgr):
+    """{node: /nodes entry} as the cluster lists itself, {} when it does not answer."""
+    try:
+        members = mgr.nodes
+        return dict(members) if isinstance(members, dict) else {}
+    except Exception:
+        return {}
+
+
+def _node_check_view(row):
+    if not row or not row.get('checked_at'):
+        return None
+    return {'code': row.get('check_status') or '', 'detail': row.get('check_detail') or '',
+            'credential': row.get('check_credential') or '', 'checked_at': row.get('checked_at')}
+
+
+@bp.route('/api/clusters/<cluster_id>/node-credentials', methods=['GET'])
+@require_auth(perms=['cluster.config'])
+def get_node_credentials(cluster_id):
+    """Every node of the cluster with whether it has a password of its own, who set it
+    when, and what its last login check said. Never the value."""
+    mgr, err = _node_creds_cluster(cluster_id)
+    if err:
+        return err
+    from pegaprox.core import node_creds
+    from pegaprox.utils.ssh import ssh_password_for
+    rows = {r['node']: r for r in node_creds.state(cluster_id)}
+    members = _cluster_members(mgr)
+    nodes = []
+    for name in sorted(set(members) | set(rows)):
+        row = rows.get(name) or {}
+        info = members.get(name) or {}
+        nodes.append({
+            'node': name,
+            'member': (name in members) if members else None,
+            'online': (info.get('status') == 'online') if info else None,
+            'has_password': bool(row.get('has_password')),
+            'updated_at': row.get('updated_at') if row.get('has_password') else None,
+            'updated_by': (row.get('updated_by') or None) if row.get('has_password') else None,
+            # where the manager last placed it, the one address its password goes to
+            'address': (row.get('address') or None) if row.get('has_password') else None,
+            'last_check': _node_check_view(row),
+        })
+    cfg = mgr.config
+    user = getattr(cfg, 'user', '') or ''
+    return jsonify({
+        'cluster_id': cluster_id,
+        'nodes': nodes,
+        'ssh_user': getattr(cfg, 'ssh_user', '') or (user or 'root').split('@')[0],
+        'ssh_key': bool(getattr(cfg, 'ssh_key', '')),
+        'ssh_disabled': bool(getattr(cfg, 'ssh_disabled', False)),
+        'token_auth': '!' in user,
+        'cluster_password': bool(ssh_password_for(cfg)),
+        'max_length': node_creds.MAX_LEN,
+    })
+
+
+@bp.route('/api/clusters/<cluster_id>/node-credentials/<node>', methods=['PUT'])
+@require_auth(perms=['cluster.config'])
+def set_node_credential(cluster_id, node):
+    """{"password": "..."}: the root password of this one node. It is offered to that
+    node's own address only, in place of the cluster password."""
+    mgr, err = _node_creds_cluster(cluster_id)
+    if err:
+        return err
+    from pegaprox.core import node_creds
+    if not node_creds.node_name_ok(node):
+        return jsonify({'error': 'Invalid node name'}), 400
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({'error': 'The request body must be a JSON object'}), 400
+    problem = node_creds.value_problem(data.get('password'))
+    if problem:
+        return jsonify({'error': problem}), 400
+    members = _cluster_members(mgr)
+    if not members:
+        return jsonify({'error': 'The node list of this cluster could not be read'}), 503
+    if node not in members:
+        return jsonify({'error': f'{node} is no node of this cluster'}), 404
+    user = request.session['user']
+    try:
+        node_creds.store(cluster_id, node, data['password'], user)
+    except Exception as e:
+        logging.error(f"[NodeCreds] storing the password of {_sl(node)} failed: {type(e).__name__}")
+        return jsonify({'error': 'The password could not be stored'}), 500
+    log_audit(user, 'cluster.node_credential_set',
+              f"Set the own root password of node {node} (it replaces the cluster password there)",
+              cluster=mgr.config.name)
+    return jsonify({'success': True, 'node': node, 'has_password': True})
+
+
+@bp.route('/api/clusters/<cluster_id>/node-credentials/<node>', methods=['DELETE'])
+@require_auth(perms=['cluster.config'])
+def clear_node_credential(cluster_id, node):
+    """The node gets the cluster password again."""
+    mgr, err = _node_creds_cluster(cluster_id)
+    if err:
+        return err
+    from pegaprox.core import node_creds
+    if not node_creds.node_name_ok(node):
+        return jsonify({'error': 'Invalid node name'}), 400
+    row = next((r for r in node_creds.state(cluster_id) if r['node'] == node), None)
+    if not row or not row.get('has_password'):
+        return jsonify({'error': f'{node} has no password of its own'}), 404
+    user = request.session['user']
+    node_creds.clear(cluster_id, node, user)
+    log_audit(user, 'cluster.node_credential_cleared',
+              f"Cleared the own root password of node {node} (the cluster password applies again)",
+              cluster=mgr.config.name)
+    return jsonify({'success': True, 'node': node, 'has_password': False})
+
+
+@bp.route('/api/clusters/<cluster_id>/node-credentials/check', methods=['POST'])
+@require_auth(perms=['cluster.config'])
+def check_node_credentials(cluster_id):
+    """One SSH login per online node with what that node gets (its own password, the
+    cluster's or the key), kept per node; `refused` names the nodes that said no.
+    {"nodes": [...]} narrows it down. A standby forwards or refuses it like any write."""
+    mgr, err = _node_creds_cluster(cluster_id)
+    if err:
+        return err
+    from pegaprox.core import node_creds
+    data = request.get_json(silent=True)
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return jsonify({'error': 'The request body must be a JSON object'}), 400
+    only = data.get('nodes')
+    if only is not None:
+        if (not isinstance(only, list) or len(only) > 512
+                or not all(node_creds.node_name_ok(n) for n in only)):
+            return jsonify({'error': 'nodes must be a list of node names'}), 400
+    if not getattr(mgr, 'is_connected', False):
+        return jsonify({'error': 'The cluster is not connected', 'code': 'NOT_CONNECTED'}), 409
+    try:
+        items, names = node_creds.run_check(mgr, cluster_id, only=set(only) if only else None)
+    except Exception as e:
+        logging.warning(f"[NodeCreds] login check of {_sl(cluster_id)} failed: {e}")
+        return jsonify({'error': safe_error(e, 'The login check failed')}), 502
+    refused = node_creds.refused(items)
+    ok = sum(1 for it in items if it.get('code') in node_creds.LOGIN_OK)
+    log_audit(request.session['user'], 'cluster.node_credential_check',
+              f"Checked the node logins of {mgr.config.name}: {ok} of {len(names)} logged in"
+              + (f", refused by {', '.join(refused)}" if refused else ''),
+              cluster=mgr.config.name)
+    from datetime import datetime, timezone
+    return jsonify({'cluster_id': cluster_id, 'nodes': items, 'refused': refused,
+                    'checked': names,
+                    'checked_at': datetime.now(timezone.utc).isoformat(timespec='seconds')})
 
 
 def _retire_cluster_claim(mgr, every_node=False):
@@ -778,6 +1196,10 @@ def delete_cluster(cluster_id):
         # affinity_rules, cluster_alerts, pool_permissions, node_maintenance, … ~20 of them), so the
         # per-table DELETEs that used to live here are gone — they only ever covered three of them.
         db.delete_cluster(cluster_id)
+        # the node passwords went with it (cluster_node_credentials), and so does what this
+        # process remembers of them (#1136)
+        from pegaprox.core import node_creds
+        node_creds.forget_cluster(cluster_id)
 
         # tenants.clusters is a JSON array, not a cluster_id column, so prune it separately: drop the
         # deleted cluster from every tenant's assigned-clusters list, else the tenant's "N clusters"
@@ -1447,6 +1869,7 @@ def get_cluster_resources(cluster_id):
 # password was that secret, offered to every node. /reconfigure changes both together.
 ALLOWED_CONFIG_FIELDS = {
     'name', 'host', 'ssl_verification', 'migration_threshold', 'migration_tolerance',
+    'migration_cooldown',  # MK Oct 2026 - seconds the balancer leaves a moved guest alone
     'check_interval', 'auto_migrate', 'balance_containers', 'balance_local_disks',
     'dry_run', 'enabled', 'ha_enabled', 'fallback_hosts', 'ssh_user', 'ssh_port',
     'excluded_nodes',
@@ -1459,12 +1882,43 @@ ALLOWED_CONFIG_FIELDS = {
     'proxlb_pins_auto_migrate',  # opt-in: migrate guests back onto their plb_pin_ node
     'proxlb_pins_strict',  # opt-in: a pin also vetoes a maintenance evacuation
     'node_ui_suffix',  # MK Aug 2026 (#689) — FQDN suffix for "Open in Proxmox" node links
+    'transfer_network',  # MK Oct 2026 - CIDR for remote migrations into this cluster
 }
 
 # These persist as INTEGER (db.py save_cluster) and reload through bool(), so a
 # truthy string like "false" would round-trip back to True and silently flip an
 # opt-in on. Only a real bool is accepted for them, no bool() coercion.
 BOOLEAN_CONFIG_FIELDS = {'proxlb_pins_auto_migrate', 'proxlb_pins_strict'}
+
+
+def _cooldown_error(data):
+    """A 400 when the body sets migration_cooldown to anything but whole seconds in
+    range. Checked before any field is applied, like the booleans above."""
+    if 'migration_cooldown' not in data:
+        return None
+    value = data['migration_cooldown']
+    if isinstance(value, bool) or not isinstance(value, int) \
+            or not BALANCER_COOLDOWN_MIN <= value <= BALANCER_COOLDOWN_MAX:
+        return jsonify({'error': f"'migration_cooldown' must be whole seconds from "
+                                 f"{BALANCER_COOLDOWN_MIN} to {BALANCER_COOLDOWN_MAX}"}), 400
+    return None
+
+
+def _transfer_network_error(data, mgr=None):
+    """A 400 when the body sets transfer_network to anything but a network in CIDR
+    notation or empty, or sets one on a cluster that is no Proxmox VE cluster. Normalises
+    it in place (10.20.0.5/24 is 10.20.0.0/24)."""
+    if 'transfer_network' not in data:
+        return None
+    from pegaprox.core.transfer_net import normalize
+    cidr, err = normalize(data['transfer_network'])
+    if err:
+        return jsonify({'error': err}), 400
+    kind = getattr(mgr, 'cluster_type', None) if mgr is not None else data.get('cluster_type', 'proxmox')
+    if cidr and (kind or 'proxmox') != 'proxmox':
+        return jsonify({'error': 'transfer_network applies to Proxmox VE clusters only'}), 400
+    data['transfer_network'] = cidr
+    return None
 
 
 def _ssh_user_error(data):
@@ -1562,9 +2016,30 @@ def _config_edit_checks(mgr, data):
     return None, {'creds': creds, 'moved': moved}
 
 
-def _rebind(mgr, rebind):
+def _drop_node_passwords(cluster_id, cluster_name, moved):
+    """MK Oct 2026 (#1136) - the root passwords of single nodes are stored secrets of the
+    cluster as well, and go wherever the cluster then says its nodes are. Nobody typed
+    them again for this edit, so they are dropped like the cluster's own. Before the edit
+    is applied: a drop that fails stops the edit. Returns the nodes that lost theirs."""
+    from pegaprox.core import node_creds
+    usr = getattr(request, 'session', {}).get('user', 'system')
+    gone = [r['node'] for r in node_creds.state(cluster_id) if r.get('has_password')]
+    for node in gone:
+        node_creds.clear(cluster_id, node, usr)
+    # what this process placed where came from the old endpoint
+    node_creds.forget_cluster(cluster_id)
+    if gone:
+        log_audit(usr, 'cluster.node_credential_removed',
+                  f"Cluster {cluster_name}: cleared the own root password of node(s) {', '.join(gone)}, "
+                  f"{', '.join(moved)} changed and they were not entered again", cluster=cluster_name)
+    return gone
+
+
+def _rebind(mgr, rebind, cluster_id):
     """Swap in the credential the request typed and forget the login of the old
     destination, so the next call logs in afresh where the admin pointed it."""
+    rebind['node_passwords_cleared'] = _drop_node_passwords(
+        cluster_id, getattr(mgr.config, 'name', cluster_id), rebind['moved'])
     for key, value in rebind['creds'].items():
         setattr(mgr.config, key, value)
     for attr in ('_ticket', '_csrf_token', '_api_token', '_original_host'):
@@ -1575,6 +2050,13 @@ def _rebind(mgr, rebind):
     reset = getattr(mgr, '_reset_auth_failures', None)
     if callable(reset):
         reset()
+
+
+def _with_cleared(body, rebind):
+    """The response of an edit, naming the nodes whose own password it cleared."""
+    if rebind and rebind.get('node_passwords_cleared'):
+        body['node_passwords_cleared'] = rebind['node_passwords_cleared']
+    return body
 
 
 @bp.route('/api/clusters/<cluster_id>', methods=['PUT'])
@@ -1601,11 +2083,17 @@ def update_cluster_config(cluster_id):
     for _bk in BOOLEAN_CONFIG_FIELDS:
         if _bk in data and type(data[_bk]) is not bool:
             return jsonify({'error': f"'{_bk}' must be a boolean"}), 400
+    _cd_err = _cooldown_error(data)
+    if _cd_err:
+        return _cd_err
+    _xn_err = _transfer_network_error(data, mgr)
+    if _xn_err:
+        return _xn_err
     _err, rebind = _config_edit_checks(mgr, data)
     if _err:
         return _err
     if rebind:
-        _rebind(mgr, rebind)
+        _rebind(mgr, rebind, cluster_id)
 
     # update config - only allowed fields
     updated = []
@@ -1623,7 +2111,8 @@ def update_cluster_config(cluster_id):
                   f"{', '.join(rebind['moved'])} changed with the credential re-entered")
     log_audit(usr, 'cluster.config_changed', f"Cluster {mgr.config.name} config updated: {', '.join(updated)}")
 
-    return jsonify({'message': 'Configuration updated successfully', 'updated_fields': updated})
+    return jsonify(_with_cleared({'message': 'Configuration updated successfully',
+                                  'updated_fields': updated}, rebind))
 
 @bp.route('/api/clusters/<cluster_id>/config', methods=['PATCH'])
 @require_auth(perms=['cluster.config'])
@@ -1649,11 +2138,17 @@ def update_cluster_config_live(cluster_id):
     for _bk in BOOLEAN_CONFIG_FIELDS:
         if _bk in data and type(data[_bk]) is not bool:
             return jsonify({'error': f"'{_bk}' must be a boolean"}), 400
+    _cd_err = _cooldown_error(data)
+    if _cd_err:
+        return _cd_err
+    _xn_err = _transfer_network_error(data, mgr)
+    if _xn_err:
+        return _xn_err
     _err, rebind = _config_edit_checks(mgr, data)
     if _err:
         return _err
     if rebind:
-        _rebind(mgr, rebind)
+        _rebind(mgr, rebind, cluster_id)
 
     updated = []
     for key, value in data.items():
@@ -1662,12 +2157,18 @@ def update_cluster_config_live(cluster_id):
             updated.append(key)
 
     save_config()
+    usr = getattr(request, 'session', {}).get('user', 'system')
     if rebind:
-        log_audit(getattr(request, 'session', {}).get('user', 'system'), 'cluster.endpoint_changed',
+        log_audit(usr, 'cluster.endpoint_changed',
                   f"Cluster {mgr.config.name}: {', '.join(rebind['moved'])} changed with the "
                   f"credential re-entered")
+    # MK Oct 2026 - the settings tab saves through here, and nothing of it reached the audit log
+    if updated:
+        log_audit(usr, 'cluster.config_changed', f"Cluster {mgr.config.name} config updated: "
+                  f"{', '.join(updated)}")
 
-    return jsonify({'message': 'Configuration updated successfully', 'updated_fields': updated})
+    return jsonify(_with_cleared({'message': 'Configuration updated successfully',
+                                  'updated_fields': updated}, rebind))
 
 
 @bp.route('/api/clusters/<cluster_id>/cpu-compatibility', methods=['GET'])
@@ -2114,7 +2615,7 @@ def set_fallback_hosts(cluster_id):
         return _err
     fallback_hosts = edit['fallback_hosts']
     if rebind:
-        _rebind(mgr, rebind)
+        _rebind(mgr, rebind, cluster_id)
     mgr.config.fallback_hosts = fallback_hosts
     
     # Save to database
@@ -2136,11 +2637,11 @@ def set_fallback_hosts(cluster_id):
     log_audit(request.session['user'], 'cluster.fallback_hosts_changed', 
               f"Cluster {mgr.config.name}: fallback hosts set to {fallback_hosts}")
     
-    return jsonify({
+    return jsonify(_with_cleared({
         'success': True,
         'fallback_hosts': fallback_hosts,
         'message': f'{len(fallback_hosts)} fallback host(s) configured'
-    })
+    }, rebind))
 
 
 @bp.route('/api/clusters/<cluster_id>/migrations', methods=['GET'])
@@ -2679,6 +3180,263 @@ def get_guest_inventory():
     return jsonify({'guests': guests, 'clusters': out_clusters})
 
 
+# MK Oct 2026 - the guest table of the All Guests page asks for one page at a time: filtered,
+# sorted and cut here, so 10k guests never cross the wire at once. The rows come from the
+# snapshot the guest list of a cluster reads (get_vm_resources, which the live loop keeps
+# fresh), not from a walk of /cluster/resources per page, so the disk figures are that list's
+# as well. Each row says which of the table's actions the caller may take on its guest; the
+# actions go to the per-guest routes and the bulk migration, which ask again.
+_GUEST_PAGE_MAX = 500
+_GUEST_PAGE_AGE = 6
+_GUEST_PAGE_TAGS = 500
+_GUEST_PAGE_TEXT = 200
+_GUEST_STATES = ('running', 'stopped', 'other')
+_GUEST_KINDS = ('qemu', 'lxc', 'template')
+_GUEST_SORTS = {
+    'name': lambda g: g['name'].lower(),
+    'vmid': lambda g: g['vmid'],
+    'cluster': lambda g: g['cluster_name'].lower(),
+    'node': lambda g: g['node'].lower(),
+    'status': lambda g: g['status'],
+    'type': lambda g: (g['template'], g['type']),
+    'cpu': lambda g: g['cpu'],
+    'mem': lambda g: g['mem'],
+    'disk': lambda g: (g['disk_size'], g['disk']),
+    'uptime': lambda g: g['uptime'],
+}
+_PAGE_NUMBER_RE = re.compile(r'[0-9]{1,9}')
+
+
+def _guest_page_query(args):
+    """The filters, order and window of a guest page as the query string gives them, or the
+    400 a malformed one earns."""
+    def number(name, default, low, high):
+        raw = args.get(name)
+        if raw in (None, ''):
+            return default
+        if not _PAGE_NUMBER_RE.fullmatch(raw) or not low <= int(raw) <= high:
+            raise ValueError(f'{name} is a whole number from {low} to {high}')
+        return int(raw)
+
+    def choice(name, allowed, default=''):
+        raw = args.get(name) or default
+        if raw != default and raw not in allowed:
+            raise ValueError(f"{name} is one of {', '.join(allowed)}")
+        return raw
+
+    def text(name, longest):
+        raw = (args.get(name) or '').strip()
+        if len(raw) > longest:
+            raise ValueError(f'{name} is at most {longest} characters')
+        return raw.lower()
+
+    try:
+        return {
+            'limit': number('limit', 100, 1, _GUEST_PAGE_MAX),
+            'offset': number('offset', 0, 0, 10_000_000),
+            'q': text('q', _GUEST_PAGE_TEXT),
+            # as typed: AND, OR and NOT are capitals
+            'q_text': (args.get('q') or '').strip(),
+            'tag': text('tag', 64),
+            'status': choice('status', _GUEST_STATES),
+            'type': choice('type', _GUEST_KINDS),
+            'sort': choice('sort', tuple(_GUEST_SORTS), 'name'),
+            'dir': choice('dir', ('asc', 'desc'), 'asc'),
+        }, None
+    except ValueError as e:
+        return None, (jsonify({'error': str(e)}), 400)
+
+
+def _guest_page_row(cid, cluster_name, g, ips, tags):
+    vmid, node = int(g['vmid']), str(g.get('node') or '')
+    running = g.get('status') == 'running'
+    # the agent cache keeps a guest that has stopped since
+    agent_ips = ips.get((node, vmid)) if running else None
+    return {
+        'cluster_id': cid, 'cluster_name': cluster_name, 'vmid': vmid, 'name': str(g.get('name') or ''),
+        'type': g['type'], 'node': node, 'status': str(g.get('status') or 'unknown'),
+        'template': bool(g.get('template')), 'vcpus': int(g.get('maxcpu') or 0),
+        'cpu': float(g.get('cpu') or 0), 'mem': int(g.get('mem') or 0), 'memory': int(g.get('maxmem') or 0),
+        'disk': int(g.get('disk') or 0), 'disk_size': int(g.get('maxdisk') or 0),
+        'uptime': int(g.get('uptime') or 0) if running else 0,
+        'ip_addresses': [str(a) for a in (agent_ips or (g.get('ip_addresses') if running else None) or [])],
+        'pool': str(g.get('pool') or ''), 'tags': sorted(tags.get(vmid, ())),
+    }
+
+
+def _guest_state(g):
+    return g['status'] if g['status'] in ('running', 'stopped') else 'other'
+
+
+def _guest_kind_fits(g, kind):
+    if not kind:
+        return True
+    if kind == 'template':
+        return g['template']
+    return g['type'] == kind and not g['template']
+
+
+def _guest_text(g):
+    return ' '.join([g['name'], str(g['vmid']), g['node'], g['cluster_name'], g['pool']]
+                    + g['ip_addresses'] + g['tags']).lower()
+
+
+def _guest_text_filter(rows, text):
+    """The rows the text filter of the page keeps. Plain text is looked for in the row's
+    text as before; a query with AND/OR/NOT, parentheses or quotes, and plain text that
+    finds nothing that way, is an expression of the global search (utils/search_query),
+    its free text still the row's text. Raises SearchSyntaxError."""
+    from pegaprox.background import guest_index
+    from pegaprox.utils import search_query
+    if not text:
+        return rows
+    plain = None
+    if not search_query.explicit(text):
+        q = text.lower()
+        plain = [g for g in rows if q in _guest_text(g)]
+        if plain:
+            return plain
+    reading = search_query.parse(text)
+    if plain is not None and reading.whole_text():
+        return plain
+    # MK Oct 2026 - MAC, notes and configured IPs from the guest search index, one copy
+    # per cluster and only when a term asks for them
+    indexes = {}
+    wants_index = any(t.field in ('ip', 'mac', 'notes') for t in reading.terms)
+    from pegaprox.utils.concurrent import HubTurns
+    turns = HubTurns()         # as the global search: many terms over 10k guests take a while
+    out = []
+    for g in rows:
+        turns.take()
+        entry = None
+        if wants_index:
+            cid = g['cluster_id']
+            if cid not in indexes:
+                indexes[cid] = guest_index.snapshot(cid)
+            entry = indexes[cid].get((g['type'], g['vmid']))
+            if not guest_index.same_guest(entry, g['name']):
+                entry = None    # read from the guest that had this id before
+        ips = g['ip_addresses']
+        facts = {
+            'name': g['name'].lower(), 'vmid': str(g['vmid']), 'node': g['node'].lower(),
+            'ip': (ips[0] if ips else '').lower(), 'ip_raw': ips[0] if ips else None,
+            'tags': [t.lower() for t in g['tags']], 'status': g['status'].lower(), 'type': g['type'],
+            'cluster_id': g['cluster_id'], 'cluster': g['cluster_name'].lower(), 'pool': g['pool'].lower(),
+            'entry': entry, 'live_ips': ips, 'text': _guest_text(g),
+        }
+        if reading.match(search_query.guest_hit, facts) is not None:
+            out.append(g)
+    return out
+
+
+def _guest_page_can(user, cid, xen, g, may):
+    """What the per-guest routes would let this caller do to the guest: the checks of
+    vm_action_api, create_snapshot_api and bulk_migrate_api, without acting."""
+    vmid, kind = g['vmid'], g['type']
+
+    def vm(perm):
+        return user_can_access_vm(user, cid, vmid, perm, kind)
+
+    if xen:
+        start = stop = reboot = vm('xapi.vm.power')
+    else:
+        start, stop, reboot = vm('vm.start'), vm('vm.stop'), vm('vm.restart')
+    return {'start': start, 'stop': stop, 'reboot': reboot,
+            'snapshot': may['vm.snapshot'] and (not xen or may['xapi.vm.snapshot']) and vm('vm.snapshot'),
+            'migrate': may['vm.migrate'] and (not xen or may['xapi.vm.migrate']) and vm('vm.migrate')}
+
+
+@bp.route('/api/inventory/guests/page', methods=['GET'])
+@require_auth()
+def get_guest_page():
+    """One page of the guests of every cluster the caller reaches
+
+    The guests the caller may see, of every Proxmox cluster and XCP-ng pool or of one
+    (?cluster=), filtered, sorted and cut to a page. Query:
+    - limit (1-500, default 100), offset (default 0)
+    - q: text in the name, VMID, node, cluster, pool, IP addresses or tags
+    - status: running, stopped or other; type: qemu, lxc or template; tag: one tag
+    - sort: name, vmid, cluster, node, status, type, cpu, mem, disk or uptime; dir: asc or desc
+
+    The answer has the rows of the page (guests, each with `can`: which of start, stop,
+    reboot, snapshot and migrate the caller may do to it), total (the guests the filters
+    leave), count (all the caller sees), status_counts (by status, the status filter aside),
+    tags (every tag among the guests) and clusters (each with its state and guest count).
+    The figures are those of the cluster's guest list, a few seconds old at most.
+    q also takes the expressions of the global search (tag:web OR node:pve2, -status:running);
+    one that cannot be read answers 400 with code SEARCH_SYNTAX.
+    """
+    from pegaprox.background import alert_events
+    from pegaprox.utils.concurrent import run_concurrent
+    from pegaprox.utils.search_query import SearchSyntaxError
+    want, err = _guest_page_query(request.args)
+    if err:
+        return err
+    only = request.args.get('cluster') or None
+    if only is not None:
+        ok, err = check_cluster_access(only)
+        if not ok:
+            return err
+        if only not in cluster_managers:
+            return jsonify({'error': 'Cluster not found'}), 404
+
+    reach, out_clusters = [], []
+    for cid, mgr, entry in _overview_reach(only):
+        out_clusters.append(entry)
+        if mgr.is_connected:
+            reach.append((cid, mgr, entry))
+        else:
+            entry['state'] = 'offline'
+
+    def _read(mgr):
+        xen = getattr(mgr, 'cluster_type', 'proxmox') == 'xcpng'
+        rows = mgr.get_vm_resources(max_age=60 if xen else _GUEST_PAGE_AGE)
+        if rows is None or getattr(rows, 'unavailable', False):
+            return None
+        return [g for g in rows if isinstance(g, dict) and g.get('type') in ('qemu', 'lxc')
+                and str(g.get('vmid', '')).isdigit()]
+
+    results = run_concurrent([lambda m=mgr: _read(m) for _, mgr, _ in reach], timeout=20)
+    seen, managers = [], {}
+    for (cid, mgr, entry), rows in zip(reach, results):
+        if rows is None:
+            entry['state'] = 'unreadable'
+            continue
+        rows = scope_vm_rows(cid, rows)
+        ips, tags = _agent_cache(mgr, '_ip_cache'), alert_events.guest_tags(cid, rows)
+        seen += [_guest_page_row(cid, entry['cluster_name'], g, ips, tags) for g in rows]
+        entry['count'] = len(rows)
+        managers[cid] = mgr
+
+    all_tags = sorted({t for g in seen for t in g['tags']})[:_GUEST_PAGE_TAGS]
+    tag, kind = want['tag'], want['type']
+    left = [g for g in seen if _guest_kind_fits(g, kind) and (not tag or tag in g['tags'])]
+    try:
+        left = _guest_text_filter(left, want['q_text'])
+    except SearchSyntaxError as e:
+        return jsonify(e.to_json()), 400
+    status_counts = {s: 0 for s in _GUEST_STATES}
+    for g in left:
+        status_counts[_guest_state(g)] += 1
+    if want['status']:
+        left = [g for g in left if _guest_state(g) == want['status']]
+    # equal values keep cluster and VMID order either way: reverse keeps a sort stable
+    left.sort(key=lambda g: (g['cluster_name'].lower(), g['vmid']))
+    left.sort(key=_GUEST_SORTS[want['sort']], reverse=want['dir'] == 'desc')
+    page = left[want['offset']:want['offset'] + want['limit']]
+
+    if page:
+        user = build_authz_user(request.session.get('user', ''), request.session)
+        may = {p: has_permission(user, p) for p in
+               ('vm.snapshot', 'vm.migrate', 'xapi.vm.snapshot', 'xapi.vm.migrate')}
+        for g in page:
+            xen = getattr(managers[g['cluster_id']], 'cluster_type', 'proxmox') == 'xcpng'
+            g['can'] = _guest_page_can(user, g['cluster_id'], xen, g, may)
+    return jsonify({'guests': page, 'total': len(left), 'count': len(seen), 'offset': want['offset'],
+                    'limit': want['limit'], 'status_counts': status_counts, 'tags': all_tags,
+                    'clusters': out_clusters})
+
+
 @bp.route('/api/clusters/<cluster_id>/nodes/<node>/tasks/<path:upid>', methods=['DELETE'])
 @require_auth(perms=['vm.stop'])  # cancelling task is like stopping
 def cancel_task(cluster_id, node, upid):
@@ -2689,6 +3447,10 @@ def cancel_task(cluster_id, node, upid):
         return jsonify({'error': 'Cluster not found'}), 404
     
     mgr = cluster_managers[cluster_id]
+    # MK Oct 2026 - a Proxmox task id has no slash, nor does an XCP-ng task reference; the
+    # id goes into the path of the cancel call
+    if not task_ref_ok(getattr(mgr, 'cluster_type', 'proxmox'), node, upid):
+        return jsonify({'error': 'Invalid node or task id'}), 400
     
     # NS Aug 2026 (Aikido #469089252) — the UPID encodes the task's VM; gate per-VM so a
     # pool-scoped user can't cancel another pool/tenant's VM task on a shared cluster.
@@ -2966,6 +3728,21 @@ def update_ha_config(cluster_id):
         if key in data and not PegaProxManager._ha_countable(data[key]):
             return jsonify({'error': f'{key} must be a number, zero or more',
                             'code': 'HA_TIMING_INVALID'}), 400
+    # MK Oct 2026 - the quorum check counts the hosts that answer plus its own vote
+    # against this: 0 or true was quorate with every host down, a string raised in it
+    if 'quorum_required_votes' in data and not PegaProxManager._ha_quorum_votes_ok(data['quorum_required_votes']):
+        return jsonify({'error': 'quorum_required_votes must be a whole number from 1 to 64',
+                        'code': 'HA_QUORUM_INVALID'}), 400
+    _qh = data.get('quorum_hosts', [])
+    if not isinstance(_qh, list) or not all(isinstance(h, str) for h in _qh):
+        return jsonify({'error': 'quorum_hosts must be a list of host names or addresses',
+                        'code': 'HA_QUORUM_INVALID'}), 400
+    # a heartbeat younger than this counts as alive. 0, a negative or a string read
+    # every node as having none
+    _hbt = data.get('storage_heartbeat_timeout', 30)
+    if not (PegaProxManager._ha_countable(_hbt) and _hbt > 0):
+        return jsonify({'error': 'storage_heartbeat_timeout must be a number of seconds, more than zero',
+                        'code': 'HA_TIMING_INVALID'}), 400
 
     # Update HA config
     if 'quorum_enabled' in data:

@@ -22,12 +22,14 @@ recommended cores/memory. We don't bake heavy verification — Proxmox-side
 qm template either succeeds or doesn't.
 """
 import os
+import re
 import json
 import uuid
 import shlex
 import logging
 import threading
 from datetime import datetime
+from urllib.parse import urljoin, urlsplit, urlunsplit
 from flask import Blueprint, jsonify, request
 
 from pegaprox.globals import cluster_managers
@@ -334,6 +336,72 @@ def _next_free_vmid(mgr):
         return 9000
 
 
+# MK Oct 2026 - wget follows up to 20 redirects on its own, to any host and to http, so
+# the guard on the first URL said nothing about where the bytes came from. A public URL
+# that answers 302 to the node's 127.0.0.1 got that service's reply imported as a disk.
+# The deploy now walks the chain itself, one hop at a time on the node, checks every hop
+# like the first URL, and downloads the end of it with redirects off.
+_MAX_REDIRECTS = 10
+
+
+def _wget_answer(out):
+    """(status, Location) of the last response in `wget -S` output, (None, None) if none.
+
+    The server's headers come indented, wget's own lines don't (its "Location: ...
+    [following]" is one of those)."""
+    status, location = None, None
+    for line in (out or '').splitlines():
+        if not line[:1].isspace():
+            continue
+        m = re.match(r'\s+HTTP/[\d.]+\s+(\d{3})\b', line)
+        if m:
+            status, location = int(m.group(1)), None
+            continue
+        m = re.match(r'\s+location:(.*)$', line, re.I)
+        if m and status is not None:
+            location = m.group(1).strip() or None
+    return status, location
+
+
+def _origin(parts):
+    port = parts.port or {'http': 80, 'https': 443}.get(parts.scheme.lower())
+    return parts.scheme.lower(), (parts.hostname or '').lower(), port
+
+
+def _final_image_url(url, probe, check):
+    """Follow the redirects of `url` and return the URL they end at.
+
+    probe(cmd) runs cmd on the node and returns its output, so each hop is asked with the
+    node's own DNS, proxy and network position. check(url) raises for a hop the first URL
+    would not have been allowed to be. A login in the URL only goes to its own origin.
+    Empty output (nothing answered) counts as the end; the download then says why."""
+    first = urlsplit(url)
+    login = first.netloc.rpartition('@')[0]
+    home = _origin(first)
+    hop, hops = url, 0
+    while True:
+        q = shlex.quote(hop)
+        status, loc = _wget_answer(probe(f"LC_ALL=C wget --max-redirect=0 -S --spider -T 20 -t 1 {q} 2>&1"))
+        if status is not None and status >= 400:
+            # some servers refuse HEAD; the first byte of a GET answers the same question
+            status, loc = _wget_answer(probe(
+                f"LC_ALL=C timeout 60 wget --max-redirect=0 -S -T 20 -t 1 "
+                f"--header 'Range: bytes=0-0' -O /dev/null {q} 2>&1"))
+        if status is None or not 300 <= status < 400 or not loc:
+            return hop
+        hops += 1
+        if hops > _MAX_REDIRECTS:
+            raise RuntimeError(f"image_url redirects more than {_MAX_REDIRECTS} times")
+        nxt = urlsplit(urljoin(hop, loc))
+        host = nxt.netloc.rpartition('@')[2]
+        try:
+            same = _origin(nxt) == home
+        except ValueError:
+            raise RuntimeError(f"bad redirect target: {_shown_url(urlunsplit(nxt))}")
+        hop = urlunsplit(nxt._replace(netloc=f"{login}@{host}" if login and same else host))
+        check(hop)
+
+
 def _run_deploy(dep_id, cluster_id, node, template_id, storage, vmid, vm_name):
     """Background worker: SSH into node, run the qm pipeline."""
     mgr = cluster_managers.get(cluster_id)
@@ -363,9 +431,15 @@ def _run_deploy(dep_id, cluster_id, node, template_id, storage, vmid, vm_name):
 
     # the log keeps the command lines, which carry the URL; not its login (see _shown_url)
     _url, _url_shown = tpl['image_url'], _shown_url(tpl['image_url'])
+    # a redirect on the same origin keeps the login, so the URL downloaded can differ from _url
+    try:
+        _login = urlsplit(_url).netloc.rpartition('@')[0]
+    except ValueError:
+        _login = ''
 
     def _scrub(text):
-        return text.replace(_url, _url_shown) if _url and _url != _url_shown else text
+        text = text.replace(_url, _url_shown) if _url and _url != _url_shown else text
+        return text.replace(f"{_login}@", '****@') if _login else text
 
     ssh = None
     try:
@@ -375,10 +449,14 @@ def _run_deploy(dep_id, cluster_id, node, template_id, storage, vmid, vm_name):
                         finished_at=_now_iso())
             return
 
-        def run(cmd, label, weight=10):
-            _update_dep(dep_id, log_append=f"$ {_scrub(cmd)}")
+        def run(cmd, label, weight=10, probe=False):
+            if not probe:
+                _update_dep(dep_id, log_append=f"$ {_scrub(cmd)}")
             stdin, stdout, stderr = ssh.exec_command(cmd, get_pty=False, timeout=900)
             rc = stdout.channel.recv_exit_status()
+            if probe:
+                # the output is the answer; wget exits 8 on the redirect it was asked about
+                return _read_capped(stdout)
             out = _scrub(_read_capped(stdout).strip())
             err = _scrub(_read_capped(stderr).strip())
             if out:
@@ -408,16 +486,30 @@ def _run_deploy(dep_id, cluster_id, node, template_id, storage, vmid, vm_name):
         except SsrfError as _se:
             raise RuntimeError(f"image_url rejected by SSRF guard: {_se}")
 
+        def _check_hop(url):
+            # same rule as the first URL, for every hop of its redirect chain
+            try:
+                sanitize_outbound_url(url, allowed_schemes=('https', 'http'),
+                                      allow_private=True, allow_loopback=False)
+            except SsrfError as _se:
+                raise RuntimeError(f"redirect to {_shown_url(url)} rejected by SSRF guard: {_se}")
+
+        # the download below follows no redirect, so it gets the end of the chain
+        final_url = _final_image_url(tpl['image_url'],
+                                     lambda c: run(c, 'redirect check', probe=True), _check_hop)
+        if final_url != tpl['image_url']:
+            _update_dep(dep_id, log_append=f"image_url redirects to {_scrub(final_url)}")
+
         vmid_i = int(vmid)
         q_img_path = shlex.quote(img_path)
-        q_url = shlex.quote(tpl['image_url'])
+        q_url = shlex.quote(final_url)
         q_vm_name = shlex.quote(vm_name)
         q_storage = shlex.quote(storage)
 
         # 1. download
         # MK: -nc skip if exists, -q quiet output. show-progress would flood log
         run(f"mkdir -m 700 -p {shlex.quote(_img_dir)}", 'staging dir', weight=1)
-        run(f"wget -q -O {q_img_path} {q_url}", 'download')
+        run(f"wget -q --max-redirect=0 -O {q_img_path} {q_url}", 'download')
         _update_dep(dep_id, progress=35, log_append='download done')
 
         # 2. qm create skeleton
@@ -531,6 +623,9 @@ def add_custom_template():
         disk_gb = int(body.get('disk_gb') or 10)
     except Exception:
         return jsonify({'error': 'cores/memory/disk_gb must be integers'}), 400
+    # MK Oct 2026 - the tenant quota counts a deploy by these: none of them may be zero or less
+    if cores < 1 or memory < 1 or disk_gb < 1:
+        return jsonify({'error': 'cores, memory and disk_gb must be at least 1'}), 400
 
     tags = body.get('tags', [])
     if isinstance(tags, list):
@@ -677,9 +772,37 @@ def deploy(cluster_id):
         if not _rok:
             return jsonify({'error': _rmsg}), 403
 
+    # MK Oct 2026 - the deployed guest takes the template's cores, memory and disk; the tenant
+    # quota counts it as a create does. A custom template from before the check at creation
+    # can still say 0 or less, which would count as nothing
+    try:
+        _t_cores, _t_mem, _t_disk = (int(tpl.get('cores', 2)), int(tpl.get('memory', 2048)),
+                                     float(tpl.get('disk_gb', 10)))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'the template has no valid cores, memory or disk size'}), 400
+    if _t_cores < 1 or _t_mem < 1 or _t_disk < 1:
+        return jsonify({'error': 'the template has no valid cores, memory or disk size'}), 400
+    dep_id = uuid.uuid4().hex[:12]
+
+    def _deploy_alive():
+        # the hold goes once the deploy failed (the guest shows on the cluster when it worked)
+        try:
+            r = get_db().conn.execute('SELECT status FROM cloud_init_deployments WHERE id = ?',
+                                      (dep_id,)).fetchone()
+            return r is None or r['status'] != 'failed'
+        except Exception:
+            return True
+    from pegaprox.api.helpers import tenant_quota_gate
+    _qerr, _qwarn = tenant_quota_gate(
+        _caller, f"template deploy of {tpl['name']}",
+        {'vms': 1, 'cores': _t_cores, 'memory_gb': _t_mem / 1024.0, 'disk_gb': _t_disk},
+        cluster=getattr(getattr(mgr, 'config', None), 'name', '') or cluster_id,
+        hold={'cluster_id': cluster_id, 'vmid': vmid, 'alive': _deploy_alive})
+    if _qerr:
+        return _qerr
+
     user = _current_user()
 
-    dep_id = uuid.uuid4().hex[:12]
     try:
         c = get_db().conn.cursor()
         c.execute('''
@@ -707,6 +830,7 @@ def deploy(cluster_id):
         'vmid': vmid,
         'name': name,
         'status': 'queued',
+        **({'quota_warning': _qwarn} if _qwarn else {}),
     })
 
 

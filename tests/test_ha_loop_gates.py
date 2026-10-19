@@ -98,6 +98,8 @@ TOP_GATED = {'run_cross_cluster_balance_check', 'recover_orphan_runs',
 # per host, never behind the gate
 UNGATED = {
     'alert_check_loop': ['_periodic_session_cleanup', '_periodic_audit_cleanup'],
+    # drift_events is a local table, a standby collapses its own repeats
+    '_scanner_loop': ['_collapse_repeats'],
     '_worker_loop': ['get', 'task_done'],
 }
 

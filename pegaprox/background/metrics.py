@@ -5,6 +5,7 @@ Background metrics snapshot collection.
 """
 
 import os
+import math
 import time
 import json
 import logging
@@ -239,6 +240,111 @@ def load_metrics_history(days=None, totals_only=False):
         except:
             pass
     return {'snapshots': [], 'last_cleanup': None}
+
+
+# MK Oct 2026 - a time range picked on a chart: any from/to the stored snapshots reach,
+# for one node, one guest or one cluster's totals. Not cached: the keys would be as many
+# as the ranges anybody ever picks, and run_heavy_read keeps a key until it is read again.
+# Bounded instead. The stride keeps the rows at what a chart draws (LineChart decimates to
+# 200 points anyway), and pick() keeps the few figures asked for out of each blob inside
+# the worker thread, so the multi-MB snapshots never pile up.
+_RANGE_ROWS = 200
+_RANGE_MAX_SECONDS = 366 * 86400
+# MK Oct 2026 - one range parse at a time. A range is up to 200 whole snapshots, seconds of
+# parsing at 10k guests, and each took one of the slots the cached report reads share: a
+# few chart drags at once held all of them, and the power, cost and insight pages waited
+_range_slot = []
+
+
+def history_range(args, now=None):
+    """from/to of a request, unix seconds, as a range of the stored history.
+
+    (start, end, None), or (None, None, why) for a 400. A range older than the
+    retention or reaching into the future is cut to what is stored, so it can come
+    back empty; nonsense (no numbers, to not after from, more than a year) is refused.
+    """
+    raw_from, raw_to = args.get('from'), args.get('to')
+    if raw_from is None or raw_to is None:
+        return None, None, 'from and to are both needed, in unix seconds'
+    try:
+        start, end = float(raw_from), float(raw_to)
+    except (TypeError, ValueError):
+        return None, None, 'from and to are unix seconds'
+    if not (math.isfinite(start) and math.isfinite(end)) or start < 0:
+        return None, None, 'from and to are unix seconds'
+    if end - start < 60:
+        return None, None, 'to has to be at least a minute after from'
+    if end - start > _RANGE_MAX_SECONDS:
+        return None, None, 'A range spans a year at most'
+    now = time.time() if now is None else now
+    return max(start, now - _retention_days() * 86400), min(end, now), None
+
+
+def _range_sem():
+    if not _range_slot:
+        try:
+            from gevent.lock import BoundedSemaphore
+            _range_slot.append(BoundedSemaphore(1))
+        except Exception:
+            _range_slot.append(None)
+    return _range_slot[0]
+
+
+def load_metrics_range(start, end, pick):
+    """[(timestamp, pick(clusters))] of the snapshots from start to end (unix seconds),
+    oldest first, at most about _RANGE_ROWS of them. pick gets the clusters map of one
+    snapshot and returns what to keep of it, None where it has nothing."""
+    from pegaprox.core.dbcrypto import run_heavy_read, _heavy_sem
+    if end <= start:
+        return []
+    lo = datetime.fromtimestamp(start).isoformat()
+    hi = datetime.fromtimestamp(end).isoformat()
+
+    def _parse(rows):
+        out = []
+        for row in rows:
+            try:
+                clusters = json.loads(row['data']).get('clusters') or {}
+                out.append((row['timestamp'], pick(clusters)))
+            except Exception:
+                continue
+        return out
+
+    # every n-th row, n from the count of the range (answered from the timestamp index),
+    # anchored on the newest row of the range so its right edge is always there
+    in_range = 'FROM metrics_history WHERE timestamp >= ? AND timestamp <= ?'
+    sql = (f'SELECT timestamp, data {in_range} '
+           f'AND ((SELECT MAX(id) {in_range}) - id) % '
+           f'MAX(1, ((SELECT COUNT(*) {in_range}) + ? - 1) / ?) = 0 '
+           'ORDER BY timestamp ASC LIMIT ?')
+    params = (lo, hi, lo, hi, lo, hi, _RANGE_ROWS, _RANGE_ROWS, _RANGE_ROWS * 2)
+    try:
+        # the same cap the cached heavy reads take, and never more than one of its slots
+        from contextlib import nullcontext
+        sem = _heavy_sem()
+        with (_range_sem() or nullcontext()), (sem or nullcontext()):
+            return run_heavy_read(sql, params, transform=_parse)
+    except Exception as e:
+        logging.error(f"Error loading a metrics range: {e}")
+        return []
+
+
+def history_series(rows, fields):
+    """Rows of load_metrics_range, where pick kept one node or guest entry, in the shape
+    of the RRD charts: {timestamps, metrics: {name: [...]}}. fields maps a chart name to
+    the key in the entry. A snapshot without the entry, or without a number for a field,
+    is a gap (None), as in the RRD series."""
+    out = {'timestamps': [], 'metrics': {name: [] for name in fields}, 'source': 'history'}
+    for ts, entry in rows:
+        try:
+            out['timestamps'].append(int(datetime.fromisoformat(ts).timestamp()))
+        except (TypeError, ValueError):
+            continue
+        for name, key in fields.items():
+            v = entry.get(key) if isinstance(entry, dict) else None
+            ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+            out['metrics'][name].append(v if ok else None)
+    return out
 
 
 def save_metrics_history(history):
@@ -492,6 +598,8 @@ def collect_metrics_snapshot():
                     cluster_data['vms'][vmid] = {
                         't': rtype, 'r': running, 'cpu': cpu_pct, 'mem': mem_pct,
                         'maxmem': maxmem, 'maxcpu': maxcpu,
+                        # #965 - the host it ran on, so power history follows a migration
+                        'n': r.get('node') or '',
                     }
             except Exception:
                 pass
