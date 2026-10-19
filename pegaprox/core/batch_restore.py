@@ -51,6 +51,9 @@ def start_restore(mgr, volid, node, vmid, storage, overwrite):
     r = mgr._api_post(f"https://{mgr.host}:{mgr.api_port}/api2/json/nodes/{node}/{'lxc' if is_lxc else 'qemu'}",
                       data=params, timeout=30)
     if r.status_code == 200:
+        # the restored config replaces what the search index read under that id
+        from pegaprox.background import guest_index
+        guest_index.drop(getattr(mgr, 'id', None), 'lxc' if is_lxc else 'qemu', vmid)
         return {'upid': r.json().get('data'), 'kind': 'lxc' if is_lxc else 'qemu'}
     try:
         err = r.json().get('errors') or r.json().get('message') or r.text

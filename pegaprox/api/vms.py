@@ -1814,6 +1814,8 @@ def restore_vm_backup(cluster_id, node, vm_type, vmid):
         
         if response.status_code == 200:
             task = response.json().get('data', '')
+            # the restored config replaces what the search index read under that id
+            guest_index.drop(cluster_id, vm_type, target_vmid)
             user = getattr(request, 'session', {}).get('user', 'system')
             log_audit(user, 'backup.restored', f"Restored {volid} to VMID {target_vmid}", cluster=manager.config.name)
             return jsonify({'success': True, 'task': task, 'vmid': target_vmid,

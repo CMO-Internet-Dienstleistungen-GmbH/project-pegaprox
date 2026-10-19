@@ -12,6 +12,11 @@ large estate fills in over a while instead of costing one request per guest at o
 
 In memory only. A description can hold anything; it stays where the config came
 from, and the search hands it out under the same per-guest check as the config.
+
+An entry is keyed by the guest id, and PVE gives a freed id to the next new guest. So
+an entry keeps the name its config had, and an entry whose guest now goes by another
+name is not handed out and is read again first. PegaProx drops the entry itself where
+it deletes a guest or puts a new one on an id.
 """
 
 import re
@@ -112,6 +117,20 @@ def parse_config(vm_type, cfg):
     return {'macs': macs, 'ips': ips, 'notes': notes, 'notes_lc': notes.lower()}
 
 
+def _config_name(vm_type, cfg):
+    # what /cluster/resources shows as the name; '' when the config sets none
+    name = cfg.get('hostname' if vm_type == 'lxc' else 'name')
+    return name.strip().lower() if isinstance(name, str) else ''
+
+
+def same_guest(entry, name):
+    """False when the entry was read from a guest of another name, which is how a VMID
+    that went to a new guest shows. An entry or a row without a name says nothing."""
+    known = (entry or {}).get('name')
+    name = str(name or '').strip().lower()
+    return not known or not name or known == name
+
+
 def ingest(cluster_id, vm_type, vmid, cfg):
     """Take a guest config that was read anyway. Never raises: a caller reads configs for
     something else and must not fail over the index."""
@@ -119,6 +138,7 @@ def ingest(cluster_id, vm_type, vmid, cfg):
         if vm_type not in ('qemu', 'lxc') or not isinstance(cfg, dict):
             return
         entry = parse_config(vm_type, cfg)
+        entry['name'] = _config_name(vm_type, cfg)
         entry['at'] = time.monotonic()
         with _lock:
             _index.setdefault(cluster_id, {})[(vm_type, int(vmid))] = entry
@@ -152,6 +172,18 @@ def forget(cluster_id, keep=None):
         if entries:
             for key in [k for k in entries if k not in keep]:
                 del entries[key]
+
+
+def drop(cluster_id, vm_type, vmid):
+    """Forget one guest: it was deleted, or its id now belongs to a new one."""
+    try:
+        key = (vm_type, int(vmid))
+    except (TypeError, ValueError):
+        return
+    with _lock:
+        entries = _index.get(cluster_id)
+        if entries:
+            entries.pop(key, None)
 
 
 def clear():
@@ -246,9 +278,17 @@ def refresh_pass(budget=PASS_BUDGET, deadline=PASS_DEADLINE):
             logging.debug(f"[guest-index] guest list of {cid}: {e}")
             continue
         if rows:
-            # an empty answer is as likely a failed read as a cluster without guests
-            forget(cid, {(r.get('type'), int(r['vmid'])) for r in rows
-                         if str(r.get('vmid', '')).isdigit()})
+            # an empty answer is as likely a failed read as a cluster without guests.
+            # An entry whose guest goes by another name now was read from the guest
+            # that had the id before: it goes too, so the new one is read first
+            entries = snapshot(cid)
+            keep = set()
+            for r in rows:
+                if str(r.get('vmid', '')).isdigit():
+                    key = (r.get('type'), int(r['vmid']))
+                    if same_guest(entries.get(key), r.get('name')):
+                        keep.add(key)
+            forget(cid, keep)
         due = _due(cid, rows, snapshot(cid), now)
         if due:
             queues.append((cid, mgr, due))

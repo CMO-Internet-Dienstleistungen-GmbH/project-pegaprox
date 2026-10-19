@@ -13896,6 +13896,9 @@ echo "AGENT_INSTALLED_OK"
             if response.status_code == 200:
                 result = response.json()
                 self.logger.info(f"[OK] Clone started: {vmid} -> {newid}")
+                # MK Oct 2026 - newid is a new guest, the search index forgets an older one there
+                from pegaprox.background import guest_index
+                guest_index.drop(self.id, vm_type, newid)
                 return {'success': True, 'data': result.get('data')}
             else:
                 error_msg = response.text
@@ -14259,6 +14262,10 @@ echo "AGENT_INSTALLED_OK"
                         return {'success': False, 'error': error_detail, 'task': task_upid}
 
                 self.logger.info(f"[OK] {vm_type}/{vmid} successfully deleted")
+                # MK Oct 2026 - and what the search index read of it (notes, MACs, IPs),
+                # before the id goes to the next new guest
+                from pegaprox.background import guest_index
+                guest_index.drop(self.id, vm_type, vmid)
 
                 # MK: Cleanup - remove VM from balancing exclusion list
                 try:
@@ -14609,6 +14616,8 @@ echo "AGENT_INSTALLED_OK"
                     except Exception as ha_err:
                         self.logger.warning(f"[WARN] HA config failed: {ha_err}")
                 
+                from pegaprox.background import guest_index
+                guest_index.drop(self.id, 'qemu', vmid)    # a guest that had the id before
                 return {'success': True, 'vmid': vmid, 'task': task_data.get('data')}
             else:
                 error_msg = response.text
@@ -14796,6 +14805,8 @@ echo "AGENT_INSTALLED_OK"
                     except Exception as ha_err:
                         self.logger.warning(f"[WARN] HA config failed: {ha_err}")
                 
+                from pegaprox.background import guest_index
+                guest_index.drop(self.id, 'lxc', vmid)    # a guest that had the id before
                 return {'success': True, 'vmid': vmid, 'task': task_data.get('data')}
             else:
                 error_msg = response.text

@@ -318,6 +318,9 @@ def _search_facts(r, cluster_id, cluster_name, indexed):
     if isinstance(tags, (list, tuple)):
         tags = ';'.join(str(t) for t in tags)
     tags_str = str(tags).lower()
+    entry = indexed.get((r.get('type'), int(vmid))) if vmid.isdigit() else None
+    if not guest_index.same_guest(entry, r.get('name')):
+        entry = None    # read from the guest that had this id before
     return {
         'row': r,
         'name': (r.get('name') or '').lower(),
@@ -334,7 +337,7 @@ def _search_facts(r, cluster_id, cluster_name, indexed):
         'pool': str(r.get('pool') or '').lower(),
         # what the guest search index knows of this guest: MACs, notes, the
         # static IPs of its config. A hit there says which value it was
-        'entry': indexed.get((r.get('type'), int(vmid))) if vmid.isdigit() else None,
+        'entry': entry,
         'live_ips': r.get('ip_addresses') or ([r['ip']] if r.get('ip') else []),
     }
 

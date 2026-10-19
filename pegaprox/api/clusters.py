@@ -3314,6 +3314,8 @@ def _guest_text_filter(rows, text):
             if cid not in indexes:
                 indexes[cid] = guest_index.snapshot(cid)
             entry = indexes[cid].get((g['type'], g['vmid']))
+            if not guest_index.same_guest(entry, g['name']):
+                entry = None    # read from the guest that had this id before
         ips = g['ip_addresses']
         facts = {
             'name': g['name'].lower(), 'vmid': str(g['vmid']), 'node': g['node'].lower(),

@@ -394,6 +394,11 @@ def _run(pve_mgr, params, status):
                 _log(f"Emergency cleanup failed for VM {test_vmid}: {why}")
 
     finally:
+        if restore_accepted:
+            # MK Oct 2026 - the test guest carried the backed up guest's notes; the
+            # search index forgets them with it, or reads them again if it was kept
+            from pegaprox.background import guest_index
+            guest_index.drop(params.get('cluster_id'), vm_type, test_vmid)
         status['completed_at'] = datetime.now().isoformat()
         status['duration_seconds'] = round(time.time() - start_time, 1)
         if status['status'] != 'running':
