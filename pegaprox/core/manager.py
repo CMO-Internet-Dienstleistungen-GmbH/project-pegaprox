@@ -5630,13 +5630,21 @@ class PegaProxManager:
         recovery_delay = saved_ha.get('recovery_delay', 30)
         if not self._ha_countable(recovery_delay):
             recovery_delay = 30
+        # same for the vote count and the heartbeat timeout: the UI sends back what it
+        # was given, so a bad stored value would get every later save refused
+        quorum_votes = saved_ha.get('quorum_required_votes', 2)
+        if not self._ha_quorum_votes_ok(quorum_votes):
+            quorum_votes = 2
+        heartbeat_timeout = saved_ha.get('storage_heartbeat_timeout', 30)
+        if not (self._ha_countable(heartbeat_timeout) and heartbeat_timeout > 0):
+            heartbeat_timeout = 30
 
         # split-brain stuff (complicated, dont touch) - NS
         ha_config = {
             'quorum_enabled': saved_ha.get('quorum_enabled', True),
             'quorum_hosts': saved_ha.get('quorum_hosts', []),
             'quorum_gateway': saved_ha.get('quorum_gateway', ''),
-            'quorum_required_votes': saved_ha.get('quorum_required_votes', 2),
+            'quorum_required_votes': quorum_votes,
             
             # self-fencing
             'self_fence_enabled': saved_ha.get('self_fence_enabled', True),
@@ -5655,7 +5663,7 @@ class PegaProxManager:
             'storage_heartbeat_enabled': saved_ha.get('storage_heartbeat_enabled', False),
             'storage_heartbeat_path': self._heartbeat_path_or_none(saved_ha.get('storage_heartbeat_path', '')),
             'storage_heartbeat_interval': saved_ha.get('storage_heartbeat_interval', 5),
-            'storage_heartbeat_timeout': saved_ha.get('storage_heartbeat_timeout', 30),
+            'storage_heartbeat_timeout': heartbeat_timeout,
             'poison_pill_enabled': saved_ha.get('poison_pill_enabled', True),
             
             # ═══════════════════════════════════════════════════════════════
@@ -9161,6 +9169,13 @@ WantedBy=multi-user.target
         timing can be worked out from: int or float, no bool, finite, not negative."""
         return (isinstance(value, (int, float)) and not isinstance(value, bool)
                 and value == value and value not in (float('inf'), float('-inf')) and value >= 0)
+
+    @staticmethod
+    def _ha_quorum_votes_ok(value) -> bool:
+        """Whether quorum_required_votes is a vote count _ha_check_quorum can use: an
+        int, no bool, 1 to 64. Zero or true made it quorate with every host down,
+        a string or null raised in it."""
+        return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 64
 
     def _ha_interval(self) -> int:
         """Seconds between two passes of the HA monitor. The loop sleeps this and

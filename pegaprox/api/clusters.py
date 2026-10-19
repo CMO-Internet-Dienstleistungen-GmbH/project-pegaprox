@@ -3726,6 +3726,21 @@ def update_ha_config(cluster_id):
         if key in data and not PegaProxManager._ha_countable(data[key]):
             return jsonify({'error': f'{key} must be a number, zero or more',
                             'code': 'HA_TIMING_INVALID'}), 400
+    # MK Oct 2026 - the quorum check counts the hosts that answer plus its own vote
+    # against this: 0 or true was quorate with every host down, a string raised in it
+    if 'quorum_required_votes' in data and not PegaProxManager._ha_quorum_votes_ok(data['quorum_required_votes']):
+        return jsonify({'error': 'quorum_required_votes must be a whole number from 1 to 64',
+                        'code': 'HA_QUORUM_INVALID'}), 400
+    _qh = data.get('quorum_hosts', [])
+    if not isinstance(_qh, list) or not all(isinstance(h, str) for h in _qh):
+        return jsonify({'error': 'quorum_hosts must be a list of host names or addresses',
+                        'code': 'HA_QUORUM_INVALID'}), 400
+    # a heartbeat younger than this counts as alive. 0, a negative or a string read
+    # every node as having none
+    _hbt = data.get('storage_heartbeat_timeout', 30)
+    if not (PegaProxManager._ha_countable(_hbt) and _hbt > 0):
+        return jsonify({'error': 'storage_heartbeat_timeout must be a number of seconds, more than zero',
+                        'code': 'HA_TIMING_INVALID'}), 400
 
     # Update HA config
     if 'quorum_enabled' in data:
