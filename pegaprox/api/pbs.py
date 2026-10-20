@@ -17,7 +17,7 @@ from pegaprox.utils.sanitization import bounded_list
 from pegaprox.api.helpers import safe_error, check_pbs_access, check_cluster_access, scope_vm_rows, require_unconfined, bounded_limit, acts_as_admin, caller_acts_as_admin
 from pegaprox.api.helpers import upstream_failure, tenant_quota_gate, caller_is_scoped
 from pegaprox.utils.sanitization import valid_pbs_upid
-from pegaprox.core.pbs import PBSManager, load_pbs_servers, save_pbs_server, pbs_config_from_row, pbs_target_refusal
+from pegaprox.core.pbs import PBSManager, load_pbs_servers, save_pbs_server, pbs_config_from_row, pbs_target_refusal, _url_host
 
 bp = Blueprint('pbs', __name__)
 
@@ -3652,7 +3652,7 @@ def probe_pbs_fingerprint():
     # SSRF-ish guard: same checks our outbound-url helper applies
     try:
         from pegaprox.utils.url_security import is_safe_outbound_url
-        ok, reason = is_safe_outbound_url(f'https://{host}:{port}/',
+        ok, reason = is_safe_outbound_url(f'https://{_url_host(host)}:{port}/',
                                           allowed_schemes=('https',),
                                           allow_private=True)  # PBS is usually on the LAN
         if not ok:
@@ -4051,7 +4051,7 @@ def storage_preflight(cluster_id):
         return jsonify({'ok': False, 'issues': ['server required'], 'info': {}}), 200
     try:
         from pegaprox.utils.url_security import is_safe_outbound_url
-        _ok, _reason = is_safe_outbound_url(f'https://{server}:{port}/',
+        _ok, _reason = is_safe_outbound_url(f'https://{_url_host(server)}:{port}/',
                                             allowed_schemes=('https',),
                                             allow_private=True)  # PBS is usually on the LAN
         if not _ok:
@@ -4103,7 +4103,7 @@ def storage_preflight(cluster_id):
         if given_fp:
             from pegaprox.core.pbs import _PinnedFingerprintAdapter
             s.mount('https://', _PinnedFingerprintAdapter(given_fp))
-        ar = s.post(f'https://{server}:{port}/api2/json/access/ticket',
+        ar = s.post(f'https://{_url_host(server)}:{port}/api2/json/access/ticket',
                     data={'username': username, 'password': password}, timeout=8)
         if ar.status_code != 200:
             issues.append(f'PBS auth failed (HTTP {ar.status_code})')
@@ -4114,7 +4114,7 @@ def storage_preflight(cluster_id):
             csrf = ar.json().get('data', {}).get('CSRFPreventionToken')
             # 4) Datastore exists?
             if datastore and ticket:
-                ds_r = s.get(f'https://{server}:{port}/api2/json/admin/datastore',
+                ds_r = s.get(f'https://{_url_host(server)}:{port}/api2/json/admin/datastore',
                              cookies={'PBSAuthCookie': ticket}, timeout=8)
                 if ds_r.status_code == 200:
                     names = [d.get('store') or d.get('name') for d in ds_r.json().get('data', [])]

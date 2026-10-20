@@ -5,6 +5,7 @@ Creates and configures the Flask application.
 """
 
 import io
+import ipaddress
 import json
 import os
 import re
@@ -2009,6 +2010,28 @@ def _test_ipv6_available():
         return False
 
 
+def _host_for_location(host_value):
+    """Host header value -> host part of the http->https Location, '' when it is unusable.
+
+    A name or an IPv4 address loses its ":port" as before. An IPv6 literal keeps its
+    brackets (#1158): the split on the last ':' made "[2001:db8::10]" "[2001:db8:".
+    Bracketed is taken only as "[addr]" or "[addr]:port" with a real IPv6 address inside
+    (no zone id); anything else with a '[' gives '' and the caller says localhost.
+    Both redirect handlers use this, so they read one Host header the same way.
+    """
+    hv = (host_value or '').strip()
+    if hv.startswith('['):
+        inner, sep, rest = hv[1:].partition(']')
+        if sep and '%' not in inner and (not rest or re.fullmatch(r':[0-9]{0,5}', rest)):
+            try:
+                ipaddress.IPv6Address(inner)
+                return f'[{inner}]'
+            except ValueError:
+                pass
+        return ''
+    return hv.rsplit(':', 1)[0] if ':' in hv else hv
+
+
 def _start_http_redirect(bind_host, http_redirect_port, https_port, domain):
     """Start a simple HTTP server that redirects to HTTPS using raw sockets"""
     try:
@@ -2061,11 +2084,7 @@ def _start_http_redirect(bind_host, http_redirect_port, https_port, domain):
                     for line in request.split('\r\n'):
                         low = line.lower()
                         if low.startswith('host:'):
-                            host_value = line.split(':', 1)[1].strip()
-                            if ':' in host_value:
-                                host_header = host_value.rsplit(':', 1)[0]
-                            else:
-                                host_header = host_value
+                            host_header = _host_for_location(line.split(':', 1)[1])
                         elif low.startswith('x-forwarded-proto:'):
                             fwd_proto = line.split(':', 1)[1].strip().lower()
                         elif low.startswith('x-forwarded-port:'):
@@ -2728,16 +2747,7 @@ def _start_gevent_server(app, bind_host, port, ssl_context, domain, workers, htt
                 host = self._redirect_domain or 'localhost'
                 for line in request.split('\r\n'):
                     if line.lower().startswith('host:'):
-                        host_value = line.split(':', 1)[1].strip()
-                        if host_value.startswith('['):
-                            if ']:' in host_value:
-                                host = host_value.rsplit(':', 1)[0]
-                            else:
-                                host = host_value
-                        elif ':' in host_value:
-                            host = host_value.rsplit(':', 1)[0]
-                        else:
-                            host = host_value
+                        host = _host_for_location(line.split(':', 1)[1])
                         break
 
                 # NS Jul 2026 (CodeAnt http-response-splitting) — the Host header is untrusted;

@@ -14,6 +14,7 @@ from datetime import datetime
 import urllib3
 from typing import List, Optional
 import re
+import ipaddress
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -56,6 +57,21 @@ def pbs_target_refusal(host: str, allow_loopback: bool = True) -> str:
     if not _validate_pbs_host(host):
         return 'Invalid PBS host'
     return infra_target_refusal(host, allow_loopback=allow_loopback, label='PBS host')
+
+
+def _url_host(host: str) -> str:
+    """The PBS host the way a URL needs it: an IPv6 literal in brackets (#1158).
+
+    The stored host is always bare (the format check above has no '[' or ']'), and the
+    refusal check, paramiko and the raw sockets all take it that way. Only the URL text
+    gets the brackets, the address it points at is the same one.
+    """
+    try:
+        ipaddress.IPv6Address(host)
+    except ValueError:
+        return host
+    return f'[{host}]'
+
 
 class _PinnedFingerprintAdapter(requests.adapters.HTTPAdapter):
     """Verify the peer certificate against a configured SHA-256 fingerprint.
@@ -158,7 +174,8 @@ class PBSManager:
     
     @property
     def base_url(self):
-        return f"https://{self.host}:{self.port}/api2/json"
+        # bare "2001:db8::10:8007" is no URL, requests could not even parse it
+        return f"https://{_url_host(self.host)}:{self.port}/api2/json"
     
     def connect(self) -> bool:
         """Authenticate with PBS server
@@ -217,7 +234,7 @@ class PBSManager:
                     return False
                     
         except requests.exceptions.ConnectionError as e:
-            self.last_error = f"Connection failed: {self.host}:{self.port}"
+            self.last_error = f"Connection failed: {_url_host(self.host)}:{self.port}"
             logging.error(f"[PBS:{self.name}] {self.last_error}")
             self.connected = False
             return False
@@ -467,7 +484,7 @@ class PBSManager:
         try:
             task.status = 'updating'
             task.phase = 'connecting'
-            task.add_output(f"Connecting to PBS {self.host}:{self.ssh_port}...")
+            task.add_output(f"Connecting to PBS {_url_host(self.host)}:{self.ssh_port}...")
             ssh, err = self._ssh_connect()
             if not ssh:
                 raise Exception(err or 'SSH connection failed')
