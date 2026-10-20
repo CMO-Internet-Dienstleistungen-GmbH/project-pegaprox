@@ -53,7 +53,7 @@ from pegaprox.models.tasks import (MaintenanceTask, PegaProxConfig, balancer_coo
 from pegaprox.core.config import save_config
 from pegaprox.utils.realtime import broadcast_sse, is_cluster_watched
 from pegaprox.utils.ssh import get_ssh_connection_stats, _ssh_track_connection, ssh_password_for
-from pegaprox.utils.ssh import ssh_login_args
+from pegaprox.utils.ssh import ssh_login_args, bare_host, is_ipv6_literal
 from pegaprox.utils.concurrent import GEVENT_PATCHED
 from pegaprox.core.db import get_db
 from pegaprox.core import ha  # PegaProx's own warm standby (#625), not PVE HA
@@ -1017,7 +1017,16 @@ class PegaProxManager:
         """
         import socket
         try:
-            results = socket.getaddrinfo(hostname, 8006, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            # AI_ADDRCONFIG: on a PegaProx without IPv4 the A record of a dual-stack name is
+            # no answer, pinning it left the cluster unreachable (#1158). Where it finds
+            # nothing (a box with only lo) ask as before, the pin stays either way
+            try:
+                results = socket.getaddrinfo(hostname, 8006, socket.AF_UNSPEC, socket.SOCK_STREAM,
+                                             0, getattr(socket, 'AI_ADDRCONFIG', 0))
+            except OSError:
+                results = None
+            if not results:
+                results = socket.getaddrinfo(hostname, 8006, socket.AF_UNSPEC, socket.SOCK_STREAM)
             if results:
                 # prefer IPv4 over IPv6 for compatibility
                 for family, _, _, _, addr in results:
@@ -1046,7 +1055,7 @@ class PegaProxManager:
     @property
     def raw_host(self) -> str:
         """Raw host/IP without brackets — for SSH, DNS lookups etc."""
-        return self.current_host or self.config.host
+        return bare_host(self.current_host or self.config.host)
 
     @property
     def api_port(self) -> int:
@@ -8166,6 +8175,15 @@ if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } ||
                 '1.1.1.1',      # Cloudflare DNS
                 '9.9.9.9',      # Quad9 DNS
             ]
+            if not self._has_v4_default_route():
+                # a v6-only PegaProx never got a vote from those and refused every
+                # recovery (#1158). Only without any IPv4 default route: a dual-stack
+                # box that lost its v4 uplink still counts as cut off, as before
+                hosts_to_check = [
+                    '2001:4860:4860::8888',
+                    '2606:4700:4700::1111',
+                    '2620:fe::fe',
+                ]
             self.logger.debug(f"[HA] No quorum hosts configured, using defaults: {hosts_to_check}")
         
         # Count successful pings
@@ -8205,17 +8223,25 @@ if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } ||
             if gateway:
                 check_hosts = [gateway]
             else:
-                # Try to detect default gateway
-                try:
-                    result = subprocess.run(
-                        ['ip', 'route', 'show', 'default'],
-                        capture_output=True, text=True, timeout=5
-                    )
-                    if result.returncode == 0 and 'via' in result.stdout:
-                        gateway = result.stdout.split('via')[1].split()[0]
-                        check_hosts = [gateway]
-                except:
-                    pass
+                # Try to detect default gateway. IPv4 first as always, then IPv6: on a
+                # v6-only host the first found none and the check was skipped
+                for route_cmd in (['ip', 'route', 'show', 'default'],
+                                  ['ip', '-6', 'route', 'show', 'default']):
+                    try:
+                        result = subprocess.run(
+                            route_cmd,
+                            capture_output=True, text=True, timeout=5
+                        )
+                        if result.returncode == 0 and 'via' in result.stdout:
+                            if '-6' in route_cmd:
+                                gateway = self._v6_gateway_of(result.stdout)
+                            else:
+                                gateway = result.stdout.split('via')[1].split()[0]
+                            if gateway:
+                                check_hosts = [gateway]
+                                break
+                    except:
+                        pass
         
         if not check_hosts:
             self.logger.debug("[HA] No network check hosts, skipping verification")
@@ -8232,8 +8258,50 @@ if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } ||
             self.logger.warning(f"[HA] Network check: only {successful}/{len(check_hosts)} hosts reachable (need {required})")
             return False
     
+    @staticmethod
+    def _has_v4_default_route():
+        """True if this host has an IPv4 default route, or when we cannot tell
+        (no /proc/net/route) - then the old IPv4 quorum defaults stay."""
+        try:
+            with open('/proc/net/route') as f:
+                next(f, None)
+                for line in f:
+                    cols = line.split()
+                    # Iface Destination Gateway Flags ...; 0x1 = RTF_UP
+                    if len(cols) > 3 and cols[1] == '00000000' and int(cols[3], 16) & 0x1:
+                        return True
+            return False
+        except Exception:
+            return True
+
+    @staticmethod
+    def _v6_gateway_of(route_out):
+        """The gateway in `ip -6 route show default` output, None without one.
+        Mostly a router's link-local address (fe80::1 dev eth0), which needs its
+        interface to be reached: fe80::1%eth0."""
+        import ipaddress
+        words = str(route_out or '').split()
+        if 'via' not in words:
+            return None
+        i = words.index('via')
+        gw = words[i + 1] if i + 1 < len(words) else ''
+        try:
+            addr = ipaddress.IPv6Address(gw)
+        except ValueError:
+            return None
+        if addr.is_link_local:
+            dev = words[words.index('dev', i) + 1] if 'dev' in words[i:-1] else ''
+            if not re.fullmatch(r'[A-Za-z0-9_.@-]{1,15}', dev):
+                return None
+            return f'{gw}%{dev}'
+        return gw
+
     def _ha_ping_host(self, host: str, timeout: int = 3) -> bool:
-        # ping check
+        # ping check. iputils ping takes a v6 literal as it is, not in URL brackets
+        host = bare_host(host)
+        if not host or host.startswith('-'):
+            # nothing to ping, or a "host" ping would read as one of its options
+            return False
         try:
             result = subprocess.run(
                 ['ping', '-c', '1', '-W', str(timeout), host],
@@ -8243,14 +8311,11 @@ if ours; then rm -f "$F" && { rmdir "$D" 2>/dev/null; echo "CLAIM_REMOVED"; } ||
         except subprocess.TimeoutExpired:
             return False
         except FileNotFoundError:
-            # ping not available, try socket
+            # ping not available (the Docker image), try a TCP connect in the family of the address
             try:
                 import socket
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(timeout)
-                result = sock.connect_ex((host, 80))
-                sock.close()
-                return result == 0
+                with socket.create_connection((host, 80), timeout=timeout):
+                    return True
             except:
                 return False
         except Exception:
@@ -9352,10 +9417,12 @@ fi
         
         # Try to get the IP we use to connect to the cluster
         try:
-            host = self.host
+            # the bare address and its own family - AF_INET with "[2001:db8::10]" never
+            # got a socket, a v6-only cluster had no agent URL
+            addr = self._resolve_host(self.raw_host)
             # Create a socket to the cluster to find our outgoing IP
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect((host, 8006))
+            s = socket.socket(socket.AF_INET6 if ':' in addr else socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((addr, 8006))
             local_ip = s.getsockname()[0]
             s.close()
             return local_ip
@@ -9365,7 +9432,8 @@ fi
         # Fallback: try to get default interface IP
         try:
             hostname = socket.gethostname()
-            return socket.gethostbyname(hostname)
+            ip = self._resolve_host(hostname)
+            return ip if ip != hostname else ''
         except:
             return ''
     
@@ -11434,7 +11502,8 @@ echo "AGENT_INSTALLED_OK"
             import socket
             for ip in ips:
                 try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    ip = bare_host(ip)   # a typed override may carry URL brackets
+                    s = socket.socket(socket.AF_INET6 if ':' in ip else socket.AF_INET, socket.SOCK_STREAM)
                     s.settimeout(2)
                     result = s.connect_ex((ip, 8006))
                     s.close()
@@ -11445,7 +11514,7 @@ echo "AGENT_INSTALLED_OK"
                     continue
             # Last resort: return first IP (might not be reachable)
             self.logger.warning(f"[HA] {node_name}: no reachable IP found, using {ips[0]}")
-            return ips[0]
+            return bare_host(ips[0])
         return None
     
     def _ha_get_all_node_ips(self, node_name: str) -> List[str]:
@@ -11500,13 +11569,17 @@ echo "AGENT_INSTALLED_OK"
             resp = self._create_session().get(url, timeout=10)
             if resp.status_code == 200:
                 for iface_data in resp.json().get('data', []):
-                    addr = iface_data.get('address') or ''
-                    if not addr:
-                        cidr = iface_data.get('cidr', '')
-                        if cidr:
-                            addr = cidr.split('/')[0]
-                    if addr and addr not in mgmt_ips and addr not in other_ips:
-                        other_ips.append(addr)
+                    # PVE lists the IPv6 address apart, in address6/cidr6
+                    for a_key, c_key in (('address', 'cidr'), ('address6', 'cidr6')):
+                        addr = iface_data.get(a_key) or ''
+                        if not addr:
+                            cidr = iface_data.get(c_key, '')
+                            if cidr:
+                                addr = cidr.split('/')[0]
+                        if a_key == 'address6' and (addr == '::1' or addr.lower().startswith('fe80:')):
+                            continue    # loopback, and link-local is nothing without its interface
+                        if addr and addr not in mgmt_ips and addr not in other_ips:
+                            other_ips.append(addr)
         except Exception as e:
             self.logger.debug(f"[HA] Could not get network info for {node_name}: {e}")
         
@@ -11528,21 +11601,30 @@ echo "AGENT_INSTALLED_OK"
         
         # Try DNS resolution as fallback
         if not ips:
+            import socket
+
+            def _lookup(name):
+                # gethostbyname knows A records only: the first IPv4 address as
+                # before, then the first IPv6 one
+                found = {}
+                for af, _, _, _, sa in socket.getaddrinfo(name, None, socket.AF_UNSPEC, socket.SOCK_STREAM):
+                    if af in (socket.AF_INET, socket.AF_INET6):
+                        found.setdefault(af, sa[0])
+                return [found[af] for af in (socket.AF_INET, socket.AF_INET6) if af in found]
+
             try:
-                import socket
-                ip = socket.gethostbyname(node_name)
-                if ip:
-                    ips.append(ip)
+                for ip in _lookup(node_name):
+                    if ip and ip not in ips:
+                        ips.append(ip)
             except:
                 pass
             
             try:
-                import socket
                 for suffix in ['.local', '.lan', '.cluster']:
                     try:
-                        ip = socket.gethostbyname(f"{node_name}{suffix}")
-                        if ip and ip not in ips:
-                            ips.append(ip)
+                        for ip in _lookup(f"{node_name}{suffix}"):
+                            if ip and ip not in ips:
+                                ips.append(ip)
                     except:
                         pass
             except:
@@ -11980,7 +12062,7 @@ echo "AGENT_INSTALLED_OK"
             # Get target node IP
             target_ip = self._ha_get_node_ip(target_node)
             if not target_ip:
-                target_ip = self.host
+                target_ip = self.raw_host
             
             # Use cluster credentials for SSH
             api_user = self.config.user
@@ -12671,12 +12753,27 @@ echo "AGENT_INSTALLED_OK"
                     return None
 
             host = self.host
-            primary_ip = self.config.host
+            primary_ip = bare_host(self.config.host)
             # MK Oct 2026 - the address no other node may resolve to is the one of the host
             # this manager talks to (answered by the local-node shortcut below). In a failover
             # that is not config.host: the configured host is then just another member, and
             # skipping its address left that node with none (SSH and its own password, #1136)
-            connected = host
+            # Bare, not the URL form: "[2001:db8::10]" equalled no address the cluster
+            # reports, so with IPv6 the filter let every node resolve to it (#1158)
+            connected = bare_host(host)
+            try:
+                connected_ip = ipaddress.ip_address(connected)
+            except ValueError:
+                connected_ip = None
+
+            def _is_connected(ip):
+                # one address in any spelling (2001:DB8::10, 2001:db8:0::10)
+                if connected_ip is None:
+                    return ip == connected
+                try:
+                    return ipaddress.ip_address(bare_host(ip)) == connected_ip
+                except ValueError:
+                    return False
 
             # If target is the local/primary node, return its IP directly
             # Otherwise the logic below skips it (ip == primary_ip filter)
@@ -12697,7 +12794,7 @@ echo "AGENT_INSTALLED_OK"
                         if item.get('type') == 'node' and item.get('name') == node_name and item.get('local', 0) == 1:
                             # #199: in failover, self.host is the actual connected node,
                             # self.config.host is the (possibly dead) configured primary
-                            local_ip = host if host != primary_ip else primary_ip
+                            local_ip = connected
                             self.logger.info(f"[NodeIP] {node_name} is the local node, using {local_ip}")
                             return local_ip
             except Exception:
@@ -12791,14 +12888,15 @@ echo "AGENT_INSTALLED_OK"
                         net_resp = self._api_get(net_url)
                         if net_resp.status_code == 200:
                             for net in net_resp.json().get('data', []):
-                                addr = net.get('address') or ''
+                                addr, ci, nm = net.get('address') or '', net.get('cidr', ''), net.get('netmask', '')
+                                if primary_parsed is not None and primary_parsed.version == 6:
+                                    # an IPv6 primary sits in address6/cidr6, as STEP 2 reads it
+                                    addr, ci, nm = net.get('address6') or '', net.get('cidr6', ''), ''
                                 if not addr:
                                     continue
                                 try:
                                     if ipaddress.ip_address(addr) == primary_parsed:
                                         primary_iface = net.get('iface', '')
-                                        ci = net.get('cidr', '')
-                                        nm = net.get('netmask', '')
                                         pi = _parse_cidr(addr, ci, nm)
                                         if pi:
                                             primary_network = pi.network
@@ -12830,7 +12928,7 @@ echo "AGENT_INSTALLED_OK"
                     for item in cs_resp.json().get('data', []):
                         if item.get('type') == 'node' and item.get('name') == node_name:
                             node_direct_ip = item.get('ip', '')
-                            if node_direct_ip and node_direct_ip != connected:
+                            if node_direct_ip and not _is_connected(node_direct_ip):
                                 in_mgmt_net = True
                                 if primary_network:
                                     try:
@@ -12939,7 +13037,7 @@ echo "AGENT_INSTALLED_OK"
             # ================================================================
             probed = 0
             for score, ip, iface, reason in candidates:
-                if score < 20 or ip == connected:
+                if score < 20 or _is_connected(ip):
                     continue
                 if probed >= 3:
                     self.logger.debug(f"[NodeIP] {node_name}: probe cap reached, falling through to STEP 4")
@@ -12982,7 +13080,7 @@ echo "AGENT_INSTALLED_OK"
             # STEP 5: High-confidence without probe (firewall may block)
             # ================================================================
             for score, ip, iface, reason in candidates:
-                if score >= 85 and ip != connected:
+                if score >= 85 and not _is_connected(ip):
                     self.logger.warning(f"[NodeIP] {node_name} -> {ip} (score={score}, {reason}) -- probe failed, high confidence")
                     return ip
             
@@ -12995,14 +13093,15 @@ echo "AGENT_INSTALLED_OK"
                 addrs = socket.getaddrinfo(node_name, 8006, socket.AF_UNSPEC, socket.SOCK_STREAM)
                 for af, socktype, proto, canonname, sa in addrs:
                     ip = sa[0]
-                    if ip and ip != connected and not ip.startswith('127.') and ip != '::1':
+                    if ip and not _is_connected(ip) and not ip.startswith('127.') and ip != '::1':
                         if _quick_probe(ip, port=probe_port):
                             self.logger.info(f"[NodeIP] Resolved {node_name} to {ip} (DNS, {'IPv6' if af == socket.AF_INET6 else 'IPv4'})")
                             return ip
-                # If probe failed, return first result anyway
+                # If probe failed, return first result anyway - but not the connected
+                # host's address either, same as the loop above
                 for af, socktype, proto, canonname, sa in addrs:
                     ip = sa[0]
-                    if ip and not ip.startswith('127.') and ip != '::1':
+                    if ip and not _is_connected(ip) and not ip.startswith('127.') and ip != '::1':
                         self.logger.info(f"[NodeIP] Resolved {node_name} to {ip} (DNS, no probe)")
                         return ip
             except (socket.gaierror, OSError):
@@ -13181,6 +13280,9 @@ echo "AGENT_INSTALLED_OK"
         # through here, so refusing here is what stops the traffic AND stops the token
         # secret being offered as a password. Callers all handle None already.
         # A transfer address is the node at pinned_as: judged and credited as that one.
+        # Bare first, so the check, the password and the pin see the address connected to
+        host = bare_host(host) if host else host
+        pinned_as = bare_host(pinned_as) if pinned_as else pinned_as
         _node_addr = pinned_as or host
         _blocked = self.ssh_blocked_reason(_node_addr)
         if _blocked:
@@ -13196,9 +13298,6 @@ echo "AGENT_INSTALLED_OK"
                                      "not one) - not connecting to its nodes")
             return None
 
-        # strip URL brackets from IPv6 if someone passes host property
-        if host and host.startswith('[') and host.endswith(']'):
-            host = host[1:-1]
         paramiko = get_paramiko()
         if not paramiko:
             self.logger.error("paramiko not installed, cannot use SSH features")
@@ -17435,8 +17534,13 @@ echo "AGENT_INSTALLED_OK"
                 # use `sshpass -e`, so neither the shell's nor sshpass's argv carries the secret.
                 # keys only towards a node with a password of its own, never a waiting prompt
                 batch = '-o BatchMode=yes ' if own_target else ''
+                # scp cuts host:path at the first colon - an IPv6 target goes in brackets,
+                # root@[2001:db8::5]:/path
+                scp_host = bare_host(tgt_ip)
+                if is_ipv6_literal(scp_host):
+                    scp_host = f'[{scp_host}]'
                 scp_tail = (f"scp {batch}-o StrictHostKeyChecking={_hkc} -o ConnectTimeout=10 -- "
-                            f"{shlex.quote(src_file)} {shlex.quote(f'{ssh_user}@{tgt_ip}')}:"
+                            f"{shlex.quote(src_file)} {shlex.quote(f'{ssh_user}@{scp_host}')}:"
                             f"{shlex.quote(tgt_path + '/')}")
                 if ssh_pass:
                     scp_cmd = f"IFS= read -r SSHPASS; export SSHPASS; sshpass -e {scp_tail}"
