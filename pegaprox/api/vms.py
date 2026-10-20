@@ -61,7 +61,7 @@ from pegaprox.core import ha, ha_transport
 from pegaprox.core import transfer_net, preflight
 from pegaprox.core.transfer_net import transfer_ssh_address
 from pegaprox.background import guest_index
-from pegaprox.utils.ssh import get_paramiko, ssh_password_for, ssh_password_to, ssh_blocked_for
+from pegaprox.utils.ssh import get_paramiko, ssh_password_for, ssh_password_to, ssh_blocked_for, bare_host
 from pegaprox.utils.sanitization import sanitize_int, validate_snapshot_name
 from urllib.parse import urlencode, quote as url_quote
 import signal
@@ -97,17 +97,29 @@ _HOST_RE = re.compile(r'^(?:'
                           r'(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*)'
                       r'|'
                       r'(?:\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})'
-                      r'|'
-                      r'(?:\[[0-9a-fA-F:]+\])'
                       r')$')
 
 
 def _validate_host(value):
-    """Return value if it looks like a hostname/IPv4/IPv6, else None.
-    Used at the boundary where flask request input flows into paramiko.connect."""
+    """Return the host to connect to if value is a hostname/IPv4/IPv6, else None.
+    Used at the boundary where flask request input flows into paramiko.connect.
+
+    IPv6 used to pass only in brackets, and paramiko got it that way and could not
+    resolve it (#1158). Now '[2001:db8::10]' and '2001:db8::10' both come back as the
+    one plain, compressed form, so the host-key pin sees the same name either way.
+    A scope id ('fe80::1%eth0') is refused: it carries free text."""
     v = (value or '').strip()
     if not v or len(v) > 253:
         return None
+    inner = v[1:-1] if v.startswith('[') and v.endswith(']') else v
+    if ':' in inner:
+        if '%' in inner:
+            return None
+        import ipaddress
+        try:
+            return str(ipaddress.IPv6Address(inner))
+        except ValueError:
+            return None
     return v if _HOST_RE.match(v) else None
 
 
@@ -3641,7 +3653,9 @@ def join_node_to_cluster(cluster_id):
             channel.recv(4096)
         
         # Build and send the join command
-        join_cmd = f'pvecm add {join_addr} --fingerprint {fingerprint}'
+        # both come from the cluster's API (or its stored host) and go into a root shell on
+        # the new node: quoted like link0 below. A plain address or AA:BB:.. stays as it is
+        join_cmd = f'pvecm add {shlex.quote(str(join_addr))} --fingerprint {shlex.quote(str(fingerprint))}'
         if force_rejoin:
             join_cmd += ' --force'
         if link0_address:
@@ -3886,7 +3900,8 @@ def remove_node_from_cluster(cluster_id, node_name):
         for node in nodes:
             if node.get('node') != node_name and node.get('status') == 'online':
                 online_node = node.get('node')
-                online_node_ip = mgr._get_node_ip(online_node) or cluster_config.host
+                # plain address for paramiko and the pin, an IPv6 one may come bracketed
+                online_node_ip = bare_host(mgr._get_node_ip(online_node) or cluster_config.host)
                 break
         
         if not online_node:
@@ -3896,6 +3911,7 @@ def remove_node_from_cluster(cluster_id, node_name):
         # After pvecm delnode, the node is gone from cluster config and _get_node_ip
         # would return wrong/stale data, potentially wiping another node's config!
         removed_node_ip = mgr._get_node_ip(node_name) if hasattr(mgr, '_get_node_ip') else None
+        removed_node_ip = bare_host(removed_node_ip) or None
         logging.info(f"[RemoveNode] Pre-resolved IP for {node_name}: {removed_node_ip}")
         # its password too, while it is still a member (#1136)
         removed_node_password = ssh_password_to(mgr, removed_node_ip) if removed_node_ip else ''
@@ -4091,8 +4107,11 @@ def remove_node_from_cluster(cluster_id, node_name):
         # NS: Feb 2026 - Use pre-resolved IP (removed_node_ip) instead of _get_node_ip()
         # because _get_node_ip() queries Proxmox API which no longer knows this node after pvecm delnode!
         fallback = getattr(mgr.config, 'fallback_hosts', []) or []
-        if removed_node_ip and removed_node_ip in fallback:
-            fallback.remove(removed_node_ip)
+        # either spelling: an IPv6 entry saved before may still carry its brackets
+        _gone = [h for h in fallback if removed_node_ip and bare_host(h) == removed_node_ip]
+        if _gone:
+            for h in _gone:
+                fallback.remove(h)
             mgr.config.fallback_hosts = fallback
             logging.info(f"Removed {removed_node_ip} from fallback_hosts")
         

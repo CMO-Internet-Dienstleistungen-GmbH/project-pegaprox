@@ -16,7 +16,7 @@ from datetime import datetime
 
 from pegaprox.globals import cluster_managers, _xhm_migrations
 from pegaprox.core import ha_transport
-from pegaprox.utils.ssh import _ssh_exec, _pve_node_exec, ssh_password_for, ssh_password_to
+from pegaprox.utils.ssh import _ssh_exec, _pve_node_exec, ssh_password_for, ssh_password_to, bare_host, is_ipv6_literal
 from pegaprox.utils.sanitization import validate_ssh_user
 from pegaprox.utils.realtime import broadcast_sse
 from pegaprox.utils.audit import log_audit
@@ -1562,17 +1562,22 @@ def _next_pve_vmid(pve_mgr):
 
 
 def _resolve_pve_node_ip(pve_mgr, node_name):
-    """Get the SSH-reachable IP of a Proxmox node. Tries API, then cluster host."""
+    """Get the SSH-reachable IP of a Proxmox node. Tries API, then cluster host.
+    Always the plain address, never '[addr]': it goes to paramiko and the host-key pin."""
     # the node's own addresses go into the manager's address book, for its password (#1136)
     from pegaprox.core import node_creds
     try:
         nr = pve_mgr._api_get(
             f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json/nodes/{node_name}/network")
         if nr.status_code == 200:
-            for iface in nr.json().get('data', []):
-                if iface.get('type') == 'bridge' and iface.get('address'):
-                    node_creds.note_address(getattr(pve_mgr, 'id', None), node_name, iface['address'])
-                    return iface['address']
+            bridges = [i for i in nr.json().get('data', []) if i.get('type') == 'bridge']
+            # IPv4 first as before; a bridge with only an IPv6 address is an IPv6-only node
+            for key in ('address', 'address6'):
+                for iface in bridges:
+                    addr = bare_host(iface.get(key))
+                    if addr:
+                        node_creds.note_address(getattr(pve_mgr, 'id', None), node_name, addr)
+                        return addr
     except:
         pass
     # fallback: use cluster host if single-node or node matches
@@ -1581,10 +1586,10 @@ def _resolve_pve_node_ip(pve_mgr, node_name):
             node_info = pve_mgr.nodes.get(node_name, {})
             if node_info.get('ip'):
                 node_creds.note_address(getattr(pve_mgr, 'id', None), node_name, node_info['ip'])
-                return node_info['ip']
+                return bare_host(node_info['ip'])
     except:
         pass
-    return pve_mgr.host
+    return bare_host(pve_mgr.host)
 
 
 def _connect_ssh(host, user, password, key_path=None, port=22):
@@ -1593,6 +1598,8 @@ def _connect_ssh(host, user, password, key_path=None, port=22):
     import paramiko
     from pegaprox.utils.ssh_security import apply_host_key_policy, persist_host_keys, verify_transport_host_key
 
+    # the same plain address for all three ways in and for the pin each one checks
+    host = bare_host(host)
     client = paramiko.SSHClient()
     apply_host_key_policy(client, paramiko)
 
@@ -1644,6 +1651,13 @@ def _connect_ssh(host, user, password, key_path=None, port=22):
     try: client2.get_transport().set_keepalive(30)  # #546: keep the channel alive through long disk transfers
     except Exception: pass
     return ha_transport.guard_client(client2, host)
+
+
+def _scp_host(host):
+    """The host part of user@host:path for scp and sshfs. An IPv6 literal goes in
+    brackets there, or its colons read as the path separator (#1158)."""
+    h = bare_host(host)
+    return f'[{h}]' if is_ipv6_literal(h) else h
 
 
 def _ssh_cleanup(ssh, path):
@@ -1972,7 +1986,7 @@ def _run_esxi_to_pve(task):
                     f"mkdir -m 700 -p {_q_local(task.scratch)}",
                     f"mkdir -m 700 -p {_q_local(mount_dir)}",
                     f"sshfs -o StrictHostKeyChecking={_hk},password_stdin "
-                    f"{_q_local(esxi_user + '@' + esxi_host + ':/vmfs/volumes/' + datastore_name)} "
+                    f"{_q_local(esxi_user + '@' + _scp_host(esxi_host) + ':/vmfs/volumes/' + datastore_name)} "
                     f"{_q_local(mount_dir)} <<< {_q_local(esxi_pass)}",
                 ]
                 for cmd in mount_cmds:
@@ -2006,7 +2020,7 @@ def _run_esxi_to_pve(task):
                     _si, _so, _se = ssh_pve.exec_command(
                         f"mkdir -m 700 -p {_q_local(task.scratch)}", timeout=30)
                     _so.channel.recv_exit_status()
-                    remote_src = f"{esxi_user}@{esxi_host}:" + _q_remote('/vmfs/volumes/' + datastore_name + '/' + flat_path)
+                    remote_src = f"{esxi_user}@{_scp_host(esxi_host)}:" + _q_remote('/vmfs/volumes/' + datastore_name + '/' + flat_path)
                     # MK Jul 2026 — this scp runs on the PVE node, so `sshpass -p <pw>`
                     # would leak the ESXi password in that node's `ps`/proc for up to
                     # 2h. Feed it over stdin into SSHPASS and use `sshpass -e` instead
@@ -2356,7 +2370,7 @@ def _run_esxi_to_xcpng(task):
                 scp_cmd = [
                     'sshpass', '-e',
                     'scp', '-o', f'StrictHostKeyChecking={_hkc}', '-o', f'UserKnownHostsFile={_kh}', '-o', 'HashKnownHosts=no',
-                    '--', f'{esxi_user}@{esxi_host}:{_q_remote_path}',
+                    '--', f'{esxi_user}@{_scp_host(esxi_host)}:{_q_remote_path}',
                     tmp_vmdk
                 ]
                 proc = subprocess.run(scp_cmd, capture_output=True, timeout=7200,

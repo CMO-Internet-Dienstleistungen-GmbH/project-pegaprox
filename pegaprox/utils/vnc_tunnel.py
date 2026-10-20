@@ -210,11 +210,14 @@ class SshVncTunnelPool:
                 self._clients.pop(cluster_id, None)
 
             from pegaprox.utils.ssh_security import apply_host_key_policy, persist_host_keys
+            from pegaprox.utils.ssh import bare_host
             client = paramiko.SSHClient()
             apply_host_key_policy(client, paramiko)
 
             connect_kwargs = dict(
-                hostname=pve_host, port=ssh_port, username=ssh_user,
+                # the callers hand in mgr.host, which is bracketed for URLs - paramiko and
+                # the host-key pin want the plain address
+                hostname=bare_host(pve_host), port=ssh_port, username=ssh_user,
                 timeout=self.SSH_CONNECT_TIMEOUT, banner_timeout=15, auth_timeout=15,
                 allow_agent=False, look_for_keys=False,
             )
