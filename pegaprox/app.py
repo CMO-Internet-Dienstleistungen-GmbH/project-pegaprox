@@ -258,6 +258,22 @@ def create_app():
                     # split request.host or fwd_host into (host, port|None)
                     if not hp: return ('', None)
                     hp = _collapse_folded_host(hp)
+                    # NS Oct 2026 (#1155) - an IPv6 literal host arrives bracketed, as
+                    # "[2001:db8::1]" or "[2001:db8::1]:8443". The bare rpartition(':')
+                    # below both mis-split it and left req_host bracketed, while
+                    # urlparse().hostname on the Origin side strips the brackets, so the
+                    # origin match never equalled it. Over an IPv6 URL every
+                    # state-changing /api/* request then failed closed with 403. Peel the
+                    # brackets here so both sides compare as the bare address.
+                    if hp.startswith('['):
+                        end = hp.find(']')
+                        if end != -1:
+                            host = hp[1:end].lower()
+                            rest = hp[end + 1:]
+                            if rest.startswith(':'):
+                                try: return (host, int(rest[1:]))
+                                except ValueError: return (host, None)
+                            return (host, None)
                     if ':' in hp:
                         h, _, p = hp.rpartition(':')
                         try: return (h.lower(), int(p))

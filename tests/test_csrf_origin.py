@@ -98,3 +98,49 @@ def test_exempt_login_path_is_not_csrf_gated(client):
     resp = client.post('/api/auth/login', json={'username': 'x', 'password': 'y'},
                        base_url=_BASE)
     assert _csrf_blocked(resp) is False
+
+
+# ---------------------------------------------------------------------------
+# IPv6 literal host (#1155) - reaching the UI by its bare IPv6 address
+# ---------------------------------------------------------------------------
+# The Host header is bracketed ("[2001:db8::1]"), but urlparse().hostname on the
+# Origin strips the brackets. req_host used to stay bracketed, so a genuine
+# same-origin request never matched and every state-changing /api/* call failed
+# closed with 403 - the symptom reported on the VM image (theme save, i.e.
+# PUT /api/user/preferences, 403'd and the first-run never reached the inventory).
+
+@pytest.mark.parametrize('base', [
+    'https://[2001:db8::1]:8443',   # explicit non-default port
+    'https://[2001:db8::1]',        # default port omitted (Host carries no port)
+    'https://[fe80::dead:beef]',    # link-local, the SLAAC shape
+])
+def test_ipv6_literal_same_origin_passes(client, base):
+    resp = client.post(_PROBE, json={'x': 1}, headers={'Origin': base}, base_url=base)
+    assert _csrf_blocked(resp) is False, base
+    assert resp.status_code == 404   # CSRF let it through to routing
+
+
+def test_ipv6_literal_matching_referer_passes(client):
+    base = 'https://[2001:db8::1]:8443'
+    resp = client.post(_PROBE, json={'x': 1},
+                       headers={'Referer': base + '/dashboard'}, base_url=base)
+    assert _csrf_blocked(resp) is False
+
+
+def test_ipv6_literal_foreign_origin_still_blocked(client):
+    # Same bracket-stripping must not over-accept: a DIFFERENT IPv6 Origin against
+    # this host is a real cross-origin request and stays blocked.
+    resp = client.post(_PROBE, json={'x': 1},
+                       headers={'Origin': 'https://[2001:db8::2]:8443',
+                                'X-Requested-With': 'XMLHttpRequest'},
+                       base_url='https://[2001:db8::1]:8443')
+    assert _csrf_blocked(resp) is True
+
+
+def test_ipv6_literal_wrong_port_still_blocked(client):
+    # Right host, wrong port is a port mismatch and must be rejected.
+    resp = client.post(_PROBE, json={'x': 1},
+                       headers={'Origin': 'https://[2001:db8::1]:9999',
+                                'X-Requested-With': 'XMLHttpRequest'},
+                       base_url='https://[2001:db8::1]:8443')
+    assert _csrf_blocked(resp) is True
