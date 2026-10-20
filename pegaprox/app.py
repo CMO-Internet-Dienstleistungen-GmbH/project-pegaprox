@@ -265,15 +265,19 @@ def create_app():
                     # origin match never equalled it. Over an IPv6 URL every
                     # state-changing /api/* request then failed closed with 403. Peel the
                     # brackets here so both sides compare as the bare address.
+                    # MK Oct 2026 - only "[addr]" or "[addr]:port" is one host. A folded second
+                    # Host ("[a],b"), a port that is no number or anything else after the
+                    # bracket stays whole and matches no Origin, the way a malformed name
+                    # does below; peeling it to the first address let it pass for an :80/:443 one
                     if hp.startswith('['):
                         end = hp.find(']')
-                        if end != -1:
-                            host = hp[1:end].lower()
-                            rest = hp[end + 1:]
-                            if rest.startswith(':'):
-                                try: return (host, int(rest[1:]))
-                                except ValueError: return (host, None)
-                            return (host, None)
+                        rest = hp[end + 1:] if end != -1 else None
+                        port = rest[1:] if rest and rest[0] == ':' else ''
+                        if rest == '':
+                            return (hp[1:end].lower(), None)
+                        if port.isascii() and port.isdigit() and len(port) <= 5:
+                            return (hp[1:end].lower(), int(port))
+                        return (hp.lower(), None)
                     if ':' in hp:
                         h, _, p = hp.rpartition(':')
                         try: return (h.lower(), int(p))

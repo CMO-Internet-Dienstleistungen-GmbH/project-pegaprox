@@ -10,6 +10,7 @@
 # downstream route would have done.
 
 import pytest
+from werkzeug.test import EnvironBuilder, run_wsgi_app
 
 # The test client posts against http://localhost/ by default, so request.host is
 # 'localhost' with no port. Same-origin therefore == scheme://localhost.
@@ -144,3 +145,35 @@ def test_ipv6_literal_wrong_port_still_blocked(client):
                                 'X-Requested-With': 'XMLHttpRequest'},
                        base_url='https://[2001:db8::1]:8443')
     assert _csrf_blocked(resp) is True
+
+
+def _raw_post(app, host, origin):
+    # The test client parses the Host before the app runs and refuses these forms, so build
+    # the environ here and hand it to the app the way the WSGI server would.
+    env = EnvironBuilder(path=_PROBE, method='POST', json={'x': 1},
+                         base_url='https://[2001:db8::1]',
+                         headers={'Origin': origin}).get_environ()
+    env['HTTP_HOST'] = host
+    body, status, _ = run_wsgi_app(app, env)
+    return status, b''.join(body)
+
+
+@pytest.mark.parametrize('host', [
+    '[2001:db8::1],evil.example',        # a second Host folded in by a proxy
+    '[2001:db8::1]:8443,evil.example',
+    '[2001:db8::1]junk',
+    '[2001:db8::1]:x',
+    '[2001:db8::1]:',
+])
+def test_ipv6_literal_host_with_more_after_the_bracket_is_blocked(_integration_app, host):
+    # Only "[addr]" or "[addr]:port" is one host. Like a folded "name,other" (#626), the
+    # rest must not be dropped so that the first address matches an :80/:443 Origin.
+    status, body = _raw_post(_integration_app, host, 'https://[2001:db8::1]')
+    assert status.startswith('403'), (host, status)
+    assert b'CSRF validation failed' in body
+
+
+def test_ipv6_literal_host_alone_passes_the_raw_path(_integration_app):
+    # counterproof on the same raw path: the plain bracketed host still gets through
+    status, _ = _raw_post(_integration_app, '[2001:db8::1]', 'https://[2001:db8::1]')
+    assert status.startswith('404'), status
