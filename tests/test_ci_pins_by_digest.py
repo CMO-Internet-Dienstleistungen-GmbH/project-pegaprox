@@ -56,8 +56,35 @@ def test_the_apt_job_with_the_signing_key_runs_no_tag():
     text = _read(os.path.join(ROOT, '.github', 'workflows', 'apt-repo.yml'))
     refs = [ref for ref, _ in USES.findall(text)]
     assert {r.split('@')[0] for r in refs} == {'actions/checkout', 'actions/upload-pages-artifact',
-                                               'actions/deploy-pages'}
+                                               'actions/deploy-pages', 'actions/upload-artifact',
+                                               'actions/download-artifact', 'actions/attest'}
     assert not [r for r in refs if re.search(r'@v\d', r)], refs
+    # NS Oct 2026 - the repo went live with a job per privilege. Pages and its OIDC token
+    # get a job of their own, so the job that holds the key runs nothing but these three;
+    # the signed tree reaches the deploy job as a plain artifact
+    publish = text[text.index('\n  publish:\n'):text.index('\n  deploy:\n')]
+    assert 'secrets.APT_GPG_PRIVATE_KEY' in publish
+    in_publish = {ref.split('@')[0] for ref, _ in USES.findall(publish)}
+    assert in_publish == {'actions/checkout', 'actions/download-artifact', 'actions/upload-artifact'}
+
+
+# A composite action runs the actions it names itself, and a commit pin on the outer one does
+# not pin those. Every composite we use is listed with the commits whose action.yml was read
+# and found to pin its inner actions by commit too. upload-pages-artifact v3.0.1 (56afc609)
+# called actions/upload-artifact@v4 by tag in the job with pages and id-token write; v4.0.0
+# pins it to ea165f8d (v4.6.2). A bump has to be read again and added here.
+CHECKED_COMPOSITES = {
+    'actions/upload-pages-artifact': {'7b1f4a764d45c48632c6b24a0339c27f5614fb0b'},
+}
+
+
+@pytest.mark.parametrize('path', WORKFLOWS, ids=os.path.basename)
+def test_composite_actions_are_on_a_commit_whose_inner_pins_were_checked(path):
+    for ref, _ in USES.findall(_read(path)):
+        action, _, pin = ref.partition('@')
+        if action in CHECKED_COMPOSITES:
+            assert pin in CHECKED_COMPOSITES[action], \
+                f'{os.path.basename(path)}: {ref} - read its action.yml for unpinned uses: first'
 
 
 @pytest.mark.parametrize('path', WORKFLOWS, ids=os.path.basename)
