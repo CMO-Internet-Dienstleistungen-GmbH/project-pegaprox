@@ -18875,22 +18875,24 @@ echo "AGENT_INSTALLED_OK"
         except Exception as e:
             return {'success': False, 'error': str(e)}
     
-    def get_node_hosts(self, node: str) -> str:
+    def get_node_hosts(self, node: str) -> Optional[str]:
         
         if not self.is_connected:
             if not self.connect_to_proxmox():
-                return ''
+                return None
         
         try:
             url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/hosts"
             response = self._api_get(url)
             
             if response.status_code == 200:
-                return response.json().get('data', {}).get('data', '')
-            return ''
+                data = response.json().get('data')
+                hosts = data.get('data') if isinstance(data, dict) else None
+                return hosts if isinstance(hosts, str) else None
+            return None
         except Exception as e:
             self.logger.error(f"Error getting hosts: {e}")
-            return ''
+            return None
     
     def update_node_hosts(self, node: str, hosts_content: str) -> Dict[str, Any]:
         

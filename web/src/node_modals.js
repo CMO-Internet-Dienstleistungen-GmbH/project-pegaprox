@@ -1607,7 +1607,7 @@
                     }
                     else if (tab === 'system') {
                         newData.dns = results[0] || {};
-                        newData.hosts = results[1]?.data || '';
+                        newData.hosts = typeof results[1]?.data === 'string' ? results[1].data : null;
                         newData.time = results[2] || {};
                         newData.syslog = results[3] || [];
                         newData.certificates = results[4] || [];
@@ -2938,9 +2938,10 @@
                                             <div className="p-4 bg-proxmox-dark rounded-lg border border-proxmox-border">
                                                 <div className="flex justify-between items-center mb-4">
                                                     <h4 className="font-medium text-white">/etc/hosts</h4>
-                                                    <button onClick={() => handleSave('hosts', { data: data.hosts }, t('hostsSaved') || 'Hosts saved')} className="px-3 py-1 bg-proxmox-orange rounded text-white text-sm hover:bg-orange-600">{t('save')}</button>
+                                                    <button onClick={() => handleSave('hosts', { data: data.hosts }, t('hostsSaved') || 'Hosts saved')} disabled={data.hosts == null} className="px-3 py-1 bg-proxmox-orange rounded text-white text-sm hover:bg-orange-600 disabled:opacity-50">{t('save')}</button>
                                                 </div>
-                                                <textarea value={data.hosts||''} onChange={(e) => setData({...data, hosts: e.target.value})} rows={5}
+                                                {data.hosts === null && <div role="alert" className="text-sm text-red-400 mb-2">Could not read hosts file from node. Check access and <button onClick={() => loadTabData('system')} className="underline">{t('retry')}</button>.</div>}
+                                                <textarea value={data.hosts||''} disabled={data.hosts == null} onChange={(e) => setData({...data, hosts: e.target.value})} rows={5}
                                                     className="w-full px-3 py-2 bg-proxmox-card border border-proxmox-border rounded-lg text-white text-sm font-mono resize-none" />
                                             </div>
 
@@ -5456,7 +5457,7 @@
                         else if (tab === 'network') newData.network = results[0];
                         else if (tab === 'system') {
                             newData.dns = results[0] || {};
-                            newData.hosts = results[1]?.data || '';
+                            newData.hosts = typeof results[1]?.data === 'string' ? results[1].data : null;
                             newData.time = results[2] || {};
                             newData.syslog = results[3] || [];
                             newData.certificates = results[4] || [];
@@ -6097,21 +6098,22 @@
                                                     <div className="flex items-center justify-between mb-3">
                                                         <span className="text-[13px] font-medium" style={{color: 'var(--color-text)'}}>{t('hostsFile')}</span>
                                                         {!editingHosts ? (
-                                                            <button onClick={() => { setEditingHosts(true); setHostsForm(data.hosts || ''); }}
+                                                            <button onClick={() => { setEditingHosts(true); setHostsForm(data.hosts || ''); }} disabled={data.hosts == null}
                                                                 className="px-2 py-1 text-[11px]" style={{color: '#49afd9', border: '1px solid #485764'}}>{t('edit')}</button>
                                                         ) : (
                                                             <div className="flex gap-1">
                                                                 <button onClick={() => setEditingHosts(false)} className="px-2 py-1 text-[11px]" style={{color: '#adbbc4', border: '1px solid #485764'}}>{t('cancel')}</button>
-                                                                <button onClick={() => { handleSave('hosts', { data: hostsForm }, 'Hosts saved', 'POST'); setEditingHosts(false); }} disabled={saving}
+                                                                <button onClick={() => { handleSave('hosts', { data: hostsForm }, 'Hosts saved', 'POST'); setEditingHosts(false); }} disabled={saving || data.hosts == null}
                                                                     className="px-2 py-1 text-[11px]" style={{color: '#60b515', border: '1px solid rgba(96,181,21,0.3)'}}>{saving ? '...' : t('save')}</button>
                                                             </div>
                                                         )}
                                                     </div>
+                                                    {data.hosts === null && <div role="alert" className="text-sm text-red-400 mb-2">Could not read hosts file from node. Check access and <button onClick={() => loadTabData('system')} className="underline">{t('retry')}</button>.</div>}
                                                     {editingHosts ? (
-                                                        <textarea value={hostsForm} onChange={e => setHostsForm(e.target.value)} rows={8}
+                                                        <textarea value={hostsForm} disabled={data.hosts == null} onChange={e => setHostsForm(e.target.value)} rows={8}
                                                             className="w-full px-3 py-2 text-[12px] bg-proxmox-dark border border-proxmox-border text-white font-mono" style={{resize: 'vertical'}} />
                                                     ) : (
-                                                        <pre className="text-[12px] p-3 overflow-auto" style={{background: 'var(--corp-surface-1)', border: '1px solid var(--corp-border-medium)', color: 'var(--corp-text-secondary)', fontFamily: 'monospace', maxHeight: '300px'}}>{data.hosts || 'No data'}</pre>
+                                                        <pre className="text-[12px] p-3 overflow-auto" style={{background: 'var(--corp-surface-1)', border: '1px solid var(--corp-border-medium)', color: 'var(--corp-text-secondary)', fontFamily: 'monospace', maxHeight: '300px'}}>{data.hosts === null ? '' : (data.hosts || 'No data')}</pre>
                                                     )}
                                                 </div>
                                             )}
