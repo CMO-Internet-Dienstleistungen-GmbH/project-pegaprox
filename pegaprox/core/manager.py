@@ -9420,12 +9420,14 @@ fi
             # the bare address and its own family - AF_INET with "[2001:db8::10]" never
             # got a socket, a v6-only cluster had no agent URL
             addr = self._resolve_host(self.raw_host)
-            # Create a socket to the cluster to find our outgoing IP
+            # Create a socket to the cluster to find our outgoing IP. MK Oct 2026 - closed
+            # also when connect fails (no route in that family), not left for the GC
             s = socket.socket(socket.AF_INET6 if ':' in addr else socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect((addr, 8006))
-            local_ip = s.getsockname()[0]
-            s.close()
-            return local_ip
+            try:
+                s.connect((addr, 8006))
+                return s.getsockname()[0]
+            finally:
+                s.close()
         except:
             pass
         
