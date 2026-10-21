@@ -83,7 +83,8 @@ def test_hosts_route_keeps_cluster_access_gate(api, seed):
 
 @pytest.mark.parametrize('layout', ['modern', 'corporate'])
 @pytest.mark.parametrize('role', ['active', 'standby'])
-def test_failed_hosts_read_is_visible_and_retry_recovers_in_browser(browser, layout, role):
+@pytest.mark.parametrize('hosts_content', ['', '127.0.0.1 localhost\n'])
+def test_failed_hosts_read_is_visible_and_retry_recovers_in_browser(browser, layout, role, hosts_content):
     extra = dict(NODE_READS)
     extra[('GET', NODE_PATH + '/hosts')] = (502, {'error': 'Could not read hosts file from node'})
     server = _FakeServer(role=role, layout=layout, clusters=[CLUSTER], resources=[VM],
@@ -110,15 +111,16 @@ def test_failed_hosts_read_is_visible_and_retry_recovers_in_browser(browser, lay
         else:
             assert page.get_by_role('button', name='Edit').last.is_disabled()
 
-        server.extra[('GET', NODE_PATH + '/hosts')] = (200, {'data': '127.0.0.1 localhost\n'})
+        server.extra[('GET', NODE_PATH + '/hosts')] = (200, {'data': hosts_content})
         retry = alert.get_by_role('button', name='Retry')
         assert retry.is_enabled()
         retry.click()
         alert.wait_for(state='hidden', timeout=8000)
         if layout == 'modern':
-            assert hosts_panel.locator('textarea').input_value() == '127.0.0.1 localhost\n'
+            assert hosts_panel.locator('textarea').input_value() == hosts_content
         else:
-            assert page.get_by_text('127.0.0.1 localhost').count() > 0
+            hosts_panel = page.get_by_text('Hosts File', exact=True).last.locator('../..')
+            assert hosts_panel.locator('pre').inner_text() == hosts_content
         assert not [error for error in app.errors if 'pageerror' in error], app.errors
     finally:
         app.ctx.close()

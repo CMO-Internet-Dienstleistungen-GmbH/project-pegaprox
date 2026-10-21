@@ -6113,7 +6113,7 @@
                                                         <textarea value={hostsForm} disabled={data.hosts == null} onChange={e => setHostsForm(e.target.value)} rows={8}
                                                             className="w-full px-3 py-2 text-[12px] bg-proxmox-dark border border-proxmox-border text-white font-mono" style={{resize: 'vertical'}} />
                                                     ) : (
-                                                        <pre className="text-[12px] p-3 overflow-auto" style={{background: 'var(--corp-surface-1)', border: '1px solid var(--corp-border-medium)', color: 'var(--corp-text-secondary)', fontFamily: 'monospace', maxHeight: '300px'}}>{data.hosts === null ? '' : (data.hosts || 'No data')}</pre>
+                                                        <pre className="text-[12px] p-3 overflow-auto" style={{background: 'var(--corp-surface-1)', border: '1px solid var(--corp-border-medium)', color: 'var(--corp-text-secondary)', fontFamily: 'monospace', maxHeight: '300px'}}>{data.hosts === null ? '' : (data.hosts ?? 'No data')}</pre>
                                                     )}
                                                 </div>
                                             )}
