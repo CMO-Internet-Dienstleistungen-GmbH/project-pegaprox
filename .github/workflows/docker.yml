@@ -9,6 +9,11 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      copy_tag:
+        description: 'Skip the build and only copy this existing ghcr.io tag to Docker Hub (e.g. 1.4.0 or latest)'
+        type: string
+        default: ''
 
 # MK May 2026 — top-level permissions implicitly cascaded `packages: write`
 # into any future job added to this workflow. Aikido flagged it as overly
@@ -18,7 +23,12 @@ permissions:
 
 jobs:
   build-and-push:
+    # a copy_tag run builds nothing, see the docker-hub job at the end
+    if: ${{ !inputs.copy_tag }}
     runs-on: ubuntu-latest
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
+      base: ${{ steps.main.outputs.digest }}
     # MK May 2026 — minimum perms for the build:
     #   contents: read   → actions/checkout@v4
     #   packages: write  → docker/login-action@v3 + push to ghcr.io
@@ -116,4 +126,71 @@ jobs:
             fi
             docker buildx imagetools create -t "$tag" "$img@$BASE" "$img@$ARM"
             echo "$tag: amd64, arm64 and arm/v7"
+          done
+
+  # NS Oct 2026 - Docker Hub (pegaprox/pegaprox) carries the same images as ghcr.io. Once the
+  # build above is done, its finished tags are copied over by digest, so a pull from either
+  # registry gets the identical manifest. Its own job, so the Docker Hub token is never in
+  # the job that runs the build. A manual run with copy_tag set skips the build and copies
+  # just that ghcr.io tag, for an older release or after a Docker Hub outage.
+  docker-hub:
+    needs: build-and-push
+    if: ${{ !cancelled() && (needs.build-and-push.result == 'success' || (needs.build-and-push.result == 'skipped' && inputs.copy_tag)) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # reads the public ghcr.io package anonymously, writes only with the Docker Hub token
+    permissions: {}
+    steps:
+      - name: Log in to Docker Hub
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          # the account name is public; as a secret it would be masked out of every log line
+          # that says pegaprox
+          username: pegaprox
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Copy to Docker Hub
+        env:
+          COPY_TAG: ${{ inputs.copy_tag }}
+          TAGS: ${{ needs.build-and-push.outputs.tags }}
+          BASE: ${{ needs.build-and-push.outputs.base }}
+        run: |
+          set -euo pipefail
+          src=ghcr.io/pegaprox/pegaprox
+          dst=docker.io/pegaprox/pegaprox
+          # the platform images an index points at, or the image itself; the attestation
+          # entries next to them only follow their image
+          platforms() {
+            docker buildx imagetools inspect "$1" --raw \
+              | jq -r --arg self "${1##*@}" 'if .manifests then .manifests[] | select(.platform.os != "unknown") | .digest else $self end' \
+              | sort
+          }
+          if [ -n "$COPY_TAG" ]; then
+            if ! [[ $COPY_TAG =~ ^([0-9]+(\.[0-9]+){1,3}(-[0-9A-Za-z.]+)?|latest)$ ]]; then
+              echo "::error::copy_tag takes a release such as 1.4.0, or latest"
+              exit 1
+            fi
+            tags=$COPY_TAG
+          else
+            tags=$(for t in $TAGS; do echo "${t##*:}"; done)
+            mine=$(platforms "$src@$BASE")
+          fi
+          for t in $tags; do
+            now=$(docker buildx imagetools inspect "$src:$t" --format '{{json .Manifest}}' | jq -r .digest)
+            # as in the arm/v7 step: a tag a newer release has moved on is left alone. The
+            # lookup sits in its own assignment, a failed one inside <(...) would read as
+            # "moved on" and skip the tag with the job still green
+            if [ -z "$COPY_TAG" ]; then
+              theirs=$(platforms "$src@$now")
+              if [ -n "$(comm -23 <(echo "$mine") <(echo "$theirs"))" ]; then
+                echo "$t now points at $now, not at this run's build - not copied"
+                continue
+              fi
+            fi
+            docker buildx imagetools create -t "$dst:$t" "$src@$now"
+            got=$(docker buildx imagetools inspect "$dst:$t" --format '{{json .Manifest}}' | jq -r .digest)
+            if [ "$got" != "$now" ]; then
+              echo "::warning::$dst:$t is $got, ghcr.io has $now"
+            fi
+            echo "$dst:$t: $now"
           done
