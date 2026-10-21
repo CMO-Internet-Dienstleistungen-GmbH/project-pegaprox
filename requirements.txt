@@ -48,7 +48,12 @@ gevent-websocket>=0.10.0
 # === Two-Factor Auth ===
 pyotp>=2.9.0
 qrcode[pil]>=7.4.0
-pillow>=13.0.0
+# MK Oct 2026 - 13.0 closes a heap overflow in the FlashPix decoder (#1160) but needs Python
+# 3.11, and one line pip cannot satisfy fails the whole `pip install -r`. 3.10 stays on 12.x,
+# which has no fix; that decoder only loads when olefile is importable, and nothing here
+# brings olefile in.
+pillow>=13.0.0; python_version >= "3.11"
+pillow>=12.3.0; python_version < "3.11"
 # WebAuthn / FIDO2 hardware tokens (optional; auto-disabled if the import fails).
 # 2.2.1 is the first fido2 whose cryptography cap is <52 — see the crypto pins above.
 fido2>=2.2.1
