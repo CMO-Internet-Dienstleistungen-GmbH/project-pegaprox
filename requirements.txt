@@ -48,7 +48,7 @@ gevent-websocket>=0.10.0
 # === Two-Factor Auth ===
 pyotp>=2.9.0
 qrcode[pil]>=7.4.0
-pillow>=12.3.0
+pillow>=13.0.0
 # WebAuthn / FIDO2 hardware tokens (optional; auto-disabled if the import fails).
 # 2.2.1 is the first fido2 whose cryptography cap is <52 — see the crypto pins above.
 fido2>=2.2.1
