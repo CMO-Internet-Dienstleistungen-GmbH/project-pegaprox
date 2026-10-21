@@ -425,6 +425,8 @@ def _v2p_task(tid='ab12cd34', vmid=101):
     t.id, t.log_lines, t.esxi_password, t.phase, t.progress = tid, [], 'S3cr3t!pw', 'transfer', 0
     t.target_node, t.target_storage, t.proxmox_vmid = 'pve-a', 'local-lvm', vmid
     t.config = {}
+    # a real run records the volume disk 0 went to; the fixes no longer guess it from the VMID
+    t._disk_vols = {0: f'local-lvm:vm-{vmid}-disk-0'}
     return t
 
 
