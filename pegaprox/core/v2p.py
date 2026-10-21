@@ -4346,18 +4346,29 @@ def _pvesm_alloc_named(pve_mgr, node, storage, storage_type, vmid, disk_index, s
             if rc == 0:
                 logging.warning(f"[V2P] pvesm path failed for {vol_id}: {dev_path[:100]}")
                 if storage_type in ('dir', 'nfs', 'cifs', 'glusterfs'):
-                    derived = f"/mnt/pve/{storage}/images/{vmid}/{fn_raw}"
+                    derived, kind = f"/mnt/pve/{storage}/images/{vmid}/{fn_raw}", '-f'
                 elif storage_type in ('lvmthin', 'lvm'):
-                    derived = f"/dev/{storage}/vm-{vmid}-disk-{disk_index}"
+                    derived, kind = f"/dev/{storage}/{stem}", '-b'
                 elif storage_type == 'zfspool':
-                    derived = f"/dev/zvol/{storage}/vm-{vmid}-disk-{disk_index}"
+                    derived, kind = f"/dev/zvol/{storage}/{stem}", '-b'
                 else:
-                    derived = None
+                    derived = kind = None
+                # MK Oct 2026 - the guess names the storage ID where the VG, the pool or the
+                # dir path belongs, and they differ often (local-lvm is VG pve). Taken only
+                # when the node has a block device or a file there: a dd onto a path that
+                # is not there writes a plain file and loses the disk, as in the RBD case
                 if derived:
-                    logging.info(f"[V2P] Using derived path: {derived}")
-                    return vol_id, derived
+                    rc_d, out_d, _ = _pve_node_exec(pve_mgr, node,
+                        f"test {kind} {shlex.quote(derived)} && echo present", timeout=15)
+                    if rc_d == 0 and 'present' in str(out_d or ''):
+                        logging.info(f"[V2P] Using derived path: {derived}")
+                        return vol_id, derived
+                    logging.error(f"[V2P] {vol_id}: the derived path {derived} is not there")
                 if errbuf is not None:
                     errbuf.append(f"alloc succeeded ({vol_id}) but volume path could not be resolved")
+                # the volume is this call's: drop it so it doesn't orphan
+                _pve_node_exec(pve_mgr, node,
+                    f"pvesm free {shlex.quote(vol_id)} 2>/dev/null", timeout=60)
                 return None, None
             last_error = (out_str or f"pvesm alloc rc={rc}, volume {vol_id} not found afterwards")[:150]
         else:
