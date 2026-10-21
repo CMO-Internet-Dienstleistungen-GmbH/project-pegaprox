@@ -447,7 +447,8 @@ class _Net:
     ([{'type': 'bridge', 'address6': '2001:db8::21'}, {'type': 'bridge', 'address': '10.0.0.22'}],
      None, '10.0.0.22'),
     ([], {'pve-a': {'ip': '[2001:db8::24]'}}, '2001:db8::24'),
-    ([{'type': 'eth', 'address6': '2001:db8::23'}], None, V6),
+    # no bridge address and no resolver: the connected host stands in only on a one-node cluster
+    ([{'type': 'eth', 'address6': '2001:db8::23'}], {'pve-a': {}}, V6),
 ])
 def test_the_migration_engine_finds_an_ipv6_node_plain(ifaces, nodes, want):
     from pegaprox.core import xhm

@@ -1581,15 +1581,30 @@ def _resolve_pve_node_ip(pve_mgr, node_name):
     except:
         pass
     # fallback: use cluster host if single-node or node matches
+    members = {}
     try:
         if hasattr(pve_mgr, 'nodes') and pve_mgr.nodes:
-            node_info = pve_mgr.nodes.get(node_name, {})
+            members = pve_mgr.nodes
+            node_info = members.get(node_name, {})
             if node_info.get('ip'):
                 node_creds.note_address(getattr(pve_mgr, 'id', None), node_name, node_info['ip'])
                 return bare_host(node_info['ip'])
     except:
         pass
-    return bare_host(pve_mgr.host)
+    # MK Oct 2026 - the network read above needs Sys.Audit on the node, which a narrow API
+    # token lacks. Then the manager's own resolver places the node by name; the connected
+    # host stands in only on a cluster of that one node. It used to stand in for every node,
+    # and in a cluster of several the migration ran its commands on another node.
+    try:
+        resolve = getattr(pve_mgr, 'member_node_ip', None)
+        ip = resolve(node_name) if callable(resolve) else None
+        if ip:
+            return bare_host(ip)
+    except Exception:
+        pass
+    if len(members) == 1 and node_name in members:
+        return bare_host(pve_mgr.host)
+    return None
 
 
 def _connect_ssh(host, user, password, key_path=None, port=22):
