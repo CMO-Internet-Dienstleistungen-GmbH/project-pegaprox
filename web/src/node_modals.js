@@ -2887,6 +2887,7 @@
                                                     </>)}
                                                 </div>
                                             )}
+                                            {data.hosts === null && <div role="alert" className="text-sm text-red-400">{t('hostsReadFailed')} <button onClick={() => loadTabData('system')} className="underline">{t('retry')}</button></div>}
                                             <fieldset {...haLock} className="space-y-6 min-w-0">
                                             {/* DNS */}
                                             <div className="p-4 bg-proxmox-dark rounded-lg border border-proxmox-border">
@@ -2940,7 +2941,6 @@
                                                     <h4 className="font-medium text-white">/etc/hosts</h4>
                                                     <button onClick={() => handleSave('hosts', { data: data.hosts }, t('hostsSaved') || 'Hosts saved')} disabled={data.hosts == null} className="px-3 py-1 bg-proxmox-orange rounded text-white text-sm hover:bg-orange-600 disabled:opacity-50">{t('save')}</button>
                                                 </div>
-                                                {data.hosts === null && <div role="alert" className="text-sm text-red-400 mb-2">Could not read hosts file from node. Check access and <button onClick={() => loadTabData('system')} className="underline">{t('retry')}</button>.</div>}
                                                 <textarea value={data.hosts||''} disabled={data.hosts == null} onChange={(e) => setData({...data, hosts: e.target.value})} rows={5}
                                                     className="w-full px-3 py-2 bg-proxmox-card border border-proxmox-border rounded-lg text-white text-sm font-mono resize-none" />
                                             </div>
@@ -5823,6 +5823,7 @@
                                     <button className={`corp-subnav-item ${configSubTab === 'ceph' ? 'active' : ''}`} onClick={() => { setConfigSubTab('ceph'); if (!data.ceph) loadTabData('ceph'); }}>Ceph</button>
                                 </div>
                                 <div className="flex-1 pl-4">
+                                    {configSubTab === 'hosts' && data.hosts === null && <div role="alert" className="text-sm text-red-400 mb-3">{t('hostsReadFailed')} <button onClick={() => loadTabData('system')} className="underline">{t('retry')}</button></div>}
                                     <fieldset disabled={haReadOnly} className="contents">
                                     {loading && !data.network && !data.dns && !data.disks ? (
                                         <div className="flex items-center justify-center h-32"><Icons.RotateCw className="w-5 h-5 animate-spin" style={{color: '#49afd9'}} /></div>
@@ -6108,7 +6109,6 @@
                                                             </div>
                                                         )}
                                                     </div>
-                                                    {data.hosts === null && <div role="alert" className="text-sm text-red-400 mb-2">Could not read hosts file from node. Check access and <button onClick={() => loadTabData('system')} className="underline">{t('retry')}</button>.</div>}
                                                     {editingHosts ? (
                                                         <textarea value={hostsForm} disabled={data.hosts == null} onChange={e => setHostsForm(e.target.value)} rows={8}
                                                             className="w-full px-3 py-2 text-[12px] bg-proxmox-dark border border-proxmox-border text-white font-mono" style={{resize: 'vertical'}} />

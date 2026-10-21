@@ -82,10 +82,11 @@ def test_hosts_route_keeps_cluster_access_gate(api, seed):
 
 
 @pytest.mark.parametrize('layout', ['modern', 'corporate'])
-def test_failed_hosts_read_is_visible_and_retry_recovers_in_browser(browser, layout):
+@pytest.mark.parametrize('role', ['active', 'standby'])
+def test_failed_hosts_read_is_visible_and_retry_recovers_in_browser(browser, layout, role):
     extra = dict(NODE_READS)
     extra[('GET', NODE_PATH + '/hosts')] = (502, {'error': 'Could not read hosts file from node'})
-    server = _FakeServer(role='active', layout=layout, clusters=[CLUSTER], resources=[VM],
+    server = _FakeServer(role=role, layout=layout, clusters=[CLUSTER], resources=[VM],
                          metrics=NODE_METRICS, extra=extra)
     app = _App(browser, server)
     try:
@@ -100,7 +101,7 @@ def test_failed_hosts_read_is_visible_and_retry_recovers_in_browser(browser, lay
             page.locator('.corp-tab-strip').last.get_by_text('Configure').click()
             page.locator('.corp-subnav-item', has_text='Hosts File').first.click()
 
-        alert = page.get_by_role('alert').filter(has_text='Could not read hosts file from node')
+        alert = page.get_by_role('alert').filter(has_text='Could not read the hosts file from this node')
         alert.wait_for(timeout=8000)
         assert 'No data' not in alert.inner_text()
         if layout == 'modern':
@@ -110,7 +111,9 @@ def test_failed_hosts_read_is_visible_and_retry_recovers_in_browser(browser, lay
             assert page.get_by_role('button', name='Edit').last.is_disabled()
 
         server.extra[('GET', NODE_PATH + '/hosts')] = (200, {'data': '127.0.0.1 localhost\n'})
-        alert.get_by_role('button', name='Retry').click()
+        retry = alert.get_by_role('button', name='Retry')
+        assert retry.is_enabled()
+        retry.click()
         alert.wait_for(state='hidden', timeout=8000)
         if layout == 'modern':
             assert hosts_panel.locator('textarea').input_value() == '127.0.0.1 localhost\n'
