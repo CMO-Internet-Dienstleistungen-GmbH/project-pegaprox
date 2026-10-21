@@ -964,8 +964,12 @@ jobs:
     # Dev builds stop at the artifacts.
     if: ${{ always() && needs.prepare.outputs.is_release == 'true' && needs.build-lxc.result == 'success' && needs.build-vm.result == 'success' }}
     runs-on: ubuntu-latest
+    # NS Oct 2026 - id-token and attestations only for the provenance step below; this job
+    # runs no build, just the download, the checksums and the upload
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -977,6 +981,16 @@ jobs:
           find . -type f \( -name '*.qcow2' -o -name '*.tar.xz' \) \
             -exec sha256sum {} \; > SHA256SUMS.txt
           cat SHA256SUMS.txt
+
+      # NS Oct 2026 - signed build provenance for every image file, as for the Docker
+      # images. A downloaded file checks with
+      #   gh attestation verify <file> -R PegaProx/project-pegaprox
+      - name: Herkunft der Images signieren
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/**/*.qcow2
+            dist/**/*.tar.xz
 
       - name: An Release anhängen
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2

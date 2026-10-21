@@ -29,6 +29,7 @@ jobs:
     outputs:
       tags: ${{ steps.meta.outputs.tags }}
       base: ${{ steps.main.outputs.digest }}
+      final: ${{ steps.armtags.outputs.final }}
     # MK May 2026 — minimum perms for the build:
     #   contents: read   → actions/checkout@v4
     #   packages: write  → docker/login-action@v3 + push to ghcr.io
@@ -111,6 +112,7 @@ jobs:
       # A tag gets arm/v7 only while it still points at what this run pushed above, so a
       # slow run cannot take back a latest that a newer release has moved on.
       - name: Add arm/v7 to the tags
+        id: armtags
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
           BASE: ${{ steps.main.outputs.digest }}
@@ -118,6 +120,16 @@ jobs:
         run: |
           set -euo pipefail
           img=ghcr.io/pegaprox/pegaprox
+          # the platform images of an index, or the image itself; attestation entries left out
+          platforms() {
+            docker buildx imagetools inspect "$1" --raw \
+              | jq -r --arg self "${1##*@}" 'if .manifests then .manifests[] | select(.platform.os != "unknown") | .digest else $self end' \
+              | sort
+          }
+          base_p=$(platforms "$img@$BASE")
+          arm_p=$(platforms "$img@$ARM")
+          want=$(printf '%s\n%s\n' "$base_p" "$arm_p" | sort)
+          final=""
           for tag in $TAGS; do
             now=$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -r .digest)
             if [ "$now" != "$BASE" ]; then
@@ -126,7 +138,50 @@ jobs:
             fi
             docker buildx imagetools create -t "$tag" "$img@$BASE" "$img@$ARM"
             echo "$tag: amd64, arm64 and arm/v7"
+            # the index just written goes to the attest job, but only while the tag still
+            # holds this run's images and nothing else. Handed over right here, so a later
+            # tag failing the step does not cost this one its attestation
+            now=$(docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' | jq -r .digest)
+            got=$(platforms "$img@$now")
+            if [ "$got" != "$want" ]; then
+              echo "$tag moved on to $now right away - not attested here"
+            elif [ -n "$final" ] && [ "$final" != "$now" ]; then
+              echo "::warning::$tag is $now, another tag of this run is $final - only $final is attested"
+            elif [ -z "$final" ]; then
+              final=$now
+              echo "final=$final" >> "$GITHUB_OUTPUT"
+            fi
           done
+
+  # NS Oct 2026 - signed build provenance (GitHub artifact attestations, logged with
+  # Sigstore) for the image indexes this run published. Anyone can check where an image
+  # came from with
+  #   gh attestation verify oci://ghcr.io/pegaprox/pegaprox:<version> -R PegaProx/project-pegaprox
+  # and Docker Hub serves the same digests, so docker.io/pegaprox/pegaprox checks the same
+  # way. Its own job, so the OIDC token that signs is never minted where the build runs.
+  # The amd64/arm64 index is attested as well: it is what the tags hold until arm/v7 is
+  # added, and for good on a tag that step never got to.
+  attest:
+    needs: build-and-push
+    if: ${{ !cancelled() && needs.build-and-push.outputs.base }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      attestations: write
+    steps:
+      - name: Attest the amd64/arm64 index
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/pegaprox/pegaprox
+          subject-digest: ${{ needs.build-and-push.outputs.base }}
+
+      - name: Attest the index with arm/v7
+        if: ${{ needs.build-and-push.outputs.final }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/pegaprox/pegaprox
+          subject-digest: ${{ needs.build-and-push.outputs.final }}
 
   # NS Oct 2026 - Docker Hub (pegaprox/pegaprox) carries the same images as ghcr.io. Once the
   # build above is done, its finished tags are copied over by digest, so a pull from either

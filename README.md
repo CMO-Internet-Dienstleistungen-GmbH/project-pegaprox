@@ -277,6 +277,13 @@ docker run -d --name pegaprox \
 
 The same image is on Docker Hub as [`pegaprox/pegaprox`](https://hub.docker.com/r/pegaprox/pegaprox), with the identical digest, so `pegaprox/pegaprox:latest` works just as well. Other PegaProx images on Docker Hub are not ours and may be outdated.
 
+From the release after 1.4.0 on, the Docker images and the VM/LXC appliance images carry a signed build provenance attestation, so you can check that an image was built by our release workflow from this repository:
+```bash
+gh attestation verify oci://ghcr.io/pegaprox/pegaprox:<version> -R PegaProx/project-pegaprox
+gh attestation verify oci://docker.io/pegaprox/pegaprox:<version> -R PegaProx/project-pegaprox
+gh attestation verify pegaprox-v<version>-vm-amd64.qcow2 -R PegaProx/project-pegaprox
+```
+
 For local builds:
 ```bash
 git clone https://github.com/PegaProx/project-pegaprox.git
