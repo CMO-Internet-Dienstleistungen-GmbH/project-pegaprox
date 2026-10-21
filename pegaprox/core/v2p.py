@@ -29,6 +29,67 @@ class V2PCutoverCancelled(Exception):
     pass
 
 
+# MK Oct 2026 - Offline Copy, Live Mirror and Snapshot-Iterative copy what the boot disk's
+# folder holds. A disk elsewhere is not there, and a disk running on a snapshot of the VM has
+# its current state in delta files the copy does not read. Live Clone reads each disk from
+# its own file as it is now.
+_MODE_NAMES = {'offline': 'Offline Copy', 'sshfs_boot': 'Live Mirror', 'snapshot_zero': 'Snapshot-Iterative',
+               'auto': 'Auto', 'vmkfstools_clone': 'Live Clone'}
+_DISK_FILE_RE = re.compile(r'^\[([^\]]+)\]\s+(.+\.vmdk)$')
+# the file ESXi runs a disk on once the VM has a snapshot: <disk>-000001.vmdk
+_SNAPSHOT_FILE_RE = re.compile(r'-\d{6}\.vmdk\Z')
+
+
+def folder_copy_gap(disks, datastore=None, vm_dir=None, descriptor_files=None):
+    """(the descriptor of every disk in the VM's disk order, None), or (None, why) when a
+    copy from the boot disk's folder would leave a disk out or read an old state of it.
+
+    The folder is datastore / vm_dir, by default the one of disk 0. descriptor_files, when
+    given, is what that folder holds; without it only the disk paths ESXi reports count."""
+    disks = [d if isinstance(d, dict) else {} for d in (disks or [])]
+    first = _DISK_FILE_RE.match(str(disks[0].get('vmdk_file') or '').strip()) if disks else None
+    if datastore is None and first:
+        datastore = first.group(1).strip()
+    if vm_dir is None and first:
+        vm_dir = os.path.dirname(first.group(2).strip())
+    out = []
+    for i, d in enumerate(disks):
+        # names ESXi reports go into the task log and the error: one line, and not too long
+        label = re.sub(r'[\x00-\x1f\x7f]', ' ', str(d.get('label') or f'Hard disk {i + 1}'))[:80]
+        what = f"disk {i + 1} ({label})"
+        m = _DISK_FILE_RE.match(str(d.get('vmdk_file') or '').strip()[:1024])
+        if not m:
+            return None, f"ESXi does not say which file holds {what}"
+        ds, rest = m.group(1).strip(), m.group(2).strip()
+        folder, name = os.path.dirname(rest), os.path.basename(rest)
+        if ds != datastore or folder != vm_dir:
+            return None, (f"{what} is in [{ds}] {folder or '.'}, not in the boot disk's "
+                          f"folder [{datastore}] {vm_dir}")
+        # ESXi says whether the disk runs on a snapshot (its backing has a parent). The
+        # -000001 name only stands in where that is not known: a disk may be db-202401.vmdk
+        on_snapshot = d.get('snapshot_delta')
+        if on_snapshot is True or (on_snapshot is None and _SNAPSHOT_FILE_RE.search(name)):
+            return None, (f"{what} runs on a snapshot of the VM ({name}): the disk files of the "
+                          f"folder hold its state from before that snapshot")
+        if descriptor_files is not None and name not in descriptor_files:
+            return None, f"{what} ({name}) is not among the disk files found in [{datastore}] {vm_dir}"
+        out.append(name)
+    if len(set(out)) != len(out):
+        return None, 'two disks of the VM name the same file'
+    return out, None
+
+
+def folder_copy_refusal(transfer_mode, why):
+    mode = _MODE_NAMES.get(str(transfer_mode or ''), str(transfer_mode or ''))
+    # Auto only gets here after its clone attempt, with the Proxmox VM made already
+    after = ("Nothing was copied and the source VM runs as it did; the Proxmox VM of this run "
+             "stays, as after any failed run." if str(transfer_mode) == 'auto'
+             else "Nothing was copied, the source VM was not touched.")
+    return (f"The {mode} transfer mode copies the disk files of the boot disk's folder, and here that "
+            f"would leave a disk out or copy an old state of it: {why}. The Live Clone transfer mode "
+            f"reads every disk from its own file as it is now. {after}")
+
+
 class V2PMigrationTask:
     """Tracks VMware -> Proxmox migration through all phases.
     
@@ -600,7 +661,21 @@ def _run_v2p_migration(task):
         task.log(f"Found {len(descriptor_files)} descriptor file(s): {descriptor_files}")
         if not descriptor_files:
             task.set_phase('failed', f'No VMDK descriptor files found in {vm_path}'); return
-        
+
+        # MK Oct 2026 - disk i is the i-th disk of the VM, not the i-th file of the folder
+        # listing: ls puts app01_10.vmdk before app01_2.vmdk, and a leftover vmdk in the folder
+        # is no disk of the VM. A disk on another datastore or in another folder is not in the
+        # listing at all, and one that runs on a snapshot of the VM has its current state in
+        # delta files the folder copies leave out: the guest came up without that disk or with
+        # an old state of it, and the run said completed. Those modes refuse here, before
+        # anything is touched; Auto only when its clone fails and it would fall back to them.
+        aligned, folder_gap = folder_copy_gap(disks, datastore, vm_dir, descriptor_files)
+        if folder_gap is None:
+            descriptor_files = aligned
+        elif task.transfer_mode not in ('vmkfstools_clone', 'auto'):
+            task.set_phase('failed', folder_copy_refusal(task.transfer_mode, folder_gap))
+            return
+
         # Verify sshfs on Proxmox node (auto-install + re-verify).
         # NS Apr 2026 — old check looked for the substring "sshfs" in apt-get output,
         # which matched even when install silently failed (lock held, mirror down).
@@ -1620,7 +1695,13 @@ def _run_v2p_migration(task):
             except _VmkFallback:
                 # auto-mode: clone path bailed before any irreversible work — drop through to
                 # the legacy auto pre-sync/live-mirror flow below (do NOT return).
-                pass
+                if folder_gap:
+                    # that flow copies from the boot disk's folder listing, which does not
+                    # hold every disk of the VM as it is now
+                    task.set_phase('failed', 'The live clone was not possible. '
+                                   + folder_copy_refusal('auto', folder_gap))
+                    _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
+                    return
             except Exception as _vce:
                 msg = str(_vce) if isinstance(_vce, _VmkSwitchoverFailed) else f'vmkfstools_clone exception: {_vce}'
                 # MK Oct 2026 (#1124) - we stopped the source and the target does not run: bring
