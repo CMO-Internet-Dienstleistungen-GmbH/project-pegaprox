@@ -275,6 +275,8 @@ docker run -d --name pegaprox \
   ghcr.io/pegaprox/pegaprox:latest
 ```
 
+The same image is on Docker Hub as [`pegaprox/pegaprox`](https://hub.docker.com/r/pegaprox/pegaprox), with the identical digest, so `pegaprox/pegaprox:latest` works just as well. Other PegaProx images on Docker Hub are not ours and may be outdated.
+
 For local builds:
 ```bash
 git clone https://github.com/PegaProx/project-pegaprox.git
