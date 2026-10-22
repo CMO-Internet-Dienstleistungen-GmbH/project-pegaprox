@@ -1786,7 +1786,9 @@
                                 vm_name: vm.name || '',
                                 backup_volid: backup.volid,
                                 backup_time: backup.ctime ? new Date(backup.ctime * 1000).toISOString() : '',
-                                storage: storageList.find(s => (s.content || '').includes('images'))?.storage || 'local-lvm',
+                                // NS Oct 2026 (#1168) - no storage from here: the first 'images' one of a list
+                                // Proxmox orders differently each time is no place for a container. The server
+                                // takes the recovery settings' test storage, else the backup's own storages
                                 check_agent: true,
                                 auto_cleanup: true,
                             })
