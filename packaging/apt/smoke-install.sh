@@ -38,8 +38,10 @@ echo "--- the modules the package depends on, and the optional ones"
 python3 -I -B /smoke/deb_imports.py
 
 # nothing above may have left bytecode in the package tree (python3 -B, and the
-# service runs as a user that cannot write there)
-if find /usr/lib/pegaprox -name __pycache__ | grep -q .; then
+# service runs as a user that cannot write there). find stops at the first one by itself:
+# piped into grep -q, a long list got find a SIGPIPE, pipefail made the pipe fail and the
+# check passed on exactly the tree it is there for
+if [ -n "$(find /usr/lib/pegaprox -name __pycache__ -print -quit)" ]; then
   echo "smoke: __pycache__ under /usr/lib/pegaprox after the install" >&2
   exit 1
 fi

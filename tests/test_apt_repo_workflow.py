@@ -11,6 +11,10 @@ NS Oct 2026
 """
 import os
 import re
+import shutil
+import subprocess
+
+import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOW = os.path.join(ROOT, '.github', 'workflows', 'apt-repo.yml')
@@ -109,3 +113,27 @@ def test_the_publish_job_checks_the_key_against_the_committed_one():
     assert 'gpg --show-keys --with-colons packaging/apt/pegaprox-archive-keyring.asc' in publish
     assert '[ "$have" != "$want" ]' in publish
     assert 'gpgv --keyring "$RUNNER_TEMP/pinned.gpg"' in publish
+
+
+def _bytecode_check():
+    """The __pycache__ check of smoke-install.sh, as it runs there (set -euo pipefail)."""
+    with open(os.path.join(ROOT, 'packaging', 'apt', 'smoke-install.sh'), encoding='utf-8') as fh:
+        smoke = fh.read()
+    m = re.search(r'^if [^\n]*__pycache__.*?^fi$', smoke, re.M | re.S)
+    assert m, 'the __pycache__ check is gone from smoke-install.sh'
+    return smoke.split('\n', 1)[0] + '\nset -euo pipefail\n' + m.group(0) + '\necho clean\n'
+
+
+@pytest.mark.skipif(not shutil.which('bash') or not shutil.which('find'), reason='needs bash and find')
+@pytest.mark.parametrize('dirs', [0, 3, 2000])
+def test_the_bytecode_check_finds_any_number_of_pycache_dirs(tmp_path, dirs):
+    tree = tmp_path / 'usr' / 'lib' / 'pegaprox'
+    tree.mkdir(parents=True)
+    for i in range(dirs):
+        (tree / f'module_with_a_rather_long_directory_name_{i}' / '__pycache__').mkdir(parents=True)
+    script = _bytecode_check().replace('/usr/lib/pegaprox', str(tree))
+    p = subprocess.run(['bash', '-c', script], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    if dirs:
+        assert p.returncode == 1 and b'__pycache__ under' in p.stderr, (p.returncode, p.stdout, p.stderr)
+    else:
+        assert p.returncode == 0 and p.stdout.strip() == b'clean', (p.returncode, p.stdout, p.stderr)
