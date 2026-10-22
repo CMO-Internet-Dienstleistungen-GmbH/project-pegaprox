@@ -10,13 +10,16 @@ already showed, with nothing in the response saying anything had been cut off.
 The read is now bounded by time instead of by row count, and comes back
 oldest-first so the timeline charts run left to right and `current` is the
 newest sample rather than the oldest one.
+
+The rows are written the way PegaProx stores them (metrics_history_fixture), and once
+more the way an older PegaProx did, which the reads take as well.
 """
-import json
-import sqlite3
 import types
 from datetime import datetime, timedelta
 
 import pytest
+
+import metrics_history_fixture as mhf
 
 
 CLUSTER = 'cluster_1'
@@ -24,53 +27,33 @@ CADENCE_MIN = 5
 DAYS_OF_HISTORY = 6
 
 
-def _snapshot_blob(i):
-    return json.dumps({'clusters': {CLUSTER: {
+def _snapshot(i):
+    return {'clusters': {CLUSTER: {
         'name': 'Cluster One',
         'totals': {'cpu_total': 100, 'cpu_used': 10 + (i % 5),
                    'mem_total': 1000, 'mem_used': 400,
                    'vms_running': 3, 'cts_running': 1},
-    }}})
+    }}}
 
 
-@pytest.fixture
-def history(monkeypatch):
-    """Six days of real snapshot rows in a real sqlite table, so the SQL we ship
-    is the SQL under test. Also sidesteps run_heavy_read's TTL cache, which is a
-    process global and would leak between these tests."""
-    conn = sqlite3.connect(':memory:')
-    conn.row_factory = sqlite3.Row
-    conn.execute('CREATE TABLE metrics_history ('
-                 'id INTEGER PRIMARY KEY AUTOINCREMENT, '
-                 'timestamp TEXT NOT NULL, data TEXT NOT NULL)')
+@pytest.fixture(params=['parts', 'legacy'])
+def history(db, monkeypatch, request):
+    """Six days of real snapshot rows in the test's own database, so the SQL we ship
+    is the SQL under test. The heavy-read cache is the db fixture's to clear."""
+    h = mhf.recorded(monkeypatch)
+    legacy = request.param == 'legacy'
     now = datetime.now()
     rows = (DAYS_OF_HISTORY * 24 * 60) // CADENCE_MIN
-    for i in range(rows, 0, -1):
-        ts = (now - timedelta(minutes=CADENCE_MIN * i)).isoformat()
-        conn.execute('INSERT INTO metrics_history (timestamp, data) VALUES (?, ?)',
-                     (ts, _snapshot_blob(i)))
-    conn.commit()
-
-    seen = []
-
-    def fake_run_heavy_read(sql, params=(), cache_key=None, ttl=None, transform=None):
-        seen.append(sql)
-        got = conn.execute(sql, params).fetchall()
-        return transform(got) if transform else got
+    h.write([((now - timedelta(minutes=CADENCE_MIN * i)).isoformat(), _snapshot(i))
+             for i in range(rows, 0, -1)], legacy=legacy)
 
     def add_snapshot(minutes_ago=1):
         """One more row, and its (id, timestamp). Used to land a newest row on an
         id the decimation would otherwise skip."""
         ts = (now - timedelta(minutes=minutes_ago)).isoformat()
-        cur = conn.execute('INSERT INTO metrics_history (timestamp, data) VALUES (?, ?)',
-                           (ts, _snapshot_blob(0)))
-        conn.commit()
-        return cur.lastrowid, ts
+        return h.write([(ts, _snapshot(0))], legacy=legacy)[0], ts
 
-    import pegaprox.core.dbcrypto as dbcrypto
-    monkeypatch.setattr(dbcrypto, 'run_heavy_read', fake_run_heavy_read)
-    yield types.SimpleNamespace(now=now, rows=rows, seen=seen, add_snapshot=add_snapshot)
-    conn.close()
+    yield types.SimpleNamespace(now=now, rows=rows, seen=h.seen, add_snapshot=add_snapshot)
 
 
 def _span_hours(timestamps):
@@ -188,43 +171,27 @@ def test_the_week_read_uses_the_shared_decimation_policy(history):
 
 # --- what a cached window holds (#963 follow-up) --------------------------------
 
-@pytest.fixture
-def fleet_history(monkeypatch):
+@pytest.fixture(params=['parts', 'legacy'])
+def fleet_history(db, monkeypatch, request):
     """Snapshots the way the collector writes them: totals plus a node, guest and
     storage map per cluster, and one cluster that carries no name. Records what each
     read hands back, which is what run_heavy_read keeps in its cache."""
-    conn = sqlite3.connect(':memory:')
-    conn.row_factory = sqlite3.Row
-    conn.execute('CREATE TABLE metrics_history ('
-                 'id INTEGER PRIMARY KEY AUTOINCREMENT, '
-                 'timestamp TEXT NOT NULL, data TEXT NOT NULL)')
+    h = mhf.recorded(monkeypatch)
     now = datetime.now()
     totals = {'cpu_total': 100, 'cpu_used': 25, 'mem_total': 1000, 'mem_used': 500,
               'vms_running': 2, 'cts_running': 1}
+    snaps = []
     for i in range(3, 0, -1):
-        blob = {'clusters': {
+        snaps.append(((now - timedelta(minutes=CADENCE_MIN * i)).isoformat(), {'clusters': {
             CLUSTER: {'name': 'Cluster One', 'totals': totals,
                       'nodes': {'pve1': {'cpu': 25.0, 'temp': 51}},
                       'vms': {str(100 + n): {'t': 'qemu', 'r': True, 'cpu': 1.0, 'mem': 2.0,
                                              'maxmem': 1, 'maxcpu': 1} for n in range(50)},
                       'storage': {'local': {'used': 1, 'total': 2, 'pct': 50.0}}},
             'cluster_2': {'totals': totals},
-        }}
-        conn.execute('INSERT INTO metrics_history (timestamp, data) VALUES (?, ?)',
-                     ((now - timedelta(minutes=CADENCE_MIN * i)).isoformat(), json.dumps(blob)))
-    conn.commit()
-    reads = []
-
-    def fake_run_heavy_read(sql, params=(), cache_key=None, ttl=None, transform=None):
-        got = conn.execute(sql, params).fetchall()
-        out = transform(got) if transform else got
-        reads.append((cache_key, out))
-        return out
-
-    import pegaprox.core.dbcrypto as dbcrypto
-    monkeypatch.setattr(dbcrypto, 'run_heavy_read', fake_run_heavy_read)
-    yield reads
-    conn.close()
+        }}))
+    h.write(snaps, legacy=request.param == 'legacy')
+    yield h.keyed
 
 
 def test_a_report_read_keeps_only_names_and_totals(api, seed, fleet_history):

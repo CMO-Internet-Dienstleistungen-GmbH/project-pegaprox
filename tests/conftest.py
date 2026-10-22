@@ -30,6 +30,13 @@ import pytest
 # save_metrics_snapshot).
 import pegaprox.background.metrics as _metrics  # noqa: E402
 _metrics.metrics_collector_loop = lambda: None
+# The same start began converting the stored snapshots to parts a minute later, in whatever
+# database the constants named by then (metrics_store.run_backfill). A test that wants the
+# conversion runs it by hand. Every save in a test reads back what it wrote and holds it
+# against the snapshot (production does that for one snapshot a day).
+from pegaprox.background import metrics_store as _metrics_store  # noqa: E402
+_metrics_store.start_backfill = lambda delay=60: None
+_metrics_store._check_every_save = True
 
 
 def _poll(done):
@@ -114,6 +121,9 @@ def db():
     _orig_const = constants.DATABASE_FILE
     constants.DATABASE_FILE = dbmod.DATABASE_FILE
     dbcrypto._HEAVY_CACHE.clear()
+    # the newest roster per cluster the metrics writer remembers is the last test's
+    _metrics_store.forget()
+    _metrics_store._mismatches.clear()
 
     database = dbmod.get_db()
     _reset_rbac_caches()  # start each test with empty process-global caches
@@ -136,8 +146,14 @@ def db():
         dbmod.CONFIG_DIR, dbmod.DATABASE_FILE, dbmod.KEY_FILE = _orig
         constants.DATABASE_FILE = _orig_const
         dbcrypto._HEAVY_CACHE.clear()
+        _metrics_store.forget()
         shutil.rmtree(tmp, ignore_errors=True)
         _reset_rbac_caches()
+    # a snapshot whose parts did not read back as written was kept as JSON and logged; in a
+    # test that is a fault of the store, unless the test made it happen and cleared it
+    mismatched, _metrics_store._mismatches[:] = list(_metrics_store._mismatches), []
+    if mismatched:
+        pytest.fail(f'metrics snapshot parts did not read back as written: {mismatched[:5]}')
 
 
 def unconfirmed_writes():

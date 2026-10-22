@@ -10,14 +10,14 @@ The stored format stays as it is. The answer carries the server's UTC offset, so
 instant is the same wherever it is read. The server runs in Asia/Kolkata here (+05:30,
 no DST), a zone the test machine is unlikely to be in by accident.
 """
-import json
 import os
-import sqlite3
 import time
 import types
 from datetime import datetime, timedelta, timezone
 
 import pytest
+
+import metrics_history_fixture as mhf
 
 CLUSTER = 'cluster_1'
 SERVER_TZ = 'Asia/Kolkata'
@@ -52,28 +52,16 @@ def _assert_same_moment(sent, stored):
 
 
 @pytest.fixture
-def history(server_tz, monkeypatch):
-    conn = sqlite3.connect(':memory:')
-    conn.row_factory = sqlite3.Row
-    conn.execute('CREATE TABLE metrics_history (id INTEGER PRIMARY KEY AUTOINCREMENT, '
-                 'timestamp TEXT NOT NULL, data TEXT NOT NULL)')
-    blob = json.dumps({'clusters': {CLUSTER: {'name': 'Cluster One', 'totals': {
+def history(server_tz, db, monkeypatch):
+    """Four snapshots in the test's own database, written as PegaProx writes them."""
+    h = mhf.recorded(monkeypatch)
+    snap = {'clusters': {CLUSTER: {'name': 'Cluster One', 'totals': {
         'cpu_total': 100, 'cpu_used': 25, 'mem_total': 1000, 'mem_used': 500,
-        'vms_running': 2, 'cts_running': 1}}}})
+        'vms_running': 2, 'cts_running': 1}}}}
     now = datetime.now()
     stamps = [(now - timedelta(minutes=m)).isoformat() for m in (40, 30, 20, 10)]
-    for ts in stamps:
-        conn.execute('INSERT INTO metrics_history (timestamp, data) VALUES (?, ?)', (ts, blob))
-    conn.commit()
-
-    def fake_run_heavy_read(sql, params=(), cache_key=None, ttl=None, transform=None):
-        got = conn.execute(sql, params).fetchall()
-        return transform(got) if transform else got
-
-    import pegaprox.core.dbcrypto as dbcrypto
-    monkeypatch.setattr(dbcrypto, 'run_heavy_read', fake_run_heavy_read)
-    yield types.SimpleNamespace(stamps=stamps, conn=conn)
-    conn.close()
+    h.write([(ts, snap) for ts in stamps])
+    yield types.SimpleNamespace(stamps=stamps, stored=h.stored)
 
 
 def _admin(api, seed):
@@ -105,7 +93,7 @@ def test_the_cross_cluster_reports_carry_it_too(api, seed, history):
 def test_the_stored_rows_keep_their_format(api, seed, history):
     admin, _ = _admin(api, seed)
     admin.get(f'/api/clusters/{CLUSTER}/reports/summary?period=week')
-    rows = [r['timestamp'] for r in history.conn.execute('SELECT timestamp FROM metrics_history')]
+    rows = [r[0] for r in history.stored('SELECT timestamp FROM metrics_history ORDER BY id')]
     assert rows == history.stamps
 
 

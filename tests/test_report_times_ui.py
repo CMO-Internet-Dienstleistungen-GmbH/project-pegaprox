@@ -17,11 +17,12 @@ LW Oct 2026
 import json
 import os
 import re
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
+
+import metrics_history_fixture as mhf
 
 from test_ha_ui import CLUSTER, LANGS, SSE_TOKEN, VM, _App, _FakeServer, browser  # noqa: F401
 from test_report_times_carry_their_offset import OFFSET, SERVER_TZ, server_tz, syslog_db  # noqa: F401
@@ -171,28 +172,14 @@ def report(server_tz, api, seed, monkeypatch):  # noqa: F811
         if all(_in_browser_tz(s).hour != 0 for s in stamps):
             break
         back += 60
-    conn = sqlite3.connect(':memory:')
-    conn.row_factory = sqlite3.Row
-    conn.execute('CREATE TABLE metrics_history (id INTEGER PRIMARY KEY AUTOINCREMENT, '
-                 'timestamp TEXT NOT NULL, data TEXT NOT NULL)')
-    for i, ts in enumerate(stamps):
-        blob = {'clusters': {'c1': {'name': 'Testi', 'totals': {
-            'cpu_total': 100, 'cpu_used': 20 + i, 'mem_total': 1000, 'mem_used': 400 + i,
-            'vms_running': 1, 'cts_running': 0}}}}
-        conn.execute('INSERT INTO metrics_history (timestamp, data) VALUES (?, ?)', (ts, json.dumps(blob)))
-    conn.commit()
-
-    def fake_run_heavy_read(sql, params=(), cache_key=None, ttl=None, transform=None):
-        got = conn.execute(sql, params).fetchall()
-        return transform(got) if transform else got
-
-    import pegaprox.core.dbcrypto as dbcrypto
-    monkeypatch.setattr(dbcrypto, 'run_heavy_read', fake_run_heavy_read)
+    # written as PegaProx writes them, into the test's own database (api brings the db fixture)
+    mhf.recorded(monkeypatch).write([(ts, {'clusters': {'c1': {'name': 'Testi', 'totals': {
+        'cpu_total': 100, 'cpu_used': 20 + i, 'mem_total': 1000, 'mem_used': 400 + i,
+        'vms_running': 1, 'cts_running': 0}}}}) for i, ts in enumerate(stamps)])
     admin, _ = _admin(api, seed)
     body = admin.get('/api/clusters/c1/reports/summary?period=day').get_json()
     assert body['data_points'] == 4, body
     yield stamps, body
-    conn.close()
 
 
 CHARTS_JS = '''() => Array.from(document.querySelectorAll('canvas'))

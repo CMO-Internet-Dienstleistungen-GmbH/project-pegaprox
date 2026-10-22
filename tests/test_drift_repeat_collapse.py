@@ -183,6 +183,8 @@ def test_a_row_acknowledged_meanwhile_stays_acknowledged(pve, db, active, monkey
             db.conn.commit()
         return out
     monkeypatch.setattr(dbcrypto, 'run_off_hub', off_hub)
+    # the prune of old events after it goes through the same door (test_drift_event_prune.py)
+    monkeypatch.setattr(drift, '_prune_events', lambda: 0)
 
     _start(monkeypatch)
 

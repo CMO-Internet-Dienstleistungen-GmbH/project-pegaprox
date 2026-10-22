@@ -225,8 +225,8 @@ def get_node_sensors_api(cluster_id, node):
 
 
 # #601 — per-node hottest-temperature history for the chart-over-time ask. Reads the
-# background collector's persisted 5-min metrics_history snapshots (off-hub, cached);
-# no live SSH here, so it stays cheap even at fleet scale.
+# background collector's persisted 5-min metrics_history snapshots (off-hub, the nodes of
+# this cluster only); no live SSH here, so it stays cheap even at fleet scale.
 @bp.route('/api/clusters/<cluster_id>/nodes/<node>/temperature-history', methods=['GET'])
 @require_auth(perms=['node.view'])
 def get_node_temperature_history_api(cluster_id, node):
@@ -234,19 +234,11 @@ def get_node_temperature_history_api(cluster_id, node):
     if not ok: return err
     bad, code = _reject_bad_node(node)
     if bad is not None: return bad, code
-    from pegaprox.background.metrics import load_metrics_history
-    series = []
+    from pegaprox.background.metrics import load_node_temps
     try:
-        hist = load_metrics_history() or {}
-        for snap in (hist.get('snapshots') or []):
-            try:
-                nodes = ((snap.get('clusters') or {}).get(cluster_id) or {}).get('nodes') or {}
-                temp = (nodes.get(node) or {}).get('temp')
-                ts = snap.get('timestamp')
-                if temp is not None and ts:
-                    series.append({'ts': ts, 'temp': temp})
-            except Exception:
-                continue
+        # MK Oct 2026 - the newest 1000 snapshots as before, this node's points worked out
+        # as they are read (load_node_temps)
+        series = [{'ts': ts, 'temp': temp} for ts, temp in load_node_temps(cluster_id, node)]
     except Exception as e:
         return jsonify({'error': f'history read failed: {e}'}), 500
     series.sort(key=lambda x: x['ts'])
@@ -277,7 +269,8 @@ def get_node_metrics_history_api(cluster_id, node):
 
     def _node(clusters):
         return ((clusters.get(cluster_id) or {}).get('nodes') or {}).get(node)
-    out = history_series(load_metrics_range(start, end, _node), {'cpu': 'cpu', 'memory': 'mem_percent'})
+    out = history_series(load_metrics_range(start, end, _node, cluster_id=cluster_id, parts=('nodes',)),
+                         {'cpu': 'cpu', 'memory': 'mem_percent'})
     out.update({'node': node, 'from': int(start), 'to': int(end)})
     return jsonify(out)
 

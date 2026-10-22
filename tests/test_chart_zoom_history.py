@@ -5,17 +5,17 @@ so the charts ask for that range at the 5-minute cadence of the snapshot table i
 nodes/<node>/metrics-history and vms/<vmid>/metrics-history for CPU and memory, and
 from/to on the cluster report summary for the dashboard charts. The read is bounded
 (a stride keeps it at about what a chart draws) and never cached. The drag itself is
-tested at runtime in test_chart_zoom_ui.py.
+tested at runtime in test_chart_zoom_ui.py. The snapshots are stored as PegaProx stores them
+(metrics_history_fixture), and once more as an older PegaProx did.
 MK Oct 2026
 """
-import json
 import math
-import sqlite3
 import types
 from datetime import datetime, timedelta
 
 import pytest
 
+import metrics_history_fixture as mhf
 from test_audit_bola_high_2026_09 import _seed_pool_membership
 from test_ha_api import ha_env, _standby_of_active  # noqa: F401
 
@@ -27,12 +27,12 @@ GUEST = f'/api/clusters/{CID}/vms/100/metrics-history'
 REPORT = f'/api/clusters/{CID}/reports/summary'
 
 
-def _blob(i):
+def _snapshot(i):
     nodes = {} if i % 50 == 0 else {'pve1': {'cpu': float(i % 100), 'mem_percent': 40.0 + i % 3,
                                              'maxcpu': 8, 'maxmem': 1}}
     nodes['pve2'] = {'cpu': 1.0, 'mem_percent': 1.0}
     stopped = i % 40 == 0
-    return json.dumps({'clusters': {
+    return {'clusters': {
         CID: {'name': 'Testi', 'nodes': nodes,
               'totals': {'cpu_total': 100, 'cpu_used': i % 100, 'mem_total': 1000, 'mem_used': 500,
                          'vms_running': 2, 'cts_running': 0},
@@ -41,34 +41,20 @@ def _blob(i):
                       '200': {'t': 'qemu', 'r': True, 'cpu': 99.0, 'mem': 99.0, 'maxmem': 4, 'maxcpu': 2}}},
         'cluster_2': {'name': 'Other', 'nodes': {'pve1': {'cpu': 77.0, 'mem_percent': 77.0}},
                       'totals': {}, 'vms': {}},
-    }})
+    }}
 
 
-@pytest.fixture
-def history(monkeypatch):
-    """Ten days of snapshots every 5 minutes in a real sqlite table, so the SQL that ships
-    is the SQL under test. Row i is i cadences old."""
-    conn = sqlite3.connect(':memory:')
-    conn.row_factory = sqlite3.Row
-    conn.execute('CREATE TABLE metrics_history (id INTEGER PRIMARY KEY AUTOINCREMENT, '
-                 'timestamp TEXT NOT NULL, data TEXT NOT NULL)')
+@pytest.fixture(params=['parts', 'legacy'])
+def history(db, monkeypatch, request):
+    """Ten days of snapshots every 5 minutes in the test's own database, so the SQL that
+    ships is the SQL under test. Row i is i cadences old."""
+    h = mhf.recorded(monkeypatch)
     now = datetime.now().replace(microsecond=0)
     rows = DAYS * 86400 // CADENCE
-    for i in range(rows, -1, -1):
-        conn.execute('INSERT INTO metrics_history (timestamp, data) VALUES (?, ?)',
-                     ((now - timedelta(seconds=CADENCE * i)).isoformat(), _blob(i)))
-    conn.commit()
-    seen = []
-
-    def fake_run_heavy_read(sql, params=(), cache_key=None, ttl=None, transform=None):
-        seen.append((sql, cache_key))
-        got = conn.execute(sql, params).fetchall()
-        return transform(got) if transform else got
-
-    import pegaprox.core.dbcrypto as dbcrypto
-    monkeypatch.setattr(dbcrypto, 'run_heavy_read', fake_run_heavy_read)
-    yield types.SimpleNamespace(now=now.timestamp(), seen=seen)
-    conn.close()
+    h.write([((now - timedelta(seconds=CADENCE * i)).isoformat(), _snapshot(i)) for i in range(rows, -1, -1)],
+            legacy=request.param == 'legacy')
+    # (sql, cache_key, what came back) of each heavy read
+    yield types.SimpleNamespace(now=now.timestamp(), reads=h.reads)
 
 
 def _ago(i, h):
@@ -148,7 +134,7 @@ def test_a_long_range_is_thinned_to_what_a_chart_draws(history):
 def test_the_read_is_never_cached(history):
     _rows(history, 30, 0)
     _rows(history, 31, 1)
-    assert [key for _, key in history.seen] == [None, None]
+    assert [key for _sql, key, _out in history.reads] == [None, None]
 
 
 def test_a_range_without_snapshots_is_empty(history):

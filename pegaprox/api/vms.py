@@ -6111,7 +6111,8 @@ def get_vm_metrics_history_api(cluster_id, vmid):
 
     def _guest(clusters):
         return ((clusters.get(cluster_id) or {}).get('vms') or {}).get(key)
-    out = history_series(load_metrics_range(start, end, _guest), {'cpu': 'cpu', 'memory': 'mem'})
+    out = history_series(load_metrics_range(start, end, _guest, cluster_id=cluster_id, parts=('vms',)),
+                         {'cpu': 'cpu', 'memory': 'mem'})
     out.update({'vmid': vmid, 'from': int(start), 'to': int(end)})
     return jsonify(out)
 

@@ -237,6 +237,66 @@ def _apply_sqlcipher_pragmas(conn, db_path: str) -> None:
 # one worker thread, so there is never cross-thread use of a shared sqlite
 # connection (unsafe even with check_same_thread=False). WAL mode (already on)
 # means this read connection doesn't lock-contend with the main writer.
+def _heavy_read_now(sql, params, transform=None):
+    """The read of _heavy_read_offload, in the calling thread.
+
+    sql may also be a list of (sql, params): MK Oct 2026 - they run in one read
+    transaction, so every statement sees the same state of the database (a metrics
+    snapshot row and its parts), and the rows come back as one list per statement."""
+    from pegaprox.constants import DATABASE_FILE
+    conn = connect(DATABASE_FILE, timeout=30, check_same_thread=False)
+    try:
+        conn.row_factory = Row
+        cur = conn.cursor()
+        if isinstance(sql, str):
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        else:
+            cur.execute('BEGIN')
+            rows = []
+            for one, args in sql:
+                cur.execute(one, args or ())
+                rows.append(cur.fetchall())
+            conn.rollback()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return transform(rows) if transform is not None else rows
+
+
+# MK Oct 2026 - a history report or a heavy read makes tens to hundreds of MB that are
+# freed again when it is done, but glibc keeps what is freed in the middle of its heaps:
+# after a few history pages the process stayed hundreds of MB larger with nothing live in
+# it. A job that ran this long hands it back when it is done. malloc_trim walks the heaps
+# (a few to a hundred ms), in the worker thread and without the GIL (ctypes lets go of it).
+_TRIM_AFTER = 0.25
+_trim_fn = []
+
+
+def trim_heap(took):
+    """Hand the memory a finished job freed back to the system, where it ran `took`
+    seconds or longer (a short one made little). True when it did."""
+    if took < _TRIM_AFTER:
+        return False
+    if not _trim_fn:
+        try:
+            import ctypes
+            fn = ctypes.CDLL(None).malloc_trim
+            fn.argtypes, fn.restype = [ctypes.c_size_t], ctypes.c_int
+        except Exception:
+            fn = None       # not glibc (musl, macOS): nothing to hand back this way
+        _trim_fn.append(fn)
+    if _trim_fn[0] is None:
+        return False
+    try:
+        _trim_fn[0](0)
+    except Exception:
+        return False
+    return True
+
+
 def _heavy_read_offload(sql: str, params: tuple, transform=None):
     """Run the query (and optionally a transform of the rows) on a fresh
     independent connection inside gevent's OS threadpool — or inline if no hub.
@@ -245,19 +305,11 @@ def _heavy_read_offload(sql: str, params: tuple, transform=None):
     post-processing (e.g. json.loads of thousands of rows) also stays off the
     hub instead of being done by the calling greenlet."""
     def _work():
-        from pegaprox.constants import DATABASE_FILE
-        conn = connect(DATABASE_FILE, timeout=30, check_same_thread=False)
+        start = _time.monotonic()
         try:
-            conn.row_factory = Row
-            cur = conn.cursor()
-            cur.execute(sql, params)
-            rows = cur.fetchall()
+            return _heavy_read_now(sql, params, transform)
         finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-        return transform(rows) if transform is not None else rows
+            trim_heap(_time.monotonic() - start)
     try:
         from gevent import get_hub
         return get_hub().threadpool.apply(_work)
@@ -287,6 +339,37 @@ import time as _time
 _HEAVY_TTL = float(os.environ.get('PEGAPROX_HEAVY_READ_TTL', '60') or '60')
 _HEAVY_CACHE: dict = {}      # cache_key -> (expiry_monotonic, rows)
 _HEAVY_INFLIGHT: dict = {}   # cache_key -> AsyncResult
+# MK Oct 2026 - an entry used to stay until the next read of its key replaced it, so a
+# window nobody asked for again was held for good, and every `days` a caller ever passed
+# kept one more. Expired entries go on every cached read (and after each metrics save),
+# and past this many keys the ones that expire first make room.
+def _max_keys():
+    # read at import: a value that is no whole number must not keep PegaProx from starting
+    try:
+        return max(1, int(os.environ.get('PEGAPROX_HEAVY_READ_MAX_KEYS', '').strip() or 64))
+    except ValueError:
+        return 64
+
+
+_HEAVY_MAX_KEYS = _max_keys()
+
+
+def _heavy_cache_sweep(now=None):
+    """Drop every cached heavy read whose time is up."""
+    now = _time.monotonic() if now is None else now
+    for key in [k for k, ent in list(_HEAVY_CACHE.items()) if ent[0] <= now]:
+        _HEAVY_CACHE.pop(key, None)
+
+
+def _heavy_cache_store(key, rows, ttl):
+    # the TTL counts from now, when the value is there: a fetch of ten seconds got ten
+    # seconds less of it when it counted from the start
+    _HEAVY_CACHE[key] = (_time.monotonic() + ttl, rows)
+    over = len(_HEAVY_CACHE) - max(1, _HEAVY_MAX_KEYS)
+    if over > 0:
+        older = sorted((k for k in _HEAVY_CACHE if k != key), key=lambda k: _HEAVY_CACHE[k][0])
+        for k in older[:over]:
+            _HEAVY_CACHE.pop(k, None)
 
 def _heavy_sem():
     # Lazily build a gevent BoundedSemaphore (needs the hub). Cap concurrent
@@ -315,6 +398,7 @@ def run_heavy_read(sql: str, params: tuple = (), cache_key: str = None, ttl: flo
     transform — optional callable(rows)->value run INSIDE the worker thread, so
     CPU-heavy post-processing (json.loads of thousands of rows) also stays off
     the hub. The transformed value is what gets cached/returned.
+    sql may be a list of (sql, params) read in one transaction (_heavy_read_now).
 
     Falls back to a direct in-thread query when gevent isn't available.
     """
@@ -322,6 +406,7 @@ def run_heavy_read(sql: str, params: tuple = (), cache_key: str = None, ttl: flo
         return _heavy_read_offload(sql, params, transform)
 
     now = _time.monotonic()
+    _heavy_cache_sweep(now)
     ent = _HEAVY_CACHE.get(cache_key)
     if ent and ent[0] > now:
         return ent[1]
@@ -350,7 +435,7 @@ def run_heavy_read(sql: str, params: tuple = (), cache_key: str = None, ttl: flo
                 rows = _heavy_read_offload(sql, params, transform)
         else:
             rows = _heavy_read_offload(sql, params, transform)
-        _HEAVY_CACHE[cache_key] = (now + (ttl if ttl is not None else _HEAVY_TTL), rows)
+        _heavy_cache_store(cache_key, rows, ttl if ttl is not None else _HEAVY_TTL)
         if ar is not None:
             ar.set(rows)
         return rows

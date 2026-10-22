@@ -29,13 +29,14 @@ Slack/Discord/ntfy/web-push channels users have configured for alerts also
 get drift notifications without extra plumbing.
 """
 import json
+import os
 import re
 import time
 import hashlib
 import uuid
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Blueprint, jsonify, request
 
 from pegaprox.globals import cluster_managers
@@ -1237,9 +1238,121 @@ def _collapse_repeats():
     return done
 
 
+# MK Oct 2026 - drift_events kept every row it ever got. A fleet-wide change at a few
+# thousand guests writes thousands per scan, and every resolved or superseded one stayed for
+# good. The rows nobody acts on any more are pruned now, by age and, per cluster, by count:
+# only 'resolved' and 'superseded' ones, never an open or acknowledged row, an incident an
+# admin confirmed or a deviation an approved change plan names (the evidence of that plan).
+# Once at the start of the scanner thread and then once a day, on every instance (the table
+# is LOCAL, a standby has a pile of its own), off the hub and in chunks like the collapse
+# above. A cluster that is no longer configured keeps its rows under the same rules, so a
+# cluster added back finds its history.
+#   PEGAPROX_DRIFT_EVENT_RETENTION_DAYS  default 365, held to 90..3650; 0 prunes nothing
+#   PEGAPROX_DRIFT_EVENT_CAP             prunable rows kept per cluster, default 200000
+#                                        (0 or less: no cap); past it the oldest go first,
+#                                        superseded ones before resolved ones
+_PRUNE_EVERY = 86400
+_PRUNE_CHUNK = 200          # a few ms of writing each, the hub writes on its own connection
+_PRUNE_PAUSE = 0.05
+_PRUNE_BATCH = 50000        # ids looked up per round, deleted in chunks
+_PRUNABLE = "status IN ('resolved', 'superseded') AND category != 'incident' AND change_id IS NULL"
+# the same for a chunk of ids: the + keeps the status indexes out of it, so SQLite finds the
+# rows by their ids (the primary key) and checks the rest on them; past about 20 ids it took
+# idx_drift_events_status and went through every resolved row for each chunk
+_PRUNABLE_IDS = '+' + _PRUNABLE
+
+
+def _event_retention_days():
+    raw = os.environ.get('PEGAPROX_DRIFT_EVENT_RETENTION_DAYS', '').strip()
+    try:
+        days = int(raw) if raw else 365
+    except ValueError:
+        days = 365
+    return 0 if days == 0 else max(90, min(days, 3650))
+
+
+def _event_cap():
+    raw = os.environ.get('PEGAPROX_DRIFT_EVENT_CAP', '').strip()
+    try:
+        cap = int(raw) if raw else 200000
+    except ValueError:
+        cap = 200000
+    return max(cap, 0)
+
+
+def _delete_events(path, ids):
+    """Delete the prunable rows among ids, a chunk per transaction with a pause in
+    between; how many went. A row acknowledged or linked meanwhile stays."""
+    done = 0
+    for at in range(0, len(ids), _PRUNE_CHUNK):
+        if at:
+            time.sleep(_PRUNE_PAUSE)    # the other writers get the database in between
+        chunk = ids[at:at + _PRUNE_CHUNK]
+
+        def work(conn, chunk=chunk):
+            c = conn.cursor()
+            c.execute(f"DELETE FROM drift_events WHERE id IN ({','.join('?' * len(chunk))}) AND {_PRUNABLE_IDS}",
+                      chunk)
+            return max(c.rowcount, 0)
+        done += dbcrypto.run_off_hub(work, path, commit=True)
+    return done
+
+
+def _prune_events():
+    """Prune resolved and superseded drift events past the retention, then per cluster past
+    the cap; logged as one line. A failure is logged and leaves the rest for the next run.
+    Returns how many rows went."""
+    days = _event_retention_days()
+    if not days:
+        return 0
+    cap = _event_cap()
+    aged = capped = 0
+    try:
+        path = get_db().db_path
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+
+        def old_ones(conn):
+            # by idx_drift_events_age, which the schema pass makes (core/db.py)
+            return [r[0] for r in conn.execute(
+                f'SELECT id FROM drift_events WHERE {_PRUNABLE} AND detected_at < ? ORDER BY id LIMIT ?',
+                (cutoff, _PRUNE_BATCH))]
+        while True:
+            ids = dbcrypto.run_off_hub(old_ones, path)
+            gone = _delete_events(path, ids)
+            aged += gone
+            if len(ids) < _PRUNE_BATCH or not gone:
+                break
+        if cap:
+            def over_cap(conn):
+                out = []
+                for (cid,) in conn.execute('SELECT DISTINCT cluster_id FROM drift_events').fetchall():
+                    n = conn.execute(f'SELECT COUNT(*) FROM drift_events WHERE cluster_id = ? AND {_PRUNABLE}',
+                                     (cid,)).fetchone()[0]
+                    if n > cap:
+                        # kept: resolved before superseded, the newest of each first
+                        out += [r[0] for r in conn.execute(
+                            f"SELECT id FROM drift_events WHERE cluster_id = ? AND {_PRUNABLE} "
+                            f"ORDER BY status = 'superseded', detected_at DESC, id DESC LIMIT -1 OFFSET ?",
+                            (cid, cap))]
+                return out
+            capped = _delete_events(path, dbcrypto.run_off_hub(over_cap, path))
+    except Exception as e:
+        logging.warning(f"[drift] pruning old drift events stopped after {aged + capped}: {e}")
+        return aged + capped
+    if aged or capped:
+        why = f"{aged} older than {days} days" + (f", {capped} over the {cap} kept per cluster" if capped else '')
+        logging.info(f"[drift] {aged + capped} resolved or superseded drift event(s) pruned: {why}")
+    return aged + capped
+
+
 def _scanner_loop():
     _collapse_repeats()
+    pruned_at = None
     while _scanner_running:
+        # the old events go at the start and then once a day; the scans every SCAN_INTERVAL
+        if pruned_at is None or time.time() - pruned_at >= _PRUNE_EVERY:
+            pruned_at = time.time()
+            _prune_events()
         try:
             for cid in list(cluster_managers.keys()):
                 # standby: baselines and events are the active instance's business

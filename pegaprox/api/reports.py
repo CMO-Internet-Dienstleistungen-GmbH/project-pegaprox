@@ -1199,7 +1199,8 @@ def get_cluster_report_summary(cluster_id):
             c = clusters.get(cluster_id)
             return {cluster_id: {'totals': c.get('totals') or {}}} if isinstance(c, dict) else {}
         filtered = [{'timestamp': ts, 'clusters': kept}
-                    for ts, kept in load_metrics_range(picked[0], picked[1], _totals)]
+                    for ts, kept in load_metrics_range(picked[0], picked[1], _totals,
+                                                       cluster_id=cluster_id, parts=('head',))]
     else:
         window_days, cutoff = _period_cutoff(period)
         history = load_metrics_history(days=window_days, totals_only=True)

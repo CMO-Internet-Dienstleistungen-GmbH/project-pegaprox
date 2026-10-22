@@ -19,6 +19,7 @@ from pegaprox.globals import cluster_managers
 from pegaprox.core.db import get_db
 from pegaprox.core import ha
 from pegaprox.utils.concurrent import run_per_node  # #601: SSH-aware bounded fan-out for per-node temp reads
+from pegaprox.background import metrics_store
 
 
 def _node_hottest_temp(mgr, node):
@@ -176,16 +177,24 @@ def load_metrics_history(days=None, totals_only=False):
 
     totals_only=True hands back each cluster's name and totals and nothing else,
     which is all the report endpoints read (see _cluster_totals_only).
+
+    MK Oct 2026 - the rows are the same as before (the same SQL picks them); what a
+    converted row holds is read from its parts (background/metrics_store.py) in the
+    same transaction: the heads only for totals_only, which leaves the guest maps unread.
     """
     try:
         from datetime import timedelta
         from pegaprox.core.dbcrypto import run_heavy_read
+        parts = (metrics_store.P_HEAD, metrics_store.P_WHOLE) if totals_only else \
+            (metrics_store.P_HEAD, metrics_store.P_NODES, metrics_store.P_STORAGE,
+             metrics_store.P_GUESTS, metrics_store.P_WHOLE)
 
-        def _parse(rows):
+        def _parse(results):
+            rows, got = results[0], metrics_store.SnapParts(*results[1:])
             out = []
             for row in rows:
                 try:
-                    data = json.loads(row['data'])
+                    data = metrics_store.snapshot_data(row, got)
                     data['timestamp'] = row['timestamp']
                     out.append(_cluster_totals_only(data) if totals_only else data)
                 except Exception:
@@ -219,15 +228,18 @@ def load_metrics_history(days=None, totals_only=False):
             # the 5-min cadence a week is unbounded decrypt + parse. Keep a
             # backstop, and trim it from the OLD end so the recent resolution the
             # charts are about survives.
-            sql = ('SELECT timestamp, data FROM ('
-                   'SELECT id, timestamp, data FROM metrics_history '
-                   f'{where} ORDER BY timestamp DESC LIMIT {_WINDOW_ROW_CAP}'
-                   ') ORDER BY timestamp ASC')
+            newest = (f'SELECT id, timestamp, data, fmt FROM metrics_history '
+                      f'{where} ORDER BY timestamp DESC LIMIT {_WINDOW_ROW_CAP}')
+            sql = f'SELECT id, timestamp, data, fmt FROM ({newest}) ORDER BY timestamp ASC'
+            ids = f'SELECT id FROM metrics_history {where} ORDER BY timestamp DESC LIMIT {_WINDOW_ROW_CAP}'
             snapshots = run_heavy_read(
-                sql, params, cache_key=f'mh_reports_d{days}{key_tail}', transform=_parse)
+                [(sql, params)] + metrics_store.part_statements(ids, params, parts),
+                cache_key=f'mh_reports_d{days}{key_tail}', transform=_parse)
         else:
+            sql = 'SELECT id, timestamp, data, fmt FROM metrics_history ORDER BY timestamp DESC LIMIT 1000'
+            ids = 'SELECT id FROM metrics_history ORDER BY timestamp DESC LIMIT 1000'
             snapshots = run_heavy_read(
-                'SELECT timestamp, data FROM metrics_history ORDER BY timestamp DESC LIMIT 1000',
+                [(sql, ())] + metrics_store.part_statements(ids, (), parts),
                 cache_key=f'mh_reports_1000{key_tail}', transform=_parse)
         return {'snapshots': snapshots, 'last_cleanup': None}
     except Exception as e:
@@ -290,21 +302,39 @@ def _range_sem():
     return _range_slot[0]
 
 
-def load_metrics_range(start, end, pick):
+# what a pick of load_metrics_range reads of its cluster -> the parts that holds
+_RANGE_PARTS = {'nodes': (metrics_store.P_NODES, metrics_store.P_WHOLE),
+                'vms': (metrics_store.P_GUESTS, metrics_store.P_WHOLE),
+                'head': (metrics_store.P_HEAD, metrics_store.P_WHOLE)}
+
+
+def load_metrics_range(start, end, pick, cluster_id=None, parts=None):
     """[(timestamp, pick(clusters))] of the snapshots from start to end (unix seconds),
     oldest first, at most about _RANGE_ROWS of them. pick gets the clusters map of one
-    snapshot and returns what to keep of it, None where it has nothing."""
+    snapshot and returns what to keep of it, None where it has nothing.
+
+    MK Oct 2026 - cluster_id and parts ('nodes', 'vms' or 'head') say what pick reads:
+    of a converted row only that part of that cluster is read then, and pick gets a map of
+    just that ({cluster_id: {'nodes': ...}}; the guests come one at a time, as a chart of
+    one guest asks for them). Rows an older PegaProx wrote are parsed whole, as before."""
     from pegaprox.core.dbcrypto import run_heavy_read, _heavy_sem
     if end <= start:
         return []
     lo = datetime.fromtimestamp(start).isoformat()
     hi = datetime.fromtimestamp(end).isoformat()
+    if parts and cluster_id is not None:
+        wanted = sorted({p for name in parts for p in _RANGE_PARTS[name]})
+    else:
+        cluster_id = None
+        wanted = (metrics_store.P_HEAD, metrics_store.P_NODES, metrics_store.P_STORAGE,
+                  metrics_store.P_GUESTS, metrics_store.P_WHOLE)
 
-    def _parse(rows):
+    def _parse(results):
+        rows, got = results[0], metrics_store.SnapParts(*results[1:])
         out = []
         for row in rows:
             try:
-                clusters = json.loads(row['data']).get('clusters') or {}
+                clusters = metrics_store.snapshot_clusters(row, got, lazy_guests=cluster_id is not None)
                 out.append((row['timestamp'], pick(clusters)))
             except Exception:
                 continue
@@ -313,19 +343,103 @@ def load_metrics_range(start, end, pick):
     # every n-th row, n from the count of the range (answered from the timestamp index),
     # anchored on the newest row of the range so its right edge is always there
     in_range = 'FROM metrics_history WHERE timestamp >= ? AND timestamp <= ?'
-    sql = (f'SELECT timestamp, data {in_range} '
-           f'AND ((SELECT MAX(id) {in_range}) - id) % '
-           f'MAX(1, ((SELECT COUNT(*) {in_range}) + ? - 1) / ?) = 0 '
-           'ORDER BY timestamp ASC LIMIT ?')
+    picked = (f'{in_range} '
+              f'AND ((SELECT MAX(id) {in_range}) - id) % '
+              f'MAX(1, ((SELECT COUNT(*) {in_range}) + ? - 1) / ?) = 0 '
+              'ORDER BY timestamp ASC LIMIT ?')
     params = (lo, hi, lo, hi, lo, hi, _RANGE_ROWS, _RANGE_ROWS, _RANGE_ROWS * 2)
+    statements = [(f'SELECT id, timestamp, data, fmt {picked}', params)] + \
+        metrics_store.part_statements(f'SELECT id {picked}', params, wanted, cluster_id)
     try:
         # the same cap the cached heavy reads take, and never more than one of its slots
         from contextlib import nullcontext
         sem = _heavy_sem()
         with (_range_sem() or nullcontext()), (sem or nullcontext()):
-            return run_heavy_read(sql, params, transform=_parse)
+            return run_heavy_read(statements, (), transform=_parse)
     except Exception as e:
         logging.error(f"Error loading a metrics range: {e}")
+        return []
+
+
+def _node_maps(results, cluster_id):
+    """(timestamp, nodes) of each row of a node history read, one at a time; a row that
+    does not read is left out, as the route skipped it."""
+    rows, got = results[0], metrics_store.SnapParts(*results[1:])
+    for row in rows:
+        try:
+            if row['fmt'] == metrics_store.FMT_PARTS:
+                clusters = got.clusters(row['id'])
+            else:
+                # the steps of the old read: the row parsed, its timestamp set, the cluster
+                snap = metrics_store.snapshot_data(row, got)
+                snap['timestamp'] = row['timestamp']
+                clusters = snap.get('clusters')
+            nodes = ((clusters or {}).get(cluster_id) or {}).get('nodes') or {}
+        except Exception:
+            continue
+        yield row['timestamp'], nodes
+
+
+def load_node_history(cluster_id):
+    """[(timestamp, nodes)] of one cluster in the newest 1000 snapshots, newest first, for
+    the temperature chart of a node. nodes is what the route read before of each snapshot,
+    ((clusters.get(cluster_id) or {}).get('nodes') or {}); a snapshot that does not read is
+    left out, as the route skipped it.
+
+    MK Oct 2026 - the route read the newest 1000 whole fleet snapshots (load_metrics_history()
+    without a window) for one number per row, and kept them for a minute: gigabytes at a few
+    thousand guests. The same rows, but of a converted one only this cluster's nodes are
+    read, and nothing is kept."""
+    from pegaprox.core.dbcrypto import run_heavy_read, _heavy_sem
+    sql = 'SELECT id, timestamp, data, fmt FROM metrics_history ORDER BY timestamp DESC LIMIT 1000'
+    ids = 'SELECT id FROM metrics_history ORDER BY timestamp DESC LIMIT 1000'
+
+    def _parse(results):
+        return list(_node_maps(results, cluster_id))
+
+    try:
+        from contextlib import nullcontext
+        with (_heavy_sem() or nullcontext()):
+            return run_heavy_read(
+                [(sql, ())] + metrics_store.part_statements(
+                    ids, (), (metrics_store.P_NODES, metrics_store.P_WHOLE), cluster_id),
+                (), transform=_parse)
+    except Exception as e:
+        logging.error(f"Error loading the node history of {cluster_id}: {e}")
+        return []
+
+
+def load_node_temps(cluster_id, node):
+    """[(timestamp, temp)] of one node in the newest 1000 snapshots, newest first: the
+    points the temperature chart draws, where (nodes.get(node) or {}).get('temp') of a
+    snapshot (load_node_history) is a value and the row has a timestamp.
+
+    MK Oct 2026 - at 200 nodes that was 1000 maps of all nodes (16 MB) read, parsed and
+    held at once per request, for one number a row. Each map is let go as soon as its point
+    is out, and the points are kept a minute under the heavy-read cache, as the whole
+    history was kept before (a chart of one node is asked for again and again)."""
+    from pegaprox.core.dbcrypto import run_heavy_read
+    sql = 'SELECT id, timestamp, data, fmt FROM metrics_history ORDER BY timestamp DESC LIMIT 1000'
+    ids = 'SELECT id FROM metrics_history ORDER BY timestamp DESC LIMIT 1000'
+
+    def _points(results):
+        out = []
+        for ts, nodes in _node_maps(results, cluster_id):
+            try:
+                temp = (nodes.get(node) or {}).get('temp')
+            except Exception:
+                continue
+            if temp is not None and ts:
+                out.append((ts, temp))
+        return out
+
+    try:
+        return run_heavy_read(
+            [(sql, ())] + metrics_store.part_statements(
+                ids, (), (metrics_store.P_NODES, metrics_store.P_WHOLE), cluster_id),
+            (), cache_key=f'mh_node_temps:{cluster_id}:{node}', transform=_points)
+    except Exception as e:
+        logging.error(f"Error loading the temperatures of {cluster_id}/{node}: {e}")
         return []
 
 
@@ -398,22 +512,15 @@ def save_metrics_snapshot(snapshot):
     gevent hub every 5 min — a periodic freeze. Now the whole thing (incl. the
     json.dumps) runs off-hub on a fresh connection via run_heavy_write, and the
     prune is an indexed timestamp DELETE instead of a full-table anti-join.
+
+    MK Oct 2026 - the snapshot goes into its per-cluster parts (metrics_store.save), the
+    row and its parts and the prune in one transaction, still off the hub.
     """
     try:
-        from pegaprox.core.dbcrypto import run_heavy_write
         from datetime import timedelta
         timestamp = snapshot.get('timestamp', datetime.now().isoformat())
         cutoff = (datetime.now() - timedelta(days=_retention_days())).isoformat()
-
-        def _build():
-            # json.dumps of the multi-MB blob happens HERE, in the worker thread
-            data = json.dumps({k: v for k, v in snapshot.items() if k != 'timestamp'})
-            return [
-                ("INSERT INTO metrics_history (timestamp, data) VALUES (?, ?)", (timestamp, data)),
-                # indexed prune (idx_metrics_timestamp) — keep last N days
-                ("DELETE FROM metrics_history WHERE timestamp < ?", (cutoff,)),
-            ]
-        run_heavy_write(build=_build)
+        metrics_store.save(snapshot, timestamp, cutoff)
     except Exception as e:
         logging.error(f"Error saving metrics snapshot: {e}")
 
@@ -665,6 +772,9 @@ def start_metrics_collector():
     _metrics_collector_running = True
     thread = threading.Thread(target=metrics_collector_loop, daemon=True)
     thread.start()
+    # MK Oct 2026 - the snapshots an older PegaProx stored are converted to parts in the
+    # background, a minute after the start so it never holds that up
+    metrics_store.start_backfill(delay=60)
     logging.info("Metrics collector started")
 
 

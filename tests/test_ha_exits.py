@@ -762,6 +762,8 @@ AUTOMATIONS = {
     ('pegaprox/background/cross_cluster_replication.py', 'start_cross_cluster_replication_thread'): (1, 'confirm'),
     ('pegaprox/background/guest_index.py', 'start_guest_index_thread'): (1, 'read'),
     ('pegaprox/background/metrics.py', 'start_metrics_collector'): (1, 'read'),
+    # the stored snapshots converted to parts, a minute after the start: this host's database
+    ('pegaprox/background/metrics_store.py', 'start_backfill'): (1, 'local'),
     ('pegaprox/background/password_expiry.py', 'start_password_expiry_thread'): (1, 'read'),
     ('pegaprox/background/scheduler.py', 'start_scheduler_thread'): (1, 'confirm'),
     # the weekly restore tests: the loop confirms each test, the run is a job of its own

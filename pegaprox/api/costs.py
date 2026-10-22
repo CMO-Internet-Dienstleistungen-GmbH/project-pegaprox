@@ -27,6 +27,7 @@ icon. Better than refusing to display anything.
 import json
 import logging
 from datetime import datetime, timedelta
+from itertools import chain, compress
 from flask import Blueprint, jsonify, request
 
 from pegaprox.globals import cluster_managers
@@ -34,6 +35,7 @@ from pegaprox.utils.auth import require_auth
 from pegaprox.utils.sanitization import sanitize_csv_field
 from pegaprox.api.helpers import (check_cluster_access, load_metrics_window, scope_vm_rows, run_off_hub,
                                   history_report, history_version)
+from pegaprox.background.metrics_store import need, guest_columns, FT, HERE, RUN, CPU_SET, MEM_SET
 from pegaprox.core.db import get_db
 from pegaprox.models.permissions import ROLE_ADMIN
 
@@ -92,16 +94,13 @@ def _current_user():
 
 def _load_history(cluster_id, days=30):
     """Pull all snapshots for a cluster. Fetch+parse run off-hub + cached in
-    load_metrics_window (shared with insights/power); we just filter."""
-    out = []
+    load_metrics_window (shared with insights/power); we just filter.
+    MK Oct 2026 - load_metrics_window reads the one cluster itself now."""
     try:
-        for ts_unix, clusters in load_metrics_window(days):
-            cd = clusters.get(cluster_id)
-            if cd:
-                out.append((ts_unix, cd))
+        return load_metrics_window(days, cluster_id)
     except Exception as e:
         logging.warning(f"[costs] history load failed for {cluster_id}: {e}")
-    return out
+    return []
 
 
 def _compute_per_vm(snapshots, mgr, rates, hours_window, stats=None):
@@ -121,7 +120,15 @@ def _compute_per_vm(snapshots, mgr, rates, hours_window, stats=None):
 
 
 def _cost_stats(snapshots):
-    """{vmid: what the cost of a guest reads of the history}: plain arithmetic, off the hub."""
+    """{vmid: what the cost of a guest reads of the history}: plain arithmetic, off the hub.
+    MK Oct 2026 - a window whose guests are all stored in columns goes to _cost_stats_cols,
+    which reads the same figures without a dict per guest and sample."""
+    cols = guest_columns(snapshots)
+    if cols is not None:
+        return _cost_stats_cols(cols)
+    snapshots = need(snapshots, 'vms')
+    # NOTE: _cost_stats_cols below is this loop on the column store, and has to give the very
+    # same result (tests/test_metrics_column_engines.py). A change here goes there as well.
     # vmid -> {cpu_samples, mem_samples, name, node, type, maxmem, maxcpu, running_samples, total_samples}
     by_vm = {}
 
@@ -152,6 +159,30 @@ def _cost_stats(snapshots):
                      'maxcpu': e['maxcpu'], 'maxmem': e['maxmem'],
                      'avg_cpu_pct': sum(cpu_samples) / len(cpu_samples),
                      'avg_mem_pct': sum(mem_samples) / len(mem_samples)}
+    return out
+
+
+def _cost_stats_cols(cols):
+    """_cost_stats on a metrics_store.GuestColumns. Per guest the same lists in the same
+    snapshot order reach the same sum(), so the averages are the same floats; the guests
+    come in the order they first show up, as the dict filled in. No list is made of them:
+    sum() takes them one by one in that order all the same, and an empty one is the [0]
+    of the dict way, 0 / 1."""
+    out = {}
+    S, get = cols.S, FT.__getitem__
+    for vmid, g in cols.order:
+        fl = cols.flags_of(g)
+        here = fl.translate(HERE)
+        cpu_set, mem_set = fl.translate(CPU_SET), fl.translate(MEM_SET)
+        nc, nm = cpu_set.count(1), mem_set.count(1)
+        cpu, mem = cols.cpu_of(g), cols.mem_of(g)
+        # the largest of what each snapshot said, 0 where none said more (all ints, >= 0)
+        out[vmid] = {'t': cols.kind(g, here.find(1)), 'r_count': fl.translate(RUN).count(1),
+                     'total': here.count(1),
+                     'maxcpu': max(chain((0,), cols.values(cols.maxcpu, g))),
+                     'maxmem': max(chain((0,), cols.values(cols.maxmem, g))),
+                     'avg_cpu_pct': sum(map(get, cpu if nc == S else compress(cpu, cpu_set))) / nc if nc else 0 / 1,
+                     'avg_mem_pct': sum(map(get, mem if nm == S else compress(mem, mem_set))) / nm if nm else 0 / 1}
     return out
 
 

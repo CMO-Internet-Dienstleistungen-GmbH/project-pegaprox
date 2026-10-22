@@ -6,6 +6,8 @@
 # at once while new ones are worked out in the background, and only a report nobody has
 # asked for (or an older one) is waited for. Every answer says when its figures were
 # worked out (computed_at) and whether newer ones are on the way (refreshing).
+import os
+import sys
 import time
 from datetime import datetime
 
@@ -423,3 +425,102 @@ def test_a_caller_that_goes_away_leaves_the_others_their_figures(api, seed, monk
     r = second.get(timeout=30)
     assert r.status_code == 200, r.get_data(as_text=True)
     assert len(runs) == 1
+
+
+def test_right_sizing_counts_the_snapshots_its_figures_were_worked_out_of(api, seed, monkeypatch):
+    """MK Oct 2026 - a stored window is two reads: its index, then the parts. The rows the
+    retention prunes in between leave the window, so the count has to be taken after the
+    figures, not before (it said 30 over figures of 25)."""
+    import metrics_history_fixture as mhf
+    from datetime import timedelta
+    from pegaprox import constants
+    from pegaprox.core import dbcrypto
+    _cluster(api, monkeypatch)
+    now = datetime.now()
+    rows = [((now - timedelta(seconds=300 * (30 - i))).isoformat(), {'clusters': {'cluster_1': cd}})
+            for i, (_ts, cd) in enumerate(_sizing_history())]
+    ids = mhf.History().write(rows)
+    real = insights._sizing_stats
+
+    def pruned_meanwhile(history):
+        conn = dbcrypto.connect(constants.DATABASE_FILE)
+        try:
+            for sid in ids[:5]:
+                conn.execute('DELETE FROM metrics_part WHERE snap_id = ?', (sid,))
+                conn.execute('DELETE FROM metrics_history WHERE id = ?', (sid,))
+            conn.commit()
+        finally:
+            conn.close()
+        return real(history)
+    monkeypatch.setattr(insights, '_sizing_stats', pruned_meanwhile)
+    body = api.as_user(_admin(seed)).get('/api/clusters/cluster_1/insights/right-sizing?days=1').get_json()
+    assert {r['samples'] for r in body['recommendations']} == {25}
+    assert body['snapshots_in_window'] == 25
+
+
+def test_the_long_term_history_is_worked_out_off_the_hub(api, seed, monkeypatch):
+    """MK Oct 2026 - the samples and buckets of insights/history were built on the hub: a
+    year at 200 nodes is 0.5-0.7 s of plain Python, and the hub stood still for it on every
+    request. It runs in the thread pool now, and answers as before."""
+    from gevent.monkey import get_original
+    real_ident = get_original('_thread', 'get_ident')
+    _cluster(api, monkeypatch)
+    monkeypatch.setattr(insights, '_load_history', lambda *a, **k: _history(30))
+    hub, seen, real = real_ident(), [], insights._avg_samples
+    monkeypatch.setattr(insights, '_avg_samples', lambda *a: seen.append(real_ident()) or real(*a))
+    c = api.as_user(_admin(seed))
+    body = c.get('/api/clusters/cluster_1/insights/history?days=7&step=3600').get_json()
+    assert body['sample_count'] == len(seen) == 3
+    assert hub not in seen
+    assert body['samples'][0]['nodes']['n1'] == {'cpu': 50.0, 'mem_percent': 50.0}
+    raw = c.get('/api/clusters/cluster_1/insights/history?days=7').get_json()
+    assert raw['sample_count'] == 30 and raw['samples'][1]['ts'] == 300
+
+
+def _rss_mb():
+    with open('/proc/self/statm') as fh:
+        return int(fh.read().split()[1]) * os.sysconf('SC_PAGE_SIZE') / 2 ** 20
+
+
+def _fragments():
+    """What a report does to the heap: a lot made and dropped, the result kept, and the
+    kept bits lie all over what was freed (2 KB blocks go to malloc, not to Python's own)."""
+    end = time.perf_counter() + 0.3          # as long as a report takes at the least
+    blocks = [bytearray(2048) for _ in range(60000)]
+    kept = blocks[::16]
+    del blocks
+    while time.perf_counter() < end:
+        pass
+    return kept
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason='glibc heap')
+@pytest.mark.parametrize('job', ['report', 'heavy read'])
+def test_a_long_job_off_the_hub_hands_back_the_memory_it_freed(db, job):
+    """MK Oct 2026 - glibc keeps memory freed in the middle of its heaps: after a few
+    history pages the process stayed some hundred MB larger at 3000 guests, more than half a
+    GB at 10k, with nothing live in it. A long job off the hub (a history report, a heavy
+    read and what it makes of its rows) hands it back when it is done."""
+    import ctypes
+    from pegaprox.core import dbcrypto
+    from gevent import get_hub
+    try:
+        libc_trim = ctypes.CDLL(None).malloc_trim
+    except (OSError, AttributeError):
+        pytest.skip('no glibc')
+    libc_trim(0)
+    base = _rss_mb()
+    kept = get_hub().threadpool.apply(_fragments)       # the same work, nothing handed back
+    held = _rss_mb() - base
+    del kept
+    libc_trim(0)
+    if held < 80:
+        pytest.skip(f'this allocator gives memory back on its own ({held:.0f} MB held)')
+    base = _rss_mb()
+    if job == 'report':
+        kept = helpers.run_off_hub(_fragments)
+    else:
+        kept = dbcrypto.run_heavy_read('SELECT 1', transform=lambda rows: _fragments())
+    after = _rss_mb() - base
+    del kept
+    assert after < held / 2, f'{after:.0f} MB still held after the job, {held:.0f} MB without handing back'
