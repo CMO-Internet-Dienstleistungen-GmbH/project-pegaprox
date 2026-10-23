@@ -4354,6 +4354,44 @@ class PegaProxManager:
             result[node_name] = self._compute_predictive_score(node_name)
         return result
 
+    # MK Oct 2026 (#1172) - PVE's own migrate dialog hands a running VM's conntrack entries
+    # over to the target (with-conntrack-state) when both nodes carry the dbus-vmstate helper.
+    # We never sent it, so PVE logged "conntrack state migration not supported or disabled"
+    # and open connections could drop mid-move. A PVE 8 node doesn't know the parameter and
+    # refuses the whole call, so both ends are asked first, the way the dialog does it.
+    # Kept per node for a few minutes: a rolling update asks once per node, not per guest.
+    _MIGRATION_CAPS_TTL = 300
+
+    def _node_has_dbus_vmstate(self, node: str) -> bool:
+        cache = getattr(self, '_migration_caps_cache', None)
+        if cache is None:
+            cache = self._migration_caps_cache = {}
+        now = time.monotonic()
+        hit = cache.get(node)
+        if hit and now - hit[1] < self._MIGRATION_CAPS_TTL:
+            return hit[0]
+        try:
+            url = f"https://{self.host}:{self.api_port}/api2/json/nodes/{node}/capabilities/qemu/migration"
+            r = self._create_session().get(url, timeout=self.per_node_timeout)
+        except Exception as e:
+            # not cached, a node that was briefly slow gets asked again next time
+            self.logger.debug(f"[MIGRATE] migration capabilities of {node} not readable: {e}")
+            return False
+        has = False
+        if r.status_code == 200:
+            try:
+                has = (r.json().get('data') or {}).get('has-dbus-vmstate') in (True, 1, '1')
+            except (ValueError, AttributeError):
+                pass
+        # Only a real answer is kept: 501 on PVE 8 (no such endpoint), 403 without Sys.Audit.
+        # A 401 (ticket ran out) or a 5xx/595 (node briefly away) says nothing about the node.
+        if r.status_code in (200, 403, 404, 501):
+            cache[node] = (has, now)
+        return has
+
+    def _with_conntrack_state(self, source_node: str, target_node: str) -> bool:
+        return self._node_has_dbus_vmstate(source_node) and self._node_has_dbus_vmstate(target_node)
+
     def migrate_vm(self, vm: Dict, target_node: str, dry_run: bool = None, wait_timeout: int = 600) -> bool:
         """migrate vm to another node"""
         # NS: this handles the proxmox api call
@@ -4430,6 +4468,8 @@ class PegaProxManager:
                     'target': target_node,
                     'online': 1
                 }
+                if self._with_conntrack_state(source_node, target_node):
+                    data['with-conntrack-state'] = 1
                 if has_local_disks:
                     data['with-local-disks'] = 1
                     # PVE wants "source_stor:target_stor" mapping for QEMU local disks
@@ -14044,6 +14084,8 @@ echo "AGENT_INSTALLED_OK"
                     'target': target_node,
                     'online': 1 if online else 0,
                 }
+                if online and self._with_conntrack_state(node, target_node):
+                    data['with-conntrack-state'] = 1
                 # Add target storage if specified
                 if options.get('targetstorage'):
                     data['targetstorage'] = options['targetstorage']
