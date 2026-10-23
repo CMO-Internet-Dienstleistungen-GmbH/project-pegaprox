@@ -642,12 +642,13 @@ _SIZE_UNIT = {'': 1, 'K': 1 << 10, 'M': 1 << 20, 'G': 1 << 30, 'T': 1 << 40}
 def _gib(size):
     """A volume size as Proxmox writes it ('8G', '512M', bytes without a unit) in GiB, as a
     restore call allocates a volume ('<storage>:<GiB>'), rounded up to a whole MiB. None
-    when it is no size."""
+    when it is no size. '0T' stays '0': a subvolume without a size limit, made on a ZFS
+    or directory storage as '<storage>:0', and pct restore passes it on just like that."""
     m = _SIZE_RE.fullmatch(str(size or '').strip())
     if not m:
         return None
     mib = math.ceil(float(m.group(1)) * _SIZE_UNIT[m.group(2).upper()] / (1 << 20))
-    return f'{mib / 1024:.10f}'.rstrip('0').rstrip('.') if mib > 0 else None
+    return f'{mib / 1024:.10f}'.rstrip('0').rstrip('.')
 
 
 def lxc_volumes(config):

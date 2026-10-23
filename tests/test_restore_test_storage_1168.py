@@ -28,12 +28,13 @@ CT_BACKUP = {
 
 
 @pytest.mark.parametrize('size,gib', [('8G', '8'), ('512M', '0.5'), ('1T', '1024'), ('1.5G', '1.5'),
-                                      ('1073741824', '1'), ('100K', '0.0009765625'), ('4m', '0.00390625')])
+                                      ('1073741824', '1'), ('100K', '0.0009765625'), ('4m', '0.00390625'),
+                                      ('0T', '0'), ('0', '0')])
 def test_a_size_as_proxmox_writes_it_in_gib(size, gib):
     assert bv._gib(size) == gib
 
 
-@pytest.mark.parametrize('size', [None, '', 'big', '0', '0G', '-1G', '8X'])
+@pytest.mark.parametrize('size', [None, '', 'big', '-1G', '8X', 'G'])
 def test_what_is_no_size(size):
     assert bv._gib(size) is None
 
@@ -55,6 +56,12 @@ def test_a_volume_without_a_size_leaves_it_to_proxmox():
     assert bv.lxc_volumes(dict(CT_BACKUP, mp1='vm-pool:vm-100-disk-1,mp=/var/lib/db')) is None
 
 
+def test_a_subvolume_without_a_size_limit_goes_back_to_its_own_pool():
+    # made as 'data-pool:0', Proxmox writes its size as 0T; pct restore would make it 'local:0'
+    vols = bv.lxc_volumes(dict(CT_BACKUP, rootfs='data-pool:subvol-100-disk-0,size=0T'))
+    assert vols['rootfs'] == 'data-pool:0'
+
+
 def _restore(pve):
     return pve.calls[pve.index('POST', '/nodes/pve1/lxc')][2]
 
@@ -72,6 +79,24 @@ def test_the_run_restores_a_container_to_the_storages_of_its_backup(clock, db, m
     # the bind mount and the device are not asked for, and isolation still takes them off
     assert 'mp0' not in restore and 'dev0' not in restore
     assert not {'mp0', 'dev0'} & set(pve.config_at_start)
+
+
+def test_the_run_restores_an_unlimited_subvolume_to_its_own_pool(clock, db, monkeypatch):
+    from pegaprox.utils import ssh
+    monkeypatch.setattr(ssh, '_pve_node_exec', lambda m, n, cmd, timeout=600, **k: (0, '', ''))
+    pve = _PVE(kind='lxc', config=dict(CT_BACKUP, rootfs='data-pool:subvol-100-disk-0,size=0T'))
+    st = bv.run_verification(pve, _params('lxc'))
+    assert st['status'] == 'passed', st['logs']
+    restore = _restore(pve)
+    assert 'storage' not in restore
+    assert restore['rootfs'] == 'data-pool:0'
+
+
+def test_the_room_check_looks_at_the_pool_an_unlimited_subvolume_goes_to(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(bv, '_backup_config', lambda *a: dict(CT_BACKUP, rootfs='data-pool:subvol-100-disk-0,size=0T'))
+    assert bv.restore_storages(SimpleNamespace(host='pve1', api_port=8006), 'pve1', 'pbs1:backup/ct/100', 'lxc', {}) \
+        == ['data-pool', 'vm-pool']
 
 
 def test_the_test_storage_of_the_recovery_settings_wins(clock, db, monkeypatch):
