@@ -917,7 +917,10 @@ def get_node_hosts_api(cluster_id, node):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
-    return jsonify({'data': cluster_managers[cluster_id].get_node_hosts(node)})
+    hosts = cluster_managers[cluster_id].get_node_hosts(node)
+    if hosts is None:
+        return jsonify({'error': 'Could not read hosts file from node'}), 502
+    return jsonify({'data': hosts})
 
 
 @bp.route('/api/clusters/<cluster_id>/nodes/<node>/hosts', methods=['POST'])

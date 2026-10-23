@@ -3326,7 +3326,7 @@ class XcpngManager:
     def get_node_hosts(self, node):
         """Return /etc/hosts content."""
         rc, out, _ = self._ssh_exec(node, "cat /etc/hosts 2>/dev/null")
-        return out if rc == 0 else ''
+        return out if rc == 0 else None
 
     def update_node_hosts(self, node, hosts_content):
         if not hosts_content:
