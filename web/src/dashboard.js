@@ -28309,7 +28309,7 @@
                                                             {vmwareMigrations.map(m => {
                                                                 const isActive = m.status === 'running';
                                                                 const isAwaiting = m.phase === 'awaiting_confirmation'; // #562
-                                                                const phaseLabel = { planning: t('phasePlanning'), pre_sync: t('phasePreSync'), delta_sync: t('phaseDeltaSync'), awaiting_confirmation: (t('phaseAwaitingConfirmation') || 'Awaiting Confirmation'), cutover: t('phaseCutover'), verify: t('phaseVerify'), cleanup: t('phaseCleanup'), completed: t('done'), failed: t('failed'), cancelled: (t('phaseCancelled') || 'Cancelled') };
+                                                                const phaseLabel = { planning: t('phasePlanning'), pre_sync: t('phasePreSync'), delta_sync: t('phaseDeltaSync'), awaiting_confirmation: t('phaseAwaitingConfirmation'), cutover: t('phaseCutover'), verify: t('phaseVerify'), cleanup: t('phaseCleanup'), completed: t('done'), failed: t('failed'), cancelled: t('phaseCancelled') };
                                                                 return (
                                                                     <div key={m.id} className={`p-4 hover:bg-proxmox-hover/30 cursor-pointer ${vmwareSelectedMigration === m.id ? 'bg-emerald-500/5 border-l-2 border-l-emerald-400' : ''}`}
                                                                          onClick={() => setVmwareSelectedMigration(vmwareSelectedMigration === m.id ? null : m.id)}>
