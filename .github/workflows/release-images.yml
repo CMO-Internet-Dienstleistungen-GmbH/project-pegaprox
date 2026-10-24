@@ -433,7 +433,7 @@ jobs:
           sha256sum -c /tmp/deb.sha256
           dpkg -i python3-flask-sock_0.7.1_all.deb
           dpkg -i python3-xenapi_26.8.1_all.deb
-          apt-get -y install sudo sqlite3 ca-certificates curl
+          apt-get -y install sudo sqlite3 ca-certificates curl qemu-guest-agent
           apt-get -y install pegaprox sshpass
           systemctl enable pegaprox || true
 
