@@ -9,6 +9,8 @@ import time
 import logging
 import threading
 import socket
+import ipaddress
+import re
 
 from pegaprox.constants import SSH_MAX_CONCURRENT
 from pegaprox.utils.ssh_security import apply_host_key_policy, persist_host_keys, verify_transport_host_key
@@ -147,6 +149,30 @@ def read_capped(fh, limit=None):
     return out
 
 
+def is_ipv6_literal(h):
+    """A plain IPv6 address. A zone is allowed only as an interface name
+    (fe80::1%eth0): ipaddress takes any text after the '%', '$(id)' too."""
+    h = str(h or '')
+    try:
+        ipaddress.IPv6Address(h)
+    except ValueError:
+        return False
+    zone = h.partition('%')[2]
+    return not zone or re.fullmatch(r'[A-Za-z0-9_.@-]{1,15}', zone) is not None
+
+
+def bare_host(host):
+    """'[2001:db8::1]' -> '2001:db8::1', anything else unchanged.
+    sockets, paramiko and ssh want the plain address, only URLs and scp/rsync
+    'user@[addr]:path' targets take the brackets (#1158).
+    Only a real IPv6 literal loses its brackets - '[-oProxyCommand=x]' stays as it
+    is and simply does not resolve."""
+    h = str(host or '').strip()
+    if h.startswith('[') and h.endswith(']') and is_ipv6_literal(h[1:-1]):
+        return h[1:-1]
+    return h
+
+
 def ssh_login_args(user, host):
     """The end of an OpenSSH argv: ['-l', user, '--', host]. The login name is checked
     and travels as the value of -l, and '--' ends option parsing before the host, so
@@ -186,6 +212,9 @@ def _ssh_exec(host, user, password, cmd, timeout=30, use_controlmaster=False,
     blocks on the kernel TCP default (~75s on Linux without SYN-ACK).
     """
     import socket as _socket
+    # one spelling from here on: the guard, the host-key pin, the TCP connect and the ssh
+    # argv all see the address that is dialled, never '[addr]' (#1158)
+    host = bare_host(host)
     last_err = ''
     errors = []
     try:

@@ -27,7 +27,7 @@ from pegaprox.utils.rbac import user_can_access_vm
 from pegaprox.core.cache import APIRateLimiter, StorageDataCache
 from pegaprox.api.helpers import get_connected_manager, check_cluster_access, safe_error, parse_pve_error, scope_vm_rows, require_unconfined
 from pegaprox.api.helpers import upstream_failure
-from pegaprox.utils.ssh import get_paramiko, _ssh_track_connection, ssh_password_to, ssh_blocked_for
+from pegaprox.utils.ssh import get_paramiko, _ssh_track_connection, ssh_password_to, ssh_blocked_for, bare_host
 from pegaprox import globals as _g
 from pegaprox.utils.ssh import read_capped as _read_capped
 
@@ -1819,6 +1819,15 @@ def get_storage_status(cluster_id, storage_id):
         return jsonify({'error': safe_error(e, 'Failed to get storage status')}), 500
 
 
+def _is_ip_literal(h):
+    import ipaddress
+    try:
+        ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    return True
+
+
 @bp.route('/api/clusters/<cluster_id>/datacenter/storage/<storage_id>/rescan', methods=['POST'])
 @require_auth(perms=['storage.config'])
 def rescan_storage(cluster_id, storage_id):
@@ -1916,8 +1925,16 @@ def rescan_storage(cluster_id, storage_id):
 
                             # Determine node hostname. MK Oct 2026 (#1136): the node's own
                             # address first - the cluster host is not necessarily nodes[0]
-                            node_host = manager.member_node_ip(node) or (
-                                host if node == nodes[0] else f"{node}.{host.split('.', 1)[1] if '.' in host else host}")
+                            # `host` is bracketed for URLs, paramiko and the pin want it plain.
+                            # The '<node>.<domain>' guess only means something for a name: from
+                            # an IP literal it made 'pve2.0.0.5', or 'pve2.[2001:db8::10]'
+                            node_host = bare_host(manager.member_node_ip(node))
+                            if not node_host:
+                                _cluster_host = bare_host(host)
+                                if node == nodes[0]:
+                                    node_host = _cluster_host
+                                elif not _is_ip_literal(_cluster_host):
+                                    node_host = f"{node}.{_cluster_host.split('.', 1)[1] if '.' in _cluster_host else _cluster_host}"
                             # None rather than '' so paramiko offers no password at all;
                             # the node's own password where it has one
                             ssh_pass = ssh_password_to(manager, node_host) or None
@@ -1964,6 +1981,9 @@ def rescan_storage(cluster_id, storage_id):
                                 connect_kwargs['password'] = ssh_pass
                             
                             try:
+                                if not node_host:
+                                    # never an empty hostname: paramiko would dial localhost
+                                    raise ValueError(f"no address known for node {node}")
                                 ssh.connect(**connect_kwargs)
                                 persist_host_keys(ssh)
 

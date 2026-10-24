@@ -28300,7 +28300,7 @@
                                                 <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                     <div className="p-4 border-b border-proxmox-border flex items-center justify-between">
                                                         <h3 className="text-sm font-semibold text-gray-400 uppercase flex items-center gap-2">
-                                                            <Icons.FolderInput className="w-4 h-4 text-emerald-400" /> Migrations ({vmwareMigrations.length})
+                                                            <Icons.FolderInput className="w-4 h-4 text-emerald-400" /> {t('migrations')} ({vmwareMigrations.length})
                                                         </h3>
                                                         <button onClick={fetchVmwareMigrations} className="text-xs text-gray-500 hover:text-white"><Icons.RefreshCw className="w-3.5 h-3.5" /></button>
                                                     </div>
@@ -28309,7 +28309,7 @@
                                                             {vmwareMigrations.map(m => {
                                                                 const isActive = m.status === 'running';
                                                                 const isAwaiting = m.phase === 'awaiting_confirmation'; // #562
-                                                                const phaseLabel = { planning:'Planning', pre_sync:'Pre-Sync', delta_sync:'Delta Sync', awaiting_confirmation: (t('phaseAwaitingConfirmation') || 'Awaiting Confirmation'), cutover:'Cutover', verify:'Verify', cleanup:'Cleanup', completed:'Done', failed:'Failed', cancelled: (t('phaseCancelled') || 'Cancelled') };
+                                                                const phaseLabel = { planning: t('phasePlanning'), pre_sync: t('phasePreSync'), delta_sync: t('phaseDeltaSync'), awaiting_confirmation: t('phaseAwaitingConfirmation'), cutover: t('phaseCutover'), verify: t('phaseVerify'), cleanup: t('phaseCleanup'), completed: t('done'), failed: t('failed'), cancelled: t('phaseCancelled') };
                                                                 return (
                                                                     <div key={m.id} className={`p-4 hover:bg-proxmox-hover/30 cursor-pointer ${vmwareSelectedMigration === m.id ? 'bg-emerald-500/5 border-l-2 border-l-emerald-400' : ''}`}
                                                                          onClick={() => setVmwareSelectedMigration(vmwareSelectedMigration === m.id ? null : m.id)}>
@@ -28320,7 +28320,7 @@
                                                                                 <span className={`text-xs px-1.5 py-0.5 rounded ${isAwaiting ? 'bg-amber-500/20 text-amber-300' : 'bg-proxmox-dark text-gray-400'}`}>{phaseLabel[m.phase] || m.phase}</span>
                                                                             </div>
                                                                             <div className="flex items-center gap-3">
-                                                                                {m.total_downtime_seconds != null && <span className="text-xs text-gray-500">Downtime: {m.total_downtime_seconds}s</span>}
+                                                                                {m.total_downtime_seconds != null && <span className="text-xs text-gray-500">{t('downtime')}: {m.total_downtime_seconds}s</span>}
                                                                                 <span className={`px-2 py-0.5 rounded text-xs font-semibold ${m.status === 'completed' ? 'bg-green-500/20 text-green-400' : m.status === 'failed' ? 'bg-red-500/20 text-red-400' : m.status === 'cancelled' ? 'bg-gray-500/20 text-gray-400' : 'bg-blue-500/20 text-blue-400'}`}>{m.status}</span>
                                                                             </div>
                                                                         </div>
@@ -28341,7 +28341,7 @@
                                                                                     const pt = m.phase_times[ph]; const isCur = m.phase === ph; const isDone = pt && pt.end;
                                                                                     return (<React.Fragment key={ph}>
                                                                                         {idx > 0 && <div className={`flex-1 h-px ${isDone ? 'bg-emerald-500' : isCur ? 'bg-emerald-500/40' : 'bg-proxmox-border'}`} />}
-                                                                                        <div title={`${ph}${pt?.duration ? ` (${pt.duration}s)` : ''}`} className={`w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold border ${isDone ? 'bg-emerald-500/20 border-emerald-500 text-emerald-400' : isCur ? 'bg-blue-500/20 border-blue-400 text-blue-400 animate-pulse' : 'bg-proxmox-dark border-proxmox-border text-gray-600'}`}>
+                                                                                        <div title={`${phaseLabel[ph] || ph}${pt?.duration ? ` (${pt.duration}s)` : ''}`} className={`w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold border ${isDone ? 'bg-emerald-500/20 border-emerald-500 text-emerald-400' : isCur ? 'bg-blue-500/20 border-blue-400 text-blue-400 animate-pulse' : 'bg-proxmox-dark border-proxmox-border text-gray-600'}`}>
                                                                                             {isDone ? '✓' : idx+1}
                                                                                         </div>
                                                                                     </React.Fragment>);
@@ -28369,19 +28369,19 @@
                                                                 );
                                                             })}
                                                         </div>
-                                                    ) : <div className="p-8 text-center text-gray-600 text-sm">No migrations yet. Start one from a VM's Migration tab.</div>}
+                                                    ) : <div className="p-8 text-center text-gray-600 text-sm">{t('noMigrationsYetHint')}</div>}
                                                 </div>
                                                 
                                                 {/* Migration Log Viewer */}
                                                 {vmwareSelectedMigration && vmwareMigrationDetail && (
                                                     <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                         <div className="p-4 border-b border-proxmox-border flex items-center justify-between">
-                                                            <h3 className="text-sm font-semibold text-white">Migration Log - {vmwareMigrationDetail.vm_name} <span className="text-gray-500 font-normal">({vmwareSelectedMigration})</span></h3>
+                                                            <h3 className="text-sm font-semibold text-white">{t('migrationLog')} - {vmwareMigrationDetail.vm_name} <span className="text-gray-500 font-normal">({vmwareSelectedMigration})</span></h3>
                                                             <button onClick={() => setVmwareSelectedMigration(null)} className="text-xs text-gray-500 hover:text-white px-2 py-1 rounded bg-proxmox-dark">{t('close')}</button>
                                                         </div>
                                                         {vmwareMigrationDetail.disk_progress && Object.keys(vmwareMigrationDetail.disk_progress).length > 0 && (
                                                             <div className="p-4 border-b border-proxmox-border/50 space-y-2">
-                                                                <div className="text-xs text-gray-500 uppercase font-semibold">Disk Transfer</div>
+                                                                <div className="text-xs text-gray-500 uppercase font-semibold">{t('diskTransfer')}</div>
                                                                 {Object.entries(vmwareMigrationDetail.disk_progress).map(([key, dp]) => (
                                                                     <div key={key}>
                                                                         <div className="flex justify-between text-xs text-gray-400 mb-0.5">
@@ -28399,7 +28399,7 @@
                                                             ))}
                                                         </div>
                                                         {vmwareMigrationDetail.error && <div className="p-3 bg-red-500/10 border-t border-red-500/20 text-red-400 text-xs">{t('error')}: {vmwareMigrationDetail.error}</div>}
-                                                        {vmwareMigrationDetail.status === 'completed' && <div className="p-3 bg-green-500/10 border-t border-green-500/20 text-green-400 text-xs">✓ Completed! VMID: {vmwareMigrationDetail.proxmox_vmid}{vmwareMigrationDetail.total_downtime_seconds ? ` - Downtime: ${vmwareMigrationDetail.total_downtime_seconds}s` : ''}</div>}
+                                                        {vmwareMigrationDetail.status === 'completed' && <div className="p-3 bg-green-500/10 border-t border-green-500/20 text-green-400 text-xs">✓ {t('migrationCompleted')} VMID: {vmwareMigrationDetail.proxmox_vmid}{vmwareMigrationDetail.total_downtime_seconds ? ` - ${t('downtime')}: ${vmwareMigrationDetail.total_downtime_seconds}s` : ''}</div>}
                                                     </div>
                                                 )}
                                                 
@@ -28407,7 +28407,7 @@
                                                 <div className="bg-proxmox-card border border-proxmox-border rounded-xl overflow-hidden">
                                                     <div className="p-4 border-b border-proxmox-border flex items-center justify-between">
                                                         <h3 className="text-sm font-semibold text-gray-400 uppercase flex items-center gap-2">
-                                                            <Icons.FileText className="w-4 h-4 text-blue-400" /> Recent ESXi Events
+                                                            <Icons.FileText className="w-4 h-4 text-blue-400" /> {t('recentEsxiEvents')}
                                                         </h3>
                                                         <button onClick={fetchVmwareEvents} disabled={vmwareEventsLoading} className="text-xs text-gray-500 hover:text-white">
                                                             <Icons.RefreshCw className={`w-3.5 h-3.5 ${vmwareEventsLoading ? 'animate-spin' : ''}`} />
@@ -28438,7 +28438,7 @@
                                                                 );
                                                             })}
                                                         </div>
-                                                    ) : <div className="p-8 text-center text-gray-600 text-sm">{vmwareEventsLoading ? 'Loading...' : 'No ESXi events in audit log'}</div>}
+                                                    ) : <div className="p-8 text-center text-gray-600 text-sm">{vmwareEventsLoading ? t('loading') : t('noEsxiEventsHint')}</div>}
                                                 </div>
                                             </div>
                                         )}
@@ -28825,7 +28825,7 @@
                                                                                 const pt = m.phase_times[ph]; const isCur = m.phase === ph; const isDone = pt && pt.end;
                                                                                 return (<React.Fragment key={ph}>
                                                                                     {idx > 0 && <div className={`flex-1 h-px ${isDone ? 'bg-purple-500' : isCur ? 'bg-purple-500/40' : 'bg-proxmox-border'}`} />}
-                                                                                    <div title={`${ph}${pt?.duration ? ` (${pt.duration}s)` : ''}`} className={`w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold border ${isDone ? 'bg-purple-500/20 border-purple-500 text-purple-400' : isCur ? 'bg-purple-500/20 border-purple-400 text-purple-400 animate-pulse' : 'bg-proxmox-dark border-proxmox-border text-gray-600'}`}>
+                                                                                    <div title={`${phaseLabel[ph] || ph}${pt?.duration ? ` (${pt.duration}s)` : ''}`} className={`w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold border ${isDone ? 'bg-purple-500/20 border-purple-500 text-purple-400' : isCur ? 'bg-purple-500/20 border-purple-400 text-purple-400 animate-pulse' : 'bg-proxmox-dark border-proxmox-border text-gray-600'}`}>
                                                                                         {isDone ? '✓' : idx+1}
                                                                                     </div>
                                                                                 </React.Fragment>);

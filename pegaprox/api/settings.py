@@ -4189,8 +4189,11 @@ def generate_support_bundle():
                 line = re.sub(r'(token["\']?\s*[:=]\s*["\']?)[^"\'&\s]+', r'\1[REDACTED]', line, flags=re.IGNORECASE)
                 line = re.sub(r'(secret["\']?\s*[:=]\s*["\']?)[^"\'&\s]+', r'\1[REDACTED]', line, flags=re.IGNORECASE)
                 # MK Oct 2026 - mail addresses: alice@corp.example -> ***@corp.example
-                # (a dotted name ending in letters, so root@pam and root@10.0.0.5 stay)
-                line = re.sub(r'[\w.%+-]+@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})\b', r'***@\1', line)
+                # (a dotted name ending in letters, so root@pam and root@10.0.0.5 stay).
+                # The name before the @ is at most 64 long (RFC 5321): unbounded, every
+                # start in a long run without an @ scanned to its end, a 40k token took
+                # seconds and held the server while the bundle was made
+                line = re.sub(r'[\w.%+-]{1,64}@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})\b', r'***@\1', line)
                 # redact IPs: 192.168.1.100 -> 192.x.x.x
                 line = re.sub(r'(\d{1,3})\.\d{1,3}\.\d{1,3}\.\d{1,3}', r'\1.x.x.x', line)
                 return line

@@ -15,12 +15,14 @@ import json
 import logging
 import math
 from datetime import datetime, timedelta
+from itertools import compress
 from flask import Blueprint, jsonify, request
 
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth
 from pegaprox.api.helpers import (check_cluster_access, safe_error, load_metrics_window, scope_vm_rows,
                                   history_report, history_version, run_off_hub)
+from pegaprox.background.metrics_store import need, guest_columns, FT, HERE, RUN, CPU_SET, MEM_SET
 from pegaprox.core.db import get_db
 
 bp = Blueprint('insights', __name__)
@@ -32,16 +34,13 @@ def _load_history(cluster_id, days=30):
 
     NS 2026-06-04: fetch+parse happen off-hub + cached/single-flighted in
     load_metrics_window (shared across clusters + cost/power); here we only do
-    the cheap per-cluster filter."""
-    out = []
+    the cheap per-cluster filter.
+    MK Oct 2026 - load_metrics_window reads the one cluster itself now."""
     try:
-        for ts_unix, clusters in load_metrics_window(days):
-            cd = clusters.get(cluster_id)
-            if cd:
-                out.append((ts_unix, cd))
+        return load_metrics_window(days, cluster_id)
     except Exception as e:
         logging.warning(f"[insights] history load failed for {cluster_id}: {e}")
-    return out
+    return []
 
 
 def _percentile(values, p):
@@ -80,7 +79,15 @@ def _linear_regression(xs, ys):
 
 def _sizing_stats(history):
     """{vmid: what right-sizing reads of a guest} over the snapshots: plain arithmetic, it
-    runs off the hub. The averages and the p95 are rounded as the page shows them."""
+    runs off the hub. The averages and the p95 are rounded as the page shows them.
+    MK Oct 2026 - a window whose guests are all stored in columns goes to
+    _sizing_stats_cols, which reads the same figures without a dict per guest and sample."""
+    cols = guest_columns(history)
+    if cols is not None:
+        return _sizing_stats_cols(cols)
+    history = need(history, 'vms')
+    # NOTE: _sizing_stats_cols below is this on the column store, and has to give the very
+    # same result (tests/test_metrics_column_engines.py). A change here goes there as well.
     by_vm = {}  # vmid -> {cpu: [], mem: [], running_count, latest_meta}
     for _ts, cd in history:
         vms = cd.get('vms') or {}
@@ -115,6 +122,35 @@ def _sizing_stats(history):
     return out
 
 
+def _sizing_stats_cols(cols):
+    """_sizing_stats on a metrics_store.GuestColumns: per guest the same values in the same
+    snapshot order reach the same sum, _percentile and max, the type is the first snapshot's
+    and the allocation the last one's. Columns hold numbers only, so nothing is unreadable."""
+    out = {}
+    S, get = cols.S, FT.__getitem__
+    for vmid, g in cols.order:
+        fl = cols.flags_of(g)
+        here = fl.translate(HERE)
+        cpu_set, mem_set = fl.translate(CPU_SET), fl.translate(MEM_SET)
+        cpu, mem = cols.cpu_of(g), cols.mem_of(g)
+        # a figure in every snapshot (most guests): no need to pick the samples out
+        cpus = list(map(get, cpu if cpu_set.count(1) == S else compress(cpu, cpu_set)))
+        mems = list(map(get, mem if mem_set.count(1) == S else compress(mem, mem_set)))
+        last = here.rfind(1)
+        s = out[vmid] = {'type': cols.kind(g, here.find(1)), 'running': fl.translate(RUN).count(1),
+                         'samples': len(cpus)}
+        s.update({
+            'cpu_avg': round(sum(cpus) / len(cpus), 1) if cpus else 0,
+            'cpu_p95': round(_percentile(cpus, 95) or 0, 1),
+            'has_mem': bool(mems),
+            'mem_avg': round(sum(mems) / max(len(mems), 1), 1) if mems else 0,
+            'mem_max': round(max(mems) if mems else 0, 1),
+            'maxcpu': int(cols.at(cols.maxcpu, g, last) or 0),
+            'maxmem': int(cols.at(cols.maxmem, g, last) or 0),
+        })
+    return out
+
+
 @bp.route('/api/clusters/<cluster_id>/insights/right-sizing', methods=['GET'])
 @require_auth(perms=['cluster.view'])
 def right_sizing(cluster_id):
@@ -134,13 +170,15 @@ def right_sizing(cluster_id):
     min_samples = 24  # 24 × 5min = 2h of data minimum
 
     history = _load_history(cluster_id, days=days)
-    sample_count = len(history)
     if history:
         # NS Oct 2026 - the history part off the hub and kept (helpers.history_report)
         by_vm, stamp = history_report(('sizing', cluster_id, days), history_version(history),
                                       lambda: run_off_hub(_sizing_stats, history), rows=len)
     else:
         by_vm, stamp = {}, {}
+    # MK Oct 2026 - counted after the figures: a snapshot the retention pruned between the
+    # window's index and its parts has left the window by now, as it left them
+    sample_count = len(history)
 
     # Resolve names from current resources
     mgr = cluster_managers[cluster_id]
@@ -292,6 +330,7 @@ def capacity_forecast(cluster_id):
             'message': 'not enough history yet — collector needs ~30 min',
             'forecasts': [],
         })
+    need(history, 'storage')
 
     now_ts = int(datetime.now().timestamp())
 
@@ -609,7 +648,23 @@ def long_term_history(cluster_id):
             'samples': [],
             'note': 'No snapshots in window yet — collector runs every 5 min',
         })
+    # MK Oct 2026 - a year at 200 nodes is half a second and more of the loops below, which
+    # held the hub: they run in the thread pool now (the node parts are read there too)
+    samples = run_off_hub(_history_samples, raw, step)
 
+    return jsonify({
+        'cluster_id': cluster_id,
+        'days_requested': days,
+        'step_seconds': step,
+        'sample_count': len(samples),
+        'samples': samples,
+    })
+
+
+def _history_samples(raw, step):
+    """long_term_history's samples of a window, averaged into step-second buckets where
+    step > 0: plain arithmetic, off the hub."""
+    raw = need(raw, 'nodes')
     # Build a flat list of (ts, cluster_pct_cpu, cluster_pct_mem, nodes_map)
     samples = []
     for ts_unix, cd in raw:
@@ -652,14 +707,7 @@ def long_term_history(cluster_id):
         if cur:
             bucketed.append(_avg_samples(cur, cur_bucket_start))
         samples = bucketed
-
-    return jsonify({
-        'cluster_id': cluster_id,
-        'days_requested': days,
-        'step_seconds': step,
-        'sample_count': len(samples),
-        'samples': samples,
-    })
+    return samples
 
 
 def _avg_samples(samples, bucket_ts):

@@ -64,6 +64,13 @@ def _alert_scoper(cluster_id):
             return False
     return _ok
 
+
+def _caller_sees_nodes():
+    """node.view, asked of the identity the node routes ask it of (require_auth perms)."""
+    from pegaprox.utils.auth import build_authz_user
+    from pegaprox.utils.rbac import has_permission
+    return has_permission(build_authz_user(request.session.get('user', ''), request.session), 'node.view')
+
 # NOTE: get_cluster_report_summary is in reports.py (no duplicate here)
 
 @bp.route('/api/clusters/<cluster_id>/reports/top-vms', methods=['GET'])
@@ -453,6 +460,11 @@ def get_active_alerts(cluster_id):
             # a guest - a pool or guest grant reaches none of them, and the rows name the nodes
             incidents = [i for i in incidents if i.get('target_type') == 'cluster'
                          or (i.get('target_type') == 'vm' and _ok(i.get('target_id')))]
+        elif not _caller_sees_nodes():
+            # MK Oct 2026 - a node's incidents (its ZFS pools and their devices, OSDs, clock,
+            # QDevice, node tasks) are what the node pages show, and those ask node.view. A
+            # cluster-wide role without it keeps the guests' and the cluster's.
+            incidents = [i for i in incidents if i.get('target_type') != 'node']
         mutes = alert_events.active_mutes(cluster_id)
         out = []
         for i in incidents:
@@ -539,6 +551,10 @@ def list_alert_mutes(cluster_id):
                 return False
             return True
         mutes = [m for m in mutes if _visible(m)]
+    elif not _caller_sees_nodes():
+        # the mute of a node's object names the node and what is on it, as its incident does
+        mutes = [m for m in mutes if not (m.get('object_key')
+                                          and alert_events.object_vmid(str(m['object_key'])) is None)]
     mutes.sort(key=lambda m: m.get('until') or '')
     return jsonify({'mutes': [_mute_out(m) for m in mutes]})
 

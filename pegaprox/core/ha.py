@@ -356,6 +356,8 @@ LOCAL_TABLES = (
     'node_state_history',
     # who wrote what on the active, and the change counter behind cv_tick
     'ha_change_journal', 'ha_cv_dirty',
+    # the parts of this host's metrics snapshots and the guest rosters they share
+    'metrics_part', 'metrics_roster',
 )
 
 # server_settings keys that describe this host, not the deployment

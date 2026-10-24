@@ -626,6 +626,9 @@ class VMwareManager:
                             thin = getattr(backing, 'thinProvisioned', False) or False
                             if hasattr(backing, 'datastore') and backing.datastore:
                                 datastore_name = backing.datastore.name
+                        # MK Oct 2026 - a disk that runs on a snapshot of the VM has a parent
+                        # backing: its current state is in the delta file, not in the base
+                        snapshot_delta = bool(getattr(backing, 'parent', None)) if backing else False
                         cap_bytes = getattr(dev, 'capacityInBytes', 0) or (getattr(dev, 'capacityInKB', 0) * 1024)
                         
                         # Detect which bus this disk is on
@@ -646,6 +649,7 @@ class VMwareManager:
                                 'vmdk_file': vmdk_file,
                                 'thin_provisioned': thin,
                                 'datastore': datastore_name,
+                                'snapshot_delta': snapshot_delta,
                             }
                         }
             
@@ -1464,6 +1468,7 @@ class VMwareManager:
                         'capacity_gb': round(disk.get('capacity', 0) / (1024**3), 1) if disk.get('capacity') else 0,
                         'thin': backing.get('thin_provisioned', False),
                         'vmdk_file': backing.get('vmdk_file', ''),
+                        'snapshot_delta': backing.get('snapshot_delta'),
                     })
         cpu = data.get('cpu', {})
         mem = data.get('memory', {})

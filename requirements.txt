@@ -48,7 +48,12 @@ gevent-websocket>=0.10.0
 # === Two-Factor Auth ===
 pyotp>=2.9.0
 qrcode[pil]>=7.4.0
-pillow>=12.3.0
+# MK Oct 2026 - 13.0 closes a heap overflow in the FlashPix decoder (#1160) but needs Python
+# 3.11, and one line pip cannot satisfy fails the whole `pip install -r`. 3.10 stays on 12.x,
+# which has no fix; that decoder only loads when olefile is importable, and nothing here
+# brings olefile in.
+pillow>=13.0.0; python_version >= "3.11"
+pillow>=12.3.0; python_version < "3.11"
 # WebAuthn / FIDO2 hardware tokens (optional; auto-disabled if the import fails).
 # 2.2.1 is the first fido2 whose cryptography cap is <52 — see the crypto pins above.
 fido2>=2.2.1
@@ -86,3 +91,10 @@ defusedxml>=0.7.1
 # where the package actually turns up. min_python is 3.8, so that case is real.
 zipp>=3.19.1; python_version < "3.10"
 idna>=3.15
+# MK Oct 2026 - brotli only comes in through flask-compress, which takes any version, so a
+# `pip install -r` on an existing install never moves it. 1.2.1 fixes an out-of-bounds write
+# in the decoder (CVE-2026-111497), and we do decode: urllib3 asks every peer for br and
+# inflates the reply itself, so a PVE node, an ESXi host, the IdP or anyone sitting on an
+# unverified TLS link can feed it a crafted stream. PyPy gets brotlicffi, same C decoder.
+brotli>=1.2.1; platform_python_implementation != "PyPy"
+brotlicffi>=1.2.1.0; platform_python_implementation == "PyPy"

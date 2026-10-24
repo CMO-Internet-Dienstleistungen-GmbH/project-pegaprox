@@ -884,6 +884,9 @@ class PegaProxDB:
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_metrics_timestamp ON metrics_history(timestamp DESC)
         ''')
+        # MK Oct 2026 - what a snapshot holds sits in parts beside it (background/metrics_store.py)
+        from pegaprox.background import metrics_store
+        metrics_store.ensure_schema(cursor)
         
         # Custom Scripts table - MK Jan 2026
         cursor.execute('''
@@ -2423,6 +2426,9 @@ class PegaProxDB:
             ''')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_drift_events_cluster ON drift_events(cluster_id, detected_at DESC)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_drift_events_status ON drift_events(status, cluster_id)')
+            # MK Oct 2026 - for the prune of old events (drift._prune_events); made here, before
+            # anything is served, as it takes seconds over a few hundred thousand rows
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_drift_events_age ON drift_events(status, detected_at)')
             # MK Oct 2026 - what an event is: a deviation from the baseline (default), a policy
             # violation, or an incident an admin confirmed. Local table, like the rest of the events.
             _have = {r[1] for r in cursor.execute("PRAGMA table_info(drift_events)").fetchall()}

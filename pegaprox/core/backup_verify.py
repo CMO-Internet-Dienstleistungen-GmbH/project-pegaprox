@@ -29,6 +29,7 @@ import re
 import shlex
 import time
 import json
+import math
 import uuid
 import threading
 from datetime import datetime
@@ -259,6 +260,9 @@ def _run(pve_mgr, params, status):
                             'start': 0}  # don't start yet
         if storage:
             restore_data['storage'] = storage
+        elif vm_type == 'lxc':
+            # NS Oct 2026 (#1168) - a container's volumes go back where they were, as a VM's do
+            restore_data.update(lxc_volumes(backup_config) or {})
         restore_data.update(restore_isolation(backup_config, vm_type, plan, mark_of(task_id)))
         # on record before Proxmox has it: a restart from here on leaves a row sweep() finds
         _save_result(status)
@@ -631,17 +635,55 @@ _RESTORED_DISK_RE = re.compile(r'(?:scsi|virtio|sata|ide)\d+|efidisk\d+|tpmstate
 SPACE_READ_TIMEOUT = 10
 
 
+_SIZE_RE = re.compile(r'(\d+(?:\.\d+)?)([KMGT]?)', re.I)
+_SIZE_UNIT = {'': 1, 'K': 1 << 10, 'M': 1 << 20, 'G': 1 << 30, 'T': 1 << 40}
+
+
+def _gib(size):
+    """A volume size as Proxmox writes it ('8G', '512M', bytes without a unit) in GiB, as a
+    restore call allocates a volume ('<storage>:<GiB>'), rounded up to a whole MiB. None
+    when it is no size. '0T' stays '0': a subvolume without a size limit, made on a ZFS
+    or directory storage as '<storage>:0', and pct restore passes it on just like that."""
+    m = _SIZE_RE.fullmatch(str(size or '').strip())
+    if not m:
+        return None
+    mib = math.ceil(float(m.group(1)) * _SIZE_UNIT[m.group(2).upper()] / (1 << 20))
+    return f'{mib / 1024:.10f}'.rstrip('0').rstrip('.')
+
+
+def lxc_volumes(config):
+    """rootfs and the volume mount points of a container's backup `config`, as the restore
+    call takes them to put each back on the storage it was on: '<storage>:<GiB>' and the
+    rest of its options. pct restore given no storage puts every volume on 'local' (#1168).
+    Bind and device mounts are left out, the copy goes without them anyway. None when
+    rootfs or a volume has no storage or no size."""
+    out = {}
+    for key, value in config.items():
+        if key != 'rootfs' and not _LXC_MP_RE.fullmatch(key):
+            continue
+        opts = _opts(value)
+        vol = _volume(opts)
+        if key != 'rootfs' and (vol.startswith('/') or ':' not in vol):
+            continue
+        size = _gib(dict((k, v) for k, v in opts[1:]).get('size'))
+        if ':' not in vol or vol.startswith('/') or size is None:
+            return None
+        out[key] = _joined([[f"{vol.split(':', 1)[0]}:{size}", None]] + [o for o in opts[1:] if o[0] != 'size'])
+    return out if 'rootfs' in out else None
+
+
 def restore_storages(pve_mgr, node, volid, vm_type, plan):
     """The storages a restore test of `volid` on `node` writes the copy's disks to, as _run
-    sends the restore: the plan's test storage when there is one; without it a container
-    goes to 'local' (pct restore puts every volume on its default storage) and a VM's disks
-    to the storages its backup's config names (qmrestore keeps them, a disk left out of the
+    sends the restore: the plan's test storage when there is one; without it the storages
+    the backup's config names, a container's volumes as lxc_volumes() puts them ('local'
+    where it cannot) and a VM's disks as qmrestore keeps them (a disk left out of the
     backup is not written). Raises when that config cannot be read."""
     if plan.get('test_storage'):
         return [plan['test_storage']]
-    if vm_type == 'lxc':
-        return ['local']
     config = _backup_config(pve_mgr, f"https://{pve_mgr.host}:{pve_mgr.api_port}/api2/json", node, volid)
+    if vm_type == 'lxc':
+        vols = lxc_volumes(config)
+        return sorted({v.split(':', 1)[0] for v in vols.values()}) if vols else ['local']
     out = set()
     for key, value in config.items():
         if not _RESTORED_DISK_RE.fullmatch(key):

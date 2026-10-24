@@ -433,7 +433,7 @@ jobs:
           sha256sum -c /tmp/deb.sha256
           dpkg -i python3-flask-sock_0.7.1_all.deb
           dpkg -i python3-xenapi_26.8.1_all.deb
-          apt-get -y install sudo sqlite3 ca-certificates curl
+          apt-get -y install sudo sqlite3 ca-certificates curl qemu-guest-agent
           apt-get -y install pegaprox sshpass
           systemctl enable pegaprox || true
 
@@ -947,11 +947,143 @@ jobs:
           cp "pegaprox-${{ needs.prepare.outputs.version }}-vm-${{ matrix.arch }}.qcow2" \
              "pegaprox-vm-${{ matrix.arch }}.qcow2"
 
+      - name: OVA für ESXi erstellen
+        run: |
+          set -e
+          VERSION="${{ needs.prepare.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          BASE="pegaprox-${VERSION}-vm-${ARCH}"
+
+          # Convert qcow2 → streamOptimized VMDK (required format for OVA packaging)
+          qemu-img convert -O vmdk -o subformat=streamOptimized \
+            "${BASE}.qcow2" "${BASE}.vmdk"
+
+          DISK_BYTES=$(qemu-img info --output=json "${BASE}.qcow2" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['virtual-size'])")
+          VMDK_BYTES=$(stat -c%s "${BASE}.vmdk")
+
+          if [ "$ARCH" = "amd64" ]; then
+            OS_ID="96"
+            OS_TYPE="debian12_64Guest"
+            OS_DESC="Debian GNU/Linux 12 (64-bit)"
+          else
+            OS_ID="96"
+            OS_TYPE="arm64Guest"
+            OS_DESC="Debian GNU/Linux 12 (ARM 64-bit)"
+          fi
+
+          cat > "${BASE}.ovf" <<OVF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <Envelope xmlns="http://schemas.dmtf.org/ovf/envelope/1"
+                    xmlns:cim="http://schemas.dmtf.org/wbem/wscim/1/common"
+                    xmlns:ovf="http://schemas.dmtf.org/ovf/envelope/1"
+                    xmlns:rasd="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ResourceAllocationSettingData"
+                    xmlns:vmw="http://www.vmware.com/schema/ovf"
+                    xmlns:vssd="http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_VirtualSystemSettingData"
+                    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+            <References>
+              <File ovf:href="${BASE}.vmdk" ovf:id="file1" ovf:size="${VMDK_BYTES}"/>
+            </References>
+            <DiskSection>
+              <Info>Virtual disk information</Info>
+              <Disk ovf:capacity="${DISK_BYTES}" ovf:capacityAllocationUnits="byte"
+                    ovf:diskId="vmdisk1" ovf:fileRef="file1"
+                    ovf:format="http://www.vmware.com/interfaces/specifications/vmdk.html#streamOptimized"
+                    ovf:populatedSize="${VMDK_BYTES}"/>
+            </DiskSection>
+            <NetworkSection>
+              <Info>The list of logical networks</Info>
+              <Network ovf:name="VM Network">
+                <Description>VM Network</Description>
+              </Network>
+            </NetworkSection>
+            <VirtualSystem ovf:id="PegaProx">
+              <Info>PegaProx ${VERSION} (${ARCH})</Info>
+              <Name>PegaProx ${VERSION}</Name>
+              <OperatingSystemSection ovf:id="${OS_ID}" vmw:osType="${OS_TYPE}">
+                <Info>Guest Operating System</Info>
+                <Description>${OS_DESC}</Description>
+              </OperatingSystemSection>
+              <VirtualHardwareSection>
+                <Info>Virtual hardware requirements</Info>
+                <System>
+                  <vssd:ElementName>Virtual Hardware Family</vssd:ElementName>
+                  <vssd:InstanceID>0</vssd:InstanceID>
+                  <vssd:VirtualSystemIdentifier>PegaProx</vssd:VirtualSystemIdentifier>
+                  <vssd:VirtualSystemType>vmx-14</vssd:VirtualSystemType>
+                </System>
+                <Item>
+                  <rasd:Description>Number of virtual CPUs</rasd:Description>
+                  <rasd:ElementName>4 virtual CPU(s)</rasd:ElementName>
+                  <rasd:InstanceID>1</rasd:InstanceID>
+                  <rasd:ResourceType>3</rasd:ResourceType>
+                  <rasd:VirtualQuantity>4</rasd:VirtualQuantity>
+                </Item>
+                <Item>
+                  <rasd:AllocationUnits>byte * 2^20</rasd:AllocationUnits>
+                  <rasd:Description>Memory size</rasd:Description>
+                  <rasd:ElementName>8192 MB of memory</rasd:ElementName>
+                  <rasd:InstanceID>2</rasd:InstanceID>
+                  <rasd:ResourceType>4</rasd:ResourceType>
+                  <rasd:VirtualQuantity>8192</rasd:VirtualQuantity>
+                </Item>
+                <Item>
+                  <rasd:Address>0</rasd:Address>
+                  <rasd:Description>SCSI Controller</rasd:Description>
+                  <rasd:ElementName>SCSI Controller 0</rasd:ElementName>
+                  <rasd:InstanceID>3</rasd:InstanceID>
+                  <rasd:ResourceSubType>VirtualSCSI</rasd:ResourceSubType>
+                  <rasd:ResourceType>6</rasd:ResourceType>
+                </Item>
+                <Item>
+                  <rasd:AddressOnParent>0</rasd:AddressOnParent>
+                  <rasd:ElementName>Hard Disk 1</rasd:ElementName>
+                  <rasd:HostResource>ovf:/disk/vmdisk1</rasd:HostResource>
+                  <rasd:InstanceID>4</rasd:InstanceID>
+                  <rasd:Parent>3</rasd:Parent>
+                  <rasd:ResourceType>17</rasd:ResourceType>
+                </Item>
+                <Item>
+                  <rasd:AddressOnParent>0</rasd:AddressOnParent>
+                  <rasd:AutomaticAllocation>true</rasd:AutomaticAllocation>
+                  <rasd:Connection>VM Network</rasd:Connection>
+                  <rasd:Description>VMXNET3 ethernet adapter</rasd:Description>
+                  <rasd:ElementName>Network adapter 1</rasd:ElementName>
+                  <rasd:InstanceID>5</rasd:InstanceID>
+                  <rasd:ResourceSubType>VMXNET3</rasd:ResourceSubType>
+                  <rasd:ResourceType>10</rasd:ResourceType>
+                </Item>
+              </VirtualHardwareSection>
+              <AnnotationSection>
+                <Info>Annotation</Info>
+                <Annotation>PegaProx ${VERSION} appliance for ESXi. Login: pegaprox_admin / PegaProx2026! | Run pegaprox-setup after first boot to configure networking.</Annotation>
+              </AnnotationSection>
+            </VirtualSystem>
+          </Envelope>
+          OVF
+          sed -i 's/^[[:space:]]*//' "${BASE}.ovf"
+
+          # OVF manifest — SHA256 of OVF and VMDK; required by the OVF spec
+          OVF_HASH=$(sha256sum "${BASE}.ovf" | awk '{print $1}')
+          VMDK_HASH=$(sha256sum "${BASE}.vmdk" | awk '{print $1}')
+          printf 'SHA256(%s)= %s\nSHA256(%s)= %s\n' \
+            "${BASE}.ovf" "${OVF_HASH}" \
+            "${BASE}.vmdk" "${VMDK_HASH}" \
+            > "${BASE}.mf"
+
+          # OVF spec §12: OVF descriptor first, manifest second, disk(s) last
+          tar -cf "${BASE}.ova" "${BASE}.ovf" "${BASE}.mf" "${BASE}.vmdk"
+          cp "${BASE}.ova" "pegaprox-latest-vm-${ARCH}.ova"
+
+          echo "OVA: $(ls -lh "${BASE}.ova")"
+
       - name: Artefakt sichern
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: vm-image-${{ matrix.arch }}
-          path: pegaprox-*vm*.qcow2
+          path: |
+            pegaprox-*vm*.qcow2
+            pegaprox-*vm*.ova
           retention-days: 7
 
   # ----------------------------------------------------------------------
@@ -964,8 +1096,12 @@ jobs:
     # Dev builds stop at the artifacts.
     if: ${{ always() && needs.prepare.outputs.is_release == 'true' && needs.build-lxc.result == 'success' && needs.build-vm.result == 'success' }}
     runs-on: ubuntu-latest
+    # NS Oct 2026 - id-token and attestations only for the provenance step below; this job
+    # runs no build, just the download, the checksums and the upload
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -974,9 +1110,19 @@ jobs:
       - name: Checksums erzeugen
         run: |
           cd dist
-          find . -type f \( -name '*.qcow2' -o -name '*.tar.xz' \) \
-            -exec sha256sum {} \; > SHA256SUMS.txt
+          find . -type f \( -name '*.qcow2' -o -name '*.tar.xz' -o -name '*.ova' \) \
+            -execdir sha256sum {} \; > SHA256SUMS.txt
           cat SHA256SUMS.txt
+
+      # NS Oct 2026 - signed build provenance for every image file, as for the Docker
+      # images. A downloaded file checks with
+      #   gh attestation verify <file> -R PegaProx/project-pegaprox
+      - name: Herkunft der Images signieren
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/**/*.qcow2
+            dist/**/*.tar.xz
 
       - name: An Release anhängen
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
@@ -985,4 +1131,5 @@ jobs:
           files: |
             dist/**/*.qcow2
             dist/**/*.tar.xz
+            dist/**/*.ova
             dist/SHA256SUMS.txt

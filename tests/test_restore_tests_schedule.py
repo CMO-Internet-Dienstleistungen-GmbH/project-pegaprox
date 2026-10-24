@@ -398,11 +398,21 @@ def test_room_is_read_on_each_storage_the_restore_writes_to():
     mgr.calls.clear()
     assert bv.room_for(mgr, 'pve2', _VOL, 'qemu', {'test_storage': 'scratch'}, 4 * GIB) is None
     assert mgr.calls == ['/nodes/pve2/storage/scratch/status']
-    # a container restored without one goes to 'local'
+    # a container without one goes back to the storages of its volumes (#1168), not its
+    # bind mount; one whose rootfs cannot be placed is left to Proxmox, which takes 'local'
     mgr.calls.clear()
+    mgr.backup_config = ('rootfs: data-pool:subvol-100-disk-0,size=8G\n'
+                         'mp0: vm-pool:vm-100-disk-1,mp=/srv,size=32G\nmp1: /mnt/nas,mp=/nas\n')
+    mgr.free['vm-pool'] = GIB
+    short = bv.room_for(mgr, 'pve1', 'pbs:backup/ct/100/x', 'lxc', {}, 2 * GIB)
+    assert short['reason'] == 'no_space' and short['storage'] == 'vm-pool'
+    assert sorted(c for c in mgr.calls if c.endswith('/status')) == [
+        '/nodes/pve1/storage/data-pool/status', '/nodes/pve1/storage/vm-pool/status']
+    mgr.calls.clear()
+    mgr.backup_config = 'rootfs: data-pool:subvol-100-disk-0\n'
     mgr.free['local'] = GIB
     assert bv.room_for(mgr, 'pve1', 'pbs:backup/ct/100/x', 'lxc', {}, 2 * GIB)['storage'] == 'local'
-    assert mgr.calls == ['/nodes/pve1/storage/local/status']
+    assert [c for c in mgr.calls if c.endswith('/status')] == ['/nodes/pve1/storage/local/status']
 
 
 @pytest.mark.parametrize('case', ['status_error', 'not_active', 'no_avail', 'raises', 'config_unreadable',

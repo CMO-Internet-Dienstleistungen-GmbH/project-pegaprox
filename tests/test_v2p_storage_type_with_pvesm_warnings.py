@@ -96,7 +96,8 @@ def test_the_injection_script_gets_the_real_type(monkeypatch):
                             lambda mgr, node, text, tag, timeout=10: written.append(text) or f'/run/{tag}.sh')
     task = SimpleNamespace(target_node='pve1', target_storage='local-lvm', proxmox_vmid=116,
                            virtio_iso_path='/var/lib/vz/template/iso/virtio-win.iso', id='t1',
-                           install_virtio_drivers=True, log=lambda *a, **k: None)
+                           install_virtio_drivers=True, log=lambda *a, **k: None,
+                           boot_volume=lambda: 'local-lvm:vm-116-disk-0')
     mgr = MagicMock(host='pve1', api_port=8006)
     mgr._api_get.return_value = MagicMock(status_code=200, json=lambda: {'data': {'status': 'stopped'}})
     try:

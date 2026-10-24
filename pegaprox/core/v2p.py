@@ -29,6 +29,67 @@ class V2PCutoverCancelled(Exception):
     pass
 
 
+# MK Oct 2026 - Offline Copy, Live Mirror and Snapshot-Iterative copy what the boot disk's
+# folder holds. A disk elsewhere is not there, and a disk running on a snapshot of the VM has
+# its current state in delta files the copy does not read. Live Clone reads each disk from
+# its own file as it is now.
+_MODE_NAMES = {'offline': 'Offline Copy', 'sshfs_boot': 'Live Mirror', 'snapshot_zero': 'Snapshot-Iterative',
+               'auto': 'Auto', 'vmkfstools_clone': 'Live Clone'}
+_DISK_FILE_RE = re.compile(r'^\[([^\]]+)\]\s+(.+\.vmdk)$')
+# the file ESXi runs a disk on once the VM has a snapshot: <disk>-000001.vmdk
+_SNAPSHOT_FILE_RE = re.compile(r'-\d{6}\.vmdk\Z')
+
+
+def folder_copy_gap(disks, datastore=None, vm_dir=None, descriptor_files=None):
+    """(the descriptor of every disk in the VM's disk order, None), or (None, why) when a
+    copy from the boot disk's folder would leave a disk out or read an old state of it.
+
+    The folder is datastore / vm_dir, by default the one of disk 0. descriptor_files, when
+    given, is what that folder holds; without it only the disk paths ESXi reports count."""
+    disks = [d if isinstance(d, dict) else {} for d in (disks or [])]
+    first = _DISK_FILE_RE.match(str(disks[0].get('vmdk_file') or '').strip()) if disks else None
+    if datastore is None and first:
+        datastore = first.group(1).strip()
+    if vm_dir is None and first:
+        vm_dir = os.path.dirname(first.group(2).strip())
+    out = []
+    for i, d in enumerate(disks):
+        # names ESXi reports go into the task log and the error: one line, and not too long
+        label = re.sub(r'[\x00-\x1f\x7f]', ' ', str(d.get('label') or f'Hard disk {i + 1}'))[:80]
+        what = f"disk {i + 1} ({label})"
+        m = _DISK_FILE_RE.match(str(d.get('vmdk_file') or '').strip()[:1024])
+        if not m:
+            return None, f"ESXi does not say which file holds {what}"
+        ds, rest = m.group(1).strip(), m.group(2).strip()
+        folder, name = os.path.dirname(rest), os.path.basename(rest)
+        if ds != datastore or folder != vm_dir:
+            return None, (f"{what} is in [{ds}] {folder or '.'}, not in the boot disk's "
+                          f"folder [{datastore}] {vm_dir}")
+        # ESXi says whether the disk runs on a snapshot (its backing has a parent). The
+        # -000001 name only stands in where that is not known: a disk may be db-202401.vmdk
+        on_snapshot = d.get('snapshot_delta')
+        if on_snapshot is True or (on_snapshot is None and _SNAPSHOT_FILE_RE.search(name)):
+            return None, (f"{what} runs on a snapshot of the VM ({name}): the disk files of the "
+                          f"folder hold its state from before that snapshot")
+        if descriptor_files is not None and name not in descriptor_files:
+            return None, f"{what} ({name}) is not among the disk files found in [{datastore}] {vm_dir}"
+        out.append(name)
+    if len(set(out)) != len(out):
+        return None, 'two disks of the VM name the same file'
+    return out, None
+
+
+def folder_copy_refusal(transfer_mode, why):
+    mode = _MODE_NAMES.get(str(transfer_mode or ''), str(transfer_mode or ''))
+    # Auto only gets here after its clone attempt, with the Proxmox VM made already
+    after = ("Nothing was copied and the source VM runs as it did; the Proxmox VM of this run "
+             "stays, as after any failed run." if str(transfer_mode) == 'auto'
+             else "Nothing was copied, the source VM was not touched.")
+    return (f"The {mode} transfer mode copies the disk files of the boot disk's folder, and here that "
+            f"would leave a disk out or copy an old state of it: {why}. The Live Clone transfer mode "
+            f"reads every disk from its own file as it is now. {after}")
+
+
 class V2PMigrationTask:
     """Tracks VMware -> Proxmox migration through all phases.
     
@@ -152,6 +213,21 @@ class V2PMigrationTask:
         # compatibility. Enable to pre-stage Windows for native virtio-scsi/virtio-net.
         self.install_virtio_drivers = bool(self.config.get('install_virtio_drivers', False))
         self.virtio_iso_path = self.config.get('virtio_iso_path', '') or ''
+        self._disk_vols = {}       # disk index -> volume id it was copied to
+
+    def record_disk_volume(self, i, vol_id):
+        if vol_id:
+            if not isinstance(getattr(self, '_disk_vols', None), dict):
+                self._disk_vols = {}
+            self._disk_vols[i] = vol_id
+
+    def boot_volume(self):
+        """Volume id of the boot disk for the post-copy fixes (EFI loader, sector size,
+        VirtIO drivers): the volume disk 0 was copied to, None before that.
+
+        MK Oct 2026 - never a name made up from the VMID. vm-<vmid>-disk-0 on target_storage
+        is the TPM state Proxmox creates with the VM, and the fixes write to what they get."""
+        return (getattr(self, '_disk_vols', None) or {}).get(0) or None
 
     def _disk_attach_opts(self):
         # #598 — extra drive options appended to a FINAL target-disk attach only.
@@ -600,7 +676,21 @@ def _run_v2p_migration(task):
         task.log(f"Found {len(descriptor_files)} descriptor file(s): {descriptor_files}")
         if not descriptor_files:
             task.set_phase('failed', f'No VMDK descriptor files found in {vm_path}'); return
-        
+
+        # MK Oct 2026 - disk i is the i-th disk of the VM, not the i-th file of the folder
+        # listing: ls puts app01_10.vmdk before app01_2.vmdk, and a leftover vmdk in the folder
+        # is no disk of the VM. A disk on another datastore or in another folder is not in the
+        # listing at all, and one that runs on a snapshot of the VM has its current state in
+        # delta files the folder copies leave out: the guest came up without that disk or with
+        # an old state of it, and the run said completed. Those modes refuse here, before
+        # anything is touched; Auto only when its clone fails and it would fall back to them.
+        aligned, folder_gap = folder_copy_gap(disks, datastore, vm_dir, descriptor_files)
+        if folder_gap is None:
+            descriptor_files = aligned
+        elif task.transfer_mode not in ('vmkfstools_clone', 'auto'):
+            task.set_phase('failed', folder_copy_refusal(task.transfer_mode, folder_gap))
+            return
+
         # Verify sshfs on Proxmox node (auto-install + re-verify).
         # NS Apr 2026 — old check looked for the substring "sshfs" in apt-get output,
         # which matched even when install silently failed (lock held, mirror down).
@@ -1620,7 +1710,13 @@ def _run_v2p_migration(task):
             except _VmkFallback:
                 # auto-mode: clone path bailed before any irreversible work — drop through to
                 # the legacy auto pre-sync/live-mirror flow below (do NOT return).
-                pass
+                if folder_gap:
+                    # that flow copies from the boot disk's folder listing, which does not
+                    # hold every disk of the VM as it is now
+                    task.set_phase('failed', 'The live clone was not possible. '
+                                   + folder_copy_refusal('auto', folder_gap))
+                    _cleanup_sshfs(pve_mgr, task.target_node, mnt_path)
+                    return
             except Exception as _vce:
                 msg = str(_vce) if isinstance(_vce, _VmkSwitchoverFailed) else f'vmkfstools_clone exception: {_vce}'
                 # MK Oct 2026 (#1124) - we stopped the source and the target does not run: bring
@@ -2208,7 +2304,10 @@ def _run_v2p_migration(task):
 # default path so OVMF auto-discovers it.
 def _register_uefi_fallback_loader(pve_mgr, task):
     try:
-        vol_id = f"{task.target_storage}:vm-{task.proxmox_vmid}-disk-0"
+        vol_id = task.boot_volume()
+        if not vol_id:
+            task.log("EFI fallback: no volume of the boot disk is known, skipping")
+            return
         _rc, vol_path, _ = _pve_node_exec(pve_mgr, task.target_node,
             f"pvesm path {shlex.quote(vol_id)} 2>/dev/null", timeout=10)
         vol_path = str(vol_path or '').strip()
@@ -2442,7 +2541,10 @@ def _inject_virtio_drivers(pve_mgr, task):
     # NS Apr 2026 — storage-type-aware: lvm/iSCSI/zfs are already block devices,
     # rbd needs `rbd map`, file-based (dir/nfs/cifs/cephfs/glusterfs/btrfs with qcow2)
     # needs `qemu-nbd --connect`. After that, losetup -b 512 -fP wraps for 512b sectors.
-    vol_id = f"{task.target_storage}:vm-{task.proxmox_vmid}-disk-0"
+    vol_id = task.boot_volume()
+    if not vol_id:
+        task.log("[VirtIO] no volume of the boot disk is known, skipping")
+        return False
     rc, vol_path, _ = _pve_node_exec(pve_mgr, node,
         f"pvesm path {shlex.quote(vol_id)} 2>/dev/null", timeout=10)
     vol_path = str(vol_path or '').strip()
@@ -3416,7 +3518,9 @@ def _rebuild_sector_args(pve_mgr, node, vmid):
 def _ensure_guest_sector_size_512(pve_mgr, task, disk_bus, disk_count):
     try:
         # pvesm path returns the host-side path for the first disk
-        vol_id = f"{task.target_storage}:vm-{task.proxmox_vmid}-disk-0"
+        vol_id = task.boot_volume()
+        if not vol_id:
+            return
         _rc, vol_path, _ = _pve_node_exec(pve_mgr, task.target_node,
             f"pvesm path {shlex.quote(vol_id)} 2>/dev/null", timeout=10)
         vol_path = str(vol_path or '').strip()
@@ -3988,6 +4092,34 @@ def _pve_storage_type(pve_mgr, node, storage):
     return ''
 
 
+# how far past disk_index an allocation looks for a name nothing on the storage has
+_ALLOC_NAMES = 64
+# the storages whose volumes are files: the name carries the format, the volume id the VMID folder
+# btrfs keeps its images as files too (storage:<vmid>/vm-N-disk-M.raw) and refuses a name
+# without the suffix
+_FILE_STORAGE_TYPES = ('dir', 'nfs', 'cifs', 'glusterfs', 'btrfs', 'pbs')
+
+
+def _taken_disk_numbers(pve_mgr, node, storage, vmid):
+    """The N of every vm-<vmid>-disk-N and base-<vmid>-disk-N on the storage, whatever its
+    format, or None when the storage's volumes cannot be listed."""
+    vmid = int(vmid)
+    rc, out, _ = _pve_node_exec(pve_mgr, node,
+        f"pvesm list {shlex.quote(str(storage))} --vmid {vmid} 2>/dev/null", timeout=60)
+    if rc != 0:
+        return None
+    pat = re.compile(rf'(?:vm|base)-{vmid}-disk-(\d+)(?:\.\w+)?')
+    taken = set()
+    for line in str(out or '').splitlines():
+        volid = (line.split() or [''])[0]
+        if ':' not in volid:
+            continue
+        m = pat.fullmatch(volid.split(':', 1)[1].rsplit('/', 1)[-1])
+        if m:
+            taken.add(int(m.group(1)))
+    return taken
+
+
 def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errbuf=None, mapped_rbd=None):
     """Robustly allocate a disk via pvesm alloc.
 
@@ -3999,21 +4131,59 @@ def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errb
     failure — MK 2026-06-04 (#529): it used to land only in the server log via
     logging.error, so the migration task log said "allocation failed" with no
     reason. Pass errbuf to surface the real cause to the user.
+
+    MK Oct 2026 - it never frees or takes over a volume it did not create. It used to free
+    a vm-<vmid>-disk-<index> that was there already, as the leftover of an earlier try. On
+    target_storage that name is the TPM state Proxmox creates with the VM, so disk 0 freed
+    it and was written over it. The disk gets the first vm-<vmid>-disk-N from disk_index on
+    that the storage's list of the VMID does not have, and a name the storage then says
+    exists after all is passed over as well. A storage whose list cannot be read gets
+    nothing: there is no telling a free name from one in use.
     """
-    import re, math
-    
-    size_gb = max(1, math.ceil(size_bytes / (1024**3)))
-    size_mb = max(1, int(size_bytes / (1024*1024)))
-    size_kb = max(1024, int(size_bytes / 1024))
-    
-    # Detect storage type first
     try:
         storage_type = _pve_storage_type(pve_mgr, node, storage) or 'unknown'
     except Exception:
         storage_type = 'unknown'
+    taken = _taken_disk_numbers(pve_mgr, node, storage, vmid)
+    if taken is None:
+        msg = (f"the volumes of VM {vmid} on storage {storage} could not be listed, so a free disk "
+               f"name cannot be told from one in use - nothing was allocated")
+        logging.error(f"[V2P] {msg}")
+        if errbuf is not None:
+            errbuf.append(msg)
+        return None, None
+    n = int(disk_index)
+    for _ in range(_ALLOC_NAMES):
+        while n in taken:
+            n += 1
+        got = _pvesm_alloc_named(pve_mgr, node, storage, storage_type, vmid, n, size_bytes,
+                                 errbuf=errbuf, mapped_rbd=mapped_rbd)
+        if got != 'taken':
+            return got
+        # there although the list did not show it (an LV of another thin pool of the same
+        # volume group): somebody else's
+        logging.info(f"[V2P] vm-{vmid}-disk-{n} exists on {storage} already, trying the next name")
+        taken.add(n)
+    msg = f"no free disk name from vm-{vmid}-disk-{disk_index} on storage {storage}"
+    logging.error(f"[V2P] {msg}")
+    if errbuf is not None:
+        errbuf.append(msg)
+    return None, None
+
+
+def _pvesm_alloc_named(pve_mgr, node, storage, storage_type, vmid, disk_index, size_bytes,
+                       errbuf=None, mapped_rbd=None):
+    """pvesm alloc of vm-<vmid>-disk-<disk_index> on the storage: (vol_id, dev_path), (None,
+    None) when it failed, or 'taken' when the storage has that name before any attempt of
+    this call could have made it."""
+    import math
+
+    size_gb = max(1, math.ceil(size_bytes / (1024**3)))
+    size_mb = max(1, int(size_bytes / (1024*1024)))
+    size_kb = max(1024, int(size_bytes / 1024))
 
     # Build filename based on storage type
-    if storage_type in ('dir', 'nfs', 'cifs', 'glusterfs', 'pbs'):
+    if storage_type in _FILE_STORAGE_TYPES:
         # File-based storage needs extension
         fn_raw = f"vm-{vmid}-disk-{disk_index}.raw"
         fn_qcow = f"vm-{vmid}-disk-{disk_index}.qcow2"
@@ -4021,26 +4191,17 @@ def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errb
         # Block-based storage (lvmthin, zfspool, rbd, iscsi, etc)
         fn_raw = f"vm-{vmid}-disk-{disk_index}"
         fn_qcow = fn_raw
-    
-    # Clean up any leftover volume from previous attempts
-    # (common when migration was retried after failure)
-    for old_fn in [fn_raw, fn_qcow]:
-        old_vol = f"{storage}:{old_fn}"
-        rc_chk, out_chk, _ = _pve_node_exec(pve_mgr, node,
-            f"pvesm path {old_vol} 2>/dev/null", timeout=5)
-        old_path = str(out_chk or '').strip()
-        if rc_chk == 0 and old_path:
-            _pve_node_exec(pve_mgr, node,
-                f"pvesm free {old_vol} 2>/dev/null", timeout=15)
-            # LVM-thin: also try lvremove in case pvesm free didn't work
-            if storage_type in ('lvmthin', 'lvm') and '/dev/' in old_path:
-                _pve_node_exec(pve_mgr, node,
-                    f"lvremove -f {old_path} 2>/dev/null", timeout=15)
-    # Also remove unused disk lines from VM config
-    _pve_node_exec(pve_mgr, node,
-        f"sed -i '/^unused.*vm-{vmid}-disk-{disk_index}/d' "
-        f"/etc/pve/qemu-server/{vmid}.conf 2>/dev/null", timeout=5)
-    
+    stem = f"vm-{vmid}-disk-{disk_index}"
+
+    def _volid(fn):
+        # a file storage keeps the volume in the VMID's folder
+        return f"{storage}:{vmid}/{fn}" if storage_type in _FILE_STORAGE_TYPES else f"{storage}:{fn}"
+
+    def _ours(vol):
+        # what alloc answered names the volume asked for, never another one
+        name = str(vol or '').split(':', 1)[-1].rsplit('/', 1)[-1]
+        return re.sub(r'\.(raw|qcow2|vmdk)$', '', name) == stem
+
     # MK: Apr 2026 — always try raw first, only fall back to qcow2 if raw fails on all attempts (#222)
     # Mixed formats (raw+qcow2) cause confusion and the dd/importdisk path always uses --format raw
     # MK Oct 2026 (#816) - and say so on every attempt. PVE 9 can put qcow2 on LVM, so an alloc
@@ -4056,7 +4217,7 @@ def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errb
         alloc_attempts.append(f"pvesm alloc {storage} {vmid} {fn_qcow} {size_gb}G --format qcow2 2>&1")
     
     last_error = ''
-    for attempt_cmd in alloc_attempts:
+    for attempt_no, attempt_cmd in enumerate(alloc_attempts):
         # NS May 2026 — bumped from 30s; shared LVM (Proxmox cluster) takes
         # longer to acquire metadata lock when a sibling disk on the same
         # storage was just allocated/attached. 30s caused false-negative
@@ -4085,6 +4246,9 @@ def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errb
         # `pvesm path` confirmation below and reuse it.
         already_exists = ('already exist' in out_low or 'already in use' in out_low
                           or 'volume already' in out_low)
+        if already_exists and attempt_no == 0:
+            # MK Oct 2026 - no attempt of this call ran yet: it is not ours to take over
+            return 'taken'
         if not real_err or already_exists:
             # extract vol_id
             vol_id = None
@@ -4095,16 +4259,17 @@ def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errb
             # and the disk aborts anyway. The target volume is fully determined by
             # storage+vmid+disk_index, so name it directly and let `pvesm path` confirm.
             if already_exists:
-                vol_id = f"{storage}:{fn_raw}"
+                vol_id = _volid(fn_raw)
             else:
-                m = re.search(r"(\S+:vm-\d+-disk-\d+(?:\.\w+)?)", out_str)
+                # a file storage answers storage:<vmid>/vm-N-disk-M.raw
+                m = re.search(r"([\w.-]+:(?:\d+/)?vm-\d+-disk-\d+(?:\.\w+)?)", out_str)
                 if m:
                     vol_id = m.group(1).strip("'\"")
                 elif out_str and ':' in out_str and 'vm-' in out_str:
                     # output is just the vol_id on its own line
                     vol_id = out_str.split('\n')[-1].strip().strip("'\"")
-            if not vol_id:
-                vol_id = f"{storage}:{fn_raw}"
+            if not vol_id or not _ours(vol_id):
+                vol_id = _volid(fn_raw)
 
             # Get device path — quote vol_id to prevent shell splitting (#251).
             # This is the authoritative check: a real /dev or file path means the
@@ -4181,18 +4346,29 @@ def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errb
             if rc == 0:
                 logging.warning(f"[V2P] pvesm path failed for {vol_id}: {dev_path[:100]}")
                 if storage_type in ('dir', 'nfs', 'cifs', 'glusterfs'):
-                    derived = f"/mnt/pve/{storage}/images/{vmid}/{fn_raw}"
+                    derived, kind = f"/mnt/pve/{storage}/images/{vmid}/{fn_raw}", '-f'
                 elif storage_type in ('lvmthin', 'lvm'):
-                    derived = f"/dev/{storage}/vm-{vmid}-disk-{disk_index}"
+                    derived, kind = f"/dev/{storage}/{stem}", '-b'
                 elif storage_type == 'zfspool':
-                    derived = f"/dev/zvol/{storage}/vm-{vmid}-disk-{disk_index}"
+                    derived, kind = f"/dev/zvol/{storage}/{stem}", '-b'
                 else:
-                    derived = None
+                    derived = kind = None
+                # MK Oct 2026 - the guess names the storage ID where the VG, the pool or the
+                # dir path belongs, and they differ often (local-lvm is VG pve). Taken only
+                # when the node has a block device or a file there: a dd onto a path that
+                # is not there writes a plain file and loses the disk, as in the RBD case
                 if derived:
-                    logging.info(f"[V2P] Using derived path: {derived}")
-                    return vol_id, derived
+                    rc_d, out_d, _ = _pve_node_exec(pve_mgr, node,
+                        f"test {kind} {shlex.quote(derived)} && echo present", timeout=15)
+                    if rc_d == 0 and 'present' in str(out_d or ''):
+                        logging.info(f"[V2P] Using derived path: {derived}")
+                        return vol_id, derived
+                    logging.error(f"[V2P] {vol_id}: the derived path {derived} is not there")
                 if errbuf is not None:
                     errbuf.append(f"alloc succeeded ({vol_id}) but volume path could not be resolved")
+                # the volume is this call's: drop it so it doesn't orphan
+                _pve_node_exec(pve_mgr, node,
+                    f"pvesm free {shlex.quote(vol_id)} 2>/dev/null", timeout=60)
                 return None, None
             last_error = (out_str or f"pvesm alloc rc={rc}, volume {vol_id} not found afterwards")[:150]
         else:
@@ -4211,7 +4387,7 @@ def _pvesm_alloc_disk(pve_mgr, node, storage, vmid, disk_index, size_bytes, errb
             data=api_data)
         if resp.status_code in (200, 201):
             result = resp.json().get('data', '')
-            if result:
+            if result and _ours(str(result).strip("'\"")):
                 vol_id = str(result).strip("'\"")
                 rc_p, out_p, _ = _pve_node_exec(pve_mgr, node,
                     f"pvesm path {shlex.quote(vol_id)} 2>&1", timeout=10)
@@ -4837,7 +5013,8 @@ fi
         _pve_node_exec(pve_mgr, task.target_node,
             f"qm set {task.proxmox_vmid} --{disk_bus}{di} {vol_id}{task._disk_attach_opts()} 2>&1", timeout=15)
         task.log(f"  Attached {disk_bus}{di}: {vol_id}")
-    
+        task.record_disk_volume(di, vol_id)
+
     # Cleanup resource isolation
     _cleanup_copy_isolation(pve_mgr, task.target_node, iso)
     task.log("Resource isolation cleaned up, page cache dropped")
@@ -6019,6 +6196,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             
             for di in range(len(descriptor_files)):
                 vol_id = local_volumes[di][0] if di < len(local_volumes) else ''
+                task.record_disk_volume(di, vol_id)
                 if vol_id:
                     rc_set, out_set, _ = _pve_node_exec(pve_mgr, task.target_node,
                         f"qm set {task.proxmox_vmid} --{disk_bus}{di} {vol_id}{task._disk_attach_opts()} 2>&1", timeout=15)
@@ -6245,6 +6423,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
         # Write disk and boot lines directly to config file
         for di in range(len(descriptor_files)):
             vol_id = local_volumes[di][0] if di < len(local_volumes) else ''
+            task.record_disk_volume(di, vol_id)
             if vol_id:
                 # Include size= parameter (required for Proxmox to manage disk properly)
                 dk = f'disk{di}'
@@ -6372,6 +6551,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
             attached_count = 0
             for di in range(len(descriptor_files)):
                 vol_id = local_volumes[di][0] if di < len(local_volumes) else ''
+                task.record_disk_volume(di, vol_id)
                 if not vol_id:
                     task.log(f"  WARNING: post-pivot no volume for disk {di} — skipping")
                     continue
@@ -6406,6 +6586,7 @@ def _do_sshfs_boot_migration(pve_mgr, task, vmware_mgr, esxi_host, esxi_user, es
         attached_count = 0
         for di in range(len(descriptor_files)):
             vol_id = local_volumes[di][0] if di < len(local_volumes) else ''
+            task.record_disk_volume(di, vol_id)
             if not vol_id:
                 task.log(f"  WARNING: No volume for disk {di} — skipping")
                 continue
@@ -7119,6 +7300,7 @@ def _ssh_pipe_transfer(pve_mgr, task, esxi_host, esxi_user, esxi_pass, datastore
         _pve_node_exec(pve_mgr, task.target_node, f"pvesm free '{vol_id}' 2>/dev/null", timeout=30)
         return None, None
 
+    task.record_disk_volume(disk_index, vol_id)
     return vol_id, vol_path
 
 

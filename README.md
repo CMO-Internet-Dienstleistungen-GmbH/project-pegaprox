@@ -22,7 +22,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.4.0-blue" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-1.4.1-blue" alt="Version"/>
   <img src="https://img.shields.io/badge/python-3.8+-green" alt="Python"/>
   <img src="https://img.shields.io/badge/license-AGPL--3.0--License-orange" alt="License"/>
 </p>
@@ -273,6 +273,15 @@ docker run -d --name pegaprox \
   -v pegaprox-logs:/app/logs \
   --restart unless-stopped \
   ghcr.io/pegaprox/pegaprox:latest
+```
+
+The same image is on Docker Hub as [`pegaprox/pegaprox`](https://hub.docker.com/r/pegaprox/pegaprox), with the identical digest, so `pegaprox/pegaprox:latest` works just as well. Other PegaProx images on Docker Hub are not ours and may be outdated.
+
+From 1.4.1 on, the Docker images and the VM/LXC appliance images carry a signed build provenance attestation, so you can check that an image was built by our release workflow from this repository:
+```bash
+gh attestation verify oci://ghcr.io/pegaprox/pegaprox:<version> -R PegaProx/project-pegaprox
+gh attestation verify oci://docker.io/pegaprox/pegaprox:<version> -R PegaProx/project-pegaprox
+gh attestation verify pegaprox-v<version>-vm-amd64.qcow2 -R PegaProx/project-pegaprox
 ```
 
 For local builds:

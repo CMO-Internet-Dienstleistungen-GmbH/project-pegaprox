@@ -1242,39 +1242,25 @@ def _history_stride(days):
     return 12        # ~hourly for month+ windows
 
 
-def load_metrics_window(days):
+def load_metrics_window(days, cluster_id):
+    """(ts_unix, cluster dict) of one cluster's snapshots of the last `days`, oldest first,
+    as a metrics_store.ClusterWindow. MK Oct 2026 - it read and parsed every cluster of
+    every snapshot and kept that for a minute (gigabytes at a few thousand guests); now
+    one cluster, its heads first, and the nodes, guests or storage when a caller needs
+    them (metrics_store.need). Callers still only read what they get."""
     from datetime import timedelta
-    from pegaprox.core.dbcrypto import run_heavy_read
+    from pegaprox.background import metrics_store
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
     stride = _history_stride(days)
-
-    def _parse(rows):
-        out = []
-        for row in rows:
-            try:
-                d = json.loads(row['data'])
-                ts_unix = int(datetime.fromisoformat(row['timestamp']).timestamp())
-                out.append((ts_unix, d.get('clusters') or {}))
-            except Exception:
-                continue
-        return out
 
     # `id % stride = 0` picks ~every Nth snapshot. rowid lives in the timestamp
     # index, so SQLite evaluates the modulo without a table lookup and only
     # decrypts the `data` blob for rows it keeps — cuts BOTH decrypt and parse.
     if stride > 1:
-        sql = ("SELECT timestamp, data FROM metrics_history "
-               "WHERE timestamp >= ? AND id % ? = 0 ORDER BY timestamp ASC")
-        sql_params = (cutoff, stride)
+        where, params = "WHERE timestamp >= ? AND id % ? = 0", (cutoff, stride)
     else:
-        sql = ("SELECT timestamp, data FROM metrics_history "
-               "WHERE timestamp >= ? ORDER BY timestamp ASC")
-        sql_params = (cutoff,)
-
-    # cache_key shared across every cluster + across insights/cost/power.
-    # NOTE: the returned dicts are the cached parsed structure — callers must
-    # treat them as read-only (the aggregation paths only read, never mutate).
-    return run_heavy_read(sql, sql_params, cache_key=f"mh_parsed:{days}", transform=_parse)
+        where, params = "WHERE timestamp >= ?", (cutoff,)
+    return metrics_store.cluster_window(cluster_id, where, params)
 
 
 # NS Oct 2026 - what the history reports (power, costs, right-sizing) work out of it: guests x
@@ -1315,12 +1301,14 @@ def report_owner(mgr):
 def run_off_hub(fn, *args):
     """fn(*args) in gevent's thread pool, one at a time, inline where there is no hub. fn is
     plain arithmetic: no request, no session, no cluster manager (their sockets belong to
-    the hub), and it only reads what it is handed."""
+    the hub), and it only reads what it is handed. MK Oct 2026 - a metrics window handed in
+    may read its parts there too, on a database connection of its own (metrics_store), and
+    what a long run freed is handed back to the system when it is done (dbcrypto.trim_heap)."""
     try:
         from gevent import get_hub
         pool = get_hub().threadpool
     except Exception:
-        return fn(*args)
+        return _trimmed(fn, *args)
     if not _report_lock:
         try:
             from gevent.lock import BoundedSemaphore
@@ -1329,10 +1317,10 @@ def run_off_hub(fn, *args):
             _report_lock.append(None)
     lock = _report_lock[0]
     if lock is None:
-        return pool.apply(fn, args)
+        return pool.apply(_trimmed, (fn,) + args)
     lock.acquire()
     try:
-        task = pool.spawn(fn, *args)
+        task = pool.spawn(_trimmed, fn, *args)
     except BaseException:
         lock.release()
         raise
@@ -1340,6 +1328,15 @@ def run_off_hub(fn, *args):
     # killed leaves its thread running, and the next report must not start beside it
     task.rawlink(lambda _done: lock.release())
     return task.get()
+
+
+def _trimmed(fn, *args):
+    from pegaprox.core.dbcrypto import trim_heap
+    start = time.monotonic()
+    try:
+        return fn(*args)
+    finally:
+        trim_heap(time.monotonic() - start)
 
 
 def history_report(key, version, build, rows=None):

@@ -43,12 +43,16 @@ import logging
 import math
 import re
 from datetime import datetime, timedelta
+from functools import reduce
+from itertools import chain, compress, repeat
+from operator import add, mul, truediv
 from flask import Blueprint, jsonify, request
 
 from pegaprox.globals import cluster_managers
 from pegaprox.utils.auth import require_auth
 from pegaprox.api.helpers import (check_cluster_access, load_metrics_window, scope_vm_rows, require_unconfined,
                                   history_report, history_version, report_owner, run_off_hub, _history_stride)
+from pegaprox.background.metrics_store import need, guest_columns, FT, HERE, RUN, ELIGIBLE
 from pegaprox.utils.audit import log_audit
 from pegaprox.core.db import get_db
 from pegaprox.models.permissions import ROLE_ADMIN
@@ -107,20 +111,16 @@ def _current_user():
 
 
 def _load_history(cluster_id, days=30):
-    # fetch+parse off-hub + cached in load_metrics_window (shared w/ insights/costs)
-    out = []
+    # fetch+parse off-hub in load_metrics_window, one cluster (shared w/ insights/costs)
     try:
-        for ts_unix, clusters in load_metrics_window(days):
-            cd = clusters.get(cluster_id)
-            if cd:
-                out.append((ts_unix, cd))
+        return load_metrics_window(days, cluster_id)
     except Exception:
-        pass
-    return out
+        return []
 
 
 _GIB = 1024 ** 3
 _PCT_GIB = 100.0 * _GIB  # a percentage of bytes, in GB
+_MEM_TABLES = 256        # _compute_power_cols: lookup tables kept for that many memory sizes
 
 
 def _get_host_profiles(cluster_id):
@@ -156,21 +156,33 @@ def _intervals(snapshots, step=300):
     return out
 
 
-def _compute_power(snapshots, resources, rates, profiles, step=300):
-    """kWh per guest and per host over the snapshots; `resources` is the live guest list
-    (names, and today's host for history from before #965).
-
-    Returns {'rows': [...], 'hosts': {node: {...}}, 'covered_h': float}. Host kWh stay
-    unrounded so the totals add up before anything is rounded for display."""
+def _live_names(resources):
     live_node, name_by_vmid = {}, {}
     for r in resources:
         vid = str(r.get('vmid') or '')
         if vid:
             name_by_vmid[vid] = r.get('name', '')
             live_node[vid] = r.get('node', '')
+    return live_node, name_by_vmid
 
-    pue = rates['pue']
-    mem_w_per_gb = rates['mem_w_per_gb']
+
+def _compute_power(snapshots, resources, rates, profiles, step=300):
+    """kWh per guest and per host over the snapshots; `resources` is the live guest list
+    (names, and today's host for history from before #965).
+
+    Returns {'rows': [...], 'hosts': {node: {...}}, 'covered_h': float}. Host kWh stay
+    unrounded so the totals add up before anything is rounded for display.
+    MK Oct 2026 - a window whose guests are all stored in columns, with the host sums of
+    pass 1 written alongside, goes to _compute_power_cols: the same figures without a dict
+    per guest and sample."""
+    cols = guest_columns(snapshots, hosts=True)
+    if cols is not None:
+        return _compute_power_cols(cols, resources, rates, profiles, step)
+    snapshots = need(snapshots, 'nodes', 'vms')
+    # NOTE: _compute_power_cols below replays pass 1 and 3 on the column store, and
+    # metrics_store.host_sums is pass 1 as written with each snapshot. All three have to give
+    # the very same floats (tests/test_metrics_column_engines.py): a change here goes there.
+    live_node, name_by_vmid = _live_names(resources)
     # per guest, a list (this loop runs guests x snapshots - 7M times at 10k guests/30d):
     # type, samples, running samples, running h, cpu % sum, mem % sum, vcpus, mem bytes,
     # {node: kwh}, samples without a recorded host, last host
@@ -228,41 +240,169 @@ def _compute_power(snapshots, resources, rates, profiles, step=300):
                 s[2] += mem_gb
 
         # pass 2 - host power, and what it pays per vCPU / used core / used GB
-        k = pue * dt_h / 1000.0
-        rate = {}
-        for n, h in nodes.items():
-            idle, mx, custom = _host_profile(n, profiles, rates)
-            util = min(max((h.get('cpu') or 0) / 100.0, 0.0), 1.0)
-            active_w = (mx - idle) * util
-            # a per-host profile is whole-system power, RAM included
-            mem_w = 0.0 if custom else (
-                (h.get('mem_percent') or 0) * (h.get('maxmem') or 0) / _PCT_GIB * mem_w_per_gb)
-            vcpus, used_cores, used_gb = per_host.get(n) or (0, 0.0, 0.0)
-            per_vcpu = idle / vcpus if vcpus else 0.0
-            cores = h.get('maxcpu') or 0
-            per_core = (mx - idle) / cores if cores else 0.0
-            # guest samples can run a little ahead of the host's - never hand out more than it drew
-            if used_cores * per_core > active_w:
-                per_core = active_w / used_cores
-            per_gb = 0.0 if custom else mem_w_per_gb
-            if used_gb * per_gb > mem_w:
-                per_gb = mem_w / used_gb
-            # already in kWh for this interval
-            rate[n] = (per_vcpu * k, per_core * k, per_gb * k)
-            total_w = idle + active_w + mem_w
-            given_w = per_vcpu * vcpus + per_core * used_cores + per_gb * used_gb
-            hs = hosts.get(n)
-            if hs is None:
-                hs = hosts[n] = {'kwh': 0.0, 'kwh_unallocated': 0.0, 'online_h': 0.0}
-            hs['kwh'] += total_w * k
-            hs['kwh_unallocated'] += max(total_w - given_w, 0.0) * k
-            hs['online_h'] += dt_h
+        rate = _host_rates(nodes, per_host, dt_h, rates, profiles, hosts)
 
         # pass 3 - each guest's share of its host
         for by_node, n, vcpus, cores_used, mem_gb in zip(p_kwh, p_node, p_vcpus, p_cores, p_gb):
             r_vcpu, r_core, r_gb = rate[n]
             by_node[n] = by_node.get(n, 0.0) + r_vcpu * vcpus + r_core * cores_used + r_gb * mem_gb
 
+    return _power_rows(by_vm, hosts, dts, live_node, name_by_vmid, rates)
+
+
+def _host_rates(nodes, per_host, dt_h, rates, profiles, hosts):
+    """Pass 2 of one snapshot: what each online host drew over dt_h, added to `hosts`, and
+    what it pays per vCPU / used core / used GB, {host: (kWh, kWh, kWh)}. per_host is pass 1
+    of that snapshot, {host: [vcpus, cores used, GB used]}."""
+    k = rates['pue'] * dt_h / 1000.0
+    mem_w_per_gb = rates['mem_w_per_gb']
+    rate = {}
+    for n, h in nodes.items():
+        idle, mx, custom = _host_profile(n, profiles, rates)
+        util = min(max((h.get('cpu') or 0) / 100.0, 0.0), 1.0)
+        active_w = (mx - idle) * util
+        # a per-host profile is whole-system power, RAM included
+        mem_w = 0.0 if custom else (
+            (h.get('mem_percent') or 0) * (h.get('maxmem') or 0) / _PCT_GIB * mem_w_per_gb)
+        vcpus, used_cores, used_gb = per_host.get(n) or (0, 0.0, 0.0)
+        per_vcpu = idle / vcpus if vcpus else 0.0
+        cores = h.get('maxcpu') or 0
+        per_core = (mx - idle) / cores if cores else 0.0
+        # guest samples can run a little ahead of the host's - never hand out more than it drew
+        if used_cores * per_core > active_w:
+            per_core = active_w / used_cores
+        per_gb = 0.0 if custom else mem_w_per_gb
+        if used_gb * per_gb > mem_w:
+            per_gb = mem_w / used_gb
+        # already in kWh for this interval
+        rate[n] = (per_vcpu * k, per_core * k, per_gb * k)
+        total_w = idle + active_w + mem_w
+        given_w = per_vcpu * vcpus + per_core * used_cores + per_gb * used_gb
+        hs = hosts.get(n)
+        if hs is None:
+            hs = hosts[n] = {'kwh': 0.0, 'kwh_unallocated': 0.0, 'online_h': 0.0}
+        hs['kwh'] += total_w * k
+        hs['kwh_unallocated'] += max(total_w - given_w, 0.0) * k
+        hs['online_h'] += dt_h
+    return rate
+
+
+def _compute_power_cols(cols, resources, rates, profiles, step=300):
+    """_compute_power on a metrics_store.GuestColumns with the host sums of every snapshot.
+
+    Pass 2 is _host_rates per snapshot, from the host sums pass 1 wrote with it. Per guest,
+    the sums pass 1 and 3 build with `+=` are built here in the same order from the same
+    operands: e[3] to e[5] start at 0.0 and add each running sample in turn (a cpu or mem
+    that was None or 0 adds 0.0 here and int 0 there, which leaves a float sum as it is),
+    and by_node[host] adds rate * vcpus, rate * cores used, rate * GB used per sample, in
+    that order. functools.reduce(add) does that left to right; sum() would not (it
+    compensates from 3.12 on)."""
+    live_node, name_by_vmid = _live_names(resources)
+    dts = _intervals(cols.rows, step)
+    S, U = cols.S, cols.U
+    names, maxcpu, maxmem, host, snap_k = cols.names, cols.maxcpu, cols.maxmem, cols.host, cols.snap_k
+    hcode = {n: i for i, n in enumerate(names)}
+    # the rates of each host per snapshot, by the window's host code
+    rv = [[0.0] * S for _ in names]
+    rc = [[0.0] * S for _ in names]
+    rg = [[0.0] * S for _ in names]
+    hosts = {}
+    for s, (nodes, per_host, dt_h) in enumerate(zip(cols.nodes, cols.host_sums, dts)):
+        for n, (a, b, c) in _host_rates(nodes, per_host, dt_h, rates, profiles, hosts).items():
+            h = hcode.get(n)
+            if h is not None:
+                rv[h][s], rc[h][s], rg[h][s] = a, b, c
+
+    # rate * vCPUs per host and core count, and what a stored tenth gives as cores used or GB
+    # used for a guest of that size (the codes run to the window's top one; the last entry is
+    # the int 0 of code -1). Memory sizes vary more than core counts: past _MEM_TABLES of them
+    # a guest's GB are worked out on the spot, the same way.
+    per_vcpus, core_tabs, gb_tabs = {}, {}, {}
+    top = max(max(cols.cpu, default=0), max(cols.mem, default=0)) + 1
+    by_vm, run_hours = {}, {}
+    for vmid, g in cols.order:
+        fl = cols.flags_of(g)
+        here, run, elig = fl.translate(HERE), fl.translate(RUN), fl.translate(ELIGIBLE)
+        rs = run.count(1)
+        running_h = run_hours.get(run)
+        if running_h is None:
+            running_h = run_hours[run] = reduce(add, compress(dts, run), 0.0)
+        by_node = {}
+        e = by_vm[vmid] = [cols.kind(g, here.find(1)), here.count(1), rs, running_h, 0.0, 0.0,
+                           max(chain((0,), cols.values(maxcpu, g))), max(chain((0,), cols.values(maxmem, g))),
+                           by_node, 0, '']
+        if not rs:
+            continue
+        cpu, mem = cols.cpu_of(g), cols.mem_of(g)
+        if rs == S:
+            # running all along: every sample counts, no need to pick them out
+            e[4] = reduce(add, map(FT.__getitem__, cpu), 0.0)
+            e[5] = reduce(add, map(FT.__getitem__, mem), 0.0)
+        else:
+            e[4] = reduce(add, map(FT.__getitem__, compress(cpu, run)), 0.0)
+            e[5] = reduce(add, map(FT.__getitem__, compress(mem, run)), 0.0)
+        n_elig = elig.count(1)
+        if not n_elig:
+            continue
+        # where the guest ran with the same host, vCPUs and memory all along (most do), its
+        # share is three products per sample, worked out a column at a time. Eligible in
+        # every snapshot, it is in every roster of the window (each is some snapshot's), and
+        # its K values per column tell at once
+        if n_elig == S:
+            hk, ck, mk = host[g::U], maxcpu[g::U], maxmem[g::U]
+            same = {(hk[0], ck[0], mk[0])} if (hk.count(hk[0]) == ck.count(ck[0]) == mk.count(mk[0])
+                                               == len(hk)) else ()
+        else:
+            ks = set(compress(snap_k, elig))
+            same = {(host[k * U + g], maxcpu[k * U + g], maxmem[k * U + g]) for k in ks}
+        if len(same) == 1:
+            h, vc, mm = same.pop()
+            vcpus = vc or 1
+            a = per_vcpus.get((h, vcpus))
+            if a is None:
+                a = per_vcpus[h, vcpus] = list(map(mul, rv[h], repeat(vcpus)))
+            cores = core_tabs.get(vcpus)
+            if cores is None:
+                cores = core_tabs[vcpus] = [x * vcpus / 100.0 for x in FT[:top]] + [FT[-1] * vcpus / 100.0]
+            gbs = gb_tabs.get(mm)
+            if gbs is None and len(gb_tabs) < _MEM_TABLES:
+                gbs = gb_tabs[mm] = [x * mm / _PCT_GIB for x in FT[:top]] + [FT[-1] * mm / _PCT_GIB]
+            if n_elig == S:
+                pick = _all
+            else:
+                def pick(seq, elig=elig):
+                    return compress(seq, elig)
+            if gbs is not None:
+                used_gb = map(gbs.__getitem__, pick(mem))
+            else:
+                used_gb = map(truediv, map(mul, map(FT.__getitem__, pick(mem)), repeat(mm)), repeat(_PCT_GIB))
+            # ((kwh + a) + b) + c sample after sample: the three terms interleaved, added up
+            # left to right
+            terms = [0.0] * (3 * n_elig)
+            terms[0::3] = pick(a)
+            terms[1::3] = map(mul, pick(rc[h]), map(cores.__getitem__, pick(cpu)))
+            terms[2::3] = map(mul, pick(rg[h]), used_gb)
+            by_node[names[h]] = reduce(add, terms, 0.0)
+            e[10] = names[h]
+            continue
+        # moved, resized, or ran on a host that was not online: sample by sample, as written
+        for s in compress(range(S), elig):
+            k = snap_k[s] * U + g
+            h = host[k]
+            n = names[h]
+            vcpus = maxcpu[k] or 1
+            cores_used = FT[cpu[s]] * vcpus / 100.0
+            mem_gb = FT[mem[s]] * maxmem[k] / _PCT_GIB
+            by_node[n] = by_node.get(n, 0.0) + rv[h][s] * vcpus + rc[h][s] * cores_used + rg[h][s] * mem_gb
+            e[10] = n
+    return _power_rows(by_vm, hosts, dts, live_node, name_by_vmid, rates)
+
+
+def _all(seq):
+    return seq
+
+
+def _power_rows(by_vm, hosts, dts, live_node, name_by_vmid, rates):
     price, co2 = rates['kwh_price'], rates['kg_co2_per_kwh']
     rows = []
     for vmid, (vtype, samples, rs, running_h, cpu_sum, mem_sum, maxcpu, maxmem,
