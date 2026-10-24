@@ -947,7 +947,7 @@ jobs:
           cp "pegaprox-${{ needs.prepare.outputs.version }}-vm-${{ matrix.arch }}.qcow2" \
              "pegaprox-vm-${{ matrix.arch }}.qcow2"
 
-      - name: VMware OVA erstellen
+      - name: OVA für ESXi erstellen
         run: |
           set -e
           VERSION="${{ needs.prepare.outputs.version }}"
@@ -1056,7 +1056,7 @@ jobs:
               </VirtualHardwareSection>
               <AnnotationSection>
                 <Info>Annotation</Info>
-                <Annotation>PegaProx ${VERSION} VMware Appliance. Login: pegaprox_admin / PegaProx2026! | Run pegaprox-setup after first boot to configure networking.</Annotation>
+                <Annotation>PegaProx ${VERSION} appliance for ESXi. Login: pegaprox_admin / PegaProx2026! | Run pegaprox-setup after first boot to configure networking.</Annotation>
               </AnnotationSection>
             </VirtualSystem>
           </Envelope>
