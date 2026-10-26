@@ -411,7 +411,7 @@ if [ "$SKIP_TESTS" -eq 0 ]; then
     # REST only: `gh pr list/create` go through GraphQL, which the sandbox the
     # routine runs in answers with 403.
     fork_owner="${FORK_SLUG%%/*}"
-    ci_pr="$(gh api "repos/$FORK_SLUG/pulls" -f state=open -f head="$fork_owner:$CI_BRANCH" \
+    ci_pr="$(gh api --method GET "repos/$FORK_SLUG/pulls" -f state=open -f head="$fork_owner:$CI_BRANCH" \
              -f base="$CI_BASE_BRANCH" --jq '.[0].number // empty')"
     if [ -z "$ci_pr" ]; then
         gh api -X POST "repos/$FORK_SLUG/pulls" -F draft=true \
