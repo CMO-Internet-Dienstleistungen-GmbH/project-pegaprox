@@ -408,12 +408,16 @@ if [ "$SKIP_TESTS" -eq 0 ]; then
     # One standing draft PR between the two branches is what makes upstream's
     # pull_request trigger fire on every push. It is never merged; the branches
     # cannot be deleted (ruleset), so they are reused instead of piling up.
-    ci_pr="$(gh pr list -R "$FORK_SLUG" --head "$CI_BRANCH" --base "$CI_BASE_BRANCH" \
-             --state open --json number --jq '.[0].number // empty')"
+    # REST only: `gh pr list/create` go through GraphQL, which the sandbox the
+    # routine runs in answers with 403.
+    fork_owner="${FORK_SLUG%%/*}"
+    ci_pr="$(gh api "repos/$FORK_SLUG/pulls" -f state=open -f head="$fork_owner:$CI_BRANCH" \
+             -f base="$CI_BASE_BRANCH" --jq '.[0].number // empty')"
     if [ -z "$ci_pr" ]; then
-        gh pr create -R "$FORK_SLUG" --draft --head "$CI_BRANCH" --base "$CI_BASE_BRANCH" \
-            --title "ci: test the rebuilt integration branch" \
-            --body "Standing draft PR used by scripts/sync-upstream-release.sh on cmo/automation: every rebuild is pushed to $CI_BRANCH so the test suite runs on it before a tag is published. Never merge, never close." \
+        gh api -X POST "repos/$FORK_SLUG/pulls" -F draft=true \
+            -f head="$CI_BRANCH" -f base="$CI_BASE_BRANCH" \
+            -f title="ci: test the rebuilt integration branch" \
+            -f body="Standing draft PR used by scripts/sync-upstream-release.sh on cmo/automation: every rebuild is pushed to $CI_BRANCH so the test suite runs on it before a tag is published. Never merge, never close." \
             >/dev/null || die "could not open the CI pull request $CI_BRANCH -> $CI_BASE_BRANCH"
     fi
 
