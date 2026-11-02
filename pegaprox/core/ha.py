@@ -344,6 +344,8 @@ SYNC_TABLES = (
     'recovery_targets', 'restore_test_marks',
     # manual confirmations of a guest's recoverability, beside the automatic facts
     'recovery_confirmations',
+    # who asked for each snapshot: it is the active instance's record, and a standby that takes over keeps it
+    'snapshot_authors',
 )
 LOCAL_TABLES = (
     'sessions', 'audit_log', 'task_users', 'migration_history', 'metrics_history',
