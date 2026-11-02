@@ -49,7 +49,8 @@ def _script_for(monkeypatch, vol_path, storage='ceph-vms', storage_type='rbd'):
     task = types.SimpleNamespace(install_virtio_drivers=True, target_node='node1',
                                  proxmox_vmid=100, target_storage=storage,
                                  virtio_iso_path='/iso/virtio-win.iso', ostype='',
-                                 config={}, log=lambda *_a: None)
+                                 config={}, log=lambda *_a: None,
+                                 boot_volume=lambda: f'{storage}:vm-100-disk-0')
     v2p._inject_virtio_drivers(mgr, task)
     return sent['script']
 
