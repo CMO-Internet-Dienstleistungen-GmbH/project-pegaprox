@@ -204,10 +204,11 @@ generated_files:
 # The suite runs in the fork's GitHub Actions, never on the machine running the
 # sync: upstream's tests assume Linux (/proc, dash, a non-root user), and a run
 # on a workstation fails for reasons that have nothing to do with the tree.
-# Upstream's own workflow is reused unchanged through its pull_request trigger:
-# `branch` carries the build, `base_branch` the release tag it was built on, and
-# one standing draft PR between them makes every push to `branch` a CI run on
-# exactly that tree. See docs/adr/0001-test-the-build-in-the-forks-ci.md.
+# Upstream's own workflow is reused through its pull_request trigger: `branch`
+# carries the build, `base_branch` the release tag it was built on plus one
+# commit that runs the suite on every core (pytest-xdist), and one standing
+# draft PR between them makes every push to `branch` a CI run on exactly the
+# built tree. See docs/adr/0001-test-the-build-in-the-forks-ci.md.
 verify:
   ci:
     workflow: test.yml

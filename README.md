@@ -63,9 +63,10 @@ upstream release with a changed patch set (a fix added, reworked, or dropped).
      `commit_message`; branch commit order never decides the subject.
 4. Regenerate the artefacts once more and commit them if they changed.
 5. Run the test suite in the fork's GitHub Actions — upstream's own
-   `test.yml`, unchanged. The build goes to `cmo/ci`, the release tag to
-   `cmo/ci-base`, and a standing draft PR between the two triggers the
-   workflow on exactly that tree. The script waits for the run and stops on
+   `test.yml`, with one change: it runs on every core of the runner
+   (`pytest-xdist`, `-n auto`). The build goes to `cmo/ci`, the release plus
+   that one workflow line to `cmo/ci-base`, and a standing draft PR between
+   the two triggers the workflow on exactly the built tree. The script waits for the run and stops on
    red. The suite never runs on the machine doing the sync: upstream's tests
    assume Linux and fail on a workstation for reasons unrelated to the tree
    ([ADR 0001](docs/adr/0001-test-the-build-in-the-forks-ci.md)). Needs the

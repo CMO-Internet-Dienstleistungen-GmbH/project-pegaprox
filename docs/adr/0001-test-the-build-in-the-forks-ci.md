@@ -54,3 +54,32 @@ the workflow and both branches.
 - The routine that runs the sync in a cloud sandbox needs `gh` and network
   access to the GitHub API; without them the gate stops with an error instead of
   publishing.
+
+## Amendment 2026-11-02: the suite runs on every core
+
+Upstream's suite grew from 522 tests in v1.0.2 to 15,364 in v1.4.1, and
+`test.yml` runs them one after another. The gate took 50 minutes for v1.4.0,
+spent almost entirely in the pytest step; no single test hangs; the time is
+spread over the whole HA suite. One sync that needs a second attempt then
+costs well over an hour of CI.
+
+`cmo/ci-base` therefore no longer points at the bare release. It points at one
+commit on top of it that changes two lines of `test.yml`: `pytest-xdist` (pinned
+in `scripts/lib.sh`) is installed next to upstream's dev requirements, and
+pytest runs with `-n auto`. The commit is built deterministically from the
+release, so a re-run pushes the same sha.
+
+- The tag still contains nothing of it: the build descends from the release, not
+  from that commit, and the merge GitHub tests is the built tree plus those two
+  workflow lines.
+- Upstream changes to `test.yml` keep applying. If upstream rewords either of
+  the two lines, the script warns and the base falls back to the plain
+  release: the suite runs serially again, slower but with the same verdict.
+- Checked before the change, in a root sandbox with Python 3.11: the whole
+  suite with `-n 4` on the patched build passed 14,059 tests in 24 minutes and
+  failed 17 -- the same 17 that fail on the plain release with `-n 4`, and that
+  still fail when run serially, so they belong to the sandbox, not to xdist.
+  The first CI run with this change is the real confirmation; a red result
+  that a serial run would not give is a reason to revert it.
+- Patch branches still keep out of `.github/workflows/`; the change lives only
+  in what the sync pushes to `cmo/ci-base`.

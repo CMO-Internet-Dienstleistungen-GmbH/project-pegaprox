@@ -399,9 +399,15 @@ if [ "$SKIP_TESTS" -eq 0 ]; then
     # release that merge has exactly the built tree -- so the run judges what
     # gets tagged, not an approximation of it. Base first: a head pushed onto
     # an old base would start a run on the wrong merge.
+    #
+    # The one exception is the workflow file itself: the base may carry a single
+    # commit on top of the release that spreads the suite over the runner's
+    # cores (ci_parallel_base). The merge is then the built tree plus that one
+    # line in test.yml, and nothing the tag contains.
     info "running the test suite in the fork's CI ($CI_WORKFLOW, $CI_BRANCH -> $CI_BASE_BRANCH)"
+    CI_BASE_SHA="$(ci_parallel_base "$RELEASE_SHA" ".github/workflows/$CI_WORKFLOW")"
     git -C "$REPO_ROOT" push --quiet --force-with-lease="$CI_BASE_BRANCH" \
-        "$FORK_REMOTE" "$RELEASE_SHA:refs/heads/$CI_BASE_BRANCH"
+        "$FORK_REMOTE" "$CI_BASE_SHA:refs/heads/$CI_BASE_BRANCH"
     git -C "$REPO_ROOT" push --quiet --force-with-lease="$CI_BRANCH" \
         "$FORK_REMOTE" "$BUILT_SHA:refs/heads/$CI_BRANCH"
 
