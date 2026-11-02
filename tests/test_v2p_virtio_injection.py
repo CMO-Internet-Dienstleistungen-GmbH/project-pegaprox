@@ -24,6 +24,9 @@ class _Task:
         self.virtio_iso_path = '/var/lib/vz/template/iso/virtio-win.iso'
         self.lines = []
 
+    def boot_volume(self):
+        return f'{self.target_storage}:vm-{self.proxmox_vmid}-disk-0'
+
     def log(self, message):
         self.lines.append(str(message))
 
@@ -579,6 +582,7 @@ class TestTheHibernationOnlyModeReachesItsOwnWork:
         task = MagicMock()
         task.proxmox_vmid, task.target_node = 120, 'node-a'
         task.target_storage, task.virtio_iso_path = 'vmstorage', ''
+        task.boot_volume.return_value = 'vmstorage:vm-120-disk-0'
         task.install_virtio_drivers = not clear_hibernation_only
         mgr = MagicMock()
         mgr.host, mgr.api_port = '127.0.0.1', 8006
