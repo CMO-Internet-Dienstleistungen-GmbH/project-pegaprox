@@ -108,6 +108,12 @@ def _load_config_legacy():
     return {}
 
 
+#: The manager kinds that really are clusters, and are therefore the only ones the cluster
+#: configuration describes. Everything else in `cluster_managers` is a migration source
+#: registered so the cross-hypervisor wizard can offer it (ADR 1).
+_CLUSTER_TYPES = ('proxmox', 'xcpng')
+
+
 def save_config():
     """Save configuration to SQLite database
     
@@ -129,9 +135,14 @@ def save_config():
         db = get_db()
 
         for cluster_id, manager in cluster_managers.items():
-            # an ESXi host registered for XHM lives in vmware_servers. Saved here it would
-            # come back at the next start as a Proxmox manager pointed at the ESXi host.
-            if getattr(manager, 'cluster_type', None) == 'esxi':
+            # A migration source shares this registry with the clusters so the
+            # cross-hypervisor wizard can find it, but it is not a cluster and must not be
+            # written to the cluster configuration. Start-up builds a PegaProxManager for
+            # every entry there, which for a Hyper-V or ESXi host means a poll thread
+            # logging in to a Proxmox API it does not have -- the failure
+            # `migrate_hyperv_out_of_cluster_config` exists to clean up. Without this
+            # guard any cluster edit puts the row straight back.
+            if getattr(manager, 'cluster_type', 'proxmox') not in _CLUSTER_TYPES:
                 continue
             try:
                 # Sanitize fallback_hosts

@@ -1366,7 +1366,15 @@
         // NS: Added bulk select for mass operations (migration, etc.)
         // This component does a lot... might need to split it up eventually
         // NS: filtering + sorting uses useMemo below (lines 1320+)
-        function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenSpice, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, nodes, datastores, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus, authFetch, onBulkDone, favorites, onToggleFavorite }) {
+        function ResourceTable({ resources, clusterId, clusters, sourceCluster, onVmAction, onOpenConsole, onOpenSpice, onOpenConfig, onMigrate, onBulkMigrate, onDelete, onClone, onForceStop, onCrossClusterMigrate, onHypervMigrate, nodes, datastores, onOpenTags, highlightedVm, addToast, pendingVmAction, onPendingActionConsumed, onVmNavigate, backupStatus, authFetch, onBulkDone, favorites, onToggleFavorite }) {
+            // Fork patch #15 — a Hyper-V guest is a migration source, not a machine this
+            // product runs. Most of the actions below address a Proxmox API its host does
+            // not have; two of them, clone and delete, would be aimed at a customer's
+            // production VM. What stays is what works: power it on, shut it down, look at
+            // its hardware, and move it to Proxmox.
+            const isHypervSource = typeof hvType === 'function'
+                && hvType((clusters || []).find(c => c.id === clusterId)) === 'hyperv';
+
             const { t } = useTranslation();
             const { getAuthHeaders, user, haReadOnly, haConsolesElsewhere } = useAuth();
             // #625 v2 - a standby shows the guests live but acts on none of them: no power,
@@ -2216,7 +2224,7 @@
                                             <div className="flex items-center gap-1">
                                                 {getProxmoxObjectUrl(getVmProxmoxTarget(resource)) && (
                                                     <button
-                                                        onClick={() => openProxmoxObject(getVmProxmoxTarget(resource))}
+                                                        onClick={() => openProxmoxObject(getVmProxmoxTarget(resource))} style={{display: isHypervSource ? 'none' : undefined}}
                                                         className="p-1.5 rounded-lg hover:bg-cyan-500/20 text-gray-400 hover:text-cyan-400 transition-all"
                                                         title={t('openInProxmox') || 'Open in Proxmox'}
                                                     >
@@ -2243,7 +2251,7 @@
                                                             {actionLoading[`${resource.vmid}-shutdown`] ? <Icons.RotateCw className="animate-spin" /> : <Icons.Power />}
                                                         </button>
                                                         <button
-                                                            onClick={() => handleAction(resource, 'reboot')}
+                                                            onClick={() => handleAction(resource, 'reboot')} style={{display: isHypervSource ? 'none' : undefined}}
                                                             disabled={actionLoading[`${resource.vmid}-reboot`]}
                                                             className="p-1.5 rounded-lg hover:bg-orange-500/20 text-gray-400 hover:text-orange-400 transition-all disabled:opacity-50"
                                                             title={t('reboot')}
@@ -2254,7 +2262,7 @@
                                                 )}
                                                 {consoles && resource.status === 'running' && (
                                                     <button
-                                                        onClick={() => onOpenConsole(resource)}
+                                                        onClick={() => onOpenConsole(resource)} style={{display: isHypervSource ? 'none' : undefined}}
                                                         className="p-1.5 rounded-lg hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
                                                         title={t('console')}
                                                     >
@@ -2267,7 +2275,7 @@
                                                 )}
                                                 {consoles && resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
                                                     <button
-                                                        onClick={() => onOpenSpice(resource)}
+                                                        onClick={() => onOpenSpice(resource)} style={{display: isHypervSource ? 'none' : undefined}}
                                                         className="p-1.5 rounded-lg hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
                                                         title={t('spiceConsole') || 'SPICE'}
                                                     >
@@ -2283,7 +2291,9 @@
                                                 </button>
                                                 {acts && (
                                                 <button
-                                                    onClick={() => setShowMigrateModal(resource)}
+                                                    onClick={() => isHypervSource
+                                                        ? (onHypervMigrate && onHypervMigrate(resource))
+                                                        : setShowMigrateModal(resource)}
                                                     className="p-1.5 rounded-lg hover:bg-cyan-500/20 text-gray-400 hover:text-cyan-400 transition-all"
                                                     title={t('migrate')}
                                                 >
@@ -2603,7 +2613,7 @@
                                                     <div className="flex items-center gap-0">
                                                         {getProxmoxObjectUrl(getVmProxmoxTarget(resource)) && (
                                                             <>
-                                                                <button onClick={() => openProxmoxObject(getVmProxmoxTarget(resource))} className="corp-action-btn" title={t('openInProxmox') || 'Open in Proxmox'}><Icons.ExternalLink className="w-3.5 h-3.5" /></button>
+                                                                <button onClick={() => openProxmoxObject(getVmProxmoxTarget(resource))} style={{display: isHypervSource ? 'none' : undefined}} className="corp-action-btn" title={t('openInProxmox') || 'Open in Proxmox'}><Icons.ExternalLink className="w-3.5 h-3.5" /></button>
                                                                 <span className="corp-toolbar-divider" style={{margin: '0 3px'}} />
                                                             </>
                                                         )}
@@ -2619,7 +2629,7 @@
                                                                     <button onClick={() => handleAction(resource, 'shutdown')} disabled={actionLoading[`${resource.vmid}-shutdown`]} className="corp-action-btn" title={t('shutdown')}>
                                                                         {actionLoading[`${resource.vmid}-shutdown`] ? <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" /> : <Icons.Power className="w-3.5 h-3.5" />}
                                                                     </button>
-                                                                    <button onClick={() => handleAction(resource, 'reboot')} disabled={actionLoading[`${resource.vmid}-reboot`]} className="corp-action-btn" title={t('reboot')}>
+                                                                    <button onClick={() => handleAction(resource, 'reboot')} style={{display: isHypervSource ? 'none' : undefined}} disabled={actionLoading[`${resource.vmid}-reboot`]} className="corp-action-btn" title={t('reboot')}>
                                                                         {actionLoading[`${resource.vmid}-reboot`] ? <Icons.RotateCw className="w-3.5 h-3.5 animate-spin" /> : <Icons.RefreshCw className="w-3.5 h-3.5" />}
                                                                     </button>
                                                                 </>
@@ -2630,13 +2640,13 @@
                                                         {/* management group */}
                                                         <div className="corp-action-group">
                                                             {consoles && resource.status === 'running' && (
-                                                                <button onClick={() => onOpenConsole(resource)} className="corp-action-btn" title={t('openConsole')}><Icons.Monitor className="w-3.5 h-3.5" /></button>
+                                                                <button onClick={() => onOpenConsole(resource)} style={{display: isHypervSource ? 'none' : undefined}} className="corp-action-btn" title={t('openConsole')}><Icons.Monitor className="w-3.5 h-3.5" /></button>
                                                             )}
                                                             {!consoles && resource.status === 'running' && (
                                                                 <HaOnActiveLink vm={resource} clusterId={clusterId} iconOnly className="corp-action-btn" iconClass="w-3.5 h-3.5" />
                                                             )}
                                                             {consoles && resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
-                                                                <button onClick={() => onOpenSpice(resource)} className="corp-action-btn" title={t('spiceConsole') || 'SPICE'}><Icons.ExternalLink className="w-3.5 h-3.5" /></button>
+                                                                <button onClick={() => onOpenSpice(resource)} style={{display: isHypervSource ? 'none' : undefined}} className="corp-action-btn" title={t('spiceConsole') || 'SPICE'}><Icons.ExternalLink className="w-3.5 h-3.5" /></button>
                                                             )}
                                                             <button onClick={() => onOpenConfig(resource)} className="corp-action-btn" title={t('configuration')}><Icons.Cog className="w-3.5 h-3.5" /></button>
                                                             {canStar && (
@@ -2645,21 +2655,23 @@
                                                                     <Icons.Star className={`w-3.5 h-3.5 ${isFav(resource) ? 'fill-yellow-400 text-yellow-400' : ''}`} />
                                                                 </button>
                                                             )}
-                                                            {acts && (<>
+                                                            {isHypervSource ? (acts && (
+                                                                <button onClick={() => onHypervMigrate && onHypervMigrate(resource)} className="corp-action-btn" title={t('hvMigrateToProxmox') || 'Migrate to Proxmox'}><Icons.FolderInput className="w-3.5 h-3.5" /></button>
+                                                            )) : acts && (<>
                                                             <button onClick={() => setShowMigrateModal(resource)} className="corp-action-btn" title={t('migrate')}><Icons.ArrowRight className="w-3.5 h-3.5" /></button>
-                                                            <button onClick={() => setShowCloneModal(resource)} className="corp-action-btn" title={t('clone')}><Icons.Copy className="w-3.5 h-3.5" /></button>
+                                                            <button onClick={() => setShowCloneModal(resource)} style={{display: isHypervSource ? 'none' : undefined}} className="corp-action-btn" title={t('clone')}><Icons.Copy className="w-3.5 h-3.5" /></button>
                                                             </>)}
                                                         </div>
                                                         {acts && (<>
                                                         <span className="corp-toolbar-divider" style={{margin: '0 3px'}} />
-                                                        <button onClick={() => setShowDeleteConfirm(resource)} className="corp-action-btn danger" title={t('delete')}><Icons.Trash className="w-3.5 h-3.5" /></button>
+                                                        <button onClick={() => setShowDeleteConfirm(resource)} style={{display: isHypervSource ? 'none' : undefined}} className="corp-action-btn danger" title={t('delete')}><Icons.Trash className="w-3.5 h-3.5" /></button>
                                                         </>)}
                                                     </div>
                                                     ) : (
                                                     <div className="flex items-center gap-1">
                                                         {getProxmoxObjectUrl(getVmProxmoxTarget(resource)) && (
                                                             <button
-                                                                onClick={() => openProxmoxObject(getVmProxmoxTarget(resource))}
+                                                                onClick={() => openProxmoxObject(getVmProxmoxTarget(resource))} style={{display: isHypervSource ? 'none' : undefined}}
                                                                 className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-cyan-500/20 text-gray-400 hover:text-cyan-400 transition-all"
                                                                 title={t('openInProxmox') || 'Open in Proxmox'}
                                                             >
@@ -2718,7 +2730,7 @@
                                                         )}
                                                         {consoles && resource.status === 'running' && (
                                                             <button
-                                                                onClick={() => onOpenConsole(resource)}
+                                                                onClick={() => onOpenConsole(resource)} style={{display: isHypervSource ? 'none' : undefined}}
                                                                 className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
                                                                 title={t('openConsole')}
                                                             >
@@ -2727,7 +2739,7 @@
                                                         )}
                                                         {consoles && resource.status === 'running' && resource.type === 'qemu' && onOpenSpice && (
                                                             <button
-                                                                onClick={() => onOpenSpice(resource)}
+                                                                onClick={() => onOpenSpice(resource)} style={{display: isHypervSource ? 'none' : undefined}}
                                                                 className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
                                                                 title={t('spiceConsole') || 'SPICE'}
                                                             >
@@ -2762,7 +2774,7 @@
                                                                     {actionLoading[`${resource.vmid}-stop`] ? <Icons.RotateCw /> : <Icons.XCircle />}
                                                                 </button>
                                                                 <button
-                                                                    onClick={() => handleAction(resource, 'reboot')}
+                                                                    onClick={() => handleAction(resource, 'reboot')} style={{display: isHypervSource ? 'none' : undefined}}
                                                                     disabled={actionLoading[`${resource.vmid}-reboot`]}
                                                                     className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-orange-500/20 text-gray-400 hover:text-orange-400 transition-all disabled:opacity-50"
                                                                     title={t('reboot')}
@@ -2782,14 +2794,14 @@
                                                             </>
                                                         )}
                                                         <button
-                                                            onClick={() => setShowCloneModal(resource)}
+                                                            onClick={() => setShowCloneModal(resource)} style={{display: isHypervSource ? 'none' : undefined}}
                                                             className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-blue-500/20 text-gray-400 hover:text-blue-400 transition-all"
                                                             title={t('clone')}
                                                         >
                                                             <Icons.Copy />
                                                         </button>
                                                         <button
-                                                            onClick={() => setShowDeleteConfirm(resource)}
+                                                            onClick={() => setShowDeleteConfirm(resource)} style={{display: isHypervSource ? 'none' : undefined}}
                                                             className="p-1.5 rounded-lg bg-proxmox-dark hover:bg-red-500/20 text-gray-400 hover:text-red-400 transition-all"
                                                             title={t('delete')}
                                                         >

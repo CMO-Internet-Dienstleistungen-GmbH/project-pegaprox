@@ -60,6 +60,7 @@ SRC_FILES=(
     vm_config.js
     vnc_secure_socket.js
     node_modals.js
+    hyperv.js
     create_modals.js
     settings_modal.js
     worldmap.js

@@ -56,6 +56,9 @@ OPTIONAL = {
                   'back to sqlite3 and the Fernet field encryption still applies.',
     'apprise': 'Extra senders of the bundled notifications plugin, which loads without it. '
                'Not packaged in trixie.',
+    'pypsrp': 'Hyper-V as a migration source (fork #15). core/hyperv_client.py raises a '
+              'classified "pypsrp is not installed" when the import fails, and nothing '
+              'else in PegaProx imports it.',
 }
 
 
