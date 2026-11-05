@@ -16,13 +16,18 @@ cd project-pegaprox
 git checkout cmo/automation
 
 # Is there a new upstream release we have no tag for?
-./scripts/run.sh check          # exit 0 = nothing to do, 10 = sync needed
+./scripts/run.sh check          # exit 0 = nothing to do, 10 = sync needed,
+                                # 11 = a published build waits for its tag
 
 # Rebuild locally and have the fork's CI test it — branch and tag stay local
 ./scripts/run.sh sync
 
 # Same, but push the branch and the new tag once CI is green
 ./scripts/run.sh publish
+
+# Set the tag a publish could not push (the cloud routine may not push tags)
+./scripts/run.sh tag --dry-run  # show it
+./scripts/run.sh tag            # set and push it
 
 # Ask the fork what is actually published right now
 ./scripts/run.sh verify
@@ -78,6 +83,23 @@ upstream release with a changed patch set (a fix added, reworked, or dropped).
 **A tag is only ever created after a green CI run**, and the tag message
 links that run. `--skip-tests` refuses
 to run together with `--push`.
+
+### When the tag cannot be pushed
+
+The cloud routine runs in a sandbox that may push branches but not tags, and
+the tag is what gets deployed and rolled back to, so setting it stays with a
+maintainer. A publish there pushes `cmo/main` once CI is green, then fails to
+push the tag. It removes the local tag again (so no revision number is
+handed out that nobody can see) and ends with exit 11 and
+`RESULT: awaiting-tag`.
+
+Until the tag is set, `check`, `sync` and `publish` all stop with exit 11
+instead of rebuilding: a rebuild would only run the same tree through CI a
+second time. In a local clone, `./scripts/run.sh tag` then tags exactly the
+commit `origin/cmo/main` points at. It refuses when that commit does not sit on
+the latest release, has merge commits above it, or has no green CI run, and it
+builds the tag message from the commit subjects and `patches.yml`, in the
+same wording a publish uses.
 
 ## Where an internal request goes
 

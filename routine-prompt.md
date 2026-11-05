@@ -25,16 +25,25 @@ git checkout cmo/automation
 ./scripts/run.sh check
 ```
 
-`check` exits 0 when there is nothing to do and 10 when a sync is needed.
+`check` exits 0 when there is nothing to do, 10 when a sync is needed, and
+11 when a build is already published but still waits for its tag.
 
 - **Exit 0** — stop here. Report one line: no new upstream release. Change
   nothing, push nothing.
+- **Exit 11** — stop here. `cmo/main` was published and tested by an earlier
+  run, but its tag is missing, because this sandbox may not push tags. Do not
+  rebuild and do not try to push the tag another way. Notify the maintainer:
+  the tag is set from a local clone with `./scripts/run.sh tag`.
 - **Exit 10** — bring every patch branch forward first (see *Making the
   branches apply again*), then run `./scripts/run.sh publish`. It rebuilds the
   integration branch on the new release, replays our patches in `patches.yml`
   order, regenerates the frontend bundle, has the fork's CI run the test
   suite on the result (needs `gh`, logged in), and only then force-pushes
-  `cmo/main` and pushes the new `v<release>-cmo.<n>` tag.
+  `cmo/main` and pushes the new `v<release>-cmo.<n>` tag. In this sandbox the
+  tag push is refused: `publish` then ends with exit 11 and
+  `RESULT: awaiting-tag`. That is the expected end of a good run, not a
+  failure — report it as *awaiting tag* with the commit and the CI link, and
+  tell the maintainer to run `./scripts/run.sh tag` in a local clone.
 
 The order in `patches.yml` is the whole definition of the rebuild: `cmo/main`
 is the upstream release with those branches applied on top, in that sequence,
@@ -228,7 +237,7 @@ Keep it short — a maintainer skims it on a phone.
 ## Upstream sync — <date>
 
 **Upstream release:** <tag> (<date>)
-**Result:** published <new tag> | up to date | stopped: <reason>
+**Result:** published <new tag> | awaiting tag on <commit> | up to date | stopped: <reason>
 
 <one or two sentences on what happened>
 

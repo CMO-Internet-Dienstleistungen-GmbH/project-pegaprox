@@ -86,3 +86,8 @@ release plus the ordered patch set in `patches.yml`.
   branches. Do not publish without authorization.
 - After publication, run `./scripts/run.sh verify` and require the remote
   `cmo/main` SHA to equal the newest immutable tag.
+- In a cloud sandbox the tag push is refused (HTTP 403 from the proxy). Do not
+  retry it and do not create the tag through the API instead. `publish` ends
+  with exit 11 `RESULT: awaiting-tag`; hand the maintainer
+  `./scripts/run.sh tag`, which they run in their own clone. Never hand out a
+  command that depends on a file inside the sandbox.

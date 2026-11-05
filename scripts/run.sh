@@ -20,12 +20,17 @@ Usage: run.sh <command>
 
 Commands:
   check     Is there a new upstream release we have no tag for?
-            Exit 0 = nothing to do, 10 = sync needed.
+            Exit 0 = nothing to do, 10 = sync needed, 11 = a published
+            build is waiting for its tag (run `tag`).
   sync      Rebuild the integration branch locally and have the fork's CI
             run the tests on it. Pushes only the CI branches; the
             integration branch and the tag stay local.
   publish   Same as sync, but force-pushes the integration branch and pushes
-            the new tag once CI is green.
+            the new tag once CI is green. Exit 11 when the branch went out
+            but the tag could not be pushed (see `tag`).
+  tag       Set and push the tag for the integration branch a publish left
+            untagged. Run it in a local clone; refuses anything without a
+            green CI run. `tag --dry-run` only shows what it would set.
   verify    Ask the fork what is actually published: the newest -cmo tag, the
             commit it points at, whether the integration branch matches it,
             and which upstream release it sits on.
@@ -80,6 +85,7 @@ case "${1:-}" in
     check)   exec "$SCRIPT_DIR/sync-upstream-release.sh" --check ;;
     sync)    exec "$SCRIPT_DIR/sync-upstream-release.sh" ;;
     publish) exec "$SCRIPT_DIR/sync-upstream-release.sh" --push ;;
+    tag)     shift; exec "$SCRIPT_DIR/tag-release.sh" "$@" ;;
     verify)  cmd_verify ;;
     -h|--help|"") usage ;;
     *)       usage >&2; die "unknown command: $1" ;;

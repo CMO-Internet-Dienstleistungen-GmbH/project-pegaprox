@@ -57,6 +57,8 @@ Environment:
 Exit codes:
   0   done (or already up to date)
   10  --check: a sync is needed
+  11  the integration branch was published but its tag is missing: a
+      maintainer runs `run.sh tag`. Nothing is rebuilt until then.
   1   error — conflict that is not a generated file, red CI, missing tools
 EOF
 }
@@ -122,6 +124,17 @@ if [ -n "$PREV_TAG" ]; then
 else
     PREV_N=0
     ok "no tag for this release yet"
+fi
+
+# A publish that could push the branch but not the tag leaves a tested build
+# with no tag on it. Rebuilding now would only run the same tree through CI
+# again, and a new tag number would be handed out over one nobody has set yet.
+if awaiting_tag "$FORK_REMOTE" "$INTEGRATION_BRANCH" "$TAG_SUFFIX" "$RELEASE_SHA"; then
+    pending="$(git -C "$REPO_ROOT" rev-parse --short "refs/remotes/$FORK_REMOTE/$INTEGRATION_BRANCH")"
+    warn "$FORK_REMOTE/$INTEGRATION_BRANCH ($pending) is published on $RELEASE_TAG but has no tag yet"
+    log "     Set it from a local clone: ./scripts/run.sh tag"
+    log "RESULT: awaiting-tag release=$RELEASE_TAG commit=$pending"
+    exit 11
 fi
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
@@ -519,7 +532,17 @@ ok "local branch $INTEGRATION_BRANCH and tag $NEW_TAG created"
 if [ "$DO_PUSH" -eq 1 ]; then
     info "publishing"
     git -C "$REPO_ROOT" push --force-with-lease "$FORK_REMOTE" "$INTEGRATION_BRANCH"
-    git -C "$REPO_ROOT" push "$FORK_REMOTE" "$NEW_TAG"
+    if ! git -C "$REPO_ROOT" push "$FORK_REMOTE" "refs/tags/$NEW_TAG"; then
+        # The branch is out and tested; only the tag is missing. That is the
+        # normal end of a run in a sandbox that may not push tags, not an error:
+        # the tag is set by a maintainer from what the remote has. The local
+        # tag goes, so this clone does not count a revision nobody can see.
+        git -C "$REPO_ROOT" tag -d "$NEW_TAG" >/dev/null
+        warn "$INTEGRATION_BRANCH is pushed and tested, but the tag could not be pushed from here"
+        log "     Set it from a local clone: ./scripts/run.sh tag"
+        log "RESULT: awaiting-tag release=$RELEASE_TAG commit=$(git -C "$REPO_ROOT" rev-parse --short "$BUILT_SHA") ci=$CI_RUN_URL"
+        exit 11
+    fi
     ok "pushed $INTEGRATION_BRANCH and $NEW_TAG"
     log "RESULT: published release=$RELEASE_TAG tag=$NEW_TAG commit=$(git -C "$REPO_ROOT" rev-parse --short "$BUILT_SHA") applied=$N_APPLIED dropped=$N_SKIPPED"
 else

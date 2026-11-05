@@ -164,3 +164,19 @@ ci_parallel_base() {
         git -C "$REPO_ROOT" commit-tree "$tree" -p "$base" \
             -m "ci: run the suite on every core of the runner (fork CI only, never tagged)"
 }
+
+# Whether the published integration branch is a build still waiting for its tag:
+# awaiting_tag <remote> <branch> <tag suffix> <release sha>
+#
+# True when <remote>/<branch> sits on the release, is not the release itself and
+# carries no -<suffix>.<n> tag. That is what a publish leaves behind when the
+# sandbox it ran in may push branches but not tags. A run that rebuilt now would
+# test the same tree in CI a second time; a maintainer runs `run.sh tag`
+# instead, which tags exactly what was tested.
+awaiting_tag() {
+    local remote="$1" branch="$2" suffix="$3" release="$4" sha
+    sha="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "refs/remotes/$remote/$branch")" || return 1
+    [ "$sha" != "$release" ] || return 1
+    git -C "$REPO_ROOT" merge-base --is-ancestor "$release" "$sha" || return 1
+    [ -z "$(git -C "$REPO_ROOT" tag --points-at "$sha" --list "*-${suffix}.*")" ]
+}
