@@ -11,6 +11,11 @@ lives on this branch; see `README.md` for how a sync builds `v<release>-cmo.<n>`
 Repository instruction files are shared. Refer to people and requesters by
 their role, such as "the user" or "a maintainer", and never use a personal name.
 
+The shared agent rules live in `.claude/rules/shared-*.md` and are loaded for
+everyone; `.claude/knowledge/` holds the reviewed technology knowledge they
+index. Every other file under `.claude/` — settings, hooks, task notes and the
+`knowledge-*.md` mirrors a local hook regenerates — stays local and untracked.
+
 ### Local verification environment
 
 Local verification may create a disposable `.venv`, use local Docker, and run

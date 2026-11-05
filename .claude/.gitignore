@@ -1,4 +1,14 @@
+# Everything under .claude/ is local by default: settings, hooks, task notes,
+# keys and the knowledge-*.md rule mirrors that a local hook regenerates.
 *
 !.gitignore
 !skills/
 !skills/**
+
+# Shared with every contributor. The repository is public: nothing here may
+# name hosts, addresses, accounts or customers.
+!rules/
+rules/*
+!rules/shared-*.md
+!knowledge/
+!knowledge/*.md
