@@ -758,8 +758,11 @@ class HyperVClusterManager:
         """Proxmox HA groups exist in a Proxmox cluster's config, which this is not."""
         return []
 
-    def get_proxmox_ha_resources(self) -> list:
-        """No guest here is under Proxmox HA management. Answered as an empty list."""
+    def get_proxmox_ha_resources(self, strict: bool = False) -> list:
+        """No guest here is under Proxmox HA management. Answered as an empty list.
+
+        `strict` mirrors the Proxmox manager, where it turns a failed read into None.
+        Nothing is read here, so there is no failure to tell apart and both answer []."""
         return []
 
     def get_content_sync_status(self, content_type: str = 'iso') -> dict:
