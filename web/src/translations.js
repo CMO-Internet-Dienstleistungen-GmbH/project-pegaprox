@@ -106764,6 +106764,8 @@
                 createSnapshot: 'Создать снапшот',
                 unknown: 'Неизвестно',
                 rollback: 'Откат',
+                snapshotAuthor: 'Создал',
+                snapshotAuthorAutomatic: 'Автоматически',
                 createReplication: 'Создать репликацию',
                 replicationNeedsTwoNodes: 'Для репликации нужно хотя бы 2 ноды в кластере',
                 replicationHint: 'Создайте задание репликации, чтобы данные VM синхронизировались между нодами',

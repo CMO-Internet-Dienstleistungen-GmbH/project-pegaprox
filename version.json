@@ -351,6 +351,7 @@
     "web/src/node_modals.js",
     "web/src/security.js",
     "web/src/settings_modal.js",
+    "web/src/snapshot_meta.js",
     "web/src/storage.js",
     "web/src/tables.js",
     "web/src/translations.js",
