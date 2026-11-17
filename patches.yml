@@ -183,6 +183,10 @@ patches:
 generated_files:
   - path: web/index.html
     rebuild: web/Dev/build.sh
+  # Since 1.5.0 the same build writes every language but English to its own file,
+  # so a patch that adds a translation conflicts here too. `path` may be a glob.
+  - path: web/i18n/*.json
+    rebuild: web/Dev/build.sh
 
 # Gate for publishing: the built tree must pass before a tag is pushed.
 #

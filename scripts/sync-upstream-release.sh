@@ -193,7 +193,8 @@ apply_commit() {   # apply_commit <sha> <patch-name>
         [ -n "$path" ] || continue
         local known=0
         while IFS=$'\x1f' read -r gpath _; do
-            [ "$path" = "$gpath" ] && known=1
+            # shellcheck disable=SC2053  # gpath is a glob on purpose (web/i18n/*.json)
+            [[ "$path" == $gpath ]] && known=1
         done < <(cfg_generated)
         [ "$known" -eq 1 ] || { warn "  conflict in $path (not a generated file)"; unresolved=1; }
     done <<< "$conflicts"
@@ -203,13 +204,19 @@ apply_commit() {   # apply_commit <sha> <patch-name>
         die "$name: conflict needs a human — $(echo "$conflicts" | tr '\n' ' ')"
     fi
 
-    while IFS=$'\x1f' read -r path rebuild; do
-        [ -n "$path" ] || continue
-        echo "$conflicts" | grep -qx "$path" || continue
-        git -C "$WORKTREE" checkout --theirs -- "$path" 2>/dev/null || true
+    local gpath hits hit
+    while IFS=$'\x1f' read -r gpath rebuild; do
+        [ -n "$gpath" ] || continue
+        hits=()
+        while IFS= read -r hit; do
+            # shellcheck disable=SC2053  # gpath is a glob on purpose (web/i18n/*.json)
+            [ -n "$hit" ] && [[ "$hit" == $gpath ]] && hits+=("$hit")
+        done <<< "$conflicts"
+        [ "${#hits[@]}" -gt 0 ] || continue
+        git -C "$WORKTREE" checkout --theirs -- "${hits[@]}" 2>/dev/null || true
         ( cd "$WORKTREE" && bash "$rebuild" >/dev/null 2>&1 ) \
-            || die "$name: regenerating $path via $rebuild failed"
-        git -C "$WORKTREE" add -- "$path"
+            || die "$name: regenerating $gpath via $rebuild failed"
+        git -C "$WORKTREE" add -- "${hits[@]}"
     done < <(cfg_generated)
 
     GIT_EDITOR=true git -C "$WORKTREE" cherry-pick --continue >/dev/null 2>&1 \
