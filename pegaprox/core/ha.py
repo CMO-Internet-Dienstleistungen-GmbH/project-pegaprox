@@ -362,6 +362,8 @@ SYNC_TABLES = (
     # VM blueprints: a library image or a PVE template plus hardware and Cloud-Init, and
     # the template each cluster deploys one from (#1220)
     'vm_blueprints', 'blueprint_templates',
+    # who asked for each snapshot: it is the active instance's record, and a standby that takes over keeps it
+    'snapshot_authors',
 )
 LOCAL_TABLES = (
     'sessions', 'audit_log', 'task_users', 'migration_history', 'metrics_history',
