@@ -29,6 +29,7 @@ from pegaprox.utils.rbac import (
 from pegaprox.utils.realtime import broadcast_sse, broadcast_update, push_immediate_update
 from pegaprox.core.config import load_config, save_config
 from pegaprox.core.health import (
+    compute_cluster_health,
     get_cluster_health as compute_health_cached,
     invalidate_cluster_health,
 )
@@ -1843,9 +1844,24 @@ def get_cluster_health(cluster_id):
 
     mgr = cluster_managers[cluster_id]
 
+    # MK Nov 2026 (#1218) - a caller confined to some guests is told about the nodes those
+    # run on: which are offline, the fullest storage, their replication jobs and backups.
+    # Nothing of it while their guests cannot be read, and no Ceph.
+    # Fork patch #11: that rollup is the caller's own, so it is computed for this request
+    # and never taken from or put into the shared cache below.
+    if mgr.is_connected:
+        try:
+            mine = caller_guest_nodes(cluster_id)
+        except Exception as e:
+            logging.warning(f"[health] guests on {cluster_id} unread, node factors left out for this caller: {e}")
+            mine = set()
+        if mine is not None:
+            return jsonify(compute_cluster_health(mgr, cluster_id, mine))
+
     # The rollup itself lives in pegaprox/core/health.py so the SSE broadcaster can
-    # compute it too. It is a cluster-wide number, identical for every viewer, so
-    # it is memoised there instead of being recomputed once per request per tab.
+    # compute it too. For a caller who sees the whole cluster it is one number, the
+    # same for each of them, so it is memoised there instead of being recomputed
+    # once per request per tab.
     payload, etag, _from_cache = compute_health_cached(cluster_id, mgr)
 
     # A repeat with nothing changed costs a 304 instead of a fan-out over every

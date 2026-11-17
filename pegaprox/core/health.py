@@ -10,8 +10,10 @@ plus one uncached GET /nodes/<node>/storage per online node.
 Two things live here so that stops being per-viewer:
 
   compute_cluster_health()  the rollup itself, lifted out of the Flask handler so
-                            the SSE broadcaster can call it too. No request
-                            context, no auth — the caller owns both.
+                            the SSE broadcaster can call it too. No auth — the
+                            caller owns it. Since upstream 1.5.0 (#1218) the
+                            number is per caller for a confined account; only the
+                            unconfined rollup is shared, cached and broadcast.
   get_cluster_health()      the same, memoised per cluster for _HEALTH_TTL_S.
 
 Why the rollup is cached rather than get_storage_list(): that method has seven
@@ -24,7 +26,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -44,13 +45,9 @@ from datetime import datetime, timezone
 # recomputation on first request is the right answer anyway.
 _HEALTH_TTL_S = float(os.environ.get('PEGAPROX_HEALTH_TTL', '90'))
 
-# cluster_id -> {'payload': dict, 'etag': str, 'at': float}
+# cluster_id -> {'payload': dict, 'etag': str, 'at': float, 'ceph': _ceph_mark()}
 _cache = {}
 _cache_lock = threading.Lock()
-
-# PVE controls node names, but a crafted one would be interpolated into a storage
-# URL. Same guard the inline version carried.
-_SAFE_NODE = re.compile(r'^[a-zA-Z][a-zA-Z0-9.\-]{0,62}$')
 
 
 def _band(score):
@@ -65,13 +62,29 @@ def _band(score):
     return 'critical'
 
 
-def compute_cluster_health(mgr, cluster_id):
+def compute_cluster_health(mgr, cluster_id, mine=None):
     """Compute the health rollup for one cluster. Returns the response payload.
 
-    Lifted verbatim from the /health handler; the scoring, the factor keys and
-    the response shape are unchanged, because the UI and the API contract both
-    depend on them.
+    `mine` is upstream's caller scope (#1218, api.helpers.caller_guest_nodes): None for a
+    caller who sees the whole cluster, else the set of nodes their own guests run on. Only
+    the None rollup is the cluster-wide number this module caches and broadcasts; a scoped
+    one is computed per request by the route and never stored here. Scoping rows needs the
+    request context, which is why only the route asks for a scoped rollup.
+
+    The factor block below is upstream's /health handler as of v1.5.0, verbatim apart from
+    its indentation, so the next release can be diffed against it line by line. The names
+    it uses are bound to the API module's own objects first: that module imports this one,
+    so they are imported at call time.
     """
+    from pegaprox.api import clusters as _clusters
+    from pegaprox.api.helpers import scope_vm_rows
+    from pegaprox.core.db import get_db
+    _health_storage_cache = _clusters._health_storage_cache
+    _health_storage_rows = _clusters._health_storage_rows
+    _HEALTH_STORAGE_TTL = _clusters._HEALTH_STORAGE_TTL
+    _health_ceph_status = _clusters._health_ceph_status
+    _health_ceph_factor = _clusters._health_ceph_factor
+
     score = 100
     factors = []
     issues = []
@@ -87,14 +100,16 @@ def compute_cluster_health(mgr, cluster_id):
             'computed_at': None,
         }
 
+
     # 1) Nodes online
     try:
         ns = mgr.get_node_status() or {}
     except Exception:
         ns = {}
+    if mine is not None:
+        ns = {name: d for name, d in ns.items() if name in mine}
     total_nodes = len(ns)
-    online_nodes = sum(1 for n in ns.values()
-                       if (n.get('status') in ('online', 'running') or not n.get('offline')))
+    online_nodes = sum(1 for n in ns.values() if (n.get('status') in ('online', 'running') or not n.get('offline')))
     if total_nodes:
         offline = total_nodes - online_nodes
         delta = -25 * offline
@@ -109,23 +124,17 @@ def compute_cluster_health(mgr, cluster_id):
                              if d.get('status') == 'offline' or d.get('offline')]
             issues.append(f'{offline} node(s) offline: {", ".join(offline_names) or "?"}')
 
-    # 2) Storage pressure — worst offender across all nodes.
-    # The lookup (one /cluster/resources call on Proxmox, a per-node listing on
-    # XCP-ng, shared per cluster for a short while, #946) belongs to the API
-    # module, which the storage overview reads too. Imported at call time: that
-    # module imports this one.
+    # 2) Storage pressure — worst-offender across all nodes
     worst_pct = 0.0
     worst_label = None
     try:
-        from pegaprox.api import clusters as _clusters
-        rows, hit = _clusters._health_storage_cache.get(cluster_id, 'storage')
+        rows, hit = _health_storage_cache.get(cluster_id, 'storage')
         if not hit:
-            rows = _clusters._health_storage_rows(cluster_id, mgr, ns)
+            rows = _health_storage_rows(cluster_id, mgr, ns)
             if rows is not None:
-                _clusters._health_storage_cache.set(cluster_id, 'storage', rows,
-                                                    ttl_seconds=_clusters._HEALTH_STORAGE_TTL)
+                _health_storage_cache.set(cluster_id, 'storage', rows, ttl_seconds=_HEALTH_STORAGE_TTL)
         for node_name, stor_name, used, total in (rows or []):
-            if total <= 0:
+            if total <= 0 or (mine is not None and node_name not in mine):
                 continue
             pct = (used / total) * 100.0
             if pct > worst_pct:
@@ -156,7 +165,11 @@ def compute_cluster_health(mgr, cluster_id):
         repl = mgr.get_replication_status() or []
     except Exception:
         repl = []
+    if mine is not None:
+        # a job's 'type' is the replication type (local), not the guest's: asked as either
+        repl = scope_vm_rows(cluster_id, repl, vmid_key='guest', type_key='guest_type') if mine else []
     if repl:
+        # PVE flags failures via 'fail_count' or non-zero error
         failed = sum(1 for r in repl if (r.get('fail_count') or 0) > 0 or r.get('error'))
         d = max(-20, -5 * failed)
         score += d
@@ -169,9 +182,8 @@ def compute_cluster_health(mgr, cluster_id):
         if failed:
             issues.append(f'{failed} replication job(s) failing')
 
-    # 4) Backup-SLA — only if an admin set a max-age threshold on the cluster
+    # 4) Backup-SLA — only if admin set a max-age threshold on the cluster
     try:
-        from pegaprox.core.db import get_db
         db = get_db()
         row = db.conn.cursor().execute(
             "SELECT backup_sla_max_age_hours FROM clusters WHERE id = ?", (cluster_id,)
@@ -180,12 +192,18 @@ def compute_cluster_health(mgr, cluster_id):
     except Exception:
         max_age = 0
     if max_age and max_age > 0:
+        # Pull the most-recent backup timestamp via cluster/backup-info — cheap call
         try:
+            import time as _t
+            now = _t.time()
             url = f"https://{mgr.host}:{mgr.api_port}/api2/json/cluster/backup-info/not-backed-up"
             r = mgr._api_get(url)
             stale = 0
             if r is not None and r.status_code == 200:
-                stale = len(r.json().get('data') or [])
+                _rows = r.json().get('data') or []
+                if mine is not None:
+                    _rows = scope_vm_rows(cluster_id, _rows) if mine else []
+                stale = len(_rows)
             d = -10 if stale else 0
             score += d
             factors.append({
@@ -198,6 +216,20 @@ def compute_cluster_health(mgr, cluster_id):
                 issues.append(f'{stale} VMs past backup RPO of {max_age}h')
         except Exception as e:
             logging.debug(f"[health] backup-sla check failed: {e}")
+
+    # 5) Ceph - last, its cap holds whatever the factors above left. Not for a caller confined
+    # to a pool or to guests: Ceph is the cluster's storage, and the Ceph overview answers
+    # 'confined' to them as well
+    try:
+        ceph, has_ceph = (None, False) if mine is not None else _health_ceph_status(cluster_id, mgr)
+        if has_ceph:
+            f, issue = _health_ceph_factor(ceph, score)
+            score += f['delta']
+            factors.append(f)
+            if issue:
+                issues.append(issue)
+    except Exception as e:
+        logging.debug(f"[health] ceph check failed: {e}")
 
     score = max(0, min(100, score))
     return {
@@ -236,6 +268,35 @@ def _storage_part_is_live(cluster_id, payload):
         return True
 
 
+def _ceph_mark(cluster_id):
+    """Which Ceph state a rollup was scored on: the time of the last Ceph read and since
+    when Ceph has been silent (#948, background/alert_events). Upstream reads Ceph in the
+    background and scores the status it has, so a rollup computed before a read landed
+    carries no Ceph factor; serving it again after the read would hide Ceph for as long
+    as the cache lives."""
+    try:
+        from pegaprox.background import alert_events
+        last = alert_events.ceph_reading(cluster_id)
+        return (last[0] if last else None, alert_events.ceph_silent_since(cluster_id))
+    except Exception:
+        return None
+
+
+def _ceph_read_outstanding(cluster_id, mark):
+    """Whether a rollup was scored before Ceph had ever answered on a cluster that has Ceph
+    storage. Upstream asks again on the next poll when such a read failed; a rollup kept
+    for that cluster would stop it asking until the cache expires, so none is kept."""
+    if mark is None or mark[0] is not None:
+        return False
+    try:
+        from pegaprox.api import clusters as _clusters
+        rows, hit = _clusters._health_storage_cache.get(cluster_id, 'resources')
+        return bool(hit) and any(r.get('plugintype') in _clusters._HEALTH_CEPH_STORAGE
+                                 for r in (rows or []))
+    except Exception:
+        return False
+
+
 def get_cluster_health(cluster_id, mgr, max_age=None, force=False):
     """Cached rollup. Returns (payload, etag, from_cache).
 
@@ -250,13 +311,16 @@ def get_cluster_health(cluster_id, mgr, max_age=None, force=False):
     if not force and ttl > 0:
         with _cache_lock:
             entry = _cache.get(cluster_id)
-        if entry and (now - entry['at']) <= ttl and _storage_part_is_live(cluster_id, entry['payload']):
+        if entry and (now - entry['at']) <= ttl and _storage_part_is_live(cluster_id, entry['payload']) \
+                and entry.get('ceph') == _ceph_mark(cluster_id) \
+                and not _ceph_read_outstanding(cluster_id, entry.get('ceph')):
             return entry['payload'], entry['etag'], True
 
     payload = compute_cluster_health(mgr, cluster_id)
     etag = health_etag(payload)
     with _cache_lock:
-        _cache[cluster_id] = {'payload': payload, 'etag': etag, 'at': time.time()}
+        _cache[cluster_id] = {'payload': payload, 'etag': etag, 'at': time.time(),
+                              'ceph': _ceph_mark(cluster_id)}
     return payload, etag, False
 
 

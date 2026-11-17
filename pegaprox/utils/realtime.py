@@ -923,6 +923,7 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
         _metrics_frame_cache = {}  # uname -> the 'metrics' frame cut to their node scope
         _metrics_by_scope = {}    # node set -> that frame, made once per distinct set
         _node_event_cache = {}    # uname -> bool: gets THIS node_status / ha_status frame
+        _health_cut = {}          # uname -> bool: gets THIS cluster's shared health rollup (fork #11)
         # only while a node of the cluster is in maintenance, so a quiet cluster costs nothing
         _metrics_maint = False
         if update_type == 'metrics' and cluster_id is not None:
@@ -1018,6 +1019,18 @@ def broadcast_sse(update_type: str, data: dict, cluster_id: str = None, target_c
                             else:
                                 client_message = None
                             _metrics_frame_cache[uname, _eff] = client_message
+                    elif update_type == 'health' and cluster_id is not None and not client_info.get('is_admin', False):
+                        # Fork patch #11 - the broadcast rollup is the cluster-wide number. Since
+                        # #1218 a confined account is answered a rollup of its own nodes over
+                        # REST, so it gets no frame and its badge keeps polling. Only a stream
+                        # that sees the whole cluster (node scope None) receives this one.
+                        uname, _eff = client_info.get('user'), client_info.get('effective_role')
+                        _ok_h = _health_cut.get((uname, _eff), _SSE_FILTER_MISSING)
+                        if _ok_h is _SSE_FILTER_MISSING:
+                            _ok_h = _sse_node_scope_for(cluster_id, uname, _eff) is None
+                            _health_cut[uname, _eff] = _ok_h
+                        if not _ok_h:
+                            continue
                     elif update_type in _NODE_EVENT_PERMS and not client_info.get('is_admin', False):
                         # MK Nov 2026 (#1218) - node online/offline and the HA events went to every
                         # client of the cluster, without node.view / ha.view and with every node
