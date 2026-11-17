@@ -46,6 +46,15 @@ after(() => {
     try { win.close(); } catch (_) { /* nothing to close */ }
 });
 
+// ClusterHealthBadge reads the account from useAuth() since upstream 1.5.0, so it
+// needs an AuthContext around it. A fixed value rather than AuthProvider: the
+// provider re-renders on its own, and these tests count the renders they cause.
+const AUTH_VALUE = { user: { username: 'tester' } };
+const badge = (props) => {
+    const { AuthContext, ClusterHealthBadge } = win.__test;
+    return h(AuthContext.Provider, { value: AUTH_VALUE }, h(ClusterHealthBadge, props));
+};
+
 const healthResponse = () => ({
     ok: true,
     json: async () => ({ score: 100, band: 'excellent', factors: [], issues: [] }),
@@ -75,13 +84,12 @@ test('getAuthHeaders keeps its identity across provider re-renders', async () =>
 
 test('ClusterHealthBadge fetches once across many re-renders when authFetch is stable',
     async () => {
-        const { ClusterHealthBadge } = win.__test;
         const calls = [];
         const authFetch = async (url) => { calls.push(url); return healthResponse(); };
 
         const root = mount();
         for (let i = 0; i < 10; i++) {
-            root.render(h(ClusterHealthBadge, { clusterId: 'c1', authFetch, apiUrl: '/api' }));
+            root.render(badge({ clusterId: 'c1', authFetch, apiUrl: '/api' }));
             await settle();
         }
 
@@ -92,14 +100,13 @@ test('ClusterHealthBadge fetches once across many re-renders when authFetch is s
 
 test('sensitivity check: an unstable authFetch identity is what caused the storm',
     async () => {
-        const { ClusterHealthBadge } = win.__test;
         const calls = [];
 
         const root = mount();
         for (let i = 0; i < 10; i++) {
             // a NEW function per render — exactly what dashboard.js used to hand down
             const authFetch = async (url) => { calls.push(url); return healthResponse(); };
-            root.render(h(ClusterHealthBadge, { clusterId: 'c1', authFetch, apiUrl: '/api' }));
+            root.render(badge({ clusterId: 'c1', authFetch, apiUrl: '/api' }));
             await settle();
         }
 
@@ -145,4 +152,18 @@ test('IP cache: entries expire, so a changed address is picked up', () => {
     assert.strictEqual(c.entry(cid, vmid), undefined, 'stale entry must be refetched');
     assert.strictEqual(c.value(cid, vmid), 'addr-beta',
         'while refetching, the row keeps showing the last known address');
+});
+
+test('IP cache: a failed call waits longer than a guest without an address', () => {
+    const c = win.PegaProxIpCache;
+    const [cid, vmid] = ['cache-test-d', 100];
+    const threeMinutesAgo = Date.now() - 3 * 60 * 1000;
+
+    c.map.set(c.key(cid, vmid), { ip: null, at: threeMinutesAgo });
+    assert.strictEqual(c.entry(cid, vmid), undefined,
+        'a guest that reported no address is asked again after two minutes');
+
+    c.map.set(c.key(cid, vmid), { ip: null, at: threeMinutesAgo, retryMs: 5 * 60 * 1000 });
+    assert.notStrictEqual(c.entry(cid, vmid), undefined,
+        'a refused or failed call is not retried within five minutes');
 });
