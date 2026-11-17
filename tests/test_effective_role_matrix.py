@@ -102,7 +102,9 @@ def _builtin_size(role):
     return len(PERMISSIONS) if role == 'admin' else len(ROLE_PERMISSIONS[ROLE_VIEWER])
 
 
-@pytest.mark.parametrize('role,count', [('admin', None), ('viewer', 31)])
+# Hyper-V patch (fork issue #15) — two hyperv.* permissions are added to the viewer role.
+# Written as upstream + patch, so a rebase can see at a glance which half belongs to this fork.
+@pytest.mark.parametrize('role,count', [('admin', None), ('viewer', 31 + 2)])
 def test_the_builtin_roles_are_unchanged(roles, role, count):
     """The remap must not touch a builtin — that is the regression this could cause."""
     expected = _builtin_size(role) if count is None else count
