@@ -49,7 +49,7 @@ function loadApp() {
 
     // The concatenation is not wrapped in build.sh's IIFE here, so the top-level
     // declarations stay reachable — append the handful the tests need.
-    inject(code + '\n;window.__test = { LanguageProvider, AuthProvider, useAuth, ClusterHealthBadge };');
+    inject(code + '\n;window.__test = { LanguageProvider, AuthProvider, AuthContext, useAuth, ClusterHealthBadge };');
 
     if (errors.length) throw new Error('window errors while loading: ' + errors.join(' | '));
     return { dom, window };
