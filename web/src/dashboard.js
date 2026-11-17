@@ -24468,7 +24468,7 @@
                                                         : `w-full flex items-center gap-3 px-3 py-2 rounded-xl transition-all ${
                                                             hvSelected
                                                                 ? 'bg-gradient-to-r from-purple-500/20 to-purple-500/20 border border-indigo-500/30 text-white'
-                                                                : 'bg-proxmox-card border border-proxmox-border hover:border-indigo-500/30 text-gray-300 hover:text-white'
+                                                                : 'bg-proxmox-card border border-proxmox-border hover:border-purple-500/30 text-gray-300 hover:text-white'
                                                           }`
                                                     }
                                                     style={isCorporate ? (hvSelected ? {background: 'rgba(73,175,217,0.10)', borderLeft: '2px solid var(--corp-accent)', color: 'var(--color-text)'} : {color: 'var(--corp-text-secondary)'}) : undefined}
@@ -24478,7 +24478,7 @@
                                                     {isCorporate ? (
                                                         <Icons.Server className="w-4 h-4 flex-shrink-0" style={{color: 'var(--corp-accent)'}} />
                                                     ) : (
-                                                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${hvSelected ? 'bg-indigo-500/20' : 'bg-proxmox-dark'}`}>
+                                                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center ${hvSelected ? 'bg-indigo-500/10' : 'bg-proxmox-dark'}`}>
                                                             <Icons.Server className="w-4 h-4 text-indigo-400" />
                                                         </div>
                                                     )}
@@ -32907,7 +32907,7 @@
                                                                                onChange={e => setXhmForm({...xhmForm, sockets: e.target.value})} className={field} />
                                                                     </div>
                                                                     <div className="col-span-2">
-                                                                        <label className="text-[10px] text-gray-500 block mb-0.5">{t('hvMemory') || 'Memory (MiB)'}</label>
+                                                                        <label className="text-[10px] text-gray-500 block mb-0.5">{t('hvMemoryMib') || 'Memory (MiB)'}</label>
                                                                         <input type="number" min="16" step="16" value={xhmForm.memory_mb}
                                                                                onChange={e => setXhmForm({...xhmForm, memory_mb: e.target.value})} className={field} />
                                                                     </div>
@@ -33341,7 +33341,7 @@
                                                                                         const warned = isDone && ph === 'completed' && d.status === 'completed_with_errors';
                                                                                         const isCur = d.phase === ph && !broke && !isDone;
                                                                                         return (<React.Fragment key={ph}>
-                                                                                            {idx > 0 && <div style={{marginTop: 10}} className={`flex-1 h-px ${isDone ? 'bg-purple-500' : broke ? 'bg-red-500/60' : isCur ? 'bg-purple-500/40' : 'bg-proxmox-border'}`} />}
+                                                                                            {idx > 0 && <div style={{marginTop: 10}} className={`flex-1 h-px ${isDone ? 'bg-purple-500' : broke ? 'bg-red-500/80' : isCur ? 'bg-purple-500/40' : 'bg-proxmox-border'}`} />}
                                                                                             <div className="flex flex-col items-center w-16 shrink-0">
                                                                                                 <div title={broke ? `${phaseLabel[ph] || ph} — failed here` : warned ? `${phaseLabel[ph] || ph} — with errors` : `${phaseLabel[ph] || ph}${pt?.duration ? ` (${pt.duration}s)` : ''}`} className={`w-5 h-5 rounded-full flex items-center justify-center text-[8px] font-bold border ${broke ? 'bg-red-500/20 border-red-500 text-red-400' : warned ? 'bg-yellow-500/20 border-yellow-500/40 text-yellow-400' : isDone ? 'bg-purple-500/20 border-purple-500 text-purple-400' : isCur ? 'bg-purple-500/20 border-purple-400 text-purple-400 animate-pulse' : 'bg-proxmox-dark border-proxmox-border text-gray-600'}`}>
                                                                                                     {broke ? '✕' : warned ? '!' : isDone ? '✓' : idx+1}

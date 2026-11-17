@@ -3277,8 +3277,9 @@ def _inject_virtio_drivers(pve_mgr, task, node_exec=None, clear_hibernation_only
         else:
             task.log("[VirtIO] ⚠ virtio-win.iso not found — skipping. Searched: " + ", ".join(iso_candidates))
             task.log("[VirtIO]   Hint: drop virtio-win.iso into /var/lib/vz/template/iso/ or set virtio_iso_path")
-        return _virtio_not_injected(task, "the chosen driver ISO is not on the node" if chosen_iso
-                                    else "virtio-win.iso was not found on the node")
+        return _virtio_not_injected(task, "virtio-win.iso was not found on the node"
+                                    + (" (the chosen one, and no other is used in its place)"
+                                       if chosen_iso else ""))
     task.log(f"[VirtIO] ISO: {iso_path}" if iso_path
              else "[VirtIO] Clearing a Fast Startup hibernation file; no ISO needed.")
 

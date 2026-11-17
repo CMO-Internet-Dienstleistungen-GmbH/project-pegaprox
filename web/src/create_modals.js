@@ -2565,7 +2565,7 @@
                                 {[
                                     { id: 'proxmox', label: 'Proxmox VE', icon: Icons.Server, active: 'bg-orange-500/20 text-orange-400 border-orange-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
                                     { id: 'xcpng', label: 'XCP-ng (TP)', icon: Icons.Cpu, active: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
-                                    { id: 'hyperv', label: 'Hyper-V', icon: Icons.Server, active: 'bg-indigo-500/20 text-indigo-400 border-indigo-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
+                                    { id: 'hyperv', label: 'Hyper-V', icon: Icons.Server, active: 'bg-indigo-500/10 text-indigo-400 border-indigo-500/30', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
                                     { id: 'pbs', label: 'PBS', icon: Icons.Shield, active: 'bg-blue-500/20 text-blue-400 border-blue-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
                                     { id: 'vmware', label: 'ESXi', icon: Icons.Cloud, active: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40', inactive: 'bg-proxmox-dark text-gray-500 border-transparent hover:text-gray-300 hover:border-proxmox-border' },
                                 ].map(tab => (

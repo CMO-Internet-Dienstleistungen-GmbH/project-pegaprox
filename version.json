@@ -373,6 +373,7 @@
     "web/src/create_modals.js",
     "web/src/dashboard.js",
     "web/src/datacenter.js",
+    "web/src/hyperv.js",
     "web/src/icons.js",
     "web/src/networking.js",
     "web/src/node_modals.js",

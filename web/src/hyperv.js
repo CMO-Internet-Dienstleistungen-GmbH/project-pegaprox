@@ -268,7 +268,7 @@
          */
         // A translator that falls back to the English text written at the call site, so a
         // language without these keys shows a sentence rather than a key name. PegaProx
-        // does the same thing product-wide with `t('x') || 'fallback'`; this only spares
+        // does the same thing product-wide with `t(key) || 'fallback'`; this only spares
         // every call site the repetition.
         function hvTranslator(t) {
             return (key, fallback) => (typeof t === 'function' && t(key)) || fallback;
