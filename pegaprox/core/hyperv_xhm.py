@@ -33,7 +33,7 @@ from pegaprox.core.hyperv import format_mac
 from pegaprox.core.hyperv_errors import HyperVError
 from pegaprox.core.hyperv_transfer import TransferError
 from pegaprox.globals import cluster_managers
-from pegaprox.utils.ssh import read_capped, ssh_password_for
+from pegaprox.utils.ssh import node_login, node_ssh_port, read_capped, ssh_password_for
 
 logger = logging.getLogger(__name__)
 
@@ -1033,11 +1033,11 @@ def _free_leftover_volumes(migration, target, volumes):
     ssh = None
     try:
         ssh = _connect_ssh(node_ip,
-                           getattr(target.config, 'ssh_user', '') or 'root',
+                           node_login(target.config),
                            ssh_password_for(target.config),
                            key_path=getattr(target.config, 'ssh_key', ''),
-                           port=int(getattr(target.config, 'ssh_port', 22) or 22))
-        node = _Node(ssh, getattr(target.config, 'ssh_user', '') or 'root')
+                           port=node_ssh_port(target.config))
+        node = _Node(ssh, node_login(target.config))
         for entry in volumes:
             volume = entry.get('id') or ''
             exit_code, _, err = node.run(f'pvesm free {shlex.quote(volume)}')
@@ -1507,11 +1507,11 @@ def open_target_node_session(target, node_name, ssh_user=None):
     if not node_ip:
         raise TransferError(f'Cannot resolve an address for Proxmox node {node_name}.')
     ssh = _connect_ssh(node_ip,
-                       ssh_user or getattr(target.config, 'ssh_user', '') or 'root',
+                       ssh_user or node_login(target.config),
                        ssh_password_for(target.config),
                        key_path=getattr(target.config, 'ssh_key', ''),
-                       port=int(getattr(target.config, 'ssh_port', 22) or 22))
-    return _Node(ssh, ssh_user or getattr(target.config, 'ssh_user', '') or 'root')
+                       port=node_ssh_port(target.config))
+    return _Node(ssh, ssh_user or node_login(target.config))
 
 
 #: How long the run waits for a node to finish downloading a driver ISO. A 500 MB file
@@ -1617,10 +1617,10 @@ def _open_target_node(task, source, target):
 
     try:
         ssh = _connect_ssh(node_ip,
-                           getattr(target.config, 'ssh_user', '') or 'root',
+                           node_login(target.config),
                            ssh_password_for(target.config),
                            key_path=getattr(target.config, 'ssh_key', ''),
-                           port=int(getattr(target.config, 'ssh_port', 22) or 22))
+                           port=node_ssh_port(target.config))
     except Exception as exc:
         # paramiko's own wording — "Bad authentication type; allowed types: ['publickey']"
         # — names the protocol and not the thing to do about it. This transfer runs on the
@@ -1628,11 +1628,11 @@ def _open_target_node(task, source, target):
         # is what failed and where it is configured.
         raise TransferError(
             f'Cannot log in to Proxmox node {task.target_node} as '
-            f'{getattr(target.config, "ssh_user", "") or "root"}: {exc}. The transfer runs '
+            f'{node_login(target.config)}: {exc}. The transfer runs '
             f'on the node itself — it mounts the Hyper-V share there and converts the disk '
             f'with qemu-img — so the cluster needs working node credentials. Add an SSH key '
             f'for this cluster, or allow password logins for that account.') from exc
-    node = _Node(ssh, getattr(target.config, 'ssh_user', '') or 'root')
+    node = _Node(ssh, node_login(target.config))
 
     credentials_path = hyperv_transfer.mount_point_for(task.id) + '.credentials'
     user, domain = hyperv_transfer.split_account(source.config.user)
@@ -2542,10 +2542,10 @@ def _node_session(task, target, min_timeout=0):
         node_ip = _resolve_pve_node_ip(target, task.target_node)
         if node_ip:
             ssh = _connect_ssh(node_ip,
-                               getattr(target.config, 'ssh_user', '') or 'root',
+                               node_login(target.config),
                                ssh_password_for(target.config),
                                key_path=getattr(target.config, 'ssh_key', ''),
-                               port=int(getattr(target.config, 'ssh_port', 22) or 22))
+                               port=node_ssh_port(target.config))
     except Exception as exc:                                   # noqa: BLE001
         task.log(f'Could not open a node session for the driver injection ({exc}); '
                  f'falling back to the shared node connection.')
@@ -2555,7 +2555,7 @@ def _node_session(task, target, min_timeout=0):
         yield None
         return
 
-    node = _Node(ssh, getattr(target.config, 'ssh_user', '') or 'root')
+    node = _Node(ssh, node_login(target.config))
 
     def run_on_node(_manager, _node, command, timeout=600, **_ignored):
         return node.run(_survives_the_caller(command), timeout=max(timeout, min_timeout))

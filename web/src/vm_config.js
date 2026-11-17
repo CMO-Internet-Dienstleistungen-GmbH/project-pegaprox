@@ -3151,6 +3151,11 @@
                                         || 'This is a migration source. Its hardware is shown as it is on the Hyper-V host and cannot be changed from here.'}
                                 </div>
                             )}
+                            {/* Fork patch #15 — one fieldset around the whole form rather than a
+                                disabled attribute on every input: a field added later is covered
+                                without anybody remembering to cover it. `contents` keeps the
+                                element out of the layout. */}
+                            <fieldset disabled={isReadOnlySource} className="contents">
                             {loading ? (
                                 isCorporate ? (
                                     <div className="corp-vm-modal-state">
@@ -3195,7 +3200,7 @@
                             ) : config ? (
                                 // #625 v2 - a standby shows the configuration and changes none of
                                 // it: every tab but History renders its controls disabled
-                                <fieldset disabled={lockedTab || isReadOnlySource} className="contents" data-ha-locked={lockedTab ? '' : undefined}>
+                                <fieldset disabled={lockedTab} className="contents" data-ha-locked={lockedTab ? '' : undefined}>
                                     {/* General Tab */}
                                     {activeTab === 'general' && (crVc ? (
                                         <CrVcGeneral t={t} vm={vm} config={config} changes={changes} rows={crv.rows}
@@ -6537,6 +6542,7 @@
                                     Konfiguration konnte nicht geladen werden
                                 </div>
                             )}
+                            </fieldset>
                         </div>
 
                         {/* Footer - the redesign has its pending changes panel there */}
