@@ -2040,10 +2040,33 @@ def _convert_linux_guest(task, target, new_vmid, volumes):
         return None
     task.completion_problem = reason
     task.target_unbootable = True
+    _record_linux_failure(task, reason, ordered)
     return (f'{reason}. The VM stays on VirtIO and was not started: a guest prepared on '
             f'Hyper-V finds its disk on neither VirtIO nor SATA until its initramfs is '
             f'rebuilt. Fix the cause and run virt-v2v-in-place on its disk, or migrate '
             f'again.')
+
+
+def _record_linux_failure(task, reason, ordered):
+    """Keep what a retry of the Linux preparation needs with the migration.
+
+    The retry is offered on every migration that completed with errors. Without this
+    record it took the failed Linux conversion for a failed Windows injection and asked
+    for a driver ISO, which a Linux guest has no use for.
+    """
+    migration_id = getattr(task, 'id', None)
+    if not migration_id:
+        return
+    try:
+        hyperv_db.set_post_import(
+            _conn(), migration_id,
+            injection={'failed': True, 'reason': reason, 'drivers': DRIVERS_LINUX,
+                       'volumes': [{'volume': v['volume'], 'index': int(v['index'])}
+                                   for v in ordered],
+                       'at': time.time()})
+    except Exception:
+        logger.warning('[XHM:%s] could not record the failed Linux conversion', migration_id,
+                       exc_info=True)
 
 
 def _run_linux_conversion(task, target, run_on_node, ordered, new_vmid):
@@ -2322,7 +2345,7 @@ def retry_driver_injection(migration_id, by, *, iso=None, background=True):
             return {'success': False,
                     'error': 'A retry of this injection is already running.'}
         _retries_running.add(migration_id)
-    work = (prepared['run'], prepared['target'], prepared['vmid'], by)
+    work = (prepared['run'], prepared['target'], prepared['vmid'], by, prepared.get('linux'))
     if background:
         from pegaprox.core import ha
         threading.Thread(target=ha.as_job(_run_injection_retry, 'VirtIO injection retry'),
@@ -2368,20 +2391,64 @@ def _prepare_injection_retry(migration_id, iso):
                          f'so shut it down first; it is not shut down from here.'}
 
     recorded = (migration.get('post_import') or {}).get('injection') or {}
+    from pegaprox.globals import _xhm_migrations
+    live = _xhm_migrations.get(migration_id)
+    vm_config = (config.json().get('data') or {})
+    if _retry_drivers(recorded, live, vm_config) == DRIVERS_LINUX:
+        volumes = recorded.get('volumes') or _own_volumes(migration, vm_config,
+                                                          VIRTIO_CONTROLLER)
+        if not volumes:
+            return {'error': f'None of this migration\'s disks is attached to VM {vmid} on '
+                             f'VirtIO, so there is nothing to prepare.'}
+        run = live or _RecordedRun(migration, '')
+        run.config = {**(run.config or {}), 'hardware': 'virtio', 'drivers': DRIVERS_LINUX}
+        return {'run': run, 'target': target, 'vmid': int(vmid), 'linux': volumes}
+
     chosen = (iso or recorded.get('iso') or '').strip()
     if not chosen:
         return {'error': 'No driver ISO is recorded for this migration. Choose one.'}
 
-    from pegaprox.globals import _xhm_migrations
-    run = _xhm_migrations.get(migration_id) or _RecordedRun(migration, chosen)
+    run = live or _RecordedRun(migration, chosen)
     run.config = {**(run.config or {}), 'hardware': 'virtio', 'virtio_iso_path': chosen}
     return {'run': run, 'target': target, 'vmid': int(vmid)}
 
 
-def _run_injection_retry(run, target, vmid, by):
+def _retry_drivers(recorded, live, vm_config):
+    """Which preparation a retry runs again: what the failure recorded, else what the run
+    in memory was asked for, else what the VM's ostype says. The last one covers a
+    migration whose Linux conversion failed before failures were recorded."""
+    if recorded.get('drivers') in DRIVER_MODES:
+        return recorded['drivers']
+    if recorded.get('iso'):
+        return DRIVERS_WINDOWS
+    if live is not None and getattr(live, 'config', None):
+        drivers = target_hardware(live.config)['drivers']
+        if drivers != DRIVERS_NONE:
+            return drivers
+    return drivers_for_ostype(vm_config.get('ostype'))
+
+
+def _own_volumes(migration, vm_config, controller):
+    """This migration's volumes as they are attached to the VM on `controller`, in slot
+    order: [{'volume', 'index'}]. A disk somebody attached afterwards is not one of them."""
+    ours = {r.get('id') for r in migration.get('created_resources') or []
+            if r.get('kind') == 'volume'}
+    found = []
+    for key, value in vm_config.items():
+        slot = re.fullmatch(rf'{controller}(\d+)', key)
+        volume = str(value).split(',')[0]
+        if slot and volume in ours and 'media=cdrom' not in str(value):
+            found.append({'volume': volume, 'index': int(slot.group(1))})
+    return sorted(found, key=lambda v: v['index'])
+
+
+def _run_injection_retry(run, target, vmid, by, linux_volumes=None):
     """The retry itself. Never raises: it runs on a thread nobody joins."""
     migration_id = run.id
     try:
+        if linux_volumes:
+            _retry_linux_conversion(run, target, vmid, by, linux_volumes)
+            return
         run.log(f'Retrying the VirtIO driver injection, requested by {by}.')
         _set_retry_status(run, hyperv_db.STATUS_RUNNING, None)
         try:
@@ -2421,6 +2488,33 @@ def _run_injection_retry(run, target, vmid, by):
         with _retries_lock:
             _retries_running.discard(migration_id)
         _record_log(run, migration_id)
+
+
+def _retry_linux_conversion(run, target, vmid, by, volumes):
+    """Run the Linux preparation again. The VM stays on VirtIO either way: a guest whose
+    initramfs was built on Hyper-V boots from SATA no better, and it is not started."""
+    run.log(f'Retrying the Linux preparation for VirtIO with virt-v2v, requested by {by}.')
+    _set_retry_status(run, hyperv_db.STATUS_RUNNING, None)
+    # The previous run's note would otherwise read as this run's.
+    run.completion_problem = None
+    reason = _convert_linux_guest(run, target, vmid, volumes)
+    if reason is not None:
+        run.log(reason)
+        _end_retry(run, run.completion_problem or reason)
+        return
+    if run.completion_problem:
+        # Converted, but the agent or the network could not be carried over: the VM boots,
+        # and the run says what is left, as the migration itself does.
+        _end_retry(run, run.completion_problem)
+        return
+    try:
+        hyperv_db.set_post_import(
+            _conn(), run.id, injection=None,
+            drivers={'confirmed': True, 'by': f'virt-v2v, retried by {by}', 'at': time.time()})
+    except Exception:
+        logger.warning('[XHM:%s] could not record the conversion', run.id, exc_info=True)
+    run.log(f'VM {vmid} is prepared for VirtIO. It has not been started.')
+    _set_retry_status(run, hyperv_db.STATUS_COMPLETED, None)
 
 
 def _end_retry(run, reason):

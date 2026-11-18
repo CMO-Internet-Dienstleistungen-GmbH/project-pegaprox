@@ -237,3 +237,155 @@ class TestTheRouteAsksFirst:
         rules = {(str(r.rule), m) for r in api.app.url_map.iter_rules() for m in r.methods}
         assert ('/api/hyperv/<cluster_id>/migrations/<migration_id>/retry-injection',
                 'POST') in rules
+
+
+# ---------------------------------------------------------------------------
+# A Linux guest: the retry runs the virt-v2v preparation again, it asks for no ISO
+# ---------------------------------------------------------------------------
+
+#: What the import leaves when the Linux conversion failed: the VM stays on VirtIO.
+LINUX_ON_VIRTIO = {
+    'name': 'guest',
+    'ostype': 'l26',
+    'scsihw': 'virtio-scsi-single',
+    'boot': 'order=scsi0',
+    'scsi0': 'vmstorage:vm-132-disk-0,size=40G',
+    'scsi1': 'vmstorage:vm-132-disk-1,size=100G',
+    'net0': 'virtio=00:15:5D:08:1E:61,bridge=vmbr1',
+}
+
+
+@pytest.fixture
+def linux_migration(db):
+    """A migration whose Linux conversion failed before failures were recorded: nothing
+    in post_import says it was Linux, only the VM's ostype does."""
+    conn = db.conn
+    mid = hyperv_db.create_migration(
+        conn, source_cluster=SOURCE, source_vm_guid=GUID, source_vm_name='guest',
+        target_cluster=TARGET, target_node=NODE, target_storage='vmstorage')
+    hyperv_db.record_created_resource(conn, mid, 'vm', str(VMID))
+    for disk in ('vmstorage:vm-132-disk-0', 'vmstorage:vm-132-disk-1'):
+        hyperv_db.record_created_resource(conn, mid, 'volume', disk)
+    hyperv_db.update_migration(conn, mid, target_vmid=VMID, phase='completed',
+                               status=hyperv_db.STATUS_COMPLETED_WITH_ERRORS,
+                               error='virt-v2v-in-place ended with exit code 1')
+    return mid
+
+
+@pytest.fixture
+def linux_target(linux_migration):
+    config = dict(LINUX_ON_VIRTIO,
+                  description=hyperv_xhm.target_vm_description(linux_migration, 'guest'))
+    node = FakeTarget(config)
+    cluster_managers[TARGET] = node
+    try:
+        yield node
+    finally:
+        cluster_managers.pop(TARGET, None)
+
+
+def _conversion(monkeypatch, *, reason=None, problem=None):
+    """Replace the node-side Linux conversion. Returns the volumes it was asked for."""
+    runs = []
+
+    def fake(run, _target, vmid, volumes):
+        runs.append({'vmid': vmid, 'volumes': [v['volume'] for v in volumes]})
+        if problem:
+            run.completion_problem = problem
+        return reason
+
+    monkeypatch.setattr(hyperv_xhm, '_convert_linux_guest', fake)
+    return runs
+
+
+class TestALinuxGuestIsPreparedAgain:
+    def test_no_iso_is_asked_for(self, linux_migration, linux_target, monkeypatch):
+        injected = _injection(monkeypatch)
+        converted = _conversion(monkeypatch)
+
+        result = _retry(linux_migration)
+
+        assert result['success'] is True, result
+        assert injected == []
+        assert converted == [{'vmid': VMID, 'volumes': ['vmstorage:vm-132-disk-0',
+                                                        'vmstorage:vm-132-disk-1']}]
+
+    def test_a_conversion_that_works_completes_the_migration(self, linux_migration,
+                                                             linux_target, monkeypatch):
+        _conversion(monkeypatch)
+
+        _retry(linux_migration)
+
+        row = hyperv_db.get_migration(hyperv_xhm._conn(), linux_migration)
+        assert row['status'] == hyperv_db.STATUS_COMPLETED
+        assert linux_target.posts == [], 'the VM stays on VirtIO and is not started'
+
+    def test_a_conversion_that_fails_again_says_why(self, linux_migration, linux_target,
+                                                    monkeypatch):
+        _conversion(monkeypatch, reason='virt-v2v-in-place ended with exit code 1')
+
+        _retry(linux_migration)
+
+        row = hyperv_db.get_migration(hyperv_xhm._conn(), linux_migration)
+        assert row['status'] == hyperv_db.STATUS_COMPLETED_WITH_ERRORS
+        assert 'exit code 1' in row['error']
+
+    def test_a_note_from_the_conversion_keeps_it_unfinished(self, linux_migration,
+                                                            linux_target, monkeypatch):
+        _conversion(monkeypatch, problem='The QEMU guest agent could not be installed')
+
+        _retry(linux_migration)
+
+        row = hyperv_db.get_migration(hyperv_xhm._conn(), linux_migration)
+        assert row['status'] == hyperv_db.STATUS_COMPLETED_WITH_ERRORS
+        assert 'guest agent' in row['error']
+
+    def test_the_recorded_volumes_are_used(self, linux_migration, linux_target, monkeypatch):
+        hyperv_db.set_post_import(
+            hyperv_xhm._conn(), linux_migration,
+            injection={'failed': True, 'drivers': 'linux', 'reason': 'x', 'at': 0,
+                       'volumes': [{'volume': 'vmstorage:vm-132-disk-0', 'index': 0}]})
+        converted = _conversion(monkeypatch)
+
+        _retry(linux_migration)
+
+        assert converted[0]['volumes'] == ['vmstorage:vm-132-disk-0']
+
+    def test_a_disk_somebody_attached_later_is_left_alone(self, linux_migration, linux_target,
+                                                          monkeypatch):
+        _config(linux_target)['scsi2'] = 'vmstorage:vm-132-disk-9,size=1G'
+        converted = _conversion(monkeypatch)
+
+        _retry(linux_migration)
+
+        assert 'vmstorage:vm-132-disk-9' not in converted[0]['volumes']
+
+    def test_still_refused_while_the_vm_runs(self, linux_migration, linux_target, monkeypatch):
+        converted = _conversion(monkeypatch)
+        linux_target.running = True
+
+        result = _retry(linux_migration)
+
+        assert result['success'] is False and 'shut it down' in result['error']
+        assert converted == []
+
+
+def test_a_failed_linux_conversion_is_recorded_for_the_retry(linux_migration, monkeypatch):
+    class Task:
+        id = linux_migration
+        target_node = NODE
+
+        def log(self, _line):
+            pass
+
+    monkeypatch.setattr(hyperv_xhm, '_node_session',
+                        lambda *a, **k: __import__('contextlib').nullcontext(lambda *a, **k: (0, '', '')))
+    monkeypatch.setattr(hyperv_xhm, '_run_linux_conversion',
+                        lambda *a, **k: 'virt-v2v-in-place ended with exit code 1')
+
+    hyperv_xhm._convert_linux_guest(Task(), None, VMID,
+                                    [{'volume': 'vmstorage:vm-132-disk-0', 'index': 0}])
+
+    recorded = hyperv_db.get_migration(hyperv_xhm._conn(), linux_migration)['post_import']['injection']
+    assert recorded['drivers'] == 'linux'
+    assert recorded['volumes'] == [{'volume': 'vmstorage:vm-132-disk-0', 'index': 0}]
