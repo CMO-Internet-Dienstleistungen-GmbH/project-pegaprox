@@ -127,7 +127,7 @@ def _read_config(target, node, vmid, *, live=False):
     if response.status_code == 404:
         raise PostImportError(f'VM {vmid} no longer exists on {node}.')
     if response.status_code != 200:
-        raise PostImportError(f'Could not read VM {vmid}: {response.text[:160]}')
+        raise PostImportError(f'Could not read VM {vmid}: {response.text}')
     return (response.json().get('data') or {})
 
 
@@ -146,7 +146,7 @@ def _post_config(target, node, vmid, data):
         f'https://{target.host}:{target.api_port}'
         f'/api2/json/nodes/{node}/qemu/{vmid}/config', data=data)
     if response.status_code not in (200, 201):
-        raise PostImportError(f'Proxmox refused the change: {response.text[:200]}')
+        raise PostImportError(f'Proxmox refused the change: {response.text}')
     return response
 
 
@@ -266,7 +266,7 @@ def download_release(target, node, storage, release):
               # Turning verification off because a download failed would remove it.
               'verify-certificates': 1})
     if response.status_code not in (200, 201):
-        raise RuntimeError(f'Proxmox refused the download: {response.text[:200]}')
+        raise RuntimeError(f'Proxmox refused the download: {response.text}')
     return (response.json() or {}).get('data')
 
 

@@ -36,7 +36,7 @@ TOOL_PROBE = 'command -v virt-v2v-in-place >/dev/null 2>&1'
 #: tail's success for an install that failed.
 INSTALL_COMMAND = (
     'out=$(DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends '
-    + ' '.join(PACKAGES) + ' 2>&1); rc=$?; printf "%s\\n" "$out" | tail -25; exit $rc')
+    + ' '.join(PACKAGES) + ' 2>&1); rc=$?; printf "%s\\n" "$out"; exit $rc')
 
 #: The block driver the guest is converted for. The Hyper-V import builds a VirtIO VM on
 #: virtio-scsi, and a guest converted for virtio-blk would look for /dev/vda on it.
@@ -159,8 +159,8 @@ if [ -n "$url" ]; then
   if present; then say "installed from the archive $url"; exit 0; fi
   tried="$tried and the archive $url"
 fi
-last=$(grep -E '^(E:|Error|No package|Cannot|Could not|Failed|Problem)' "$log" 2>/dev/null | tail -n 1)
-say "failed: not installable from $tried${last:+ (last error: $last)}; see $log in the guest"
+errors=$(grep -E '^(E:|Error|No package|Cannot|Could not|Failed|Problem)' "$log" 2>/dev/null | sed -e ':a' -e '$!N' -e '$!ba' -e 's/\n/; /g')
+say "failed: not installable from $tried${errors:+ (errors: $errors)}; see $log in the guest"
 exit 0
 ''').strip()
 
@@ -361,6 +361,7 @@ MARK_UNMAP_FAILED = 'RBD_UNMAP_FAILED'
 #: or supermin does not start with 'virt-v2v' and would otherwise not reach the log.
 MARK_DEBUG = 'V2V_DEBUG'
 
+
 _RBD_OPTION = re.compile(r':(conf|id|keyring|mon_host)=([^:]*)')
 _FILE_FORMATS = {'.raw': 'raw', '.qcow2': 'qcow2', '.img': 'raw'}
 
@@ -494,8 +495,11 @@ def conversion_script(sources: list[dict], guest_name: str = 'guest', macs=None)
     lines.append("grep -E '^(virt-v2v|semodule|libsemanage)' \"$DEBUG\" | awk '!seen[$0]++'")
     lines.append(f"grep -oE '({MARK_AGENT}|{MARK_NETWORK}) .*' \"$DEBUG\" | awk '!seen[$0]++'")
     # Without the appliance's kernel log, which is what most of the rest is.
-    lines.append(f"[ $rc -ne 0 ] && grep -vE '^\\[' \"$DEBUG\" | tail -n 30 "
-                 f"| sed 's/^/{MARK_DEBUG} /'")
+    # A failed run hands over its whole debug output, the appliance's kernel log included.
+    # Where virt-v2v gives up says little; why it did -- a package database it could not
+    # read, a query that failed inside the guest, a kernel without its files, an I/O error
+    # on the disk -- can stand anywhere in it.
+    lines.append(f"[ $rc -ne 0 ] && sed 's/^/{MARK_DEBUG} /' \"$DEBUG\"")
     lines.append(f'echo "{MARK_EXIT}$rc"')
     lines.append('exit $rc')
     return '\n'.join(lines)

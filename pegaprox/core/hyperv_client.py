@@ -358,7 +358,7 @@ class PsrpHyperVClient(HyperVPowerShellClient):
             raise HyperVError(
                 f'The host answered with something that is not JSON ({exc}).',
                 kind='unknown',
-                detail=redact(raw[:500], self._connection.redactions()),
+                detail=redact(raw, self._connection.redactions()),
             ) from exc
 
     def run_json(self, script: str, **parameters: Any) -> Any:

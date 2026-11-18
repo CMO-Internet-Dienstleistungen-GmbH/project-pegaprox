@@ -568,7 +568,9 @@ exit 1
         assert result['exit'] == 1
         assert (f'{linux.MARK_DEBUG} libguestfs: error: could not create appliance through '
                 'libvirt') in result['lines']
-        assert not any('appliance kernel' in line for line in result['lines'])
+        # all of it, the appliance's kernel log too: the reason can stand anywhere
+        assert f'{linux.MARK_DEBUG} [    0.000000] Linux version 6.12 (appliance kernel)' \
+            in result['lines']
 
     def test_a_successful_run_keeps_its_debug_output_to_itself(self, node):
         script = linux.conversion_script([linux.disk_source('/dev/pve/vm-1-disk-0')])
@@ -774,3 +776,27 @@ iface eth1 inet dhcp
         script = linux.conversion_script(source, macs=[MAC0])
         assert script.index('typepermissive') < script.index('give each adapter back')
         assert script.index('give each adapter back') < script.index('-i disk')
+
+
+def test_a_failed_run_hands_over_its_whole_debug_output(tmp_path):
+    """'no installed kernel packages were found' says the kernel list came out empty, not
+    why. The line that says why can stand anywhere in the debug output, so all of it goes
+    into the migration log, the appliance's kernel log included."""
+    import subprocess
+    debug = tmp_path / 'debug.log'
+    body = (['libguestfs: trace: inspect_list_applications2 = []',
+             '[    6.97] sd 0:0:0:0: [sda] tag#225 FAILED Result: hostbyte=DID_OK']
+            + [f'line {i}' for i in range(5000)]
+            + ['virt-v2v-in-place: error: no installed kernel packages were found.'])
+    debug.write_text('\n'.join(body) + '\n')
+    script = linux.conversion_script([{'kind': 'block', 'path': '/dev/x', 'format': 'raw'}])
+    tail = [line for line in script.splitlines() if line.startswith('[ $rc -ne 0 ]')]
+    out = subprocess.run(['bash', '-c', 'rc=1\n' + '\n'.join(tail)], capture_output=True,
+                         text=True, env={'PATH': '/usr/bin:/bin', 'DEBUG': str(debug)}).stdout
+
+    lines = linux.read_result(out + f'{linux.MARK_EXIT}1\n')['lines']
+    assert lines == [f'{linux.MARK_DEBUG} {line}' for line in body]
+
+
+def test_the_node_install_reports_all_of_apt(tmp_path):
+    assert 'tail' not in linux.INSTALL_COMMAND and 'head' not in linux.INSTALL_COMMAND

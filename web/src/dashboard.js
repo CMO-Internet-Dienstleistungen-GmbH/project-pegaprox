@@ -12281,7 +12281,7 @@
                                                 </p>
                                             )}
                                             {fw.note && (
-                                                <p className="text-[10px] text-yellow-400/80 leading-4" title={fw.note}>⚠ {fw.note.slice(0, 80)}{fw.note.length > 80 ? '…' : ''}</p>
+                                                <p className="text-[10px] text-yellow-400/80 leading-4">⚠ {fw.note}</p>
                                             )}
                                             <button
                                                 onClick={() => downloadFrameworkReport(fw)}

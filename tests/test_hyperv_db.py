@@ -448,17 +448,16 @@ class TestTheLogOutlivesTheRun:
         assert row['log_lines'] == ['[13:04:56] Phase: planning',
                                     '[13:06:18] FAILED: name invalid format']
 
-    def test_an_endless_log_is_cut_from_the_front(self, conn):
-        # The end is what matters: the failure and what was said about it.
+    def test_a_long_log_is_kept_whole(self, conn):
+        # A failed conversion hands over virt-v2v's whole debug output; the line that says
+        # why can stand anywhere in it, so none is dropped.
         hyperv_db.create_migration(conn, source_cluster='hv1', source_vm_guid='guid-2',
                                    migration_id='mig-long')
-        lines = [f'line {n}' for n in range(hyperv_db.MAX_RECORDED_LOG_LINES + 50)]
+        lines = [f'line {n}' for n in range(25000)]
 
         hyperv_db.save_log(conn, 'mig-long', lines)
 
-        kept = hyperv_db.get_migration(conn, 'mig-long')['log_lines']
-        assert len(kept) == hyperv_db.MAX_RECORDED_LOG_LINES
-        assert kept[-1] == lines[-1]
+        assert hyperv_db.get_migration(conn, 'mig-long')['log_lines'] == lines
 
     def test_a_migration_without_a_log_reads_as_an_empty_one(self, conn):
         hyperv_db.create_migration(conn, source_cluster='hv1', source_vm_guid='guid-3',
