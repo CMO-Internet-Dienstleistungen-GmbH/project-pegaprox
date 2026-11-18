@@ -769,7 +769,7 @@ def check_guest_windows(images: list[dict] | None, injecting: bool = True,
     disk = windows_disk(images)
     if disk is None:
         reasons = {i.get('windows_error', '') for i in images if i.get('windows_error')}
-        detail = '; '.join(sorted(r for r in reasons if r))[:300]
+        detail = '; '.join(sorted(r for r in reasons if r))
         return Finding('guest_windows', WARNING,
                        'No Windows installation was found on any of this VM\'s disks.',
                        (f'{detail} ' if detail else '')

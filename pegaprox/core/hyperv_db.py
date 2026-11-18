@@ -547,12 +547,6 @@ def migrations_for_cluster(conn, source_cluster: str, limit: int = 100) -> list[
     return [_row_to_dict(row) for row in cursor.fetchall()]
 
 
-#: How much of a migration's log is kept with its record. The whole log, in practice: an
-#: import writes a few lines per disk and per phase, so a run stays in the hundreds. The
-#: bound is only there so that a loop logging without end cannot fill the database.
-MAX_RECORDED_LOG_LINES = 10000
-
-
 def save_log(conn, migration_id: str, lines, snapshot: dict | None = None) -> None:
     """Write the migration's log - and, when given, its snapshot - into its record.
 
@@ -561,7 +555,8 @@ def save_log(conn, migration_id: str, lines, snapshot: dict | None = None) -> No
     phase boundary. A transfer logs a handful of lines per disk and reports its progress
     through another path, so this stays a few dozen small writes per migration.
     """
-    kept = [str(line) for line in (lines or [])][-MAX_RECORDED_LOG_LINES:]
+    # Every line: the one cut off is the one somebody needs to find out what happened.
+    kept = [str(line) for line in (lines or [])]
     if snapshot is None:
         conn.cursor().execute(
             'UPDATE hyperv_migrations SET log_lines = ?, updated_at = ? WHERE migration_id = ?',

@@ -995,7 +995,7 @@ def _remove_target_vm(target, node, vmid, migration_id):
         return {'removed': True, 'note': f'VM {vmid} no longer exists.'}
     if response.status_code != 200:
         return {'removed': False,
-                'note': f'Could not read VM {vmid}: {response.text[:160]}'}
+                'note': f'Could not read VM {vmid}: {response.text}'}
 
     description = (response.json().get('data') or {}).get('description', '')
     if not _describes_migration(description, migration_id):
@@ -1010,7 +1010,7 @@ def _remove_target_vm(target, node, vmid, migration_id):
         return {'removed': False, 'note': f'Could not delete VM {vmid}: {exc}'}
     if response.status_code not in (200, 201):
         return {'removed': False,
-                'note': f'Could not delete VM {vmid}: {response.text[:160]}'}
+                'note': f'Could not delete VM {vmid}: {response.text}'}
     return {'removed': True, 'note': f'Deleted VM {vmid} and the disks attached to it.'}
 
 
@@ -1045,12 +1045,12 @@ def _free_leftover_volumes(migration, target, volumes):
                 freed.append({'kind': 'volume', 'id': volume, 'note': 'Freed.'})
             else:
                 kept.append({'kind': 'volume', 'id': volume,
-                             'note': err.strip()[:160] or f'pvesm free exited {exit_code}'})
+                             'note': err.strip() or f'pvesm free exited {exit_code}'})
     except Exception as exc:  # noqa: BLE001 — reported, never raised at the caller
         logger.warning('Could not free leftover volumes of %s',
                        migration.get('migration_id'), exc_info=True)
         already = {f['id'] for f in freed}
-        kept.extend({'kind': 'volume', 'id': v.get('id'), 'note': str(exc)[:160]}
+        kept.extend({'kind': 'volume', 'id': v.get('id'), 'note': str(exc)}
                     for v in volumes if v.get('id') not in already)
     finally:
         if ssh is not None:
@@ -1415,7 +1415,7 @@ def vmids_with_volumes(target, node, storage) -> set:
             f'/api2/json/nodes/{node}/storage/{storage}/content?content=images')
         if response.status_code != 200:
             logger.warning('Could not list %s on %s: %s', storage, node,
-                           response.text[:160])
+                           response.text)
             return taken
         for item in (response.json().get('data') or []):
             vmid = item.get('vmid')
@@ -1646,7 +1646,7 @@ def _open_target_node(task, source, target):
     if exit_code != 0:
         node.close()
         raise TransferError(
-            f'Could not prepare the share credentials on the target node: {err.strip()[:200]}')
+            f'Could not prepare the share credentials on the target node: {err.strip()}')
     return node, credentials_path
 
 
@@ -1667,7 +1667,7 @@ def _mounted_path_for(task, node, source, credentials_path, mounts, share_map, d
         if exit_code != 0:
             raise TransferError(
                 f'Could not mount //{source.transfer_address}/{share} on {task.target_node}: '
-                f'{err.strip()[:200]}. The node needs cifs-utils, network access to the '
+                f'{err.strip()}. The node needs cifs-utils, network access to the '
                 f'Hyper-V host, and an account that may read that share.')
         mounts[share] = point
         task.log(f'Mounted {share} read-only on {task.target_node}')
@@ -1771,7 +1771,7 @@ def _transfer_one_disk(task, node, migration_id, source_file, new_vmid, index, d
         # and the attempt starts over on a fresh one.
         _free_volume(node, volume)
         _forget_volume(migration_id, volume)
-        last_error = err.strip()[:300] or f'qemu-img exited {exit_code}'
+        last_error = err.strip() or f'qemu-img exited {exit_code}'
         if task.cancel_event.is_set():
             _fail(task, migration_id, 'Cancelled during the conversion')
             return None
@@ -1795,7 +1795,7 @@ def _allocate_volume(task, node, new_vmid, size_bytes):
     exit_code, out, err = node.run(
         f'pvesm alloc {shlex.quote(task.target_storage)} {int(new_vmid)} \'\' {size_kib}')
     if exit_code != 0:
-        logger.warning('[XHM:%s] pvesm alloc failed: %s', task.id, err.strip()[:200])
+        logger.warning('[XHM:%s] pvesm alloc failed: %s', task.id, err.strip())
         return None
 
     match = _ALLOC_VOLUME.search(out)
@@ -1903,7 +1903,7 @@ def _resolve_iso_path(task, run_on_node, chosen):
     path = str(out or '').strip().splitlines()[-1] if out else ''
     if exit_code == 0 and path.startswith('/'):
         return path
-    task.log(f'Could not resolve {text} on the node: {(err or "").strip()[:160]}')
+    task.log(f'Could not resolve {text} on the node: {(err or "").strip()}')
     return ''
 
 
@@ -2078,7 +2078,7 @@ def _run_linux_conversion(task, target, run_on_node, ordered, new_vmid):
                  f'comes with it and rebuilds the node\'s initramfs once.')
         rc, out, _ = run_on_node(target, node, hyperv_linux.INSTALL_COMMAND, timeout=900)
         if rc != 0:
-            return f'virt-v2v could not be installed on {node}: {str(out or "").strip()[-400:]}'
+            return f'virt-v2v could not be installed on {node}: {str(out or "").strip()}'
 
     sources = []
     for volume in ordered:
@@ -2087,7 +2087,7 @@ def _run_linux_conversion(task, target, run_on_node, ordered, new_vmid):
         path = str(out or '').strip().splitlines()[-1] if out else ''
         if rc != 0 or not path:
             return (f'Proxmox could not name a path for {volume["volume"]}: '
-                    f'{str(err or "").strip()[:200]}')
+                    f'{str(err or "").strip()}')
         try:
             sources.append(hyperv_linux.disk_source(path))
         except hyperv_linux.UnsupportedVolume as exc:
@@ -2526,7 +2526,7 @@ def _set_retry_status(run, status, error):
     run.status = status
     run.error = error
     _broadcast(run)
-    _update_migration_row(run.id, status=status, error=(error or '')[:500])
+    _update_migration_row(run.id, status=status, error=(error or ''))
 
 
 def _move_to_virtio_hardware(run, target, vmid):
@@ -2692,7 +2692,7 @@ def _move_disks(task, target, new_vmid, ordered, current, detail, controller,
             response = target._api_post(config_url, data=data)
             if response.status_code == 200:
                 return True
-            task.log(f'Could not change the VM hardware: {response.text[:160]}')
+            task.log(f'Could not change the VM hardware: {response.text}')
         except Exception as exc:                               # noqa: BLE001
             task.log(f'Could not change the VM hardware: {exc}')
         return False
@@ -3036,7 +3036,7 @@ def _create_target_vm(task, target, new_vmid, detail):
     except Exception as exc:
         return f'Creating the target VM failed: {exc}'
     if response.status_code not in (200, 201):
-        return f'Creating the target VM failed: {response.text[:200]}'
+        return f'Creating the target VM failed: {response.text}'
 
     # Creating a VM is an asynchronous task and it holds a lock while it runs. Posting the
     # disk configuration straight afterwards is refused with "VM is locked (create)", which
@@ -3080,7 +3080,7 @@ def _attach_disks(task, target, new_vmid, volumes, detail):
                 attached.append((volume['index'], name))
             else:
                 failed.append(name)
-                task.log(f'Could not attach {name}: {response.text[:160]}')
+                task.log(f'Could not attach {name}: {response.text}')
         except Exception as exc:
             failed.append(name)
             task.log(f'Could not attach {name}: {exc}')
@@ -3126,7 +3126,7 @@ def _attach_disks(task, target, new_vmid, volumes, detail):
                 f'/api2/json/nodes/{task.target_node}/qemu/{new_vmid}/config', data=extra)
             if response.status_code != 200:
                 failed.append('boot configuration')
-                task.log(f'Could not finish the VM configuration: {response.text[:160]}')
+                task.log(f'Could not finish the VM configuration: {response.text}')
         except Exception as exc:
             failed.append('boot configuration')
             task.log(f'Could not finish the VM configuration: {exc}')
@@ -3179,7 +3179,7 @@ def _start_target(task, new_vmid):
         task.log(f'VMID {new_vmid} could not be started: {exc}. Start it on the target.')
         return
     if response.status_code not in (200, 201):
-        task.log(f'VMID {new_vmid} could not be started: {response.text[:200]}')
+        task.log(f'VMID {new_vmid} could not be started: {response.text}')
         return
     task.log(f'VMID {new_vmid} was started, as the migration asked for. The Hyper-V source '
              f'is still there and still carries the same hostname and MAC — do not start '
@@ -3204,7 +3204,7 @@ def _finish(task, migration_id, new_vmid):
         _broadcast(task)
         _update_migration_row(migration_id, phase='completed',
                               status=hyperv_db.STATUS_COMPLETED_WITH_ERRORS,
-                              error=str(problem)[:500], progress=100,
+                              error=str(problem), progress=100,
                               completed_at=time.time())
         task.log(f'Migration completed with errors: {problem}.')
     else:
@@ -3246,7 +3246,7 @@ def _fail(task, migration_id, reason):
     """
     task.set_phase('failed', reason)
     _report_leftovers(task, migration_id)
-    _update_migration_row(migration_id, status=hyperv_db.STATUS_FAILED, error=str(reason)[:500],
+    _update_migration_row(migration_id, status=hyperv_db.STATUS_FAILED, error=str(reason),
                      completed_at=time.time())
     # Last, so the log carries the failure and everything that was said about it.
     _record_log(task, migration_id)

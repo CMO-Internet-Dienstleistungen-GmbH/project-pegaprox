@@ -1183,7 +1183,7 @@ def cleanup_hyperv_migration(cluster_id, migration_id):
     if not result.get('success'):
         log_audit(_acting_user(), 'hyperv.migration.cleanup.refused',
                   f'Cleanup of Hyper-V migration {_sl(migration_id)} was refused: '
-                  f'{_sl(str(result.get("error", "")))[:200]}')
+                  f'{_sl(str(result.get("error", "")))}')
         return jsonify(result), 409
 
     log_audit(_acting_user(), 'hyperv.migration.cleanup',
@@ -1379,7 +1379,7 @@ def apply_hyperv_vm_profile(cluster_id, migration_id):
     if not result.get('success'):
         log_audit(_acting_user(), 'hyperv.migration.profile.refused',
                   f'Switching the VM imported by migration {_sl(migration_id)} to the VM '
-                  f'standard was refused: {_sl(str(result.get("error", "")))[:200]}')
+                  f'standard was refused: {_sl(str(result.get("error", "")))}')
         return jsonify(result), 409
 
     log_audit(_acting_user(), 'hyperv.migration.profile',
