@@ -53,6 +53,7 @@ SRC_FILES=(
     auth.js
     icons.js
     ui.js
+    snapshot_meta.js
     datacenter.js
     security.js
     storage.js
@@ -62,6 +63,7 @@ SRC_FILES=(
     vm_config.js
     vnc_secure_socket.js
     node_modals.js
+    hyperv.js
     create_modals.js
     settings_modal.js
     worldmap.js

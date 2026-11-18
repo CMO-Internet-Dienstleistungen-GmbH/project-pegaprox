@@ -13,6 +13,7 @@ ssl/*.crt
 ssl/*.pem
 *.p12
 *.pfx
+.keys/
 
 # Runtime data
 config/
@@ -42,3 +43,7 @@ archive/
 
 # codeant CLI scratch output — tool state, never source
 .codeant/
+
+# Task journal and generated rule mirrors — working memory, never a deliverable.
+# The journal names hosts and customers; this repository is public.
+.claude/
