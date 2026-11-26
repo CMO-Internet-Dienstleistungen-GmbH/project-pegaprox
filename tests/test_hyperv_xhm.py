@@ -1715,32 +1715,64 @@ class TestAConfiguredSshKeyIsActuallyUsed:
            'bm90LWEtcmVhbC1rZXktanVzdC1hLWZpeHR1cmU=\n'
            f'{_EDGE}END {_LABEL}{_EDGE}')
 
-    def test_key_material_becomes_a_file_paramiko_can_read(self):
-        from pegaprox.core import xhm as core_xhm
-        path, temporary = core_xhm._key_file_for(self.KEY)
-        try:
-            assert temporary is True
-            with open(path, encoding='utf-8') as handle:
-                written = handle.read()
-            assert self._LABEL in written
-            # OpenSSH refuses a key file that does not end in a newline.
-            assert written.endswith('\n')
-        finally:
-            import os
-            os.unlink(path)
+    # Upstream 1.5.1 fixed the same defect in `_connect_ssh` itself (`_pkey_from_text`), so
+    # the fork's own helper went away on the rebase. What these tests hold is the intent:
+    # whatever `key_path` carries, a key that is there is the first thing offered.
 
-    def test_an_existing_path_is_passed_through_untouched(self, tmp_path):
+    @staticmethod
+    def _recording_paramiko(monkeypatch, seen):
+        paramiko = pytest.importorskip('paramiko')
+
+        class _SSHClient(paramiko.SSHClient):
+            def connect(self, *a, **kw):
+                seen.append(kw)
+                raise paramiko.AuthenticationException('stub')
+
+        class _Transport:
+            def __init__(self, *a, **k):
+                pass
+
+            def connect(self):
+                raise paramiko.SSHException('stub')
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(paramiko, 'SSHClient', _SSHClient)
+        monkeypatch.setattr(paramiko, 'Transport', _Transport)
+        return paramiko
+
+    def test_key_material_is_offered_as_a_key(self, monkeypatch):
         from pegaprox.core import xhm as core_xhm
+        seen = []
+        self._recording_paramiko(monkeypatch, seen)
+        parsed = object()
+        monkeypatch.setattr(core_xhm, '_pkey_from_text',
+                            lambda _p, text: parsed if self._LABEL in text else None)
+        with pytest.raises(Exception):
+            core_xhm._connect_ssh('10.0.0.7', 'root', '', key_path=self.KEY)
+        assert seen and seen[0].get('pkey') is parsed
+
+    def test_an_existing_path_is_passed_through_untouched(self, monkeypatch, tmp_path):
+        from pegaprox.core import xhm as core_xhm
+        seen = []
+        self._recording_paramiko(monkeypatch, seen)
         key_file = tmp_path / 'id_test'
         key_file.write_text(self.KEY + '\n')
-        path, temporary = core_xhm._key_file_for(str(key_file))
-        assert path == str(key_file)
-        assert temporary is False
+        with pytest.raises(Exception):
+            core_xhm._connect_ssh('10.0.0.7', 'root', '', key_path=str(key_file))
+        assert seen and seen[0].get('key_filename') == str(key_file)
 
-    def test_a_cluster_without_a_key_stays_on_the_password_path(self):
+    def test_a_cluster_without_a_key_stays_on_the_password_path(self, monkeypatch):
         from pegaprox.core import xhm as core_xhm
-        assert core_xhm._key_file_for('') == (None, False)
-        assert core_xhm._key_file_for('not a key at all') == (None, False)
+        seen = []
+        paramiko = self._recording_paramiko(monkeypatch, seen)
+        assert core_xhm._pkey_from_text(paramiko, 'not a key at all') is None
+        for no_key in ('', 'not a key at all'):
+            seen.clear()
+            with pytest.raises(Exception):
+                core_xhm._connect_ssh('10.0.0.7', 'root', 'pw', key_path=no_key)
+            assert all('pkey' not in kw and 'key_filename' not in kw for kw in seen)
 
 
 class TestAnImportThatInstallsNoDrivers:
