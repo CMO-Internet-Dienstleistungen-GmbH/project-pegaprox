@@ -63,6 +63,9 @@ OPTIONAL = {
     'backports': 'backports.zstd, the zstd variant of the page before Python 3.14.',
     'compression': 'compression.zstd, the zstd variant of the page from Python 3.14 on '
                    '(standard library there).',
+    'pypsrp': 'Hyper-V as a migration source (fork #15). core/hyperv_client.py raises a '
+              'classified "pypsrp is not installed" when the import fails, and nothing '
+              'else in PegaProx imports it.',
 }
 
 # NS Nov 2026 - the module the smoke test imports for an OPTIONAL entry where the name says

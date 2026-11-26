@@ -458,6 +458,9 @@ def test_every_cluster_exit_names_its_cluster():
 # body or a plan: each checks the lease of every one before a multi-step operation starts
 _FED_BODY_CLUSTER_WRITES = {
     ('POST', '/api/xhm/migrate'),
+    # Hyper-V patch (#15): a share mounted on a target node, an ISO written to its storage
+    ('POST', '/api/hyperv/<cluster_id>/transfer-check'),
+    ('POST', '/api/hyperv/target-virtio-isos/download'),
     ('POST', '/api/site-recovery/plans/<plan_id>/failover'),
     ('POST', '/api/site-recovery/plans/<plan_id>/emergency'),
     ('POST', '/api/site-recovery/plans/<plan_id>/test'),
@@ -474,6 +477,7 @@ _REVIEWED_BODY_WRITES = {
     ('POST', '/api/clusters'): 'adds a cluster: a new row, never enrolled',
     ('POST', '/api/config/restore'): 'this instance\'s configuration, no cluster call',
     ('POST', '/api/cross-cluster-migrate/preflight'): 'reads only',
+    ('POST', '/api/hyperv/<cluster_id>/vms/<int:vmid>/preflight'): 'reads only',
     ('POST', '/api/cross-cluster-replications'): 'stores a job; the replication loop checks '
                                                  'the lease of both clusters on every run',
     ('POST', '/api/cross-cluster-replications/preflight'): 'reads only',
