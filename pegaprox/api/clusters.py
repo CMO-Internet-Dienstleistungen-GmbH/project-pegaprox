@@ -7,7 +7,7 @@ import logging
 import re
 import threading
 import uuid
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, make_response, request
 
 from pegaprox.constants import *
 from pegaprox.globals import *
@@ -28,6 +28,11 @@ from pegaprox.utils.rbac import (
 )
 from pegaprox.utils.realtime import broadcast_sse, broadcast_update, push_immediate_update
 from pegaprox.core.config import load_config, save_config
+from pegaprox.core.health import (
+    compute_cluster_health,
+    get_cluster_health as compute_health_cached,
+    invalidate_cluster_health,
+)
 from pegaprox.core.manager import PegaProxManager, ha_cache_node_status, management_token_form
 from pegaprox.core.xcpng import XcpngManager, XENAPI_AVAILABLE
 from pegaprox.utils.sanitization import bounded_list, validate_ssh_user, validate_host_address, dns_suffix
@@ -1838,180 +1843,38 @@ def get_cluster_health(cluster_id):
         return jsonify({'error': 'Cluster not found'}), 404
 
     mgr = cluster_managers[cluster_id]
-    score = 100
-    factors = []
-    issues = []
-
-    # Connectivity gate — if API isn't reachable, everything else is moot
-    if not mgr.is_connected:
-        return jsonify({
-            'score': 0,
-            'band': 'critical',
-            'factors': [{'key': 'api', 'label': 'API connectivity', 'value': 'disconnected', 'delta': -100}],
-            'issues': ['Cluster API not reachable'],
-            'computed_at': None,
-        })
 
     # MK Nov 2026 (#1218) - a caller confined to some guests is told about the nodes those
     # run on: which are offline, the fullest storage, their replication jobs and backups.
-    # Nothing of it while their guests cannot be read, and no Ceph (below)
-    try:
-        mine = caller_guest_nodes(cluster_id)
-    except Exception as e:
-        logging.warning(f"[health] guests on {cluster_id} unread, node factors left out for this caller: {e}")
-        mine = set()
-
-    # 1) Nodes online
-    try:
-        ns = mgr.get_node_status() or {}
-    except Exception:
-        ns = {}
-    if mine is not None:
-        ns = {name: d for name, d in ns.items() if name in mine}
-    total_nodes = len(ns)
-    online_nodes = sum(1 for n in ns.values() if (n.get('status') in ('online', 'running') or not n.get('offline')))
-    if total_nodes:
-        offline = total_nodes - online_nodes
-        delta = -25 * offline
-        score += delta
-        factors.append({
-            'key': 'nodes', 'label': 'Nodes online',
-            'value': f'{online_nodes}/{total_nodes}', 'delta': delta,
-            'severity': 'critical' if offline else 'ok',
-        })
-        if offline:
-            offline_names = [name for name, d in ns.items()
-                             if d.get('status') == 'offline' or d.get('offline')]
-            issues.append(f'{offline} node(s) offline: {", ".join(offline_names) or "?"}')
-
-    # 2) Storage pressure — worst-offender across all nodes
-    worst_pct = 0.0
-    worst_label = None
-    try:
-        rows, hit = _health_storage_cache.get(cluster_id, 'storage')
-        if not hit:
-            rows = _health_storage_rows(cluster_id, mgr, ns)
-            if rows is not None:
-                _health_storage_cache.set(cluster_id, 'storage', rows, ttl_seconds=_HEALTH_STORAGE_TTL)
-        for node_name, stor_name, used, total in (rows or []):
-            if total <= 0 or (mine is not None and node_name not in mine):
-                continue
-            pct = (used / total) * 100.0
-            if pct > worst_pct:
-                worst_pct = pct
-                worst_label = f"{stor_name} @ {node_name}"
-    except Exception as e:
-        logging.debug(f"[health] storage scan failed: {e}")
-    if worst_label is not None:
-        if worst_pct >= 95:
-            d = -25
-        elif worst_pct >= 90:
-            d = -15
-        elif worst_pct >= 80:
-            d = -5
-        else:
-            d = 0
-        score += d
-        factors.append({
-            'key': 'storage', 'label': 'Worst storage',
-            'value': f'{worst_label} ({worst_pct:.0f}%)', 'delta': d,
-            'severity': 'critical' if worst_pct >= 95 else 'warning' if worst_pct >= 80 else 'ok',
-        })
-        if worst_pct >= 90:
-            issues.append(f'Storage near full: {worst_label} at {worst_pct:.0f}%')
-
-    # 3) Replication — failed jobs hurt
-    try:
-        repl = mgr.get_replication_status() or []
-    except Exception:
-        repl = []
-    if mine is not None:
-        # a job's 'type' is the replication type (local), not the guest's: asked as either
-        repl = scope_vm_rows(cluster_id, repl, vmid_key='guest', type_key='guest_type') if mine else []
-    if repl:
-        # PVE flags failures via 'fail_count' or non-zero error
-        failed = sum(1 for r in repl if (r.get('fail_count') or 0) > 0 or r.get('error'))
-        d = max(-20, -5 * failed)
-        score += d
-        factors.append({
-            'key': 'replication', 'label': 'Replication',
-            'value': f'{failed} failing / {len(repl)} jobs',
-            'delta': d,
-            'severity': 'warning' if failed else 'ok',
-        })
-        if failed:
-            issues.append(f'{failed} replication job(s) failing')
-
-    # 4) Backup-SLA — only if admin set a max-age threshold on the cluster
-    try:
-        db = get_db()
-        row = db.conn.cursor().execute(
-            "SELECT backup_sla_max_age_hours FROM clusters WHERE id = ?", (cluster_id,)
-        ).fetchone()
-        max_age = (dict(row).get('backup_sla_max_age_hours') if row else None) or 0
-    except Exception:
-        max_age = 0
-    if max_age and max_age > 0:
-        # Pull the most-recent backup timestamp via cluster/backup-info — cheap call
+    # Nothing of it while their guests cannot be read, and no Ceph.
+    # Fork patch #11: that rollup is the caller's own, so it is computed for this request
+    # and never taken from or put into the shared cache below.
+    if mgr.is_connected:
         try:
-            import time as _t
-            now = _t.time()
-            url = f"https://{mgr.host}:{mgr.api_port}/api2/json/cluster/backup-info/not-backed-up"
-            r = mgr._api_get(url)
-            stale = 0
-            if r is not None and r.status_code == 200:
-                _rows = r.json().get('data') or []
-                if mine is not None:
-                    _rows = scope_vm_rows(cluster_id, _rows) if mine else []
-                stale = len(_rows)
-            d = -10 if stale else 0
-            score += d
-            factors.append({
-                'key': 'backup_sla', 'label': 'Backup SLA',
-                'value': f'{stale} VM(s) past RPO ({max_age}h)' if stale else 'within RPO',
-                'delta': d,
-                'severity': 'warning' if stale else 'ok',
-            })
-            if stale:
-                issues.append(f'{stale} VMs past backup RPO of {max_age}h')
+            mine = caller_guest_nodes(cluster_id)
         except Exception as e:
-            logging.debug(f"[health] backup-sla check failed: {e}")
+            logging.warning(f"[health] guests on {cluster_id} unread, node factors left out for this caller: {e}")
+            mine = set()
+        if mine is not None:
+            return jsonify(compute_cluster_health(mgr, cluster_id, mine))
 
-    # 5) Ceph - last, its cap holds whatever the factors above left. Not for a caller confined
-    # to a pool or to guests: Ceph is the cluster's storage, and the Ceph overview answers
-    # 'confined' to them as well
-    try:
-        ceph, has_ceph = (None, False) if mine is not None else _health_ceph_status(cluster_id, mgr)
-        if has_ceph:
-            f, issue = _health_ceph_factor(ceph, score)
-            score += f['delta']
-            factors.append(f)
-            if issue:
-                issues.append(issue)
-    except Exception as e:
-        logging.debug(f"[health] ceph check failed: {e}")
+    # The rollup itself lives in pegaprox/core/health.py so the SSE broadcaster can
+    # compute it too. For a caller who sees the whole cluster it is one number, the
+    # same for each of them, so it is memoised there instead of being recomputed
+    # once per request per tab.
+    payload, etag, _from_cache = compute_health_cached(cluster_id, mgr)
 
-    # Clamp & band
-    score = max(0, min(100, score))
-    if score >= 90:
-        band = 'excellent'
-    elif score >= 70:
-        band = 'good'
-    elif score >= 50:
-        band = 'warning'
-    elif score >= 30:
-        band = 'degraded'
+    # A repeat with nothing changed costs a 304 instead of a fan-out over every
+    # node. app.py's after_request only applies no-store when the route set no
+    # Cache-Control of its own, so this header survives.
+    inm = request.headers.get('If-None-Match', '')
+    if etag in [t.strip() for t in inm.split(',') if t.strip()]:
+        resp = make_response('', 304)
     else:
-        band = 'critical'
-
-    import datetime as _dt
-    return jsonify({
-        'score': score,
-        'band': band,
-        'factors': factors,
-        'issues': issues,
-        'computed_at': _dt.datetime.utcnow().isoformat() + 'Z',
-    })
+        resp = make_response(jsonify(payload))
+    resp.headers['ETag'] = etag
+    resp.headers['Cache-Control'] = 'private, max-age=0, must-revalidate'
+    return resp
 
 
 # MK May 2026 — API latency dashboard backing endpoint. Reads the deque the

@@ -14645,6 +14645,10 @@
                 [remoteClusters, allClusterGuests]);
             const [knownNodes, setKnownNodes] = useState({}); // NS: Track all nodes ever seen to show offline ones
             const [clusterResources, setClusterResources] = useState([]);
+            // cluster_id -> health rollup, pushed over SSE (see the 'health' branch
+            // in the SSE handler). The REST poll in ClusterHealthBadge stays as a
+            // fallback for a dropped stream or a server that predates the push.
+            const [clusterHealth, setClusterHealth] = useState({});
             const [clusterDatastores, setClusterDatastores] = useState({ shared: [], local: {} }); // LW: Mar 2026 - sidebar datastore list
             // LW Nov 2026 - how the last /datastores read of each cluster ended ({ ok, at, msg }), Corporate Redesigned says a failed one.
             // The ref has every read (its time decides against the Datastore tab's own read), the state only a change, so a
@@ -18470,6 +18474,19 @@
                                         if (!prev[data.cluster_id]) return prev;
                                         return { ...prev, [data.cluster_id]: { ...prev[data.cluster_id], metrics: data.data } };
                                     });
+                                }
+                            } else if (data.type === 'health') {
+                                // The cluster health rollup, computed once per cluster on
+                                // the server instead of polled by every open tab. Keyed by
+                                // cluster so the sidebar and a switched-to cluster can use
+                                // the last value without asking for it again.
+                                if (data.cluster_id) {
+                                    // _receivedAt: der Badge muss unterscheiden koennen, ob ein
+                                    // Frame GERADE kam oder irgendwann einmal — sonst faellt es nach
+                                    // einem Serverneustart in einen langsamen Poll zurueck und zeigt
+                                    // minutenlang einen alten Wert.
+                                    setClusterHealth(prev => ({ ...prev,
+                                        [data.cluster_id]: { ...data.data, _receivedAt: Date.now() } }));
                                 }
                             } else if (data.type === 'resources') {
                                 if (currentCluster && data.cluster_id === currentCluster.id) {
@@ -23813,7 +23830,7 @@
                                                                 {selectedCluster.connected ? t('online') : t('offline')}
                                                             </span>
                                                             {selectedCluster.connected && (
-                                                                <ClusterHealthBadge clusterId={selectedCluster.id} authFetch={authFetch} apiUrl={API_URL} />
+                                                                <ClusterHealthBadge clusterId={selectedCluster.id} authFetch={authFetch} apiUrl={API_URL} health={clusterHealth[selectedCluster.id]} />
                                                             )}
                                                         </div>
                                                         {/* NS Nov 2026 - loadTabData only exists in the node modal, the click threw; same reads as the Cloud shell's refresh */}
