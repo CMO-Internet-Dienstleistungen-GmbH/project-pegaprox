@@ -417,6 +417,13 @@ def check_hyperv_transfer(cluster_id):
     if target is None or getattr(target, 'cluster_type', 'proxmox') != 'proxmox':
         return jsonify({'error': 'The target has to be a Proxmox cluster.'}), 400
 
+    # It mounts the host's share on a node of the target cluster. Under a federation that is
+    # an act on that cluster, so it waits for this instance to hold its lease.
+    from pegaprox.api.federation import refuse_unleased
+    refused = refuse_unleased(target_cluster, f'cluster {target_cluster}')
+    if refused:
+        return refused
+
     result = hyperv_transfer_check.run_check(
         mgr, target, target_node,
         lambda: open_target_node_session(target, target_node))
@@ -595,6 +602,13 @@ def download_target_virtio_iso():
     ok, denied = check_cluster_access(cluster_id)
     if not ok:
         return denied
+
+    # The download is written to a storage of that cluster: under a federation, only by
+    # the instance that holds its lease.
+    from pegaprox.api.federation import refuse_unleased
+    refused = refuse_unleased(cluster_id, f'cluster {cluster_id}')
+    if refused:
+        return refused
 
     target = cluster_managers.get(cluster_id)
     if target is None:

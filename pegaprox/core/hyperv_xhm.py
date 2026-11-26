@@ -1036,7 +1036,8 @@ def _free_leftover_volumes(migration, target, volumes):
                            node_login(target.config),
                            ssh_password_for(target.config),
                            key_path=getattr(target.config, 'ssh_key', ''),
-                           port=node_ssh_port(target.config))
+                           port=node_ssh_port(target.config),
+                           cluster_id=getattr(target, 'id', None))
         node = _Node(ssh, node_login(target.config))
         for entry in volumes:
             volume = entry.get('id') or ''
@@ -1510,7 +1511,8 @@ def open_target_node_session(target, node_name, ssh_user=None):
                        ssh_user or node_login(target.config),
                        ssh_password_for(target.config),
                        key_path=getattr(target.config, 'ssh_key', ''),
-                       port=node_ssh_port(target.config))
+                       port=node_ssh_port(target.config),
+                       cluster_id=getattr(target, 'id', None))
     return _Node(ssh, ssh_user or node_login(target.config))
 
 
@@ -1620,7 +1622,8 @@ def _open_target_node(task, source, target):
                            node_login(target.config),
                            ssh_password_for(target.config),
                            key_path=getattr(target.config, 'ssh_key', ''),
-                           port=node_ssh_port(target.config))
+                           port=node_ssh_port(target.config),
+                           cluster_id=getattr(target, 'id', None))
     except Exception as exc:
         # paramiko's own wording — "Bad authentication type; allowed types: ['publickey']"
         # — names the protocol and not the thing to do about it. This transfer runs on the
@@ -2639,7 +2642,8 @@ def _node_session(task, target, min_timeout=0):
                                node_login(target.config),
                                ssh_password_for(target.config),
                                key_path=getattr(target.config, 'ssh_key', ''),
-                               port=node_ssh_port(target.config))
+                               port=node_ssh_port(target.config),
+                               cluster_id=getattr(target, 'id', None))
     except Exception as exc:                                   # noqa: BLE001
         task.log(f'Could not open a node session for the driver injection ({exc}); '
                  f'falling back to the shared node connection.')

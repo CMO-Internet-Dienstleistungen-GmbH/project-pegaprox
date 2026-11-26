@@ -20640,7 +20640,7 @@
                 finally { setXhmDismissing(false); }
             };
             const xhmClusterLabel = (id) => {
-                const c = clusters.find(x => x.id === id);
+                const c = allClusters.find(x => x.id === id);
                 return c ? `${c.name} (${id})` : (id || '—');
             };
 
@@ -20730,7 +20730,7 @@
                 setXhmSourceVms([]);
                 xhmSourceClusterRef.current = cid;
                 (async () => {
-                    await fetchXhmSourceVms(cid, hvType(clusters.find(c => c.id === cid)) === 'hyperv');
+                    await fetchXhmSourceVms(cid, hvType(allClusters.find(c => c.id === cid)) === 'hyperv');
                     // also ensure metrics are loaded for node dropdown
                     if (!sidebarClusterData[cid]?.metrics && cid !== selectedCluster?.id) {
                         fetchSidebarClusterData(cid);
@@ -20744,7 +20744,7 @@
             // the button: their plan is a summary, not a verdict.
             useEffect(() => {
                 if (!xhmForm.source_cluster || !xhmForm.source_vmid || !xhmForm.target_cluster) return;
-                if (hvType(clusters.find(c => c.id === xhmForm.source_cluster)) !== 'hyperv') return;
+                if (hvType(allClusters.find(c => c.id === xhmForm.source_cluster)) !== 'hyperv') return;
                 fetchXhmPlan();
             }, [xhmForm.source_cluster, xhmForm.source_vmid, xhmForm.target_cluster]);
 
@@ -21923,7 +21923,7 @@
                         // the vocabulary is deliberately shorter: start and an orderly shutdown,
                         // no reset and no pulling the power, because a migration source must not
                         // be left in the state an unexpected outage leaves it in.
-                        hvType(clusters.find(c => c.id === cId)) === 'hyperv'
+                        hvType(allClusters.find(c => c.id === cId)) === 'hyperv'
                             ? `${API_URL}/hyperv/${cId}/vms/${resource.vmid}/${action === 'stop' ? 'shutdown' : action}`
                             : `${API_URL}/clusters/${cId}/vms/${resource.node}/${resource.type}/${resource.vmid}/${action}`,
                         { method: 'POST' }
@@ -22549,7 +22549,7 @@
                     // the cross-hypervisor wizard with this VM already chosen. Picking it
                     // out of a select is what makes that wizard unusable on a host with a
                     // few hundred guests.
-                    if (hvType(clusters.find(c => c.id === cId)) === 'hyperv') {
+                    if (hvType(allClusters.find(c => c.id === cId)) === 'hyperv') {
                         items.push(
                             { separator: true },
                             { perm: 'vm.migrate', label: t('hvMigrateToProxmox') || 'Migrate to Proxmox',
@@ -34050,7 +34050,7 @@
                                         the same name exists on every cluster. */}
                                     <div className="mt-2 space-y-0.5 text-xs text-gray-400">
                                         <div><span className="text-gray-500">{t('hvCleanupCluster') || 'Target cluster'}:</span> {(() => {
-                                            const c = clusters.find(x => x.id === hypervCleanup.migration.target_cluster);
+                                            const c = allClusters.find(x => x.id === hypervCleanup.migration.target_cluster);
                                             return c ? `${c.name} (${c.id})` : (hypervCleanup.migration.target_cluster || '—');
                                         })()}</div>
                                         <div><span className="text-gray-500">Node:</span> {hypervCleanup.migration.target_node || '—'}</div>
@@ -34101,7 +34101,7 @@
                                     <span className="text-gray-500"> · {hypervRetry.id}</span>
                                     <div className="mt-2 space-y-0.5 text-xs text-gray-400">
                                         <div><span className="text-gray-500">{t('hvCleanupCluster') || 'Target cluster'}:</span> {(() => {
-                                            const c = clusters.find(x => x.id === hypervRetry.target_cluster);
+                                            const c = allClusters.find(x => x.id === hypervRetry.target_cluster);
                                             return c ? `${c.name} (${c.id})` : (hypervRetry.target_cluster || '—');
                                         })()}</div>
                                         <div><span className="text-gray-500">Node:</span> {hypervRetry.target_node || '—'}</div>
