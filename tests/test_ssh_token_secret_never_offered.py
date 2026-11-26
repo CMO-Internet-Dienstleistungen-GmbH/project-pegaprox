@@ -293,7 +293,9 @@ def test_the_migration_ssh_offers_nothing_when_there_is_no_password(monkeypatch)
 
     with pytest.raises(Exception):
         xhm._connect_ssh('10.0.0.7', 'root', '', key_path=KEY_TEXT)
-    assert tried == [], f'something was offered to sshd: {tried}'
+    # Fork patch #15: a key given as its text is tried as a key now (connect with no password);
+    # what must never reach sshd is a password.
+    assert [t for t in tried if t[1]] == [], f'a password was offered to sshd: {tried}'
 
     with pytest.raises(paramiko.AuthenticationException):
         xhm._connect_ssh('10.0.0.7', 'root', ACCOUNT_SIDE, key_path=KEY_TEXT)
@@ -351,7 +353,8 @@ _PASSWORD_SLOTS = {'password', 'SSHPASS'}
 
 # pass_ that is not a PVE cluster's: XenAPI logs in with a real account password, and the
 # ESXi side of a migration carries the ESXi host's own password
-_OTHER_HYPERVISOR_FILES = {'pegaprox/core/xcpng.py'}
+# Hyper-V: its pass_ is the Windows account the host is read with, never an SSH password
+_OTHER_HYPERVISOR_FILES = {'pegaprox/core/xcpng.py', 'pegaprox/core/hyperv_cluster.py'}
 _OTHER_HYPERVISOR_NAMES = {('pegaprox/core/xhm.py', 'esxi_pass')}
 
 

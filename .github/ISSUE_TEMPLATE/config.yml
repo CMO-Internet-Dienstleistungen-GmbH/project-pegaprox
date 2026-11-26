@@ -1,8 +1,9 @@
+# Upstream's chooser sells sponsorship and asks for stars. This fork is the one
+# CMO runs, and the people opening issues here are colleagues reporting
+# something about their own deployment -- so those links are gone and the two
+# forms below are the whole menu.
 blank_issues_enabled: false
 contact_links:
-  - name: 💖 Sponsor PegaProx
-    url: https://pegaprox.com/#sponsor
-    about: Help us dedicate more time to PegaProx by becoming a sponsor!
-  - name: 📖 Documentation
+  - name: 📖 Dokumentation von PegaProx
     url: https://docs.pegaprox.com
-    about: Check the docs first — your answer might already be there.
+    about: Erst nachsehen -- vielleicht steht die Antwort schon da.
